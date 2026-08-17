@@ -1,16 +1,71 @@
 ---
 title: "Result Files & Analytics"
-description: "Where per-run results are written and how analytics are recorded."
+description: "The per-run results JSON, the l_eval_run analytics row, and the on-device results file."
 ---
 
-Each run writes a per-run results JSON and upserts an analytics row tracking the run's lifecycle.
+Each run writes a per-run results JSON to disk and upserts one analytics row that tracks the run's lifecycle. The on-device eval port writes an equivalent JSON to device storage for parity checking.
 
-## What this covers
+## The per-run results JSON
 
-- Per-run JSON at `evals/results/<YYYY-MM-DD>/<run_id>.json` (`Runner._safe_write_results_file`): counts, per-case verdicts, `session_trace`, cost.
-- `l_eval_run` analytics upserts via `AnalyticsClient` (`evals/analytics/client.py`, Bearer `ANALYTICS_INGEST_SECRET`); running→completed/aborted/failed lifecycle with retry on finalize.
-- On-device equivalent written by `ResultWriter` to device storage.
+`Runner._safe_write_results_file` (`evals/core/runner.py`) writes `evals/results/<YYYY-MM-DD>/<run_id>.json`, where the date is the day portion of `started_at` and `run_id` is the run's UUID. The write is best-effort — a failure logs to stderr rather than crashing the run. The summary printout echoes the exact path so it can be pasted into a triage prompt.
+
+The file is `RunResult.to_dict()`:
+
+| Key | Contents |
+| --- | --- |
+| `run_id`, `scope` | The run UUID and its scope label. |
+| `started_at`, `finished_at`, `status` | ISO timestamps and `running` / `completed` / `failed` / `aborted`. |
+| `dry_run`, `git_sha`, `git_branch` | Run mode and best-effort git context. |
+| `cases` | Array of per-case results (below). |
+| `counts` | `{run, passed, failed, uncertain, skipped, flaked}`. |
+| `pass_floor` | The `--pass-floor` threshold this run was judged against. |
+| `cost` | The cost ledger — production and judge calls, tokens, and USD. |
+| `notes` | Free-form notes, e.g. the `quota_abort:` message when a run aborts. |
+
+### Per-case rows
+
+Each entry is a `CaseResult.to_dict()`:
+
+| Field | Contents |
+| --- | --- |
+| `case_fqid` | `<suite>.<id>`. |
+| `bucket` | The case's cost tier. |
+| `verdict` | The final `Verdict` — `kind`, `confidence`, `reason`, `judge_name`, `cost_usd`, and a `details` blob (child verdicts for chains, matched/missed keywords, retrieval metric values, the LLM rubric response). |
+| `latency_ms` | Wall-clock latency. |
+| `baseline_kind` | Diff against `baseline.json` — `new` / `unchanged` / `regression` / `fix` / `changed`. |
+| `actual_text` | The model's response text, capped at `_MAX_ACTUAL_TEXT_CHARS` (4000). |
+| `actual_body_summary` | A small projection of the response body (keys + value types plus short scalar fields) so structured responses are readable without dumping arrays. |
+| `expected` | The case's `expected` dict, copied so a reader knows what the case was checking. |
+| `is_flake` | Whether the source case was flake-marked. |
+| `session_trace` | For session cases, the full per-round `SessionTrace` — request/response per round, mock resolutions, cost, `terminal_reason`. Absent for single-shot cases. |
+
+## The `l_eval_run` analytics row
+
+`AnalyticsClient.log_eval_run` (`evals/analytics/client.py`) upserts one row per run in `l_eval_run`, keyed on `run_id` and idempotent — it is called repeatedly across a run (start, progress, finalize). Transport is a `POST` to the `analytics` Edge Function with `Authorization: Bearer <ANALYTICS_INGEST_SECRET>` and body `{"operation": "log_eval_run", "input": { ... }}`. The runner catches failures and logs them without failing the run, so an observability hiccup never taints regression signal.
+
+The payload carries run identity, status, git context, the case counts, the pass floor, and the cost-ledger fields:
+
+| Group | Fields |
+| --- | --- |
+| Identity | `run_id`, `status`, `scope`, `dry_run`, `started_at`, `finished_at`, `git_sha`, `git_branch` |
+| Counts | `cases_run`, `cases_passed`, `cases_failed`, `cases_uncertain`, `cases_skipped`, `cases_flaked` |
+| Threshold | `pass_rate_floor` |
+| Production cost | `production_model`, `production_calls`, `production_input_tokens`, `production_output_tokens`, `production_cost_usd` |
+| Judge cost | `judge_calls`, `judge_input_tokens`, `judge_output_tokens`, `judge_cost_usd` |
+| Notes | `notes` |
 
 <Note>
-Scaffold generated from the codebase map — expand with full detail, examples, and specifics.
+`pass_rate` itself is **not** sent — it is a server-side GENERATED column derived from the counts. The client sends only `pass_rate_floor`, so the stored rate and floor always line up. The analytics function does not proxy Anthropic judge calls; `LlmJudge` calls Anthropic directly through `evals/_anthropic.py`.
 </Note>
+
+The lifecycle is `running` on open, then `completed`, `aborted`, or `failed` on finalize, with retry on the finalizing upsert.
+
+## The on-device results file
+
+The in-app eval port writes the same shape to the device. `ResultWriter` (`app/app/src/debug/java/com/intuisoftllc/rollingrecord/evalmode/results/ResultWriter.kt`) serializes a completed run to `{getExternalFilesDir}/evals/results/<yyyy-MM-dd>/<uuid>.json` — output-only, adb-pullable, with per-case rows carrying id / suite / status / verdict / reason so a device run can be diffed against the Python results in the parity gate. See [On-device results UI](/rollingrecord/evals/on-device/results-ui).
+
+## Where to go next
+
+- [Pass Floor, Flakes & Exit Codes](/rollingrecord/evals/operations/pass-floor) — how the counts in the results file become an exit code.
+- [Running Evals](/rollingrecord/evals/operations/running) — producing these files.
+- [Runner](/rollingrecord/evals/harness/runner) — how `RunResult` is assembled.

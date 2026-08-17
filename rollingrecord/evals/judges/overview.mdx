@@ -1,16 +1,82 @@
 ---
 title: "Judge Framework"
-description: "The Judge contract and per-case resolution."
+description: "The Judge contract, the Verdict vocabulary, and how a suite resolves a judge per case."
 ---
 
-Judges turn a case's actual output into a verdict; each suite resolves the right judge (or chain) per case.
+Every grading decision in the harness flows through one interface: a `Judge` takes the `(actual, expected, context)` triple and returns a single `Verdict`. Composition primitives, deterministic string checks, LLM rubric grading, retrieval scoring, and session-trace assertions are all the same shape, so they nest into arbitrary trees and the runner only ever knows about the abstract base class.
 
-## What this covers
+## The `Judge` contract
 
-- `Judge` ABC + `JudgeContext` + single `evaluate()→Verdict` contract (`evals/judges/base.py`); why cost is bundled into the verdict.
-- Per-case resolution: each suite exports `judge_for_case(case, *, anthropic)` (`run.py` `_load_judge_resolver`), dispatched across suites in `--all` runs.
-- The judge file inventory in `evals/judges/` (deterministic, fuzzy, semantic, llm, external_llm, faithfulness, grounded_extraction, retrieval, session_judges).
+`Judge` (`evals/judges/base.py`) is an ABC with two members:
+
+| Member | Kind | Purpose |
+| --- | --- | --- |
+| `name` | abstract property | Stable identifier shown in verdict output. Convention is the class name with an optional configuration suffix, e.g. `KeywordsJudge` or `MinConfidence[LlmJudge[...],t=0.85]`. |
+| `evaluate(ctx)` | abstract method | Grade one case. Returns a `Verdict`. Must not raise on normal disagreement — only on infrastructure failure. |
+
+The design rationale (documented at the top of `base.py`): a single `evaluate()` method — rather than separate `score` / `reason` / `cost` calls — makes the verdict the judge's atomic unit of work. An LLM judge cannot know its dollar cost without making the call, so cost is bundled into the returned `Verdict` and aggregation is automatic at the runner.
+
+`evaluate()` never raises on disagreement. For a case the judge cannot decide it returns `UNCERTAIN`; for a case the judge is structurally not applicable to, it returns `SKIP`. Infrastructure failures (network, a body the judge genuinely cannot parse) are the only reason to raise — and even most of those are converted to `SKIP` in practice (see the LLM judges).
+
+## `JudgeContext`
+
+`JudgeContext` (`evals/judges/base.py`) is the side-channel the runner injects at call time so judges don't need per-suite constructor wiring:
+
+| Field | Type | Purpose |
+| --- | --- | --- |
+| `case` | `TestCase` | The case under test — judges read `case.expected` (the grading spec) and `case.input` / `case.tags`. |
+| `actual` | `ActualOutput` | What the system-under-test produced. Judges read `actual.body`. |
+| `cost_ledger` | `Optional[CostLedger]` | Shared ledger; LLM judges record token spend here via `record_judge()`. `None` during dry-run. |
+| `extra` | `dict[str, Any]` | Catch-all for suite-specific extras — avoid relying on it; favor explicit fields. |
+
+See [Test cases](/rollingrecord/evals/harness/cases) for the shape of `TestCase` and the `expected` dict, and [Cost baseline](/rollingrecord/evals/harness/cost-baseline) for `CostLedger`.
+
+## The `Verdict` vocabulary
+
+`Verdict` (`evals/core/verdict.py`) is the frozen dataclass every judge returns. Its `kind` is a `VerdictKind` string enum with four values chosen so the cascade rule is unambiguous:
+
+| Kind | Meaning | Cascade behavior |
+| --- | --- | --- |
+| `PASS` | Judge is confident the actual matches expected. | Terminal — halts a `Cascade`. |
+| `FAIL` | Judge is confident the actual does NOT match. | Terminal — halts a `Cascade`. |
+| `UNCERTAIN` | Judge ran and looked at the data but can't decide (a low-confidence guess). | Advances the cascade; contributes confidence info. |
+| `SKIP` | Judge is structurally not applicable (e.g. `JsonShapeJudge` on free text). | Advances the cascade; contributes no verdict info. |
+
+Other `Verdict` fields: `confidence` (`[0.0, 1.0]`), `reason` (one-sentence human-readable explanation), `judge_name`, `cost_usd` (zero for deterministic judges), and an optional `details` dict persisted into the per-case results JSON. The convenience constructors `Verdict.passed()`, `Verdict.failed()`, `Verdict.uncertain()`, and `Verdict.skipped()` are what concrete judges call. The `is_terminal` property is `True` only for `PASS` and `FAIL` — this is what `Cascade` reads to decide whether to stop.
+
+The split between `UNCERTAIN` and `SKIP` matters: both advance a cascade, but `UNCERTAIN` means "the judge ran but isn't sure" (carries confidence), while `SKIP` means "the judge couldn't meaningfully run at all" (contributes nothing).
+
+## Per-case judge resolution
+
+A judge is chosen per case, not per suite. Each suite exports a `judge_for_case(case, *, anthropic)` function from its `judges.py` module. The runner loads it through `_load_judge_resolver()` (`evals/run.py`) — which imports `suites.<suite>.judges` and asserts the module exports `judge_for_case` — and builds a resolver per suite so an `--all` run dispatches each case to its own suite's resolver.
+
+Resolvers commonly branch on `case.tags` or an explicit `expected.judge_chain` override, returning a composed chain. For example, `kb_chat` (`evals/suites/kb_chat/judges.py`) routes hard-contract tags to a deterministic `AllOf` and free-text-quality tags to a Sonnet-then-Opus `Cascade`; `rag_real_content` (`evals/suites/rag_real_content/judges.py`) returns `AllOf(structural, llm_cascade)`. See [Judge resolvers](/rollingrecord/evals/authoring/judge-resolvers) for the authoring pattern.
+
+## Judge inventory
+
+Every judge type in `evals/judges/`, grouped by file:
+
+| File | Judges | Cost |
+| --- | --- | --- |
+| `chains.py` | `Cascade`, `AllOf`, `AnyOf`, `Majority`, `MinConfidence` | Sum of children that ran. |
+| `deterministic.py` | `ExactMatchJudge`, `ContainsJudge`, `KeywordsJudge`, `RegexJudge`, `LengthJudge`, `JsonShapeJudge`, `BodyFieldJudge`, `ToolCallJudge`, `ListShapeJudge` | Zero (pure code). |
+| `fuzzy.py` | `LevenshteinJudge`, `SetSimilarityJudge` | Zero (pure code). |
+| `semantic.py` | `EmbeddingSimilarityJudge` | Zero — Phase 1 stub, always `SKIP`. |
+| `llm.py` | `LlmJudge`, `LlmJudgePositionSwap` | Anthropic tokens (`2×` for the position-swap variant). |
+| `external_llm.py` | `ExternalLlmJudge` | External provider (not recorded in the Anthropic ledger). |
+| `faithfulness.py` | `FaithfulnessJudge` | Anthropic tokens. |
+| `grounded_extraction.py` | `GroundedExtractionJudge` | Anthropic tokens. |
+| `retrieval.py` | `RetrievalRecallAtK`, `RetrievalPrecisionAtK`, `RetrievalMRR` | Zero (pure code). |
+| `session_judges.py` | `MustCallToolJudge`, `MustNotCallToolJudge`, `RoundBudgetJudge`, `ToolCallSequenceJudge`, `WasteThresholdJudge` | Zero (pure code). |
 
 <Note>
-Scaffold generated from the codebase map — expand with full detail, examples, and specifics.
+`EmbeddingSimilarityJudge` (`evals/judges/semantic.py`) is a Phase 1 interface stub: its `evaluate()` always returns `SKIP` so it composes safely into chains without affecting outcomes. The wiring to an embedding endpoint is deferred until a Python-callable `embed_text` op is exposed. Do not describe it as an active grader.
 </Note>
+
+## Where to go next
+
+- [Chain primitives](/rollingrecord/evals/judges/chains) — how `Cascade`, `AllOf`, `AnyOf`, `Majority`, and `MinConfidence` aggregate child verdicts, and the full PASS/FAIL/UNCERTAIN/SKIP truth table.
+- [Deterministic, fuzzy & semantic judges](/rollingrecord/evals/judges/deterministic) — the zero-cost structural tier, the `expected` keys each reads, and when each SKIPs.
+- [LLM-as-judge, faithfulness & grounded extraction](/rollingrecord/evals/judges/llm) — rubric grading via Anthropic, the bias mitigations, and claim-/field-level grounding checks.
+- [Session-aware judges](/rollingrecord/evals/judges/session) — assertions over the multi-round trace: which tools were called, in what order, within what round budget.
+- [Retrieval judges](/rollingrecord/evals/judges/retrieval) — Recall@k, Precision@k, and MRR over the chunks the agent's tools pulled back.

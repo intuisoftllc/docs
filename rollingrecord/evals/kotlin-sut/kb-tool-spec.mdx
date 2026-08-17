@@ -1,16 +1,67 @@
 ---
 title: "KbToolSpec (client-owned tools)"
-description: "The single source of truth for the client-owned KB tool definitions."
+description: "The single source of truth for the KB-chat tool definitions and usage instructions the AI sees, and how it generates the eval fixture."
 ---
 
-`KbToolSpec` is the single source of truth for the KB tool definitions and usage instructions the AI sees — client-owned by design.
+`KbToolSpec` (`app/agentcore/.../data/repository/KbToolSpec.kt`) is the single source of truth for the `kb_query` (KB chat) AI tool SPEC — the tool DEFINITIONS the AI sees and the tool USAGE INSTRUCTIONS prose block. Both are client-owned per the AI-Content-Placement HARD RULE (Rule 2, tool-referencing): tool changes ship as app-only updates without a server deploy, while the server owns the system prompt and model selection.
 
-## What this covers
+## Two pure functions
 
-- `KbToolSpec.kt` (`app/agentcore/.../data/repository`): single source of truth for tool DEFINITIONS + usage instructions the AI sees; client-owned per the AI-Content-Placement HARD RULE.
-- How `KbToolSpec.definitions()`/`usageInstructions()` feed both `agentrunner` and the snapshot that generates `evals/fixtures/kb_query_tools.json`.
-- The full production tool catalog (search/list/transcript/propose/write tools) referenced by mock-tool and session judges.
+`KbToolSpec` exposes exactly two functions, both PURE — they depend only on the global `KbToolNames` and `ClientConfig` objects, never on any `KnowledgeBaseAdvisor` instance state. The advisor's tool DISPATCH logic (the `when (toolUse.name)` handlers that execute tools against DAOs and search engines) stays in `KnowledgeBaseAdvisor`; only the spec lives here.
+
+| Function | Returns | Role |
+| --- | --- | --- |
+| `definitions()` | `List<KbQueryTool>` | The tool definitions passed through to the AI provider — each a `{name, description, input_schema}` JSON-Schema object. |
+| `usageInstructions()` | `String` | The usage-instruction prose injected into the server prompt at the `{TOOL_USAGE_INSTRUCTIONS}` placeholder — when/how to call each tool, multi-tool workflows, context resolution, write ops, blueprint drafting, transcript snippets. |
+
+Every tool name comes from `KbToolNames` (`app/agentcore/.../data/repository/KbToolNames.kt`), the single source of truth for tool-name strings. The usage instructions interpolate those constants (never raw literals) so a rename is a compile error, and they also interpolate live config — e.g. the per-turn transcript-snippet cap `ClientConfig.aiChatMaxTranscriptSnippets`. IDs referenced in tool descriptions carry a type prefix (`ctx-`, `rec-`, `sec-`, `bp-` via `IdPrefix`) so the model passes the right shape back.
+
+## The tool catalog
+
+`definitions()` registers 23 tools (13 read + 5 write + 5 propose). The five write tools flip the loop's `hadWriteOp` flag (they match `RunnerToolExecutor.WRITE_TOOLS`); the five propose tools do NOT — they draft a confirmation card that the user accepts in the app UI, so calling the tool never writes.
 
 <Note>
-Scaffold generated from the codebase map — expand with full detail, examples, and specifics.
+The docstring in `evals/core/tool_fixtures.py` and the injection comment in `client.py` still say production sends "~14 real tools" — that figure is stale. The spec has since grown to the 23 tools below; the fixture is regenerated from `definitions()`, so it always reflects the real count regardless of the comment.
 </Note>
+
+| Tool | Required params | Purpose |
+| --- | --- | --- |
+| `getCapabilities` | — | Full description of what the assistant can do. |
+| `findContextByName` | `name` | Fuzzy context lookup (exact → starts-with → contains). |
+| `listAllContexts` | — | All contexts, active and completed. |
+| `getContextOverview` | — | Read-only shape snapshot (names, lifecycle, counts) before organize-my-library advice. |
+| `getContextSections` | `contextId` | A context's topic list — id, title, item count, preview line. |
+| `getSectionDetail` | `contextId`, `sectionId` | Full content of one topic. |
+| `searchContext` | `query` | Full-text search across extracted context / notes. |
+| `searchRecordings` | `query`, `scope` | Topic search over recordings with explicit `scope` (`in_scope` / `out_of_scope` / `all`). |
+| `getRecordingTranscriptSnippet` | `recordingId` | Semantic passage retrieval from one recording's transcript. |
+| `scanRecording` | `recordingId` | Literal whole-transcript scan for names/terms semantic search can't surface. |
+| `listAllRecordings` | — | Browse the whole library, one page at a time. |
+| `listContextRecordings` | — | List recordings IN a context (optional `contextId`). |
+| `getBlueprints` | — | Extraction blueprints; no query = count/list, query = relevant subset. |
+| `proposeBlueprint` *(propose)* | `name`, `description`, `systemPrompt` | Drafts a blueprint proposal card. |
+| `createTask` *(write)* | `contextId`, `text` | Creates an action item in a context. |
+| `addNote` *(write)* | `contextId`, `sectionId`, `text` | Appends a note to a topic. |
+| `createSection` *(write)* | `contextId`, `title`, `items` | Creates a new topic. |
+| `correctContext` *(write)* | `contextId`, `sectionId`, `insightIndex`, `correctedText` | Replaces one insight's text to fix an error. |
+| `renameSection` *(write)* | `contextId`, `sectionId`, `newTitle` | Renames a topic. |
+| `proposeContext` *(propose)* | `name`, `scopeDescription` | Drafts a new-context proposal card. |
+| `proposeAddRecordingToContext` *(propose)* | `recordingId`, `contextId` | Drafts an add-recording card. |
+| `proposeRemoveRecordingFromContext` *(propose)* | `recordingId`, `contextId` | Drafts a remove-recording card (destructive on confirm). |
+| `proposeMoveRecordingBetweenContexts` *(propose)* | `recordingId`, `fromContextId`, `toContextId` | Drafts a single move card — the only correct tool for relocations. |
+
+## Two consumers, one spec
+
+Both `definitions()` and `usageInstructions()` feed the production loop and the eval fixture from the same source, which is what keeps evals honest.
+
+- **The agent loop** — [`agentrunner`](/rollingrecord/evals/kotlin-sut/agentrunner) passes `KbToolSpec.definitions()` and `KbToolSpec.usageInstructions()` straight into every `AgentTurnRequest`, exactly as `KnowledgeBaseAdvisor` does on-device. Evals therefore run against the real tool set, not a hand-written sandbox.
+- **The eval fixture** — the Gradle snapshot test `KbToolSpecSnapshotTest` serializes `KbToolSpec` into `evals/fixtures/kb_query_tools.json` (shape `{tools: [...], tool_instructions: "..."}`) and fails the build on drift. That generated file is the canonical fixture `load_tool_fixture("kb_query")` loads and `_inject_canonical_tools()` splices into any bare `kb_query` case.
+
+The Python SUT injects this fixture because a hand-written two-tool sandbox masked real bugs (the bot got "stuck in card world" and refused to pull a transcript) — the full tool set changes the bot's behavior. `validate_mock_tool_names()` cross-checks a case's `mock_tools` keys against the fixture's tool names, so a stale sandbox name like `searchContext` left after a case should have migrated is caught immediately.
+
+## Where to go next
+
+- [agentcore Shared Agent Loop](/rollingrecord/evals/kotlin-sut/agentcore) — where `definitions()`/`usageInstructions()` enter the loop.
+- [Tool fixtures](/rollingrecord/evals/harness/tool-fixtures) — how `kb_query_tools.json` is loaded, cached, and validated.
+- [Live Dev Backend Client](/rollingrecord/evals/sut/ai-engine-http) — `_inject_canonical_tools`, which splices this spec into bare cases.
+- [Mock tools](/rollingrecord/evals/harness/mock-tools) — how tool calls against these definitions resolve to fixture results.

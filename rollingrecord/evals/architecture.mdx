@@ -1,16 +1,82 @@
 ---
 title: "Architecture & Data Flow"
-description: "The end-to-end path a case takes through the eval harness."
+description: "The end-to-end path a case takes from run.py through the runner and a system-under-test to a verdict, results JSON, and analytics."
 ---
 
-An eval case flows from `run.py` through the runner and a system-under-test into the judge chain, producing a verdict, results JSON, and analytics.
+An eval run flows from the `run.py` CLI through the `Runner`, into a `SystemUnderTest` (single-shot) or a session driver (multi-round), and finally through the suite's judge chain to produce a `Verdict`, a per-run results JSON, and an `l_eval_run` analytics row.
 
-## What this covers
+## The end-to-end path
 
-- End-to-end path: `run.py` → `Runner` → `SystemUnderTest`/`SessionRunner` → judge chain → `Verdict` → results JSON + `l_eval_run` analytics.
-- The three SUT backends behind one `SystemUnderTest` ABC (`evals/core/system.py`): `AiEngineHttp` (Python), `KotlinSessionDriver` (`--sut=kotlin`), and on-device `OnDeviceSystemUnderTest`.
-- Where fidelity is deliberately imperfect vs production (documented in `evals/core/session.py` and `evals/ai_engine/kotlin_runner.py` headers).
+The entry point is `main()` in `evals/run.py`. Startup, in order:
 
-<Note>
-Scaffold generated from the codebase map — expand with full detail, examples, and specifics.
-</Note>
+1. **Parse args** — `_parse_args()` resolves the run scope (`--all` / `--suite` / `--case`), filters (`--bucket`), and modifiers (`--dry-run`, `--sut`, `--repeat`, `--pass-floor`).
+2. **Load config** — `from_env()` (`evals/config.py`) builds the immutable `EvalConfig` from `.env.local` / the process environment, failing fast if any required var is missing.
+3. **Resolve cases** — `_resolve_suites_and_cases()` walks `SUITES_ROOT` and calls `load_suite_cases()` (`evals/core/case.py`) to load every matching `TestCase`. `--repeat N` multiplies the case list N times before the run.
+4. **Load judge resolvers** — one per suite via `_load_judge_resolver()`, which imports `evals.suites.<suite>.judges` and returns its `judge_for_case` function. `_resolver_dispatch()` wraps them so a single `Runner.run()` can span multiple suites in `--all` mode.
+5. **Load baselines** — each suite's `baseline.json` is loaded and merged into one combined `Baseline` (`evals/core/baseline.py`), keyed by fully-qualified id so cross-suite ids can't collide.
+6. **Mint auth + build the SUT** — outside dry-run, `mint_tokens()` (`evals/ai_engine/auth.py`) mints the Clerk JWT + App Check token, and the `Runner` is constructed around `AiEngineHttp` (`evals/ai_engine/client.py`). For `--sut=kotlin`, a `KotlinSessionDriver` (`evals/ai_engine/kotlin_runner.py`) is also attached to drive session cases.
+7. **Run** — `Runner.run()` executes the cases, then `_print_summary()` (or `_print_repeat_summary()`) prints the tally and returns the process exit code.
+
+## The Runner
+
+`Runner` (`evals/core/runner.py`) drives one full invocation. Its lifecycle:
+
+- Opens an `l_eval_run` analytics row (`status='running'`) via `_safe_analytics_upsert()`.
+- Executes every case, tallying verdicts and accumulating cost into a `CostLedger` (`evals/core/cost.py`).
+- Finalizes with `status='completed'`, `'aborted'`, or `'failed'`, retrying the terminal analytics upsert so the server row never gets stuck showing `running`.
+- Writes the per-run results JSON to `RESULTS_ROOT/<YYYY-MM-DD>/<run_id>.json` via `_safe_write_results_file()`.
+- Returns a `RunResult` the CLI uses for the summary and exit code.
+
+### Sequential vs parallel execution
+
+The runner picks an execution path by worker count:
+
+| Path | When | Method |
+| --- | --- | --- |
+| Sequential | `--case=X`, a single-case suite, or `workers=1` | `_run_cases_sequential()` — deterministic case order, no thread overhead. |
+| Parallel | Everything else (the default) | `_run_cases_parallel()` — a `ThreadPoolExecutor` with `DEFAULT_WORKERS` (4). |
+
+Worker count is fixed at `Runner.DEFAULT_WORKERS = 4`; the old `--workers` override was removed because raising it (e.g. to 8) overloaded the `ai-engine` and fabricated failures (empty output, HTTP 400 `ai_call_failed`, missed tool calls). The parallel path stores each result in a per-index slot and re-sorts to input order after the pool drains, so the results JSON and baseline diff are deterministic regardless of which worker finished first. A `print_lock` serializes multi-line output; a `state_lock` guards the completion counter and analytics upserts.
+
+## Per-case evaluation
+
+`_run_one_case()` is the core of the loop. For each case:
+
+1. **Unfilled-stub guard** — if `case.input` contains the `<<REPLACE_ME` marker (a deliberately-blank moderation fixture awaiting a human), the case is `SKIP`-ed before the SUT is even called.
+2. **Mock-tool-name guard** — `_check_mock_tool_names()` fails a `kb_query` session case in isolation if its `mock_tools` reference a tool name absent from the canonical fixture (`evals/core/tool_fixtures.py`).
+3. **Drive the system** — a single-shot case calls `self._system.call(case.input)`; a session case (`case.session is not None`) delegates to `SessionRunner` (`--sut=python`) or the attached `KotlinSessionDriver` (`--sut=kotlin`), which returns both an `ActualOutput` and a session trace.
+4. **Judge** — if the call errored, a synthetic `system_error` `FAIL` verdict is recorded; otherwise `resolve_judge(case)` returns the `Judge`, and `judge.evaluate(JudgeContext(...))` produces the `Verdict`.
+5. **Baseline diff** — `_baseline_diff()` compares the verdict against the baseline and stamps `new` / `unchanged` / `regression` / `fix` / `changed`.
+6. **Capture forensics** — the response text (capped at `_MAX_ACTUAL_TEXT_CHARS` = 4000) and a shallow body summary are stored on the `CaseResult` for after-the-fact review without re-running.
+
+## The system-under-test boundary
+
+Every production call goes through the `SystemUnderTest` ABC (`evals/core/system.py`), which returns an `ActualOutput` carrying `body`, `latency_ms`, token counts (including Anthropic prompt-cache tokens), `model`, `stop_reason`, `response_headers`, and an optional `error`. Centralizing the call surface lets the runner swap implementations without changing any judge:
+
+| Implementation | Location | Drives |
+| --- | --- | --- |
+| `AiEngineHttp` | `evals/ai_engine/client.py` | Live `ai-engine` HTTP call (all single-shot cases; Python session rounds). |
+| `KotlinSessionDriver` | `evals/ai_engine/kotlin_runner.py` | `app/agentrunner` → the real `app/agentcore` `AgentLoop` (session cases under `--sut=kotlin`). |
+| `OnDeviceSystemUnderTest` | `evalmode/systemundertest/OnDeviceSystemUnderTest.kt` | The in-app Kotlin runtime against a seeded local corpus. |
+
+### Where fidelity is deliberately imperfect
+
+The Python `SessionRunner` is an **imitation** of the client agent loop, not the loop itself — its own header documents this. It threads the `X-Query-Session-Token` header across rounds, resolves `mock_tools` locally, and honors the server's authoritative `max_rounds` cap. When exact parity with the shipping client matters, `--sut=kotlin` drives the literal `AgentLoop`; the `kotlin_runner.py` header spells out the frozen case-JSON stdin/stdout contract that keeps that path honest.
+
+## Termination and abort handling
+
+A run can end early on a server-side quota gate. `_detect_quota_error()` scans each verdict (and any session trace) for the canonical `rate_limited` or `cap_reached` codes and raises `_QuotaAbort`, which finalizes the run as `aborted` with an actionable banner (most often: the eval user is missing the `developer` RC entitlement). `provider_rate_limited` is explicitly excluded — that upstream-provider 429 is transient and retried by `AiEngineHttp`, not a reason to abort. `KeyboardInterrupt` is also caught and finalized as `aborted` with partial counts preserved.
+
+## Exit codes
+
+`_print_summary()` returns the process exit code (RR-433):
+
+| Code | Meaning |
+| --- | --- |
+| `0` | Completed run, pass rate `>=` floor, no regressions. |
+| `1` | Pass rate below `--pass-floor` (default `0.95`), OR at least one regression. |
+| `2` | Runner aborted or failed (`status != 'completed'`). |
+
+Pass rate is `cases_passed / (cases_run - cases_flaked)` — flake-marked cases are excluded from the denominator so a known-noisy case can't drag the run below floor. Regression detection always breaks the build regardless of the floor. In `--repeat` mode, `_print_repeat_summary()` instead badges each case `RELIABLE` / `FLAKY` / `BROKEN` and exits `1` only on a non-flake `BROKEN` case.
+
+Continue to [Core Concepts & Glossary](/rollingrecord/evals/concepts) for the vocabulary these stages share, or the [Runner page](/rollingrecord/evals/harness/runner) for orchestration detail.

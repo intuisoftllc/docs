@@ -1,16 +1,81 @@
 ---
-title: "Session Runner (multi-round loop)"
-description: "The simulated multi-round chatbot loop for SESSION cases."
+title: "Session Runner"
+description: "The multi-round chatbot loop, session-token threading, terminal reasons, and the synthesized trace."
 ---
 
-`SessionRunner` simulates a multi-round conversation with the agent, threading session tokens and producing the canonical `_session` trace.
+`SessionRunner` (`evals/core/session.py`) drives a multi-round agent session against ai-engine with case-defined mock tools. Where a single-shot case hits the SUT once and grades one response, a session case simulates the FULL chatbot loop — user prompt, tool calls, tool results fed back, and a final answer — because the bot's quality emerges from the loop, not any single call.
 
-## What this covers
+## Why the loop matters
 
-- `SessionRunner` in `evals/core/session.py`: the simulated chatbot loop, `X-Query-Session-Token` threading across rounds, `is_final` fallback round, `follow_ups` injection with per-turn stage advance.
-- Terminal reasons (`end_turn`, `max_rounds_exceeded`, `harness_round_cap`, `harness_cost_cap`, `mock_not_found`, `transport_error`, `upstream_error`) and the `HARNESS_MAX_ROUNDS_DEFAULT`/`DEFAULT_MAX_COST_USD` safety nets vs the server's authoritative round cap.
-- `SessionTrace` + `_synthesize_output` producing the canonical `_session` body block (rounds, all_tool_calls, all_tool_results) that both SUTs must emit.
+Tests that only hit round 1 miss whether the bot used the tool result, whether it looped forever instead of finalizing, and whether it abandoned the user's question after one search. A session test exercises all three. The loop is `kb_query`-only today; any other operation is single-shot by nature, and a session spec on a non-`kb_query` case terminates immediately with a `transport_error`.
 
-<Note>
-Scaffold generated from the codebase map — expand with full detail, examples, and specifics.
-</Note>
+## Round loop
+
+Each iteration sends one round to ai-engine and then decides to terminate, fan out tool results, or inject the next scripted follow-up:
+
+1. Build the round's `kb_query` input from the case's `inner` payload, overriding `messages` with the running list and `is_final` with the round-specific boolean.
+2. Attach `X-Query-Session-Token` on continuation rounds; round 1 sends none.
+3. Call the SUT; record per-round tokens, latency, cost, response text, and tool-use blocks into a `SessionRound`.
+4. Capture the session token from the response header on the first round that surfaces one.
+5. If the bot emitted `tool_use` blocks, resolve each against the `MockToolRegistry`, append the assistant turn and a `user` turn of `tool_result` blocks, and loop.
+6. If the bot finished a turn with no tool calls, either inject a pending follow-up and continue, or terminate.
+
+The token is captured under the lower-cased header key `x-query-session-token` (`SESSION_TOKEN_HEADER`) — `AiEngineHttp` normalizes headers to lower case. It keys the server's per-session round counter; conversation context is preserved separately via the `messages` list.
+
+## Session-token threading and follow-ups
+
+`session.follow_ups` are scripted user messages injected after the bot ends a turn. A follow-up may be a bare string (fires after the next unclaimed `end_turn`) or an object with `after_round` to fire only when the bot ends turn at exactly round `N`.
+
+When a follow-up is injected, `SessionRunner` does three things: it appends the new user turn, calls `registry.advance_stage()` so staged mock tools reveal their next stage (see [Mock tool registry](/rollingrecord/evals/harness/mock-tools)), and drops the session token to `None`. Dropping the token matches production: a new user question mints a fresh query-session (`KbQuerySessionManager` is started per question in `KnowledgeBaseAdvisor`), so the server round budget resets each turn rather than being shared across the whole thread.
+
+## Budget ceilings
+
+The authoritative round budget is enforced server-side by ai-engine via the query-session row (`server_config.kb_chat_max_tool_rounds`, default 5). The harness ceilings are runaway-prevention safety nets that should never bind in a healthy run.
+
+| Ceiling | Constant / spec key | Default | Role |
+| --- | --- | --- | --- |
+| Harness round cap | `HARNESS_MAX_ROUNDS_DEFAULT` / `session.max_rounds` | 50 | Defense-in-depth; if it fires, the server-side cap failed to terminate first — investigate. |
+| Cost cap | `DEFAULT_MAX_COST_USD` / `session.max_cost_usd` | `$0.50` | Halts if a case somehow runs every round and is still spending. |
+
+Cases should NOT set `session.max_rounds`, so a change to the server cap doesn't break tests; a case may set it only when it specifically wants to test a tighter ceiling.
+
+## Terminal reasons
+
+Every session records why it ended, used in the trace and by judges that care about HOW it terminated (e.g. a round-budget judge).
+
+| `terminal_reason` | Constant | Meaning |
+| --- | --- | --- |
+| `end_turn` | `TERMINAL_END_TURN` | The bot answered and stopped — the common healthy path. |
+| `scripted_end` | `TERMINAL_SCRIPTED_END` | Ended at `end_turn` with follow-ups still queued whose `after_round` gate never matched. |
+| `max_rounds_exceeded` | `TERMINAL_MAX_ROUNDS_SERVER` | The server's authoritative round budget terminated the session — a normal terminal. |
+| `harness_round_cap` | `TERMINAL_MAX_ROUNDS_HARNESS` | The harness safety net fired (should never happen in a healthy run). |
+| `harness_cost_cap` | `TERMINAL_COST_CAP` | Session cost reached `max_cost_usd`. |
+| `mock_not_found` | `TERMINAL_TOOL_NOT_FOUND` | The bot called a write tool with no matching mock (`MockNotFound`). |
+| `transport_error` | `TERMINAL_TRANSPORT_ERROR` | Malformed session case (wrong operation, missing seed messages, non-object input). |
+| `upstream_error` | `TERMINAL_UPSTREAM_ERROR` | A non-quota ai-engine error, or an unrecognized `stop_reason`. |
+
+A `stop_reason` of `end_turn`, `stop_sequence`, `max_tokens`, empty, or `None` is treated as the bot finishing a turn. An error message containing `max_rounds_exceeded` is mapped to the server terminal, not a generic upstream error.
+
+## Trace types
+
+`SessionTrace` is the end-to-end record, attached to the `CaseResult` so a failure is debuggable from the per-run JSON without re-running.
+
+- `SessionRound` — one ai-engine call: `request_messages` (a deep copy so later mutation doesn't poison the trace), `response_text`, `response_tool_uses`, `stop_reason`, latency, tokens, model, `cost_usd`, `mock_resolutions`, and any `error`.
+- `SessionTrace` — the `rounds` list, `terminal_reason`, `final_text`, `final_tool_calls`, `all_tool_calls` (every tool_use across every round — the source of truth for must-call / must-not-call judges), `all_tool_results` (every resolved mock result — retrieval judges parse chunk ids from these against `expected.gold_chunk_ids`), the `session_token`, and aggregate token / cost / latency totals.
+
+## Synthesized output
+
+`_synthesize_output` builds the `ActualOutput` that single-shot judges grade against. Its `body` carries the LAST round's `text` and `tool_calls` — so `KeywordsJudge`, `LengthJudge`, and `LlmJudge` work unchanged on the bot's final answer — plus a `_session` sub-field for session-aware judges:
+
+| `_session` key | Contents |
+| --- | --- |
+| `round_count` | Number of rounds. |
+| `terminal_reason` | Why the session ended. |
+| `all_tool_calls` | Every tool call across the session as `{name, input}`. |
+| `all_tool_results` | Every resolved mock result. |
+| `total_cost_usd` | Aggregate production cost. |
+| `rounds` | Per-round summary (`response_text`, `tool_calls`, `stop_reason`, `is_final_round`). |
+
+Per-round detail matters because the bot may call a write tool in round 2 and end with a one-line acknowledgment in round 3 — a judge looking only at the final round would wrongly conclude the tool was never called. The full trace also lives in `raw_response["session_trace"]` for debugging. `error` is set on the synthesized output only for the harness-fault terminals (`transport_error`, `mock_not_found`, `upstream_error`, `harness_cost_cap`, `harness_round_cap`), so those short-circuit judging as a `system_error` while a healthy `end_turn` does not.
+
+The `--sut=kotlin` driver produces a trace in this same `_session` shape so both SUTs grade identically — see [Kotlin SUT contract](/rollingrecord/evals/kotlin-sut/contract). Session-aware judges are covered in [Session judges](/rollingrecord/evals/judges/session).

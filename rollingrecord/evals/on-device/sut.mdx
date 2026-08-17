@@ -1,16 +1,56 @@
 ---
 title: "OnDeviceSystemUnderTest"
-description: "The on-device SUT that runs the literal production ask() path."
+description: "The in-process SUT that runs the literal production ask() path and reconstructs the loop's session trace."
 ---
 
-`OnDeviceSystemUnderTest` runs the real production `ask()` path against real Room data and the live backend for the signed-in test account.
+`OnDeviceSystemUnderTest` (`evalmode/systemundertest/OnDeviceSystemUnderTest.kt`) is the on-device implementation of the `SystemUnderTest` (`evalmode/core/SystemUnderTest.kt`) interface — the in-process simulator `evals/core/system.py` anticipated, made real. It runs the LITERAL production path: it resolves the same `ContextCardRepository` the KB-chat ViewModel uses from `UserSessionManager.currentScope` and calls `ask(...)`, so the agent loop, the real `AndroidToolExecutor` reading real Room, the live `ai-engine`, and the signed-in identity all execute for real. Its `name` is `"on-device@dev"`.
 
-## What this covers
+## The SystemUnderTest contract
 
-- `systemundertest/OnDeviceSystemUnderTest.kt`: runs the LITERAL production `ContextCardRepository.ask()` path (real loop, real Room, live ai-engine, signed-in identity).
-- `_session` reconstruction from `DevChatTraceCapture` so session judges run on-device; follow-ups as successive turns on one threadId; per-case synthetic identity/timezone/`history_truncated`.
-- Supported ops: `kb_query` end-to-end; `template_moderation` via `AiEngineClient`; `extract` returns an honest unsupported error (server-side tool calls not observable).
+`call(case, extraHeaders?)` issues the production call for a case and returns an `ActualOutput` (`evalmode/core/SystemUnderTest.kt`). The runner never retries — a transient failure is recorded as an error verdict for that case. The whole `Case` is passed (not just `input`) so a session-mode case can drive its follow-ups as successive turns.
 
-<Note>
-Scaffold generated from the codebase map — expand with full detail, examples, and specifics.
-</Note>
+`ActualOutput` carries the fields judges and the cost ledger read:
+
+| Field | Purpose |
+| --- | --- |
+| `body` | Free-form `JsonObject` judges read (`text`, `retrieval_summary`, `tool_calls`, `_session`). |
+| `latencyMs` | Wall-clock time for the call/session. |
+| `inputTokens` / `outputTokens` | Agent token spend, summed across turns; feeds the `CostLedger`. |
+| `model` | The model the SUT actually used (set to `PRODUCTION_MODEL`). |
+| `stopReason` | Anthropic termination reason / session terminal reason. |
+| `error` | Non-null when the production call failed — short-circuits judging. |
+
+## Supported operations
+
+`call(...)` dispatches on `case.input.operation` (defaulting to `kb_query`):
+
+| Operation | Path |
+| --- | --- |
+| `kb_query` | Full end-to-end via `ContextCardRepository.ask()` (the bulk of the suites). |
+| `template_moderation` | The standalone `AiEngineClient.templateModeration(...)` production call. |
+| `extract` | Returns an honest error — extraction runs server-side, and its raw tool calls aren't observable on-device (run the `extract_template` suite via the Python harness). |
+| *(any other)* | Returns a clear `on-device SUT does not support operation '<op>'` error rather than crashing. |
+
+## kb_query: driving the real loop
+
+`runKbQuery` parses the case's `input.input.messages` into the last user turn (the question) plus prior user/assistant pairs (the history), then calls `ask(...)` on a unique `threadId` (`eval-<uuid>`). Follow-ups from `session.follow_ups` fire as successive turns on the **same** `threadId`, accumulating conversation history exactly as the app does; a non-`Success` turn is terminal and stops the session. Agent token spend is summed across every turn via an `onTurnTokens` sink `(Int, Int) -> Unit` and attached to the `ActualOutput`.
+
+Several optional per-case fields ride the real `ask()` wire so a case can test identity-, timezone-, or truncation-sensitive behavior. They live under `input.input` and are null when omitted (the bot then uses the real account, exactly as a live test would):
+
+- `eval_system_suffix` — a synthetic identity/profile suffix.
+- `user_timezone` — a synthetic timezone.
+- `history_truncated` — the conversation-window rolloff fact, threaded as the `history_truncated` wire field so the server's memory prompt states rolloff as fact.
+
+## Mock tools (opt-in)
+
+A session case that declares `session.mock_tools` runs the real agent loop with only the tool *result bytes* swapped, via `MockToolExecutor` (`evalmode/mocks/MockToolExecutor.kt`) passed as `toolExecutorOverride`. The server prompt, round budget, LLM, threading, and `ask()`'s FTS prefetch all still execute. Absence of `mock_tools` is *always* the real path (real Room + real search), so the opt-in can't become a catch-all — new cases run end-to-end by default. `MockToolRegistry` (`evalmode/mocks/MockToolRegistry.kt`) is a byte-faithful port of `evals/core/mock_tools.py`: it resolves each `tool_use` block against the case spec (LOOSE, EXPLICIT `{match, result}` list, or STAGED per-turn form), returns a safe-empty default for unmocked READ-only tools, and throws `MockNotFound` for an unmocked write tool (which `AgentLoop` converts to an error outcome — the on-device equivalent of the Python `SESSION_ERROR` hard stop). `advanceStage()` is called after each injected follow-up so stage N serves the (N+1)-th turn.
+
+## Session trace reconstruction
+
+Session-structural judges (MustCallTool, RoundBudget, ToolCallSequence, retrieval, faithfulness) need the loop's rounds and tool calls, which aren't in `ask()`'s return value. To surface them without any production-code change, the SUT drives the loop with the existing debug `DevChatTraceCapture` enabled (ref-counted so parallel SUT calls flip `DevFlags.captureKbChatTraces` atomically), then reshapes the captured turns into the `body._session` block via `buildSessionBlock(threadId)`:
+
+- `round_count`, `terminal_reason` (`upstream_error` when a turn recorded an error, else `end_turn`).
+- `all_tool_calls[]` (`{name, input}`) and `all_tool_results[]` (`{result}`), flattened across every round of every turn.
+- `rounds[]` — per round: `round_number`, `is_final_round`, `response_text`, `stop_reason` (`tool_use` if it called tools, else `end_turn`), and `tool_calls[]`.
+
+When nothing was captured (capture off / not wired), `_session` is null and the session judges SKIP rather than fail. On `AskResult.Success` the SUT also lifts the last round's `tool_calls` to `body.tool_calls` for body-level tool-call judges. `AskResult.Error` still attaches `_session` and appends the internal diagnostic to `message` so a "Something went wrong" is traceable straight from the uploaded results.

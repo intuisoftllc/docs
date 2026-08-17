@@ -1,16 +1,65 @@
 ---
 title: "Daily Eval Analysis File"
-description: "The per-day analysis file that records eval iteration and patterns."
+description: "The per-day analysis file that records eval iteration and surfaces oscillation and regression chains."
 ---
 
-One analysis file per day records what was tried during eval iteration, so future sessions don't repeat the same thrash.
+Eval iteration is high-cost and easy to thrash: a fix in one round breaks a previously-passing case in the next, then fixing that re-breaks the original, and hours later there is no record of what was actually tried. The daily analysis file is the single artifact that lets a future session see what has already been attempted. Keeping it is a `CLAUDE.md` HARD RULE, applied whenever you run, debug, or tune the suites in `evals/`.
 
-## What this covers
+## Location and purpose
 
-- The `CLAUDE.md` HARD RULE: one `evals/results/YYYY-MM-DD/analysis.md` per day, read at session start, appended after each meaningful iteration.
-- Required structure (Context / Run log / Patterns observed / Open questions) and what it is explicitly NOT.
-- Why it exists: eval iteration is high-cost and thrash-prone; the file is the anti-oscillation record.
+One file per day, in the same folder as that day's run JSONs:
 
-<Note>
-Scaffold generated from the codebase map — expand with full detail, examples, and specifics.
-</Note>
+```
+evals/results/<YYYY-MM-DD>/analysis.md
+```
+
+It has two purposes and no others:
+
+1. **Historical log** — the AI/prompt/eval state at the time, what was being iterated on, what changed and why.
+2. **Pattern detection** — surface oscillation (a case that keeps flipping pass/fail across runs), regression chains (fixing case X breaks case Y), and root-cause-vs-cosmetic-fix decisions, so future sessions don't repeat the same thrash.
+
+## When to read and write
+
+<Steps>
+<Step title="At the start of any eval session">
+Open today's `analysis.md`. If it exists, read it before proposing changes — it tells you what was already tried, what's oscillating, and which hypotheses are active. If it doesn't exist, create it once you have a meaningful observation (don't create empty stubs).
+</Step>
+<Step title="After each meaningful iteration">
+Append a short entry per run + change + re-run cycle — anything that produced a hypothesis-worthy observation (a case oscillated, a fix worked, a fix broke something else, the bot kept failing the same way despite a prompt change). Log as you go; don't batch.
+</Step>
+<Step title="When a pattern emerges">
+On the third failure of a case, the second reverted fix, or a cluster failing the same way, elevate it to a Patterns section and call it out explicitly.
+</Step>
+</Steps>
+
+## Required structure
+
+The file is a tool, not a report — keep it tight and add a section only when it has content.
+
+| Section | Contents |
+| --- | --- |
+| Context (top, 2–4 lines) | Which suite is being worked, the current pass floor, the rough goal of the session. |
+| Run log | One bullet per run, newest first: short run-id prefix, result summary, what changed since the prior run, one-line takeaway. |
+| Patterns observed | Recurring failures, oscillation between fixes, cases that keep regressing — each with name, cases involved, what's been tried, current hypothesis. |
+| Open questions / things to watch | Unresolved hypotheses, suspected root causes not yet confirmed. |
+
+## What it is not
+
+- Not a PR description or a marketing summary.
+- Not a complete diff of every prompt/rubric change — git history has those.
+- Not a list of every failing case ever — only patterns and open questions.
+- Not a place for apology language or conversation-tone recap.
+
+## Related run discipline
+
+The analysis file sits alongside three operational rules that shape how runs are done:
+
+- **Never run evals autonomously** — runs hit the live dev server and cost money; ask the user to run and paste results.
+- **Keep workers at the default 4** — `run.py` fixes the worker count at `Runner.DEFAULT_WORKERS`; higher parallelism overloads `ai-engine` and fabricates failures that would otherwise pollute the analysis file.
+- **Read the [pass floor and regression policy](/rollingrecord/evals/operations/pass-floor)** — the analysis file is where a regression chain gets documented once the runner flags it.
+
+## Where to go next
+
+- [Running Evals](/rollingrecord/evals/operations/running) — producing the runs this file logs.
+- [Pass Floor, Flakes & Exit Codes](/rollingrecord/evals/operations/pass-floor) — the regression and flake signals worth recording.
+- [Result Files & Analytics](/rollingrecord/evals/operations/results-files) — the run JSONs that live in the same daily folder.

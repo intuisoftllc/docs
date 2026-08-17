@@ -1,16 +1,92 @@
 ---
 title: "Mock Tool Registry"
-description: "How tool calls are mocked in eval cases."
+description: "The three mock-tool fixture forms, match operators, staged progressive disclosure, and read vs write fallback."
 ---
 
-The mock tool registry supplies deterministic tool results to the agent loop during a session case.
+`MockToolRegistry` (`evals/core/mock_tools.py`) resolves the `tool_use` blocks a bot emits during a session run against case-defined fixtures. It lives in `core`, not under a suite, because every session test for every tool-exposing operation needs the same matching behavior — centralizing it keeps suite-level JSON dead-simple.
 
-## What this covers
+## Fixture forms
 
-- Three fixture forms in `evals/core/mock_tools.py`: loose, explicit `{match,result}` list, and staged progressive-disclosure; match operators (exact / `_contains` / `_in`).
-- `READ_ONLY_TOOL_DEFAULTS` safe-empty fallbacks vs `MockNotFound` for unmocked write tools; `MockResolution` trace records.
-- Stage advancement keyed to user turns (sticky-last clamp), driven by `advance_stage()`.
+A case's `session.mock_tools` maps each tool name to one of three forms. The registry normalizes all three internally into a list of stages, each a list of `MockMatch` entries, so `resolve()` only ever deals with one shape.
 
-<Note>
-Scaffold generated from the codebase map — expand with full detail, examples, and specifics.
-</Note>
+| Form | Shape | When |
+| --- | --- | --- |
+| Loose | the value IS the result | The common path — a single result per tool. |
+| Explicit | a list of `{match, result}` entries, scanned in order | One tool must return different results based on how it was called. |
+| Staged | `{"stages": [...]}` | The result must CHANGE across the user's conversation turns (progressive disclosure). |
+
+Loose form — a single result served for every call:
+
+```json
+"mock_tools": {
+  "getCapabilities": {"capabilities": ["..."]}
+}
+```
+
+Explicit form — entries scanned in order, first match wins, with a `default`:
+
+```json
+"mock_tools": {
+  "searchRecordings": [
+    {"match": {"query": "API auth"}, "result": {"results": ["..."]}},
+    {"match": {"query_contains": "auth"}, "result": {"results": ["..."]}},
+    {"default": true, "result": {"results": []}}
+  ]
+}
+```
+
+## Match operators
+
+All constraints in a `match` spec must hold for the entry to win; an empty spec always matches (used for `default`). Matching is implemented in `_match`.
+
+| Operator | Key form | Semantics |
+| --- | --- | --- |
+| Exact | `field` | `tool_input[field]` equals the value exactly. |
+| Contains | `<field>_contains` | Case-insensitive substring on a string field. |
+| In | `<field>_in` | The field value is one of the listed values. |
+
+There is deliberately no regex or deeper matcher — every case today is served by exact + contains + in, and extending `_match` later keeps the public API put. An explicit entry that drops both `match` and `default` is treated as a default (loud cases tend to want that implicit); combining `default` with a non-empty `match` raises a `ValueError`.
+
+## Read vs write fallback
+
+When the bot calls a tool that has no matching entry and no case default, behavior depends on the tool's classification:
+
+- **Read-only tools** (search / find / list / get-*) fall back to a safe-empty global default from `READ_ONLY_TOOL_DEFAULTS`. Calling a read tool with no fixture isn't a semantic error — the bot just sees "nothing found" and continues. This kills the recurring class of `system_error` failures caused by a case author not pre-emptively mocking every read tool the bot might explore.
+- **Write tools** (`correctContext`, `addNote`, `createTask`, `propose*`, etc.) raise `MockNotFound`. Write tools carry semantic intent, so a silent no-op would mask a real case-authoring bug. The `SessionRunner` converts `MockNotFound` into a hard session error with terminal reason `mock_not_found`.
+
+`READ_ONLY_TOOL_DEFAULTS` maps each read tool name to a natural-language empty result matching the shapes cases already use for explicit empty mocks — `searchContext` → `"[]"`, `listAllContexts` → `"0 context(s)."`, `getContextSections` → a `NOT_FOUND:` hint pointing at `listAllContexts`, and so on — so behavior is consistent whether the empty came from a case mock or the fallback. Write tools are deliberately absent from that map.
+
+## Staged progressive disclosure
+
+The `"stages"` wrapper is the one and only opt-in to turn-varying behavior. Each element of `stages` accepts either flat form (a loose value or an explicit entry list), and the stage index advances by one each time the `SessionRunner` injects a scripted follow-up — stage `N` serves the `(N+1)`-th user turn.
+
+```json
+"mock_tools": {
+  "searchRecordings": {
+    "stages": [
+      "…served during the 1st user turn…",
+      [{"match": {"query_contains": "x"}, "result": "…"},
+       {"default": true, "result": "…2nd-turn fallback…"}],
+      "…3rd turn and every turn after (last stage is sticky)…"
+    ]
+  }
+}
+```
+
+Stage advancement is keyed to user turns, not raw call counts — the bot may fan out several tool calls within one turn, so a per-call counter would make reveal timing nondeterministic. Turn boundaries are the deterministic unit. When a session has more turns than stages, the last stage keeps serving (a sticky-last clamp in `resolve`, `stage = min(self._stage_index, len(entries_by_stage) - 1)`).
+
+Flat tools (loose or explicit) are structurally immune to this: they normalize to a single stage and the clamp pins them to stage 0 regardless of how many follow-ups have fired, so existing cases are byte-for-byte unaffected. `advance_stage()` is driven by the runner (see [Session runner](/rollingrecord/evals/harness/sessions)); the staged form allows only the `stages` key, and any extra key raises a `ValueError`.
+
+## Resolution order and trace
+
+`resolve()` follows a fixed order for each tool_use block:
+
+1. Pick the tool's current stage (flat tools have exactly one; staged tools use the turn-advanced, clamped index).
+2. A case-defined match within that stage wins.
+3. A case-defined `default` within that stage wins.
+4. If the tool isn't in the case's mock spec at all but is a read-only tool, return the global safe-empty default.
+5. Otherwise raise `MockNotFound`.
+
+Each resolution produces a `MockResolution` — `tool_name`, `tool_use_id` (echoed in the returned `tool_result` so Anthropic pairs them), `tool_input`, `matched_index` (or `None` for the loose form), `matched_default`, the `result`, `from_global_default`, and the `stage` that served it. Every resolution is recorded into the session trace so a failure is debuggable from the per-run JSON without re-running.
+
+The registry carries one piece of session state — the stage index — and is not locked: an instance is owned by exactly one `SessionRunner.run()` invocation, which drives rounds sequentially on one thread, and parallel cases each build their own. Mock-tool keys are validated against the canonical tool set in [Canonical tool fixtures](/rollingrecord/evals/harness/tool-fixtures).

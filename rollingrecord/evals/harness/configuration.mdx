@@ -1,16 +1,84 @@
 ---
-title: "config.py & Environment"
-description: "Eval configuration, required environment, and model/pricing constants."
+title: "Configuration & Environment"
+description: "EvalConfig, the required environment variables, and the model / pricing / floor constants."
 ---
 
-`EvalConfig` centralizes the harness's environment, model ids, and path constants, loaded from the repo-root `.env.local`.
+`evals/config.py` is the single namespace for the harness's environment-driven values and hardcoded constants, so no other module ever touches `os.environ` directly. It loads the repo-root `.env.local` on import and fails fast with every missing variable named at once.
 
-## What this covers
+## Path constants
 
-- `EvalConfig` + `from_env()` required vars (Supabase dev, Clerk, Firebase App Check, analytics secret, optional `ANTHROPIC_API_KEY`); loaded from repo-root `.env.local` (`evals/config.py`).
-- Hardcoded model ids (`PRODUCTION_MODEL`/`JUDGE_MODEL`/`ARBITER_MODEL`), `MODEL_PRICING`, `DEFAULT_CONFIDENCE_THRESHOLD`, `DEFAULT_PASS_FLOOR=0.95`.
-- Path constants (`SUITES_ROOT`, `RESULTS_ROOT`) and derived URLs (`ai_engine_url`, `analytics_url`).
+Resolved from the module's own location — `evals/` lives directly under the repo root.
 
-<Note>
-Scaffold generated from the codebase map — expand with full detail, examples, and specifics.
-</Note>
+| Constant | Value | Use |
+| --- | --- | --- |
+| `EVALS_ROOT` | `evals/` | Base for the fixtures loader (`FIXTURES_ROOT`). |
+| `REPO_ROOT` | repo root | Where `.env.local` is loaded from. |
+| `SUITES_ROOT` | `evals/suites/` | Walked by `_resolve_suites_and_cases`. |
+| `RESULTS_ROOT` | `evals/results/` | Per-run JSON is written under `RESULTS_ROOT/<YYYY-MM-DD>/`. |
+
+## `.env.local` loading
+
+On import, `config.py` calls `load_dotenv(REPO_ROOT / ".env.local", override=False)` when the file exists — the same file Gradle and the smoke test harness use. `override=False` means a variable already exported in the shell wins over the file. The file is gitignored and off-limits to Claude by hard rule; the Python process running on the developer's machine reads it.
+
+## `EvalConfig`
+
+`EvalConfig` is a `frozen=True` dataclass built once by `from_env()` at process start and passed around immutably. `from_env()` collects every missing required variable into one list and raises a single `RuntimeError` naming all of them — the same fail-fast UX as `SmokeTestConfig.fromEnvironment`.
+
+| Env var | Field | Purpose |
+| --- | --- | --- |
+| `SUPABASE_URL_DEV` | `supabase_url` | Dev Supabase project base URL (trailing slash stripped). |
+| `SUPABASE_ANON_KEY_DEV` | `supabase_anon_key` | Dev anon key. |
+| `EVAL_TEST_USER_EMAIL` | `test_user_email` | Eval-harness test user, distinct from the smoke test user so quotas and abuse signals don't blend. |
+| `EVAL_TEST_USER_PASSWORD` | `test_user_password` | Used only by the Clerk FAPI cold-start fallback when no session exists. |
+| `CLERK_SECRET_KEY_DEV` | `clerk_secret_key` | Clerk Backend API key (`sk_test_...`) — looks up the eval user and mints short-lived JWTs. |
+| `CLERK_DOMAIN_DEV` | `clerk_fapi_url` | Dev instance FAPI base for the password fallback (trailing slash stripped). |
+| `FIREBASE_APP_CHECK_DEBUG_SECRET` | `firebase_app_check_debug_secret` | Same debug token the smoke test uses (App Check is per-device). |
+| `FIREBASE_APP_ID` | `firebase_app_id` | Parsed for the project number. |
+| `FIREBASE_WEB_API_KEY` | `firebase_web_api_key` | App Check debug-token exchange. |
+| `ANALYTICS_INGEST_SECRET` | `analytics_ingest_secret` | Bearer for the `analytics` Edge Function. |
+| `ANTHROPIC_API_KEY` | `anthropic_api_key` | OPTIONAL — harness-side LLM judges. `None` when unset. |
+
+`ANTHROPIC_API_KEY` is the only optional variable: Phase 1 cases graded by deterministic judges run fine without it, and `main()` builds the shared `AnthropicMessages` client only when it is present. A suite that needs an `LlmJudge` without the key raises a clear error rather than silently skipping.
+
+### Derived accessors
+
+`EvalConfig` exposes computed properties so callers never re-assemble URLs:
+
+- `ai_engine_url` — `<supabase_url>/functions/v1/ai-engine`
+- `analytics_url` — `<supabase_url>/functions/v1/analytics`
+- `firebase_project_number` — parsed from `firebase_app_id`, which must follow `1:<projectNumber>:<platform>:<hash>` or a `RuntimeError` is raised
+- `firebase_app_check_exchange_url` — the App Check debug-token exchange endpoint
+
+## Model identifiers
+
+Hardcoded constants, not env vars — the model a suite tests is a property of the suite, and bumping it is a code change reviewed via PR. The design rule is that the judge model must be meaningfully smarter than the model being judged.
+
+| Constant | Value | Role |
+| --- | --- | --- |
+| `PRODUCTION_MODEL` | `claude-haiku-4-5-20251001` | The model the suite tests; mirrors what the app uses for ai-engine operations. |
+| `JUDGE_MODEL` | `claude-sonnet-4-6` | Default LLM-as-judge model. |
+| `ARBITER_MODEL` | `claude-opus-4-6` | Tiebreaker / arbiter for ambiguous judge verdicts or golden-dataset bootstrapping. |
+
+## Pricing
+
+`MODEL_PRICING` maps a model id to `(input_per_million, output_per_million)` in USD, used by the [cost ledger](/rollingrecord/evals/harness/cost-baseline). These are worst-case PAYG rates with no discounts, matching `claude/business/cost-analysis.py` — real eval-run cost is always at or below what the harness reports.
+
+| Model | Input / 1M | Output / 1M |
+| --- | --- | --- |
+| `claude-haiku-4-5-20251001` | `$1.00` | `$5.00` |
+| `claude-sonnet-4-6` | `$3.00` | `$15.00` |
+| `claude-opus-4-6` | `$15.00` | `$75.00` |
+| `gemini-2.5-flash` | `$0.30` | `$2.50` |
+| `gemini-2.5-flash-lite` | `$0.10` | `$0.40` |
+| `gemini-2.5-pro` | `$1.25` | `$10.00` |
+
+The Gemini rows cover ai-engine's failover provider when Anthropic is rate-limited; they mirror `supabase/functions/_shared/ai/pricing.ts` and must be kept in sync. An unknown model prices at `$0` with a stderr warning rather than crashing the ledger.
+
+## Threshold constants
+
+| Constant | Value | Meaning |
+| --- | --- | --- |
+| `DEFAULT_CONFIDENCE_THRESHOLD` | `0.85` | A judge verdict below this confidence is demoted to `UNCERTAIN`, triggering escalation in a Cascade chain. Per-case overrides allowed. |
+| `DEFAULT_PASS_FLOOR` | `0.95` | Minimum pass rate for a run to be treated as a successful build; overridable with `--pass-floor`. |
+
+`DEFAULT_PASS_FLOOR` accepts up to 5% non-flake failure noise as the realistic ceiling for an LLM-graded suite. See [run.py CLI](/rollingrecord/evals/harness/run-cli) for how `--pass-floor` overrides it and [Pass floor](/rollingrecord/evals/operations/pass-floor) for the rationale.

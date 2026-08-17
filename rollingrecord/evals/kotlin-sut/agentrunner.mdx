@@ -1,16 +1,86 @@
 ---
 title: "agentrunner CLI (Main.kt)"
-description: "The pure-JVM CLI that runs the real agent loop for --sut=kotlin."
+description: "The pure-JVM CLI that reads one case envelope, runs the real AgentLoop per turn, and emits the session trace."
 ---
 
-`agentrunner` reads one case envelope, runs the real `AgentLoop`, and emits the `_session` trace — the binary that `--sut=kotlin` drives.
+`agentrunner` (`app/agentrunner/src/main/kotlin/.../Main.kt`) is the binary that [`--sut=kotlin`](/rollingrecord/evals/kotlin-sut/contract) drives. It reads ONE JSON case envelope from stdin (UTF-8), runs the LITERAL production [`AgentLoop`](/rollingrecord/evals/kotlin-sut/agentcore) once per user turn against the dev `ai-engine`, and writes ONE JSON session trace to stdout. Diagnostics go to stderr. The Gradle module is `app/agentrunner`, built from the pure-JVM `:agentcore` module the Android app itself uses.
 
-## What this covers
+## Exit-code contract
 
-- `app/agentrunner/src/main/kotlin/.../Main.kt`: reads one case envelope, runs `AgentLoop` once per user turn with a fresh `KbQuerySessionManager`, emits the `_session` + `turns` JSON; exit-code rules.
-- `parseSeededConversation` (user/assistant pairs → history + trailing question), follow-up ordering, per-turn stage advance, config application through real `ServerConfig`/`ClientConfig`.
-- Supporting classes: `HttpAiEnginePort`, `RecordingAiEnginePort`, `RunnerMockRegistry`, `RunnerToolExecutor`, and `AgentLog`→stderr diagnostics.
+| Exit code | When |
+| --- | --- |
+| `0` | Whenever a JSON trace could be emitted — including in-band failures, which ride `_session.error` + `_session.terminal_reason`. |
+| `1` | ONLY when stdin is not parseable JSON at all. |
 
-<Note>
-Scaffold generated from the codebase map — expand with full detail, examples, and specifics.
-</Note>
+At startup `main()` binds `AgentLog.error`/`warn`/`errorWithThrowable` to `System.err` so the loop's real `DeveloperError`/`Validation` HTTP codes are visible on stderr — in the app these go to `AppLogger`, but the runner leaves `AgentLog` a no-op by default, which used to swallow the real cause behind generic "Something went wrong" outcomes. Stdout is an explicit UTF-8 `PrintStream` because the JVM's default charset on Windows may not be UTF-8 and the Python harness decodes the trace as UTF-8.
+
+## Parsing the case envelope
+
+`runCase()` reads the inner case input at `case.input.input` (the case's `input` object itself wraps an `input` object holding the turn fields), plus `case.session`, and the `auth` block. Missing required keys throw `CaseShapeException`, which `main()` catches and converts into a `transport_error` trace (still exit 0).
+
+Config is applied through the REAL config objects so the loop reads exactly the values production would:
+
+- `config.server` → `ServerConfig.update(...)` (round ceiling, etc.).
+- `config.client` → `ClientConfig.update(...)` (history window, etc.).
+- A case-level `max_history_pairs` also drives `ClientConfig.kbChatMaxHistoryPairs`, because production reads that one value both for the in-memory deque cap and for the wire's `max_history_pairs`.
+
+Per-turn fields are forwarded exactly as the Python SUT forwards them — dropping any of these silently broke a class of cases:
+
+| Field | Effect if forwarded | If dropped |
+| --- | --- | --- |
+| `medical_mode` | Rides every round as `medical_mode`. | — |
+| `history_truncated` | Tri-state; absent → `null` → server keeps its conditional wording. | — |
+| `scope_block` | Simulates a focused context. | Scope-discipline cases (`in_scope` vs `all`) silently fail. |
+| `eval_system_suffix` | Injects a case's synthetic profile identity. | Server falls back to the real eval-account identity; name/email/timezone cases fail. |
+| `user_timezone` | Drives temporal filtering ("yesterday"); falls back to `UTC` when absent. | Hardcoded `UTC` broke timezone cases. |
+
+## Seeded conversation
+
+`parseSeededConversation(messages)` turns the case's `messages` array into pre-baked history plus turn 1's question. Sequential user/assistant plain-string pairs become the conversation history; the trailing unpaired `user` message is the first question. Any other shape is a `CaseShapeException`: empty messages, a trailing non-user message, non-alternating roles, or non-string content.
+
+## The turn loop
+
+`runCase()` runs `turnTexts = [seed.question] + followUps` inside a single `runBlocking`. For each turn it:
+
+1. Advances the mock registry one stage before each FOLLOW-UP turn (never turn 1) — stage N serves the (N+1)-th user turn, mirroring the Python registry.
+2. Calls `port.markTurnStart()` to record where the turn begins in the global round stream.
+3. Windows history to `ClientConfig.kbChatMaxHistoryPairs` and builds the opening messages via `AgentMessageAssembly.buildInitialMessages(...)`.
+4. Constructs a **fresh** `AgentLoop` with a **fresh** `KbQuerySessionManager` (production mints a new query session with a fresh server round budget per question) and runs one `AgentTurnRequest` carrying `KbToolSpec.definitions()` + `KbToolSpec.usageInstructions()`.
+
+On `AgentTurnOutcome.Success`, the turn's `(question, answer)` is recorded, and the assistant entry pushed into history is prefixed with the turn's retrieval recap (`"$summary\n\n$answer"`) — production fidelity: the app carries the retrieval scratchpad into follow-up turns exactly this way, while the visible `turns` trace records only the user-facing answer. On `AgentTurnOutcome.Error`, the exact user-facing error string is recorded as the turn's text and the loop breaks.
+
+`follow_ups` entries may be plain strings or `{content}` objects; a `{"after_round": n}` gate is parsed but ignored on purpose (see [the contract](/rollingrecord/evals/kotlin-sut/contract) for why).
+
+## Terminal reason
+
+`runCase()` derives one `terminal_reason` after the turn loop, checked in order:
+
+| Condition | `terminal_reason` |
+| --- | --- |
+| The executor recorded a `MockNotFound` message | `mock_not_found` |
+| Any recorded round's variant is `MaxRoundsExceeded` | `max_rounds_exceeded` |
+| No error occurred | `end_turn` |
+| The last round's variant is `Network` | `transport_error` |
+| Otherwise | `upstream_error` |
+
+`buildOutput()` then serializes the trace: top-level `text` (the final turn's visible text) and empty `tool_calls`, plus `_session` with `round_count`, `terminal_reason`, `all_tool_calls`, `all_tool_results`, a `rounds` array (each with `round_number`, `is_final_round`, `response_text`, `tool_calls`, `stop_reason`, `input_tokens`, `output_tokens`, `model`, `request_message_count`), `total_input_tokens`/`total_output_tokens`, and `error` when present — plus a `turns` array of `{question, answer}`.
+
+## Supporting classes
+
+| Class | Role |
+| --- | --- |
+| `HttpAiEnginePort` | `AiEnginePort` over `java.net.http` using harness-minted tokens. Serializes with a Json configured exactly like the app's `aiengine` Retrofit converter (`ignoreUnknownKeys` + `explicitNulls=false` + `encodeDefaults=true`) — `encodeDefaults` matters so `operation` and default booleans reach the wire. Retries transient upstream (`Network`/`RateLimited`/`ServiceUnavailable`/5xx `Upstream`) on backoff `[2, 3, 5, 8]s`; sends `X-App-Version`. |
+| `RecordingAiEnginePort` | Decorator that records one `RoundRecord` per `ai-engine` call (= per loop round) for the trace, then forwards the result untouched. Round numbers are global across turns; `markTurnStart()` marks each turn's start index. |
+| `RunnerMockRegistry` | 1:1 Kotlin port of the Python `MockToolRegistry` — same three case formats (loose / explicit `{match, result}` list / staged `{"stages": [...]}`), same match operators, same `READ_ONLY_TOOL_DEFAULTS`, same `MockNotFound` behavior for unmocked write tools. |
+| `RunnerToolExecutor` | `ToolExecutor` backed by the registry; records every resolution for `all_tool_results`, treats `MockNotFound` as terminal, and flags writes via `WRITE_TOOLS` = `{createTask, addNote, createSection, correctContext, renameSection}`. |
+
+`HttpAiEnginePort`'s error mapping is a deliberately partial port of the app's full `AiEngineClient` decode — only the failure classes a session eval can meaningfully hit (`max_rounds_exceeded`, rate limits, session expiry, caps, 5xx, network) get typed variants; everything else lands in `Validation`, which the loop maps to a generic error outcome, the same user-visible behavior as an unrecognized server error in production.
+
+`RunnerMockRegistry.render()` carries the one deliberate fidelity divergence from the Python `SessionRunner`: production tool handlers hand the loop RAW text, so a JSON-string mock is used as-is (not `json.dumps`-quoted); non-string mocks are compact-serialized. See [Mock tools](/rollingrecord/evals/harness/mock-tools) for the shared resolution semantics.
+
+## Where to go next
+
+- [agentcore Shared Agent Loop](/rollingrecord/evals/kotlin-sut/agentcore) — the `AgentLoop` this CLI drives per turn.
+- [KbToolSpec](/rollingrecord/evals/kotlin-sut/kb-tool-spec) — the tool definitions and instructions each turn sends.
+- [--sut=kotlin & KotlinSessionDriver](/rollingrecord/evals/kotlin-sut/contract) — the Python side that builds this binary's stdin.
+- [Mock tools](/rollingrecord/evals/harness/mock-tools) — the resolution semantics `RunnerMockRegistry` ports.

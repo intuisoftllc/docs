@@ -1,16 +1,66 @@
 ---
 title: "Suite Catalog"
-description: "The real eval suites and what each one targets."
+description: "The real eval suites under evals/suites, what each targets, and which drive the agent loop."
 ---
 
-The harness ships a catalog of suites, each targeting a specific behavior — adversarial safety, tool routing, retrieval, moderation, and more.
+The harness ships fifteen suites under `evals/suites/`, each targeting a specific behavior of an `ai-engine` operation — adversarial safety, tool routing, retrieval, abstention, moderation, extraction. Most are session-mode (they drive the full multi-round `kb_query` loop); a few are single-shot. Every suite has a `judges.py`; most also carry a `README.md`.
 
-## What this covers
+## The suites
 
-- Enumerate the real suites under `evals/suites/`: `kb_chat`, `kb_chat_session`, `kb_chat_session_live`, `abstention`, `context_architecture`, `efficiency`, `extract_template`, `long_recording`, `multi_recording`, `rag_real_content`, `response_variety`, `security`, `source_attribution`, `template_moderation`, `tool_correctness`.
-- What each targets (adversarial/injection, medical verification, tool routing, moderation, retrieval), sourced from suite READMEs.
-- Which are session-based (drive the agent loop) vs single-shot.
+| Suite | Mode | Operation | Targets |
+| --- | --- | --- | --- |
+| `kb_chat` | Mixed | `kb_query` | Core chatbot answers over recordings/notes/contexts — capability listing, factual recall, hallucination, over-refusal, multi-turn context. |
+| `kb_chat_session` | Session | `kb_query` | End-to-end agent loop: tool use, empty-result honesty, follow-up reuse, over-use on meta questions, looping to budget. Broad adversarial coverage. |
+| `kb_chat_session_live` | Session | `kb_query` | Live multi-turn coherence — the bot generates every assistant turn; grades the full transcript for held positions under escalating pressure. |
+| `abstention` | Session | `kb_query` | The "I don't know" test — admit when content isn't recorded vs fabricate; and the mirror, false abstention when the answer IS present. |
+| `context_architecture` | Session | `kb_query` | Organization advice — when to propose a context, split a mega-context, resolve time references, attribute speakers, flag contradictions and staleness, hold scope. |
+| `efficiency` | Session | `kb_query` | Tool-call waste — catch 5–6 calls where 1 sufficed, without grading efficiency on a curve. |
+| `long_recording` | Session | `kb_query` | "Lost in the middle" fact recall — one planted fact at 5/25/50/75/95% depth of a long transcript. |
+| `multi_recording` | Session | `kb_query` | Cross-recording synthesis — blocker tracking, timelines, aggregation, contradiction resolution across several recordings. |
+| `source_attribution` | Session | `kb_query` | Multi-source attribution correctness and tool discipline (e.g. a removal case must not draft a proposal). |
+| `response_variety` | Session | `kb_query` | Varied phrasing when holding a position — catch broken-record verbatim repetition across rephrasings. |
+| `rag_real_content` | Session | `kb_query` | Real-content RAG — answer only from retrieved chunks of real source material; anti-freestyle refusal; retrieval scoring. |
+| `tool_correctness` | Session | `kb_query` | Per-tool routing — right tool picked, sensible args, correct result interpretation, graceful error/empty recovery. |
+| `security` | Session | `kb_query` | Adversarial safety — prompt injection, system-prompt leakage, persona adoption, data exfiltration, scope escalation. |
+| `template_moderation` | Single-shot | `template_moderation` | The safety gate that vets user-authored extraction templates — reject jailbreaks/injection, approve legit templates. |
+| `extract_template` | Single-shot | `extract` | Per-template extraction quality (sections + tasks). **Parked — see below.** |
 
-<Note>
-Scaffold generated from the codebase map — expand with full detail, examples, and specifics.
-</Note>
+## Session vs single-shot
+
+Session suites carry a `session` block on their cases and are driven by `SessionRunner` (or the Kotlin production loop under `--sut=kotlin`) — see [Authoring Session Cases](/rollingrecord/evals/authoring/session-cases). Single-shot suites issue one call and grade the single response.
+
+`kb_chat` is **mixed**: its README frames it as pre-baked single-response grading, but the current `capabilities_loop` cases carry a `session` block and run through the agent loop (the bot must actually call `getCapabilities`). Treat `kb_chat` as either shape depending on whether a case declares `session`.
+
+## Judge style by suite
+
+- **Structural + LLM cascade** (`AllOf(structural…, Cascade(Sonnet, Opus))`) — `kb_chat_session`, `kb_chat_session_live`, `context_architecture`, `multi_recording`, `source_attribution`, `long_recording`, `tool_correctness`, `rag_real_content` (which adds the retrieval judges), `efficiency` (waste gate first), `response_variety`. See [Writing judges.py](/rollingrecord/evals/authoring/judge-resolvers).
+- **Deterministic** — `template_moderation` grades the JSON envelope with `BodyFieldJudge` against `expected.body_fields`; `kb_chat` hard-contract tags use `KeywordsJudge` / `ListShapeJudge` / `LengthJudge` / `ContainsJudge`.
+- **LLM-only** — `security` is entirely LLM-graded (Sonnet → Opus arbiter); a deterministic override exists for cases that reduce to an exact string check.
+
+## `template_moderation` response shape
+
+The moderation operation returns a tight JSON envelope, graded by `BodyFieldJudge`:
+
+```json
+{ "result": "APPROVED" }
+{ "result": "REJECTED", "reason": "JAILBREAK_BYPASS" }
+```
+
+Rejection cases usually allow several adjacent `reason` codes (`ADULT_CONTENT`, `CSAM`, `ILLEGAL_ACTIVITY`, `VIOLENCE_TERRORISM`, `PIPELINE_INJECTION`, `JAILBREAK_BYPASS`, `MODERATOR_MANIPULATION`) because the boundary between, say, `JAILBREAK_BYPASS` and `PIPELINE_INJECTION` is judgment-dependent — both mean the template is malicious. Scalar `body_fields` values are equality checks; list values are one-of checks.
+
+## `extract_template` is parked
+
+<Warning>
+The `extract_template` suite **does not run** (RR-503). Every case posts `{"operation": "extract"}`, and that operation is retired — extraction moved to the async `extract-submit` → `extract-runner` → `extract-results` pipeline and the `ai-engine` registry no longer knows the name. A run now returns `400 unknown_operation` for every case. Treat any red result from this suite as harness breakage, not a prompt regression, until it is re-plumbed against the async pipeline. The judges, rubrics, and fixtures in the folder are unchanged and reusable — only the transport moved. Until then the app ships with no automated extraction-quality signal.
+</Warning>
+
+## Test data provenance
+
+Every suite's transcripts, template strings, and mock results are **synthetic or paraphrased from public sources** (Mayo Clinic patient education, food-science guides, Cloudflare explainers, Wikipedia, well-known prompt-injection patterns). No real customer recordings, transcripts, or content are committed to the suites — consistent with the product's privacy guarantee. When adding cases, source from the same kinds of public material and avoid PII, verbatim real transcripts, and proprietary specs.
+
+## Where to go next
+
+- [Suite & Case File Layout](/rollingrecord/evals/authoring/suite-layout) — the directory contract and case schema.
+- [Authoring Session Cases](/rollingrecord/evals/authoring/session-cases) — the `session` block and mock tools the session suites use.
+- [Writing judges.py](/rollingrecord/evals/authoring/judge-resolvers) — how each suite composes its chain.
+- [Running Evals](/rollingrecord/evals/operations/running) — running one suite, one bucket, or `--all`.

@@ -1,16 +1,70 @@
 ---
 title: "Deterministic, Fuzzy & Semantic Judges"
-description: "The structural judge tier that runs before LLM grading."
+description: "The zero-cost structural tier: string, set, shape, and tool-call checks that run before any LLM grading."
 ---
 
-Deterministic, fuzzy, and semantic judges perform cheap structural checks and sit ahead of the LLM tier in a typical chain.
+Deterministic and fuzzy judges are pure code with zero LLM cost — the first line of defense for any case where the right/wrong question reduces to a string, set, or shape comparison. Each reads only the `expected` keys it cares about and SKIPs cleanly when they're absent, so many can share one `expected` dict inside an `AllOf` without conflict.
 
-## What this covers
+## How the actual text is extracted
 
-- Keyword/length/body-field/list-shape/tool-call style judges (`evals/judges/deterministic.py`, `fuzzy.py`, `semantic.py`).
-- What `expected` keys each reads and when they SKIP vs decide.
-- Where they sit in a typical suite chain (structural `AllOf` before the LLM tier).
+Every deterministic and fuzzy judge resolves the response body to a string the same way (the `_extract_text()` helper in both `evals/judges/deterministic.py` and `evals/judges/fuzzy.py`): it reads `actual.body['text']` if it's a string, otherwise it falls back to the compact (single-line) JSON of the entire body. Suites whose response shape isn't `{text: ...}` can subclass a judge and override the extraction. `JsonShapeJudge`, `BodyFieldJudge`, and `ToolCallJudge` are the exceptions — they read structured fields off `actual.body` directly rather than a flattened text string.
 
-<Note>
-Scaffold generated from the codebase map — expand with full detail, examples, and specifics.
-</Note>
+## Deterministic judges
+
+All nine live in `evals/judges/deterministic.py`. Each reads a distinct set of `expected` keys and SKIPs when none are declared:
+
+| Judge | `expected` keys | PASSes when |
+| --- | --- | --- |
+| `ExactMatchJudge` | `exact` (str) | actual text equals `exact` verbatim. |
+| `ContainsJudge` | `must_contain` (list), `must_not_contain` (list, optional) | every `must_contain` substring is present AND no `must_not_contain` substring is. Case-insensitive unless `case_sensitive=True`. |
+| `KeywordsJudge` | `must_contain_keywords` (list), `min_keyword_hits` (int, optional) | at least `min_keyword_hits` keywords appear (case-insensitive). Default threshold is every keyword. |
+| `RegexJudge` | `regex_must_match` (list), `regex_must_not_match` (list, optional) | every must-match pattern matches at least once AND no must-not-match pattern matches at all. |
+| `LengthJudge` | `min_length`, `max_length` (either optional) | `min_length <= len(text) <= max_length`. Catches truncation and runaway-rambling regressions. |
+| `JsonShapeJudge` | `required_fields` (list) | every listed key is present at the top level of `actual.body`. |
+| `BodyFieldJudge` | `body_fields` (dict) | each `body[field]` equals the expected value (or is one of it, when the expected value is a list). |
+| `ToolCallJudge` | `tool_calls` (dict) | the structured `tool_calls` list satisfies count and title-keyword constraints. |
+| `ListShapeJudge` | `must_be_list_shape` (bool), `min_list_items` (int, optional) | the text contains at least `min_list_items` list-shaped items. |
+
+### `KeywordsJudge` confidence
+
+`KeywordsJudge` returns confidence equal to the hit fraction (`hits / total`), so a `MinConfidence` wrapper can escalate a partial-match to an LLM judge. `details` carries the `hits`, `misses`, and `min_hits`. When it fails, confidence is `1 - fraction`.
+
+### `BodyFieldJudge`
+
+`BodyFieldJudge` grades structured JSON responses field by field — for example the `template_moderation` op that returns `{result: "APPROVED" | "REJECTED", reason?: <code>}`. A scalar expected value must equal the body value; a list expected value means the body value must be one of the listed options. Every mismatch is classified in `details.mismatches` as `missing`, `not_equal`, or `not_in_oneof`.
+
+### `ToolCallJudge`
+
+`ToolCallJudge` validates the structured `tool_calls` list (populated from Anthropic tool-use content blocks) rather than free text — used to grade extraction operations that respond with `saveSection` / `saveTasks` / `completeTasks` / `replaceSection` calls. Its `expected.tool_calls` dict supports:
+
+| Field | Meaning |
+| --- | --- |
+| `total_min` / `total_max` | Bounds on the total number of tool calls. |
+| `by_name` | Per-tool count constraints, e.g. `{saveSection: {min: 3, max: 12}}`. |
+| `save_section_title_keywords` | At least one `saveSection` / `replaceSection` title must contain each keyword (case-insensitive). |
+| `save_section_title_min_keyword_hits` | Softer threshold: N of M title keywords must appear across all titles (default = all). |
+
+### `ListShapeJudge`
+
+`ListShapeJudge` targets the "capability-listing" regression where the model says "those are my capabilities" without ever listing anything. It counts list markers via two multiline regexes — bullet lines (`-`, `*`, `•`) and numbered lines (`1.` / `1)`) — plus a comma-only fallback that counts comma-separated items within a single sentence. It PASSes when the item count meets `min_list_items` (default `2`), with confidence scaled to the item count.
+
+## Fuzzy judges
+
+Two string-distance / set-overlap judges live in `evals/judges/fuzzy.py`. Both are cheaper than an LLM call but more forgiving than `ExactMatchJudge`:
+
+| Judge | `expected` keys | Metric | Default threshold |
+| --- | --- | --- | --- |
+| `LevenshteinJudge` | `fuzzy_target` (str), `fuzzy_threshold` (float, optional) | `1 - distance / max_len` against the target text | `0.85` |
+| `SetSimilarityJudge` | `set_similarity_target` (str), `set_similarity_threshold` (float, optional) | Jaccard similarity over lowercased, regex-tokenized word sets | `0.6` |
+
+`LevenshteinJudge` uses a two-row DP (`_levenshtein()`) that caps either string at `4096` chars — beyond that the metric isn't meaningful and the returned distance is just the longer length. It returns confidence equal to the similarity ratio, which is what makes `MinConfidence(LevenshteinJudge())` a sensible escalation stage. `SetSimilarityJudge` ignores word order, so it fits short multiple-choice or summary-bullet outputs where exact phrasing varies; both PASS trivially (confidence `1.0`) when the compared texts are empty.
+
+## Semantic judge (stub)
+
+`EmbeddingSimilarityJudge` (`evals/judges/semantic.py`) is a Phase 1 interface stub, not an active grader. Its `evaluate()` **always returns `SKIP`** so it composes safely into chains without affecting outcomes. The intended cosine-similarity implementation is deferred until a Python-callable `embed_text` endpoint is exposed via the analytics Edge Function; when that lands, the file gains an implementation and nothing else in the harness changes because the `Judge` ABC stays the same. Do not rely on it to decide any case today.
+
+## Where they sit in a chain
+
+Deterministic judges are the cheap floor of a chain. In `rag_real_content` (`evals/suites/rag_real_content/judges.py`) they sit inside the structural `AllOf` alongside the session and retrieval judges, gating before the LLM cascade runs. In `kb_chat` (`evals/suites/kb_chat/judges.py`) they form standalone chains for hard-contract tags — for example the capability-listing chain is `AllOf(ListShapeJudge(), KeywordsJudge(), ContainsJudge())`, which requires the response to actually list items, mention the right keywords, and avoid dodge phrases, all without spending a judge token.
+
+See [Chain primitives](/rollingrecord/evals/judges/chains) for how these compose and [the Judge framework](/rollingrecord/evals/judges/overview) for the `expected`-dict contract.

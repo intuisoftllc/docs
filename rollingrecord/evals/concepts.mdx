@@ -1,16 +1,116 @@
 ---
 title: "Core Concepts & Glossary"
-description: "The vocabulary of the eval harness: cases, buckets, judges, verdicts."
+description: "The shared vocabulary of the eval harness: cases, suites, buckets, judges, verdicts, baselines, and flakes."
 ---
 
-The harness has a small, consistent vocabulary shared across the Python and Kotlin runtimes.
+The harness has a small, consistent vocabulary defined in `evals/core/` and reused verbatim by the on-device Kotlin port. This page is the glossary; the deep pages link off each term.
 
-## What this covers
+## Cases and suites
 
-- `TestCase` (input/expected/session/bucket/is_flake), suite, `TokenBucket` (small/med/large), judge, `Verdict` (PASS/FAIL/UNCERTAIN/SKIP), baseline/regression — from `evals/core/case.py` and `evals/core/verdict.py`.
-- Single-shot vs SESSION cases (multi-round agent loop), and the `_session` trace shape every judge reads.
-- Fully-qualified id convention `<suite>.<id>` used as the baseline + results key.
+A **`TestCase`** (`evals/core/case.py`) is one frozen golden example — a triple of input, expected, and metadata. The runner hands `input` to the system-under-test, captures the response, and grades it against `expected`.
 
-<Note>
-Scaffold generated from the codebase map — expand with full detail, examples, and specifics.
-</Note>
+| Field | Type | Meaning |
+| --- | --- | --- |
+| `id` | `str` | Unique within the suite; the baseline key, results key, and spinner label. Convention: snake_case starting with the section name (e.g. `capabilities_loop_basic`). |
+| `suite` | `str` | Suite name, set by the loader from the parent directory (not the JSON). |
+| `bucket` | `TokenBucket` | Cost tier, set by the loader from the parent directory. |
+| `input` | `dict` | Payload handed to the SUT — for `kb_chat`, the body `ai-engine` accepts directly. |
+| `expected` | `dict` | Free-form spec; each judge reads only the keys it cares about. |
+| `tags` | `tuple[str, ...]` | Categorical labels for slicing results. |
+| `session` | `dict \| None` | Optional multi-round spec; when present the run is delegated to a session driver. |
+| `is_flake` | `bool` | Marks a case as known-noisy (see [Flakes](#flakes-and-reliability)). |
+| `notes` / `source_file` | `str` | Free-form annotation and the loaded-from path (loader-set). |
+
+A **suite** is a directory under `evals/suites/<name>/`. Cases live in per-bucket subdirectories, each JSON file holding an array of cases:
+
+```
+suites/<name>/
+  small/   *_<n>.json
+  med/     *_<n>.json
+  large/   *_<n>.json
+  judges.py        # exports judge_for_case(case, *, anthropic=None) -> Judge
+  baseline.json    # last-known verdict per case
+```
+
+`load_suite_cases()` walks only the `small` / `med` / `large` subdirectories; a `judges.py`, `README.md`, or `baseline.json` at the suite root is ignored. A duplicate `id` within a suite is a hard load error. See [Suite layout](/rollingrecord/evals/authoring/suite-layout).
+
+### Fully-qualified id
+
+`TestCase.fully_qualified_id` is `<suite>.<id>` (e.g. `kb_chat.capabilities_loop_basic`). It is the baseline key and the results-file case key, so two suites can share a short id without colliding.
+
+## Token buckets
+
+`TokenBucket` (`evals/core/case.py`) is the cost tier, mirrored by the directory layout. `--bucket=small` is the cheapest iteration cycle.
+
+| Bucket | Rough input size |
+| --- | --- |
+| `small` | `< 500` input tokens |
+| `med` | `500`–`5,000` input tokens |
+| `large` | `5,000+` input tokens |
+
+## Judges
+
+A **`Judge`** (`evals/judges/base.py`) takes the `(actual, expected, context)` triple via a `JudgeContext` and returns exactly one `Verdict` from its `evaluate()` method. Judges must not raise on normal disagreement — they return `UNCERTAIN` for ambiguity and `SKIP` for inapplicability, raising only on infrastructure failure. Because chain primitives are themselves judges, arbitrary trees compose through the same interface.
+
+| Family | Location | Examples |
+| --- | --- | --- |
+| Deterministic | `evals/judges/deterministic.py` | keyword / JSON-shape / substring checks — zero cost. |
+| Fuzzy & retrieval | `evals/judges/fuzzy.py`, `retrieval.py` | approximate string and retrieval-quality checks. |
+| Semantic & LLM | `evals/judges/semantic.py`, `llm.py`, `external_llm.py` | embedding similarity and LLM-as-judge grading. |
+| Faithfulness & grounding | `evals/judges/faithfulness.py`, `grounded_extraction.py` | hallucination / source-grounding checks. |
+| Session | `evals/judges/session_judges.py` | judges that read the multi-round session trace. |
+| Chains | `evals/judges/chains.py` | `Cascade`, `AllOf`, `AnyOf`, `Majority`, `MinConfidence`. |
+
+Chains compose the leaf judges: `Cascade` tries a cheap judge first and escalates only on `UNCERTAIN`; `AllOf` / `AnyOf` / `Majority` combine several; `MinConfidence` demotes a low-confidence verdict to `UNCERTAIN` (the default threshold `DEFAULT_CONFIDENCE_THRESHOLD` = `0.85` lives in `evals/config.py`). Each suite's `judge_for_case` picks the chain per case. See [Judges overview](/rollingrecord/evals/judges/overview) and [Chains](/rollingrecord/evals/judges/chains).
+
+## Verdicts
+
+A **`Verdict`** (`evals/core/verdict.py`) is what every `evaluate()` returns — the universal vocabulary chains speak. Its `kind` is one of four `VerdictKind` values:
+
+| Kind | Meaning | Cascade behavior |
+| --- | --- | --- |
+| `PASS` | Judge is confident actual matches expected. | Terminal — halts the cascade. |
+| `FAIL` | Judge is confident actual does NOT match. | Terminal — halts the cascade. |
+| `UNCERTAIN` | Judge ran but can't decide (low-confidence guess). | Escalates to the next judge. |
+| `SKIP` | Judge is structurally inapplicable to this case. | Advances the cascade as informational only. |
+
+`UNCERTAIN` and `SKIP` both advance a `Cascade`, but only `UNCERTAIN` contributes confidence info — `SKIP` means "the judge couldn't even meaningfully run." A `Verdict` also carries `confidence` (`[0.0, 1.0]`), a one-sentence `reason`, the `judge_name`, an attributable `cost_usd` (zero for deterministic judges), and an optional `details` blob (persisted for debugging, and carrying `children` for chain composers). The convenience constructors `Verdict.passed()`, `.failed()`, `.uncertain()`, and `.skipped()` are pure ergonomics.
+
+## Single-shot vs SESSION cases
+
+- A **single-shot** case (`session` is `None`) hits the SUT once and grades the single response.
+- A **SESSION** case (`session` is a dict) simulates the full chatbot agent loop — user prompt, tool calls resolved from `mock_tools`, and continuation rounds — until the bot writes a final answer or a budget is hit. Session cases are driven by `SessionRunner` (`evals/core/session.py`) under `--sut=python`, or by the real production loop under `--sut=kotlin`.
+
+Every round is recorded into a `SessionTrace` and attached to the `CaseResult` so a failure is reviewable from the per-run JSON without re-running. A session ends with a terminal reason (constants in `session.py`) — `end_turn`, `scripted_end`, `max_rounds_exceeded` (the server's authoritative round cap), `harness_round_cap`, `harness_cost_cap`, `mock_not_found`, `transport_error`, or `upstream_error`. See [Sessions](/rollingrecord/evals/harness/sessions) and [Mock tools](/rollingrecord/evals/harness/mock-tools).
+
+## Baselines and regressions
+
+A **`Baseline`** (`evals/core/baseline.py`) is the last-known verdict kind per fully-qualified id, stored as a suite's `baseline.json`. After each case, `Runner._baseline_diff()` compares the fresh verdict against the baseline and stamps a `baseline_kind`:
+
+| `baseline_kind` | Transition |
+| --- | --- |
+| `new` | No baseline entry for this case. |
+| `unchanged` | Same verdict kind as the baseline. |
+| `regression` | `PASS` → `FAIL` or `PASS` → `UNCERTAIN`. |
+| `fix` | `FAIL`/`UNCERTAIN` → `PASS`. |
+| `changed` | Any other transition. |
+
+A `regression` always breaks the build (exit `1`) regardless of the pass floor — it is the single strongest signal in a run.
+
+## Flakes and reliability
+
+A case marked `is_flake: true` is one whose bot or judge behavior is known to occasionally flip, not a real regression. When such a case produces `FAIL` or `UNCERTAIN`, it routes to `cases_flaked` instead of `cases_failed` / `cases_uncertain`, is excluded from the pass-rate denominator, and does not affect the exit code; a `PASS` on a flake-marked case still counts as a pass. The flag is used sparingly — overusing it masks real regressions.
+
+Under `--repeat N`, each case runs N times and earns a reliability badge:
+
+| Badge | Pass rate |
+| --- | --- |
+| `RELIABLE` | `>= 95%` |
+| `FLAKY` | `50%`–`94%` |
+| `BROKEN` | `< 50%` |
+
+Only a non-flake `BROKEN` case fails the run. See the [pass-floor operations page](/rollingrecord/evals/operations/pass-floor).
+
+## Cost accounting
+
+Every production call and every LLM-judge call records token usage into a per-run `CostLedger` (`evals/core/cost.py`), split into a production channel and a judge channel. `MODEL_PRICING` in `evals/config.py` holds worst-case PAYG rates (Anthropic and the Gemini failover models); prompt-cache tokens are priced separately. The ledger drives the `$X production + $Y judge = $Z total` line in every run summary. See [Cost & baseline](/rollingrecord/evals/harness/cost-baseline).

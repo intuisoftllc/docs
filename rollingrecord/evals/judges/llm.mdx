@@ -1,16 +1,85 @@
 ---
 title: "LLM-as-Judge, Faithfulness & Grounded Extraction"
-description: "Rubric grading and grounding judges backed by Anthropic models."
+description: "Rubric grading via Anthropic, cross-family judging, and claim-/field-level grounding checks."
 ---
 
-The LLM judge tier grades responses against rubrics and source material, escalating from Sonnet to an Opus arbiter.
+The LLM tier grades responses too nuanced for string checks: rubric conformance, faithfulness to a source, and grounding of extracted fields. All of these judges call an LLM, parse a JSON verdict, and record their token spend to the shared cost ledger. Anthropic outages degrade to `SKIP` so a flaky network never fails an otherwise-clean run.
 
-## What this covers
+## The Anthropic client
 
-- `LlmJudge`/rubric grading via `evals/_anthropic.py` (`AnthropicMessages`), Sonnet default + Opus arbiter; SKIPs cleanly when `ANTHROPIC_API_KEY` is unset.
-- Faithfulness + grounded-extraction judges (`evals/judges/faithfulness.py`, `grounded_extraction.py`) grading against retrieved tool results / source material.
-- Confidence thresholds and demotion-to-UNCERTAIN behavior.
+`AnthropicMessages` (`evals/_anthropic.py`) is a thin synchronous wrapper around `POST /v1/messages` — no provider fallback, no streaming, no tool use. It's constructed once per run in `run.py` from the resolved API key so a single client and connection pool serves the whole run, and injected into judges via their constructors. Its `complete()` method returns a `MessagesResult` (`text`, `input_tokens`, `output_tokens`, `model`, `stop_reason`) — concatenating every `text`-type content block — and raises `RuntimeError` on transport failure or any non-200 response. Judges catch that and return `SKIP`.
+
+The models come from `evals/config.py`: `JUDGE_MODEL` (`claude-sonnet-4-6`) is the default grader, and `ARBITER_MODEL` (`claude-opus-4-6`) is the tiebreaker used as the second stage of a confidence cascade.
+
+## `LlmJudge`
+
+`LlmJudge` (`evals/judges/llm.py`) is the baseline rubric grader and the primary grader in most suites. It reads `expected.llm_rubric` (plain-English grading instructions; SKIPs if absent) and optional `expected.llm_target` (reference content), interpolates both plus the rendered actual into `_RUBRIC_PROMPT_TEMPLATE`, and asks the model for exactly this JSON object:
+
+```
+{ "verdict": "pass" | "fail" | "uncertain", "confidence": 0.0-1.0, "reason": "<one short sentence>" }
+```
+
+The prompt caps the reason to one sentence and includes an explicit verbosity note instructing the judge not to reward length — one of the RR-402 bias mitigations. The call uses `max_output_tokens=400` (raised from 200, which truncated longer reason strings and caused spurious JSON-decode failures that escalated to Opus).
+
+### Response parsing
+
+Sonnet (and sometimes Opus) wraps JSON in markdown fences or adds a preamble even when asked for raw JSON. `_extract_json_object()` salvages the object: it strips ```` ``` ```` fences, then walks from the first `{` counting brace balance in a string-aware way (so braces inside quoted values don't fool it) to return the first balanced block. Parsing still runs through strict `json.loads`; if it fails, the judge returns `UNCERTAIN` (it "ran" but couldn't form a verdict) and stashes the raw text under `details.raw` for forensic review.
+
+### Rendering the actual
+
+`_extract_actual()` renders `actual.body` into a form the judge can grade, in four modes:
+
+| Mode | Trigger | Rendering |
+| --- | --- | --- |
+| Session | `body['_session']` present with rounds | Full round-by-round transcript via `_render_session_transcript()`. |
+| Tool-call | `tool_calls` list present | Structured transcript of `saveSection` / `saveTasks` / `completeTasks` / `replaceSection` calls with titles and contents. |
+| Text | `body['text']` present | The text as-is. |
+| Mixed / fallback | both, or neither | Text first with tool calls below, else a JSON dump of the body. |
+
+The session transcript labels each round as `>>> USER-VISIBLE <<<` (the bot ended its turn with `stop_reason='end_turn'`) or internal scratch, and the prompt header instructs the judge that Supabase Edge Functions do not stream — only user-visible rounds reach the user, and internal-scratch round text is agentic intermediate output, never a user-facing leak. This lets a leak-check grade only what the user actually saw while still using internal rounds to verify tool usage.
+
+## `LlmJudgePositionSwap`
+
+`LlmJudgePositionSwap` (`evals/judges/llm.py`) mitigates position bias (RR-402). It runs the same rubric twice — once with EXPECTED shown before ACTUAL, once swapped — and only accepts a decisive verdict when both orderings agree:
+
+| Forward | Swapped | Result |
+| --- | --- | --- |
+| `PASS` | `PASS` | `PASS` (confidence = mean of the two) |
+| `FAIL` | `FAIL` | `FAIL` (confidence = min of the two) |
+| `PASS` | `FAIL` (or vice versa) | `UNCERTAIN` — "position-inconsistent … possible position bias" |
+| any `UNCERTAIN`/`SKIP` | — | `UNCERTAIN` |
+
+Both calls go through the shared `_call_and_parse()` helper (also `max_output_tokens=400`), and cost is the sum of both — `2×` an `LlmJudge` call. A disagreement signals the verdict depended on prompt position rather than content, so it defers to a downstream arbiter or cascade.
+
+## `ExternalLlmJudge`
+
+`ExternalLlmJudge` (`evals/judges/external_llm.py`) mitigates Claude self-preference bias by grading with a different model family. It speaks the OpenAI `/v1/chat/completions` wire format, so any compatible provider (OpenAI, Gemini via OpenAI-compat, Azure OpenAI, Mistral) works. It resolves its `api_key` and `base_url` from constructor args or the `EVAL_EXTERNAL_JUDGE_KEY` / `EVAL_EXTERNAL_JUDGE_URL` environment variables (base URL defaults to `https://api.openai.com`), and **SKIPs gracefully when no key is configured** so existing runs aren't broken. It reuses `LlmJudge._extract_actual` (via a thin `_ActualRenderer` shim that needs no live Anthropic client) and the same `_RUBRIC_PROMPT_TEMPLATE` and `_extract_json_object` parsing.
+
+<Warning>
+`ExternalLlmJudge` does not record cost in the Anthropic `CostLedger` (which is Anthropic-specific): its verdicts carry `cost_usd = 0.0`. Add per-model pricing if you need accurate cost attribution for external providers.
+</Warning>
+
+## `FaithfulnessJudge`
+
+`FaithfulnessJudge` (`evals/judges/faithfulness.py`) is a claim-level grounding check. It decomposes the bot's answer into atomic factual claims and marks each SUPPORTED or UNSUPPORTED against an explicit source, returning the fraction supported. It reads:
+
+| Key | Purpose |
+| --- | --- |
+| `faithfulness_source` (str, required) | The transcript / retrieved chunks that are the sole ground truth. SKIPs if absent (opt-in). |
+| `faithfulness_threshold` (float, optional) | Minimum supported fraction to PASS. Default `0.8`. |
+
+It grades only user-visible text — for a session case it concatenates the `end_turn` rounds via `_extract_user_visible_text()`. Correct abstention ("I don't see any recording of this") has no factual claims, so the prompt's special rule sets the supported fraction to `1.0` and PASSes. The call uses `max_output_tokens=1000` and surfaces the first five unsupported claims in `details.unsupported_claims`.
 
 <Note>
-Scaffold generated from the codebase map — expand with full detail, examples, and specifics.
+`faithfulness_source` must mirror the **full set of tool results** the bot was shown, not just the transcript snippet. A bot that cites `date=2026-05-08` from a `searchRecordings` result is being faithful even though that date isn't in the transcript chunk — if the source omits it, the judge would wrongly flag correctly-cited metadata as fabrication.
 </Note>
+
+## `GroundedExtractionJudge`
+
+`GroundedExtractionJudge` (`evals/judges/grounded_extraction.py`) is the field-level analogue for extract operations. It collects every insight (from `saveSection` / `replaceSection`) and task text/owner (from `saveTasks`) via `_extract_fields_from_tool_calls()`, then asks the judge whether each value traces back to the source transcript. It reads the transcript from `case.input['input']['transcript']` (SKIPs if absent, or if no `saveSection` / `saveTasks` calls were made) and `expected.grounding_threshold` (default `0.8`). A reasonable inference from explicit content is acceptable; a specific unsupported fact (date, name, number, decision, quote) is HALLUCINATED. The prompt samples at most `_MAX_FIELDS` (`30`) fields, uses `max_output_tokens=2500`, and surfaces the first five hallucinated fields in `details.hallucinated_fields`. It's designed for `extract_template`, where the bot's job is to pull from the transcript, not synthesize beyond it.
+
+## Cost accounting
+
+`LlmJudge`, `LlmJudgePositionSwap`, `FaithfulnessJudge`, and `GroundedExtractionJudge` all build an `AnthropicUsage` from the returned token counts and call `ctx.cost_ledger.record_judge(usage)` when a ledger is present, and set each verdict's `cost_usd` to `usage.cost_usd()`. Inside a `Cascade`, those per-verdict costs sum up the chain. See [Cost baseline](/rollingrecord/evals/harness/cost-baseline) for the ledger and pricing.
+
+For the confidence-cascade pattern that pairs a Sonnet `LlmJudge` behind `MinConfidence` with an Opus arbiter, see [Chain primitives](/rollingrecord/evals/judges/chains).

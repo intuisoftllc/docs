@@ -1,16 +1,70 @@
 ---
 title: "Pass Floor, Flakes & Exit Codes"
-description: "How the harness decides pass/fail and sets its exit code."
+description: "How the harness turns case verdicts into a pass rate, a build verdict, and an exit code."
 ---
 
-The exit-code policy combines the pass floor, regression detection, and flake accounting to decide whether a run succeeds.
+`_print_summary` (`evals/run.py`) computes the run's pass rate, checks it against the pass floor, folds in regression detection and flake accounting, and returns the process exit code. The floor accepts a small amount of LLM-grading noise; a regression breaks the build regardless of the floor.
 
-## What this covers
+## Exit-code policy
 
-- Exit-code policy in `run.py` `_print_summary`: 0 (rate ≥ floor, no regressions), 1 (below floor OR any regression), 2 (run aborted/failed); default floor `0.95` in `config.py`.
-- Flake accounting (`is_flake` excluded from denominator + exit code) and `--repeat` reliability badges (reliable ≥95% / flaky 50–94% / broken <50%).
-- Regression always breaks the build regardless of floor.
+| Exit | Meaning |
+| --- | --- |
+| `0` | Run completed, pass rate ≥ floor, no regressions. |
+| `1` | Pass rate below floor **or** at least one regression. |
+| `2` | Run did not complete (`status != "completed"` — aborted or failed). |
+
+## Pass rate and the floor
+
+Pass rate is `cases_passed / (cases_run - cases_flaked)` — flake-marked cases that flaked are excluded from the denominator, so a known-noisy case can't drag the rate below the floor. The default floor is `DEFAULT_PASS_FLOOR` (`0.95`, `evals/config.py`), the realistic ceiling for an LLM-graded suite where the last few percent are inconsistent Haiku behaviors or borderline rubric edges. Override per run with `--pass-floor=<float>`; set it to `1.0` to require every non-flake case to pass.
+
+The floor check is **skipped** (treated as met) for dry runs, zero-case runs, and runs where every case was a flake — there is nothing meaningful to evaluate.
+
+## Flake accounting
+
+A case marked `"is_flake": true` in its JSON is one whose occasional failure is confirmed judge/bot non-determinism, not a real regression. Its accounting (`RunResult`, `evals/core/runner.py`):
+
+- A **PASS** on a flake-marked case still counts as a pass.
+- A **FAIL** or **UNCERTAIN** routes to `cases_flaked` instead of `cases_failed` / `cases_uncertain`, is excluded from the pass-rate denominator, and does **not** affect the exit code.
+- A flake-marked PASS→FAIL transition is **not** counted as a regression — flakes are expected to flip.
+
+The flag is deliberately hard to earn: the bar is "we've confirmed the bot's behavior is correct and retries pass cleanly; judge variance is the only failure source." Overusing it masks real regressions.
+
+## Regression detection
+
+`baseline.json` at each suite root records the last-known-good verdict per `<suite>.<id>` (`Baseline`, `evals/core/baseline.py`). `_baseline_diff` classifies each case against it:
+
+| `baseline_kind` | Transition |
+| --- | --- |
+| `new` | No baseline entry for this case yet. |
+| `unchanged` | Same verdict kind as baseline. |
+| `regression` | Baseline PASS → now FAIL or UNCERTAIN. |
+| `fix` | Baseline FAIL/UNCERTAIN → now PASS. |
+| `changed` | Any other kind transition. |
+
+Any non-flake `regression` breaks the build (exit 1) **regardless of the pass floor** — a previously-passing case that now fails is real signal worth flagging immediately, and the summary lists each one with its reason.
 
 <Note>
-Scaffold generated from the codebase map — expand with full detail, examples, and specifics.
+Baselines are committed `baseline.json` files consumed by the runner; there is no `--update-baseline` flag on `run.py` today (the `baseline.py` docstring references one, but `_parse_args` does not implement it). Update baselines by editing the file after a reviewed green run.
 </Note>
+
+## Repeat mode
+
+`--repeat N` runs each case N times to measure reliability (RR-384). The case list is multiplied before the run, then `_print_repeat_summary` groups the `N × M` results by `case_fqid` and badges each unique case by its pass rate:
+
+| Badge | Pass rate | Meaning |
+| --- | --- | --- |
+| `RELIABLE` | ≥ 95% | Safe to trust. |
+| `FLAKY` | 50–94% | Worth investigating; a warning, not a build break. |
+| `BROKEN` | < 50% | Consistently failing. |
+
+Repeat-mode exit code is `1` if any **non-flake** case is `BROKEN`, else `0` (flaky cases pass with warnings). A flake-marked case that lands `BROKEN` is reported but ignored for the exit code.
+
+## Reading the summary
+
+The bottom banner repeats the outcome so "did it work?" is answerable at a glance without scrolling back through per-case diagnostics: a `FINAL` line (pass/fail/flake/uncertain/skip counts and percentages), a `COST` line, a `RESULT` line stating whether the floor was met and whether regressions were found, and the `RUN` id plus `FILE` path to the [results JSON](/rollingrecord/evals/operations/results-files). FAILs expand their verdict tree and an `actual:` snippet; `--show-pass` expands PASSes the same way. A quota-abort surfaces its banner again here with the reminder to verify the eval user's `developer` entitlement.
+
+## Where to go next
+
+- [Result Files & Analytics](/rollingrecord/evals/operations/results-files) — where the counts and per-case verdicts are persisted.
+- [Running Evals](/rollingrecord/evals/operations/running) — the flags that feed this policy.
+- [Daily Eval Analysis File](/rollingrecord/evals/operations/daily-analysis) — logging oscillation and regression chains across runs.

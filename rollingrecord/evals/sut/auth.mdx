@@ -1,16 +1,56 @@
 ---
 title: "Token Minting & Auth"
-description: "How the harness mints App Check and Clerk tokens for the dev backend."
+description: "How the harness mints Firebase App Check and Clerk bearer tokens for the dev ai-engine, and keeps the short-lived bearer fresh."
 ---
 
-The harness mints Firebase App Check and Clerk bearer tokens for a dedicated eval user with the `developer` entitlement.
+Every eval request to `ai-engine` carries a Firebase App Check JWT and a Clerk session bearer JWT. `evals/ai_engine/auth.py` mints both at run start for a dedicated eval account, and re-mints the bearer on access because its TTL is far shorter than an eval run. The flow is intentionally identical to the Kotlin `SmokeTokenMinter` so failure modes present the same way in both harnesses.
 
-## What this covers
+## The two tokens
 
-- `mint_tokens`/`EvalTokens` (`evals/ai_engine/auth.py`): Firebase App Check debug-token exchange + Clerk Backend-API/FAPI bearer flow; 60s bearer TTL with `force_fresh_bearer_jwt()` re-mint.
-- The dedicated eval test user (distinct from smoketest) and the `developer` RC entitlement requirement that bypasses caps/rate limits.
-- Parity with the Kotlin `SmokeTokenMinter` failure modes.
+| Token | Source | TTL | Refresh strategy |
+| --- | --- | --- | --- |
+| App Check JWT | Firebase debug-token exchange (`_mint_app_check_jwt`) | ~1 hour | Minted once per run, never refreshed — a run completes well within an hour. |
+| Bearer JWT | Clerk Backend API session-token mint | ~60s (Clerk default) | `EvalTokens.bearer_jwt` re-mints when within `REFRESH_HEADROOM_SECS` (15s) of the `BEARER_TTL_SECS` (60s) TTL. |
 
-<Note>
-Scaffold generated from the codebase map — expand with full detail, examples, and specifics.
-</Note>
+App Check is exchanged by POSTing `{debugToken: FIREBASE_APP_CHECK_DEBUG_SECRET}` to `config.firebase_app_check_exchange_url`; a non-200 raises with a message pointing at the debug secret and Firebase app id. The naive "mint once and reuse" pattern would 401 mid-run because eval runs routinely outlive 60s — a lesson the docstring notes was learned the hard way in the smoketest suite.
+
+## Clerk bearer flow
+
+`_mint_bearer_jwt()` resolves the eval user and mints a session JWT, with a cold-start fallback when no session exists yet.
+
+<Steps>
+<Step title="Resolve the Clerk user id">
+`_lookup_clerk_user_id()` calls `GET /v1/users?query=<email>&limit=50` and filters client-side for an exact case-insensitive email match. It uses the fuzzy `query=` parameter, not `email_address[]=`: the latter silently normalizes Gmail `+` subaddresses, collapsing every `...+anything@gmail.com` to the same base and returning whichever user Clerk's index hits first.
+</Step>
+<Step title="Fast path — existing session">
+`_try_existing_session_token()` calls `GET /v1/sessions?user_id=...&limit=5`, prefers a session with `status == "active"` (else any non-terminal one, excluding `revoked`/`ended`/`removed`), and POSTs `/v1/sessions/{id}/tokens` for a fresh JWT. On any failure it returns a description that is threaded into the cold-path error so a diagnosis sees both reasons at once.
+</Step>
+<Step title="Cold-start fallback — FAPI password sign-in">
+When no usable session exists, `_fapi_password_sign_in()` signs in via Clerk FAPI (`POST {clerk_fapi_url}/v1/client/sign_ins`, `strategy=password`) to create one, then mints a JWT from the new `session_id`. A short-lived Clerk testing token is fetched first and appended as `?__clerk_testing_token=...` to clear dev-instance bot detection.
+</Step>
+</Steps>
+
+## `EvalTokens`
+
+`EvalTokens` holds the immutable App Check JWT and a refresh-aware bearer, and is thread-safe because the harness runs cases on a `ThreadPoolExecutor`.
+
+| Member | Behavior |
+| --- | --- |
+| `app_check_jwt` | Returns the cached value; never refreshed within a run. |
+| `bearer_jwt` | Lock-free fast path when the token is fresh; on the slow path takes a per-instance lock and re-mints from the existing Clerk session if within the refresh headroom of expiry. |
+| `force_fresh_bearer_jwt()` | Mints a guaranteed-fresh bearer regardless of cache age, under the lock. |
+| `auth_user_id` | The resolved Clerk user id (the `sub` identity used across the backend). |
+| `close()` | Closes the shared `httpx.Client` when `EvalTokens` owns it. |
+
+`force_fresh_bearer_jwt()` exists for the Kotlin runner: that runner holds one token for a whole multi-turn case (all turns in a single subprocess), so reading the refresh-on-access property could hand it a token already most of the way through its 60s TTL, and a long case would cross expiry mid-run and fail with `invalid_jwt`. Forcing a fresh mint per case starts each case with the full TTL. See [`KotlinSessionDriver`](/rollingrecord/evals/kotlin-sut/contract), which calls it in every payload it builds.
+
+`mint_tokens(cfg, http=None)` is the entry point: it mints App Check, resolves the user, mints the bearer, and returns a wired `EvalTokens`. Pass an `httpx.Client` to reuse the connection pool across the run; otherwise a client is created and owned by the returned `EvalTokens`.
+
+## The eval account
+
+The eval user is a dedicated dev account, distinct from the smoketest account, identified by `EVAL_TEST_USER_EMAIL`. It is provisioned with the `developer` RevenueCat entitlement so an eval run can exercise AI behavior end-to-end without burning monthly caps or tripping the per-user rate limit. Per the backend's dev-bypass design that entitlement cascades to the top tier and flags the caller for cap and rate-limit bypass — but structural validation (App Check, JWT, the app-version floor, `kb_query` round budgets) still applies, which is why the harness always presents a valid App Check token and an over-the-floor `X-App-Version`.
+
+## Where to go next
+
+- [Live Dev Backend Client](/rollingrecord/evals/sut/ai-engine-http) — the client that attaches these tokens as request headers.
+- [`--sut=kotlin` & KotlinSessionDriver](/rollingrecord/evals/kotlin-sut/contract) — the session driver that consumes `force_fresh_bearer_jwt()` per case.

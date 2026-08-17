@@ -1,16 +1,104 @@
 ---
 title: "Writing judges.py"
-description: "The per-case judge resolver convention each suite implements."
+description: "The per-case judge resolver each suite implements, and how chains compose deterministic and LLM tiers."
 ---
 
-Each suite's `judges.py` exports a `judge_for_case` resolver that returns the composed judge chain for a given case.
+Every suite exports a `judge_for_case` function from its `judges.py`. The harness imports it (`_load_judge_resolver` in `evals/run.py`) and calls it once per case to get the composed `Judge` that grades that case. Judge choice is per-case — driven by tags and `expected.judge_chain` — not fixed per suite.
 
-## What this covers
+## The resolver convention
 
-- The `judge_for_case(case, *, anthropic)` convention and returning a composed chain; reading `expected.judge_chain`/tags for per-case variation.
-- Combining structural judges (`AllOf`) with the LLM tier; how absent `ANTHROPIC_API_KEY`/rubric degrades to structural-only.
-- Keeping Python `judges.py` and the Kotlin `SuiteRegistry` in step.
+```python
+def judge_for_case(
+    case: TestCase, *, anthropic: Optional[AnthropicMessages] = None
+) -> Judge:
+    ...
+```
 
-<Note>
-Scaffold generated from the codebase map — expand with full detail, examples, and specifics.
-</Note>
+`_load_judge_resolver` requires the module `evals.suites.<suite>.judges` to expose `judge_for_case`; a missing module or missing function raises `SystemExit` with the fix. The `anthropic` client is passed through from the run — it is `None` when `ANTHROPIC_API_KEY` is unset, which resolvers use to decide whether LLM grading is available. In `--all` runs, `_resolver_dispatch` routes each case to its suite's resolver by `case.suite`.
+
+## The standard fan-out
+
+Most suites build an `AllOf(...)` of cheap structural judges, then (unless the case opts out) combine it with an LLM tier — a `Cascade` that tries Sonnet first and escalates to an Opus arbiter only when Sonnet is under-confident:
+
+```python
+structural = AllOf(RoundBudgetJudge(), MustCallToolJudge(),
+                   MustNotCallToolJudge(), ToolCallSequenceJudge(), ContainsJudge())
+
+if explicit == "structural_only" or anthropic is None:
+    return structural
+if not case.expected.get("llm_rubric"):
+    return structural
+
+return AllOf(
+    structural,
+    Cascade(
+        MinConfidence(LlmJudge(anthropic=anthropic, model=JUDGE_MODEL), threshold=0.85),
+        LlmJudge(anthropic=anthropic, model=ARBITER_MODEL),
+    ),
+)
+```
+
+The models come from `evals/config.py`: `JUDGE_MODEL` (`claude-sonnet-4-6`), `ARBITER_MODEL` (`claude-opus-4-6`), and the production model under test, `PRODUCTION_MODEL` (`claude-haiku-4-5-20251001`). The 0.85 threshold is `DEFAULT_CONFIDENCE_THRESHOLD`. The design rule is that the judge model must be meaningfully smarter than the model being judged.
+
+## Graceful degradation
+
+The resolver degrades to structural-only grading whenever LLM grading can't run, without failing the case:
+
+| Condition | Result |
+| --- | --- |
+| `expected.judge_chain == "structural_only"` (or `"deterministic_only"` / `"waste_only"`, per suite) | Structural chain only; no judge tokens spent. |
+| `anthropic is None` (no `ANTHROPIC_API_KEY`) | Structural chain only. |
+| `expected.llm_rubric` missing or blank | Structural chain only — round budget + tool shape still meaningful. |
+
+Some suites are stricter. `kb_chat`'s free-text-quality tags (`hallucination`, `refusal`, `multi_turn`) and every `security` case **raise** `RuntimeError` when `ANTHROPIC_API_KEY` is absent or `llm_rubric` is missing, because those cases are only meaningful under LLM grading. The message tells the author to set the key or override to `deterministic_only`.
+
+## Per-case dispatch
+
+Resolvers vary the chain by reading `case.tags` and `case.expected`. `kb_chat`'s resolver is the reference: hard-contract tags (`capability`, `factual_recall`) get deterministic chains; free-text tags get the LLM cascade; `expected.judge_chain = "with_llm"` forces LLM grading regardless of tag.
+
+| `kb_chat` tag | Chain |
+| --- | --- |
+| `capability` | `AllOf(ListShapeJudge, KeywordsJudge, ContainsJudge)` |
+| `factual_recall` | `AllOf(KeywordsJudge, LengthJudge)` |
+| `hallucination` / `refusal` / `multi_turn` / `quality` | `Cascade(MinConfidence(LlmJudge[Sonnet], 0.85), LlmJudge[Opus])` |
+| (fallback) | `KeywordsJudge` |
+
+## Judge inventory
+
+Judges are exported from `evals/judges/__init__.py`. Every judge implements `Judge.evaluate(ctx) -> Verdict` and reads only the `expected.*` keys it recognizes, SKIPping cleanly otherwise.
+
+| Family | Judges | File |
+| --- | --- | --- |
+| Deterministic | `ExactMatchJudge`, `ContainsJudge`, `KeywordsJudge`, `RegexJudge`, `LengthJudge`, `JsonShapeJudge`, `BodyFieldJudge`, `ToolCallJudge`, `ListShapeJudge` | `judges/deterministic.py` |
+| Fuzzy | `LevenshteinJudge`, `SetSimilarityJudge` | `judges/fuzzy.py` |
+| Semantic | `EmbeddingSimilarityJudge` | `judges/semantic.py` |
+| LLM | `LlmJudge`, `LlmJudgePositionSwap`, `ExternalLlmJudge`, `FaithfulnessJudge`, `GroundedExtractionJudge` | `judges/llm.py`, `external_llm.py`, `faithfulness.py`, `grounded_extraction.py` |
+| Retrieval | `RetrievalRecallAtK`, `RetrievalPrecisionAtK`, `RetrievalMRR` | `judges/retrieval.py` |
+| Session | `MustCallToolJudge`, `MustNotCallToolJudge`, `RoundBudgetJudge`, `ToolCallSequenceJudge`, `WasteThresholdJudge` | `judges/session_judges.py` |
+| Chains | `AllOf`, `AnyOf`, `Cascade`, `Majority`, `MinConfidence` | `judges/chains.py` |
+
+See [Deterministic judges](/rollingrecord/evals/judges/deterministic), [LLM judges](/rollingrecord/evals/judges/llm), [Session judges](/rollingrecord/evals/judges/session), and [Retrieval judges](/rollingrecord/evals/judges/retrieval) for the `expected.*` keys each reads.
+
+## Chain composition
+
+Every chain in `judges/chains.py` is itself a `Judge`, so they nest arbitrarily. A `Verdict` (`evals/core/verdict.py`) has four kinds — `PASS`, `FAIL`, `UNCERTAIN`, `SKIP` — and the chains combine child verdicts by these rules:
+
+| Chain | PASS when | FAIL when | UNCERTAIN when |
+| --- | --- | --- | --- |
+| `Cascade(j1, j2, …)` | first child PASSes | first child FAILs | all children UNCERTAIN (SKIP advances silently) |
+| `AllOf(j1, j2, …)` | every non-SKIP PASSes | any child FAILs | any UNCERTAIN, no FAIL |
+| `AnyOf(j1, j2, …)` | any child PASSes | every non-SKIP FAILs | otherwise |
+| `Majority(judges, n)` | at least `n` PASS | fewer than `n` PASS | (binary — never UNCERTAIN) |
+| `MinConfidence(j, t)` | `j` PASS and confidence ≥ `t` | `j` FAIL and confidence ≥ `t` | confidence below `t` |
+
+`Cascade` ordering is a design tool: put cheap deterministic judges first, expensive LLM judges last, and use `MinConfidence` as the "I'm not sure — escalate" knob. If every child of a chain SKIPs, the chain returns SKIP. See [Chain primitives](/rollingrecord/evals/judges/chains).
+
+## Keeping the Kotlin registry in step
+
+The on-device eval port has a parallel resolver: `SuiteRegistry.judgeFor(case)` (`app/app/src/debug/java/com/intuisoftllc/rollingrecord/evalmode/suites/SuiteRegistry.kt`) wires the same per-case chains for each suite, degrading to structural-only when the rubric or judge client is unavailable — the same "standard fan-out" pattern. When you change a suite's `judges.py`, mirror it in `SuiteRegistry` so the two harnesses grade identically. See [On-device judges & suites](/rollingrecord/evals/on-device/judges-suites).
+
+## Where to go next
+
+- [Judges overview](/rollingrecord/evals/judges/overview) — the grading model and the `Verdict` vocabulary.
+- [Suite & Case File Layout](/rollingrecord/evals/authoring/suite-layout) — where `judges.py` sits and how `expected` is shaped.
+- [Suite Catalog](/rollingrecord/evals/authoring/suites-catalog) — which chain each real suite uses.

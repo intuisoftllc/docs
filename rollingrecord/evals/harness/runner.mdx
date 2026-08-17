@@ -1,16 +1,73 @@
 ---
-title: "Runner: Orchestration & Concurrency"
-description: "How the runner orchestrates cases, judges, and concurrency."
+title: "Runner"
+description: "The run lifecycle, sequential vs parallel execution, quota-abort, and the pre-judge guards."
 ---
 
-`Runner` drives each case through the SUT and judge, manages bounded concurrency, and finalizes analytics and results.
+`Runner` (`evals/core/runner.py`) drives one full eval invocation end-to-end: it opens an analytics row, runs each case through the system-under-test and its judge, accumulates cost, and finalizes an analytics row plus a per-run results JSON. `Runner.run()` returns a `RunResult` the CLI uses to print a summary and select an exit code.
 
-## What this covers
+## Lifecycle
 
-- Lifecycle in `evals/core/runner.py`: open analytics row → per-case SUT call + judge → periodic upsert → finalize + write results JSON.
-- Fixed `DEFAULT_WORKERS=4` (the `--workers` override was removed because 8 overloaded ai-engine); sequential path for single-case runs; `ThreadPoolExecutor` parallel path with input-order re-sort.
-- Quota-cascade abort (`_detect_quota_error` on `rate_limited`/`cap_reached`, excluding `provider_rate_limited`), unfilled-stub `<<REPLACE_ME` skip, and stale-mock-tool-name guard.
+`run()` follows a fixed sequence for a non-dry run:
 
-<Note>
-Scaffold generated from the codebase map — expand with full detail, examples, and specifics.
-</Note>
+1. Open the `l_eval_run` analytics row (`status="running"`, counts 0).
+2. For each case: call the SUT, build a `JudgeContext`, evaluate the judge, tally the verdict, and accumulate cost.
+3. Every `PROGRESS_BATCH` (10) cases, print a checkpoint and upsert the analytics row so a long run isn't silent.
+4. Finalize: upsert `status="completed"` / `"aborted"` / `"failed"` with counts, costs, and notes, then write `RESULTS_ROOT/<day>/<run_id>.json`.
+
+A dry run short-circuits after step 1 — it opens and finalizes the analytics row (with `dry_run=true`) so every harness invocation shows up in `l_eval_run`, but never calls the SUT or a judge.
+
+## Concurrency
+
+Worker count resolves from `Runner.DEFAULT_WORKERS` (4). A single-case run and an explicit `workers=1` take the sequential path; everything else uses a `ThreadPoolExecutor`.
+
+`DEFAULT_WORKERS` is fixed at 4 and no longer user-tunable (RR-429). The `--workers` CLI override was removed because raising it to 8 overloaded the ai-engine / Edge Function and fabricated failures — empty bot output, `HTTP 400 ai_call_failed`, missed tool calls. Four is the safe ceiling.
+
+| Path | When | Ordering |
+| --- | --- | --- |
+| `_run_cases_sequential` | one case, or `workers=1` | Deterministic input order; the canonical reference path, easiest to read a failure in. |
+| `_run_cases_parallel` | two or more cases (the default) | Workers run cases concurrently; results are collected into per-index `slots` and re-sorted into INPUT order before being appended to `result.cases`. |
+
+Both paths produce identical prints, quota-abort behavior, and progress cadence — only case ordering differs. The parallel path uses two locks: a `print_lock` so a case's multi-line non-PASS dump doesn't interleave with other output, and a `state_lock` guarding the completion counter and the analytics upsert (the analytics client is not documented as thread-safe). The shared `CostLedger` is independently thread-safe (see [Cost ledger](/rollingrecord/evals/harness/cost-baseline)).
+
+Mid-run progress in the parallel path reads counts from the `slots` array directly, not from `result.cases` — the latter stays empty until the pool drains to preserve input ordering, and reading it mid-run would report `0/0/0/0` (the bug RR-429 originally shipped with).
+
+## Pre-judge guards
+
+Before touching the SUT, `_run_one_case` applies two short-circuit checks so a broken case fails in isolation rather than costing a production + judge call or aborting the whole run:
+
+| Guard | Trigger | Outcome |
+| --- | --- | --- |
+| Unfilled-stub skip | `case.input` contains the `<<REPLACE_ME` marker anywhere (deep-walked) | `SKIP` verdict from `UnfilledStubSkip` — the fixture is still a placeholder (e.g. CSAM / adult-content moderation cases left for a human to fill in). |
+| Stale-mock-tool-name guard | A `kb_query` session case using the canonical tool set references a `mock_tools` key that isn't a real tool name | `FAIL` verdict `stale_mock_tool_name` via `validate_mock_tool_names`. |
+
+The stale-mock guard only applies when the case is a `kb_query` operation, has a `session` with `mock_tools`, and did NOT supply its own explicit `tools` / `tool_instructions` (an un-migrated sandbox case keeps its own names and is exempt). See [Canonical tool fixtures](/rollingrecord/evals/harness/tool-fixtures).
+
+## Per-case execution
+
+`_run_one_case` dispatches on whether the case is single-shot or session-mode:
+
+- **Session case** (`case.session is not None`): if a `session_driver` was injected (`--sut=kotlin`), it drives the whole session in an external process and returns the trace; otherwise a Python `SessionRunner` drives it. Cost is recorded per-round inside the driver / runner — the outer method does not double-count. See [Session runner](/rollingrecord/evals/harness/sessions).
+- **Single-shot case**: `self._system.call(case.input)`; the production cost is recorded once from the returned `ActualOutput`'s model and token counts.
+
+If the `ActualOutput` carries an `error`, judging is skipped and the case is recorded as a `FAIL` with a synthetic `system_error` verdict. Otherwise the resolved judge evaluates a `JudgeContext(case, actual, cost_ledger)`.
+
+Each `CaseResult` also captures forensic detail for later review without re-running: `actual_text` (the model's response text, truncated to `_MAX_ACTUAL_TEXT_CHARS` = 4000), an `actual_body_summary` shallow projection of the body (scalars inlined, structured values shown as their type), the copied `expected` dict, and the `session_trace` for session cases.
+
+## Quota-cascade abort
+
+When the eval user lacks the `developer` RC entitlement, ai-engine eventually returns a quota gate and every remaining case turns into garbage. `_detect_quota_error` watches for two canonical `AppError` codes and aborts the run cleanly with an actionable message.
+
+| Code | Gate |
+| --- | --- |
+| `rate_limited` | The per-user `ai_engine` rate-limit bucket (60 calls / rolling hour). |
+| `cap_reached` | A per-operation monthly usage cap (e.g. `kb_query_cap_per_month`). |
+
+`provider_rate_limited` is deliberately excluded — that means the upstream AI provider is throttling the shared key under burst load, which is transient and handled by `AiEngineHttp`'s retry-with-backoff. `_match_quota_code` strips `provider_rate_limited` mentions before scanning so its `rate_limited` substring can't false-positive.
+
+The first worker to detect a quota code raises `_QuotaAbort` (internal to the runner). In the parallel path, pending futures are cancelled and in-flight cases are allowed to finish naturally before the abort bubbles up; the run finalizes as `status="aborted"` and the CLI exits `2`. The abort notes point at the most likely cause: the eval user is missing the `developer` entitlement, so dev-bypass for caps and rate limits is inactive. A `KeyboardInterrupt` similarly finalizes as `aborted` with best-effort analytics retries and a locally-written results JSON.
+
+## Aggregates and finalization
+
+`RunResult` exposes computed counts read by the CLI summary: `cases_run`, `cases_passed`, `cases_failed`, `cases_uncertain`, `cases_skipped`, `cases_flaked`, and `regressions`. Flake-marked cases that FAIL or are UNCERTAIN route to `cases_flaked` and are excluded from `cases_failed` / `cases_uncertain` and from the regression list — see [Cost, baselines & regressions](/rollingrecord/evals/harness/cost-baseline).
+
+`_finalize` retries the terminal analytics upsert with short backoffs (`_UPSERT_FINALIZE_BACKOFFS` = `[0.5, 1.0, 2.0]`) so a transient network blip during shutdown can't leave the server row stuck in `running`. The local results-file write is best-effort; a failure there prints to stderr but does not taint the run.

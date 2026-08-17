@@ -1,16 +1,72 @@
 ---
 title: "Chain Primitives"
-description: "Composing judges with Cascade, AllOf, AnyOf, Majority, MinConfidence."
+description: "Cascade, AllOf, AnyOf, Majority, and MinConfidence — the composable judges that aggregate other judges' verdicts."
 ---
 
-Chain primitives compose individual judges into a decision pipeline, ordering cheap deterministic checks before expensive LLM grading.
+The primitives in `evals/judges/chains.py` are themselves `Judge`s, so they nest arbitrarily. A resolver builds a decision pipeline out of them — cheap deterministic judges first, expensive LLM judges last — and returns the root as a single judge the runner grades with.
 
-## What this covers
+## The composition tree
 
-- `Cascade`, `AllOf`, `AnyOf`, `Majority`, `MinConfidence` composition semantics and the PASS/FAIL/UNCERTAIN/SKIP truth table (`evals/judges/chains.py`).
-- Cost = sum of children that ran; cheap-deterministic-first, expensive-LLM-last ordering; `MinConfidence` as the escalation knob.
-- How child verdicts nest into `details.children` (rendered by the runner's verdict tree).
+Because every chain is a `Judge`, chains hold other chains. A representative tree:
 
-<Note>
-Scaffold generated from the codebase map — expand with full detail, examples, and specifics.
-</Note>
+```
+Cascade(
+    Keywords(),
+    MinConfidence(LevenshteinJudge(), threshold=0.85),
+    LlmJudge(analytics),
+)
+```
+
+This reads as: try `Keywords`; if it's `UNCERTAIN`, try `Levenshtein`; if `Levenshtein`'s `PASS`/`FAIL` has confidence below `0.85`, demote it to `UNCERTAIN` and escalate to the LLM judge. Ordering is a deliberate cost tool — put the zero-cost deterministic judges first so the LLM call only fires when the cheap checks can't decide.
+
+## Composition semantics
+
+Each chain has its own rule for combining child verdicts:
+
+| Chain | `PASS` when | `FAIL` when | `UNCERTAIN` when |
+| --- | --- | --- | --- |
+| `Cascade(j1, j2, ...)` | first child that is `PASS` wins | first child that is `FAIL` wins | no child terminal; at least one `UNCERTAIN` |
+| `AllOf(j1, j2, ...)` | every child `PASS`es | any child `FAIL`s | any child `UNCERTAIN` and no `FAIL` |
+| `AnyOf(j1, j2, ...)` | any child `PASS`es | every child `FAIL`s | otherwise |
+| `Majority(judges, n)` | `>= n` children `PASS` | `< n` children `PASS` | never — `Majority` is binary |
+| `MinConfidence(j, t)` | `j` `PASS` and confidence `>= t` | `j` `FAIL` and confidence `>= t` | confidence `< t` |
+
+## `Cascade`
+
+`Cascade` tries judges in order. A terminal verdict (`PASS` or `FAIL`, per `Verdict.is_terminal`) halts the chain and is re-wrapped so the result carries the cascade's own `name` and a `cost_usd` **summed across every child that ran** — a cascade that reaches the LLM judge pays for the LLM call and every deterministic judge before it, which is correct because they were all called. An `UNCERTAIN` child is remembered and the chain advances; a `SKIP` child advances without contributing.
+
+If every child `SKIP`s, the cascade returns `SKIP`. If no child was terminal but at least one was `UNCERTAIN`, the cascade returns `UNCERTAIN` with a reason of the form `cascade exhausted: <last uncertain reason>` so the operator can see why it couldn't decide. Child verdicts are preserved under `details.children` and the winner under `details.winner`.
+
+`Cascade` requires at least one judge — the constructor raises `ValueError` on an empty chain.
+
+## `AllOf`
+
+`AllOf` evaluates every child and combines: any `FAIL` makes the chain `FAIL` (confidence is the minimum over the failing children); otherwise any `UNCERTAIN` makes it `UNCERTAIN`; otherwise, all children `PASS`ed and the chain `PASS`es (confidence is the minimum over the passing children). `SKIP`s are dropped from consideration — and if every child `SKIP`s, the chain returns `SKIP`. This is the "structural gate" primitive: `rag_real_content` builds `AllOf(RoundBudgetJudge(), MustCallToolJudge(), MustNotCallToolJudge(), ToolCallSequenceJudge(), ContainsJudge(), RetrievalRecallAtK(), ...)` so every declared constraint must hold at once, and any undeclared one SKIPs harmlessly.
+
+## `AnyOf`
+
+`AnyOf` `PASS`es if any child `PASS`es (confidence is the maximum over the passing children), `FAIL`s only if every non-skip child `FAIL`s, and returns `UNCERTAIN` for anything in between. As with `AllOf`, all-`SKIP` returns `SKIP`.
+
+## `Majority`
+
+`Majority(judges, n)` `PASS`es when at least `n` of the `M` children `PASS`, and `FAIL`s otherwise. It is deliberately binary: `UNCERTAIN` and `SKIP` from children both count as "not PASS". The constructor raises `ValueError` if `n` is outside `[1, len(judges)]`. Use `AllOf` instead when you want graceful uncertainty rather than a hard vote count.
+
+## `MinConfidence`
+
+`MinConfidence(judge, threshold)` wraps a single judge and is the escalation knob. If the wrapped judge returns `PASS` or `FAIL` with confidence at or above `threshold`, the verdict passes through untouched. If confidence is below `threshold`, the verdict is rewritten as `UNCERTAIN` — so a surrounding `Cascade` escalates instead of locking in a low-confidence decision. `SKIP` and `UNCERTAIN` from the wrapped judge pass through untouched, and cost is always preserved. The default threshold is `DEFAULT_CONFIDENCE_THRESHOLD` (`0.85`, from `evals/config.py`); the constructor raises `ValueError` if the threshold is outside `[0.0, 1.0]`. The canonical use is `MinConfidence(LlmJudge(..., model=JUDGE_MODEL))` as the first stage of a cascade whose second stage is the Opus arbiter.
+
+## SKIP semantics across chains
+
+A `SKIP` from a child means "this judge didn't participate":
+
+- In `Cascade`, a `SKIP` advances to the next judge, contributing no verdict info.
+- In `AllOf`, `AnyOf`, and `Majority`, a `SKIP` is treated as a missing input — the judge is dropped from the tally.
+- In all four multi-child chains, if **every** child `SKIP`s, the chain itself returns `SKIP`.
+
+This is what lets a single broad `AllOf` list many opt-in judges: each SKIPs cleanly when its `expected` key is absent, so a case only pays for and is graded by the judges whose constraints it actually declares.
+
+## Where verdicts nest
+
+Every multi-child chain (`Cascade`, `AllOf`, `AnyOf`, `Majority`) records its children's verdicts under `details.children` (each rendered via `Verdict.to_dict()`), and `Majority` additionally records `n_required` / `n_passed`. `MinConfidence` is the exception — it does not populate `details.children`: on a demote it stores `details={'wrapped_verdict': ..., 'threshold': ...}`, and when it passes a verdict through untouched it adds no details. This nested structure is what surfaces in the per-case results JSON and the runner's verdict tree, so a failing chain can be traced down to the exact child judge that decided it.
+
+See [the Judge framework](/rollingrecord/evals/judges/overview) for the `Verdict` and `VerdictKind` definitions these rules operate on.

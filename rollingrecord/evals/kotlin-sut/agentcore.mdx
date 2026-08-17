@@ -1,16 +1,99 @@
 ---
 title: "agentcore Shared Agent Loop"
-description: "The KB-chat agent loop shared by the app and the eval runner."
+description: "AgentLoop and its seams — the KB-chat tool loop extracted verbatim so evals drive the exact production client loop."
 ---
 
-`agentcore` holds the `AgentLoop` extracted verbatim from the app, so evals drive the exact production loop.
+`agentcore` is a pure Kotlin/JVM module shared by the Android app and the eval runner. Its centerpiece, `AgentLoop` (`app/agentcore/.../agentcore/AgentLoop.kt`), is the KB-chat agentic tool loop extracted verbatim from `KnowledgeBaseAdvisor.ask()`. The app implements the module's ports with Room/Retrofit/Koin; the [`agentrunner`](/rollingrecord/evals/kotlin-sut/agentrunner) implements them with an HTTP transport and mock tools — so an eval run drives the LITERAL production loop, not an imitation.
 
-## What this covers
+## What the loop owns — and does not
 
-- `AgentLoop.kt` (`app/agentcore`): the KB-chat tool loop extracted verbatim from `KnowledgeBaseAdvisor`, driving both the Android app and the eval runner; round budget from `ServerConfig.kbChatMaxToolRounds` + fallback final round.
-- `AgentTurnRequest`/`AgentTurnOutcome`, the full `AiEngineResult`→user-string mapping, `hadWriteOp`, and response sanitization.
-- What the loop does NOT own (pre-flight, tool dispatch behind `ToolExecutor`, analytics) plus wire models under `data/remote/aiengine/model`.
+`AgentLoop.run(request)` owns the round mechanics: per-round `KbQueryInput` construction, the `start`/`continueQuery` session calls, the full `AiEngineResult` → error-string mapping, token accounting, `tool_use` filtering and `tool_result` message assembly, the exhausted-rounds fallback round, and crash containment.
 
-<Note>
-Scaffold generated from the codebase map — expand with full detail, examples, and specifics.
-</Note>
+It deliberately does NOT own pre-flight (FTS orientation, scope resolution, scope-block construction, capability gates), tool-handler logic (behind the `ToolExecutor` seam), proposal/source accumulation (executor state), or the turn-lifecycle trace and end-of-turn analytics (the caller's). The caller does all pre-flight and hands the finished inputs in; the loop never reaches back into app state.
+
+## `AgentTurnRequest`
+
+Everything the loop consumes for a turn is pre-computed by the caller and passed in `AgentTurnRequest`.
+
+| Field | Purpose |
+| --- | --- |
+| `question` | The user's question, verbatim; rides every round as `question`. |
+| `initialMessages` | The already-assembled message list (rolling history + composed first user message). The loop copies it and appends rounds. |
+| `tools` | Client-owned tool definitions — `KbToolSpec.definitions()`. |
+| `toolInstructions` | Client-owned usage instructions — `KbToolSpec.usageInstructions()`. |
+| `scopeBlock` | Focused-context prompt snippet built from local state; `null` when unscoped. |
+| `medicalMode` | The user's Medical Mode setting, snapshotted for the turn. |
+| `historyTruncated` | Tri-state history-window fact; rides every round as `history_truncated`. |
+| `userTimezone` | IANA timezone, passed in (not read here) so a runner can pin it deterministically. |
+| `evalSystemSuffix` | Dev/eval-only profile-data override; `null` on every real client turn. |
+| `onStreamToken` | When non-null, the complete final answer is emitted here before the outcome returns; tool rounds are never streamed. |
+| `recap` | Caller-owned `RetrievalSummaryBuilder`; the loop adds one line per tool call and bakes the build into a success outcome. |
+
+## `AgentTurnOutcome`
+
+The terminal result is a sealed class with token totals, round count, and the write flag on both variants, so the caller can flush end-of-turn analytics (which fire on success and error alike) without the loop owning them.
+
+- `Success(answer, retrievalSummary, totalInputTokens, totalOutputTokens, toolRounds, hadWriteOp)` — `answer` is the sanitized final answer; `retrievalSummary` is a compact recap of the turn's tool calls (`null` if none ran).
+- `Error(message, totalInputTokens, totalOutputTokens, toolRounds, hadWriteOp, diagnostic)` — `message` carries the exact user-facing error string byte-for-byte; `diagnostic` is INTERNAL (the server's error code + details), never shown to the user, carried only for logs and the eval harness so a "Something went wrong" can be traced to its cause.
+
+## The round loop
+
+`maxRounds` is read from `ServerConfig.kbChatMaxToolRounds`. The loop `repeat(maxRounds)` times, each iteration building an inputs-only `KbQueryInput` with `isFinal = false` — the server owns the prompt, tools, model, round number, and round budget; the client only signals "this is a tool round." Round 1 calls `sessionManager.start(kbInput)`; every later round calls `sessionManager.continueQuery(kbInput)`, threading the server-issued `x-query-session-token`.
+
+A round is done when `response.stopReason == "end_turn"` or there are no `tool_use` blocks. Text is only read when Claude has explicitly finished — text blocks that appear alongside `tool_use` blocks are internal monologue and must never reach the user. When not done, the assistant's full content is appended to the message list, each `tool_use` is dispatched through `ToolExecutor.execute(...)` (ORing `isWriteOp` into the sticky `hadWriteOp`), and the results are appended as a `tool_result` user message.
+
+When all tool rounds are exhausted, the loop pushes a terminal user message and makes one final `is_final = true` round with a client-owned fallback prompt (`FALLBACK_PROMPT_WRITE` when a write occurred, else `FALLBACK_PROMPT_READ`) and no tools, so the model cannot emit XML stubs. The session budget reserves one slot beyond `max_tool_rounds` for this final step. These fallback prompts live in the loop per the AI-Content-Placement HARD RULE (Rule 3, atomic with loop code).
+
+### `AiEngineResult` → user-facing string
+
+Every failure class maps to an exact user-facing message inside `run()`. The three "generic" classes never reveal internals per the HARD RULE and set the internal-only `diagnostic`.
+
+| `AiEngineResult` variant | User-facing message |
+| --- | --- |
+| `Cap` | You've reached your monthly AI usage limit. It will reset at the start of next month. |
+| `SubscriptionRequired` | This feature requires a subscription upgrade. |
+| `FeatureDisabled` | AI chat is temporarily unavailable. Please try again soon. |
+| `MaxRoundsExceeded` | Maximum search rounds exceeded |
+| `SessionExpired` | Your session expired — please try asking again. |
+| `ModerationRejected` | Your message couldn't be processed — please rephrase. |
+| `NotFound` | The requested item could not be found. |
+| `Forbidden` | You don't have access to that resource. |
+| `ServiceUnavailable` | AI service is temporarily unavailable. Please try again in a moment. |
+| `RateLimited` | You're sending messages too quickly. Please wait a few minutes before chatting again. |
+| `RunawayProtection` | Request failed. Please try again. (logged; never reveals the cap) |
+| `DeveloperError` / `Validation` | Something went wrong. Please try again. (logged; `diagnostic` set) |
+| `Upstream` | AI service is temporarily unavailable. Please try again in a moment. |
+| `Network` | Rethrown so `runCatching` wraps it as an error outcome. |
+
+`CancellationException` always propagates out of `run()`; every other throwable is caught by the outer `runCatching`, logged via `AgentLog`, counted as a `loop_crash` analytics event, and returned as `AgentTurnOutcome.Error`. `sanitizeResponseText()` strips any leaked function-call XML (`<function_calls>`, `<invoke>`, `<parameter>`) and internal identifiers (`contextId=…`, `recordingId=…`, `insightIndex=…`, `[internal-only:…]`) before the answer is returned.
+
+## The seams
+
+The loop reaches the outside world through three interfaces, each bound differently by the app and the runner.
+
+| Seam | Contract | App binding | Runner binding |
+| --- | --- | --- | --- |
+| `AiEnginePort` | `fun interface` — `suspend kbQuery(input, sessionToken)` → `AiEngineResult<AiPassthroughResponse>` | `AiEngineClient::kbQuery` (Retrofit + App Check/JWT interceptors) | `HttpAiEnginePort` (plain HTTP + harness tokens) |
+| `ToolExecutor` | `fun interface` — `suspend execute(ToolCall)` → `ToolResult(text, isWriteOp)` | Per-turn dispatcher in `KnowledgeBaseAdvisor` (DAO reads, write callbacks, per-turn caps) | `RunnerToolExecutor` (mock fixtures) |
+| `KbQuerySessionManager` | Holds one in-progress `kb_query`; `start()` mints the token, `continueQuery()` reuses it | Same class, one per user question | Same class, fresh per turn |
+
+`ToolCall` keeps `name` NULLABLE on purpose — the wire model's `AiContentBlock.name` is nullable and the dispatcher's `else` branch historically rendered a null name as the literal `Unknown tool: null`; executors apply `name ?: "unknown"` themselves. `AgentMessageAssembly.buildInitialMessages(...)` lives in `:agentcore` too, so the app and the runner assemble BYTE-IDENTICAL turn openings — drift there would mean evals test a different prompt shape than production sends.
+
+## Wire models
+
+The request/response types live in `app/agentcore/.../data/remote/aiengine/model/AiOperationModels.kt`. Since RR-164 `kb_query` is inputs-only: the server owns the prompt, tools, and model, and derives round state (round number, max rounds) from the session row + `server_config`, so a client-supplied round count can't stretch the budget (RR-194).
+
+| Type | Role |
+| --- | --- |
+| `KbQueryRequestBody` | Envelope; `@EncodeDefault operation = "kb_query"` forces the field onto the wire. |
+| `KbQueryInput` | The inputs — `messages`, `is_final`, `had_write_op`, `question`, `tools`, `tool_instructions`, `scope_block`, `fallback_system_prompt`, `user_timezone`, `medical_mode`, `max_history_pairs`, `history_truncated`, `eval_system_suffix`. |
+| `KbQueryMessage` | `role` + `content` (a `JsonElement` — a string or a content-block array). |
+| `KbQueryTool` | `name`, `description`, `input_schema`. |
+| `AiPassthroughResponse` | Provider-normalized response — `content` blocks, `stop_reason`, `model`, `usage`, `provider`. Renamed from `AnthropicPassthroughResponse` so provider failover needs no client change. |
+| `AiContentBlock` / `AiUsage` | One content block (`text` or `tool_use`); token usage incl. `cache_creation`/`cache_read`. |
+
+## Where to go next
+
+- [agentrunner CLI (Main.kt)](/rollingrecord/evals/kotlin-sut/agentrunner) — how the runner binds the seams and drives one turn.
+- [KbToolSpec](/rollingrecord/evals/kotlin-sut/kb-tool-spec) — the `tools` and `toolInstructions` every turn carries.
+- [--sut=kotlin & KotlinSessionDriver](/rollingrecord/evals/kotlin-sut/contract) — the Python driver that shells out to this loop.

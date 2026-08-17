@@ -1,16 +1,33 @@
 ---
 title: "Access Gate & Safety"
-description: "The fail-closed gate that protects real user data during on-device evals."
+description: "The fail-closed gate that admits only a developer test account before any on-device run, seed, or spend."
 ---
 
-`EvalAccess` is a fail-closed gate that only admits a developer test account before any run, seed, or spend.
+`EvalAccess` (`evalmode/access/EvalAccess.kt`) is the authorization gate every run passes through first. It is fail-closed: anything short of a signed-in developer *test* account returns `Denied`, which the dashboard renders as a lock screen — no run, no seeding, no spend.
 
-## What this covers
+## Why the gate is strict
 
-- `access/EvalAccess.kt` fail-closed gate: signed in + `developer` RC entitlement + Clerk `+clerk_test` sub-address account required before any run/seed/spend.
-- Why the test-account marker is the load-bearing data-safety guard (seeded corpus lives in the signed-in account's real Room DB).
-- Denied reasons surfaced as the access screen.
+On-device evals are not free and not sandboxed. They seed fixtures into — and run the real production path against — the signed-in account's **live Room database**, and they cost real money through live `ai-engine` calls plus direct-Anthropic judge calls. A run therefore requires **all three** conditions below to hold at once (the 2026-07-29 decision).
 
-<Note>
-Scaffold generated from the codebase map — expand with full detail, examples, and specifics.
-</Note>
+## The three checks
+
+`check()` returns an `AccessResult` after evaluating, in order:
+
+| # | Check | Authority | Fails with |
+| --- | --- | --- | --- |
+| 1 | Signed in (`AuthState.SignedIn`) | Clerk (`AuthRepository`) | `NOT_SIGNED_IN` |
+| 2 | Holds the `developer` RC entitlement | RevenueCat (`RevenueCatManager`) | `NOT_AUTHORIZED` |
+| 3 | Email contains the `+clerk_test` marker | Clerk sub-address | `NOT_TEST_ACCOUNT` |
+
+The `developer` entitlement does double duty: it is the authorization to run *and* the reason a run doesn't burn quota or get throttled — the same entitlement cascades to `pro_cloud_ai` and flags the caller for the server's Gate 5/6 bypass. The marker constant is `CLERK_TEST_MARKER = "+clerk_test"` (e.g. `you+clerk_test@example.com`).
+
+## The test-account marker is the load-bearing guard
+
+Checks 1 and 2 establish *who* may run; check 3 is the data-safety guarantee. Because a seeded corpus lands in whatever account is signed in, requiring a dedicated Clerk test account (identified by the `+clerk_test` sub-address) means a run can never touch or corrupt a real user's data by accident. Every seeded row is additionally namespaced (see [fixture seeding](/rollingrecord/evals/on-device/corpus)), but the account marker is the first line of defense.
+
+## Result types
+
+- `AccessResult` is a sealed interface with `Authorized` and `Denied(reason)`.
+- `DeniedReason` is an enum: `NOT_SIGNED_IN`, `NOT_AUTHORIZED`, `NOT_TEST_ACCOUNT`.
+
+`Runner.run(...)` emits `EvalRunState.CheckingAccess`, calls `access.check()`, and on `Denied` emits `EvalRunState.Denied(reason)` and returns without loading a single case. The dashboard's `DeniedBody` maps each reason to a titled explanation — for `NOT_TEST_ACCOUNT` it spells out that the email must contain `+clerk_test` so a run can never touch real user data.

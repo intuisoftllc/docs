@@ -1,16 +1,124 @@
 ---
 title: "Authoring Session Cases"
-description: "Writing multi-round session cases with mock tools and follow-ups."
+description: "Writing multi-round session cases with mock tools, scripted follow-ups, and terminal reasons."
 ---
 
-A `session` block turns a case multi-round, driving the agent loop with mock tool results and scripted follow-ups.
+A `session` block turns a case multi-round: instead of one call to the system under test, the runner delegates to `SessionRunner` (`evals/core/session.py`), which drives the full agent loop — the bot calls tools, the harness answers with case-defined mock data, the bot uses the results to write its next answer. Session mode is `kb_query`-only; other operations are single-shot by nature.
 
-## What this covers
+## The `session` block
 
-- The `session` block (`max_rounds`, `max_cost_usd`, `mock_tools`, `follow_ups`) and how it turns a case multi-round.
-- Writing `mock_tools` in loose/explicit/staged forms with match operators; canonical-tool-name validation and read-vs-write default behavior.
-- `follow_ups` semantics differences between the Python runner (`after_round` honored) and the Kotlin runner/on-device (ignored).
+When `case.session` is present, `SessionRunner.run` reads these keys off it. `case.input` still holds the **first round's** payload (`operation` + inner `input.messages` with the seed user turn); the runner appends subsequent rounds to that messages list.
+
+| Key | Type | Default | Purpose |
+| --- | --- | --- | --- |
+| `mock_tools` | object | `{}` | Fixtures that resolve the bot's tool calls — see [Mock tool forms](#mock-tool-forms). |
+| `follow_ups` | array | `[]` | Scripted user turns injected after the bot ends a turn — see [Scripted follow-ups](#scripted-follow-ups). |
+| `max_cost_usd` | float | `0.50` (`DEFAULT_MAX_COST_USD`) | Per-case cost ceiling; the session halts if total production cost crosses it. |
+| `max_rounds` | int | `50` (`HARNESS_MAX_ROUNDS_DEFAULT`) | Harness-side runaway safety net only. |
+
+<Warning>
+Do **not** set `session.max_rounds` in a case. The authoritative round budget is server-side — `server_config.kb_chat_max_tool_rounds` (default 5) enforced via the query-session row. The harness ceiling of 50 is defense-in-depth that should never bind; if it fires, that is a configuration bug, not a normal terminal. A case that specifically wants to test a tighter ceiling is the rare exception.
+</Warning>
+
+## The round loop
+
+Each iteration sends one `kb_query` round to `ai-engine`. On `stop_reason=tool_use`, `SessionRunner` resolves every `tool_use` block through `MockToolRegistry`, appends the assistant turn plus a `user` turn of `tool_result` blocks, and loops. On `end_turn` (or `stop_sequence` / `max_tokens`), the bot is finishing — the runner either injects the next follow-up or terminates. The session token is carried forward across rounds in the `X-Query-Session-Token` header (constant `SESSION_TOKEN_HEADER`, `x-query-session-token`); the server mints it on round 1 and the harness echoes it on continuations.
+
+Every round is recorded into a `SessionTrace` (request messages, response text, tool-use blocks, mock resolutions, latency, tokens, cost) and attached to the `CaseResult`, so a failure is debuggable from the per-run JSON without re-running the case. See [Session runner](/rollingrecord/evals/harness/sessions).
+
+## Terminal reasons
+
+The session ends with one `terminal_reason` (constants in `evals/core/session.py`). Judges such as `RoundBudgetJudge` grade against it via `expected.round_budget.allowed_terminals`.
+
+| `terminal_reason` | Constant | Meaning |
+| --- | --- | --- |
+| `end_turn` | `TERMINAL_END_TURN` | Bot finished with no pending follow-up — the common healthy path. |
+| `scripted_end` | `TERMINAL_SCRIPTED_END` | Bot ended a turn but a follow-up remained whose `after_round` gate didn't match. |
+| `max_rounds_exceeded` | `TERMINAL_MAX_ROUNDS_SERVER` | Server returned its round-budget error — a normal terminal, not a failure. |
+| `harness_round_cap` | `TERMINAL_MAX_ROUNDS_HARNESS` | Harness safety net fired (should never happen). |
+| `harness_cost_cap` | `TERMINAL_COST_CAP` | `max_cost_usd` crossed mid-session. |
+| `mock_not_found` | `TERMINAL_TOOL_NOT_FOUND` | Bot called a tool with no fixture and no read-only default (see below). |
+| `transport_error` | `TERMINAL_TRANSPORT_ERROR` | HTTP/transport failure from the SUT, or a malformed session case. |
+| `upstream_error` | `TERMINAL_UPSTREAM_ERROR` | Non-budget error from `ai-engine`, or an unrecognized `stop_reason`. |
+
+## Mock tool forms
+
+`MockToolRegistry` (`evals/core/mock_tools.py`) normalizes three declaration shapes into one internal form. Full detail lives in [Mock tools](/rollingrecord/evals/harness/mock-tools).
+
+**Loose** — one result for any input:
+
+```json
+"mock_tools": { "getCapabilities": { "capabilities": [ ... ] } }
+```
+
+**Explicit** — a list of `{match, result}` entries scanned in order, first match wins, with an optional `{"default": true, "result": ...}` fallback:
+
+```json
+"mock_tools": {
+  "searchRecordings": [
+    { "match": { "query_contains": "auth" }, "result": { "results": [ ... ] } },
+    { "default": true, "result": { "results": [] } }
+  ]
+}
+```
+
+**Staged** — results change per user turn (progressive disclosure). The `stages` wrapper is the **only** opt-in to turn-varying behavior; flat tools are pinned to a single stage and can never be moved by the turn counter:
+
+```json
+"mock_tools": {
+  "searchRecordings": {
+    "stages": [
+      "…served during the 1st user turn…",
+      [ { "match": { "query_contains": "x" }, "result": "…" }, { "default": true, "result": "…" } ],
+      "…3rd turn and every turn after (last stage is sticky)…"
+    ]
+  }
+}
+```
+
+The stage index advances each time a `follow_ups` entry is injected (`advance_stage`), so stage N serves the (N+1)-th user turn; once the session outruns the stage list the last stage keeps serving. Staging is keyed to **user turns, not raw call counts** — the bot may fan out several tool calls in one turn, so a per-call counter would make reveal timing nondeterministic.
+
+### Match operators
+
+Within a `match` object, every declared constraint must hold (empty `match` / `default` always matches):
+
+| Operator | Example key | Semantics |
+| --- | --- | --- |
+| exact | `query` | `tool_input["query"]` equals the value |
+| `<field>_contains` | `query_contains` | case-insensitive substring on a string field |
+| `<field>_in` | `status_in` | value is one of the listed items |
+
+### Read-vs-write default behavior
+
+If the bot calls a tool with no matching entry and no case-level default, the outcome depends on the tool's classification:
+
+- **Read-only tools** (`searchRecordings`, `listAllContexts`, `getContextSections`, `getCapabilities`, and the rest of `READ_ONLY_TOOL_DEFAULTS`) get a global safe-empty result. Calling a read tool the case author didn't anticipate is not a semantic error — the bot just sees "nothing found" and continues.
+- **Write tools** (anything not in that map — `correctContext`, `createTask`, `propose*`, …) raise `MockNotFound`, which the runner converts to a `mock_not_found` terminal and a hard failure. Silent fall-through would mask case-authoring bugs where the bot was supposed to be blocked from writing.
 
 <Note>
-Scaffold generated from the codebase map — expand with full detail, examples, and specifics.
+There is no validation of mock-tool keys against a fixed canonical tool list — the read/write split above is the only name-based behavior. An unknown tool name that is neither mocked nor in `READ_ONLY_TOOL_DEFAULTS` simply raises `MockNotFound`.
 </Note>
+
+## Scripted follow-ups
+
+`follow_ups` entries are the next user turns, popped by `_pop_follow_up` whenever the bot ends a turn. Each entry is either a plain string or an object:
+
+```json
+"follow_ups": [
+  "Tell me more about the second one",
+  { "content": "And what did finance say?", "after_round": 4 }
+]
+```
+
+A string (or `after_round: null`) fires after the next end-turn boundary that hasn't consumed a follow-up. An `after_round: N` object only fires when the bot ends its turn at exactly round N. When a follow-up is injected, the session token is dropped so the next turn starts a fresh server session with a fresh round budget — matching production, where each user question mints its own query session (conversation context is preserved through the `messages` list regardless of the token).
+
+<Warning>
+`after_round` gating is honored **only by the Python `SessionRunner`**. The Kotlin runner (`--sut=kotlin`, `evals/ai_engine/kotlin_runner.py`) and the on-device port fire follow-ups strictly in order and ignore `after_round`, because rounds are internal to the real production loop and have no round-gated-injection analog. Cases that must run under `--sut=kotlin` should not depend on `after_round`.
+</Warning>
+
+## Where to go next
+
+- [Mock tools](/rollingrecord/evals/harness/mock-tools) — the registry's normalization, matching, and staging in full.
+- [Session runner](/rollingrecord/evals/harness/sessions) — the round loop, trace types, and output synthesis.
+- [Writing judges.py](/rollingrecord/evals/authoring/judge-resolvers) — how session judges read the trace.
+- [Kotlin SUT contract](/rollingrecord/evals/kotlin-sut/contract) — the production-loop driver and its deliberate fidelity differences.

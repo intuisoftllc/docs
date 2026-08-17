@@ -1,16 +1,120 @@
 ---
-title: "run.py CLI & Flags"
-description: "The command-line entry point to the Python eval harness."
+title: "run.py CLI"
+description: "Every flag, the run flow, and the exit-code policy of the Python eval harness entry point."
 ---
 
-`run.py` is the entry point for the Python harness, with flags for scoping, dry-runs, and choosing the system-under-test.
+`evals/run.py` is the command-line entry point for the Python eval harness. It resolves which suites and cases to run, drives them through a `Runner` (`evals/core/runner.py`), and prints a one-screen summary whose exit code gates the build.
 
-## What this covers
+## Invocation
 
-- Every flag from `evals/run.py` `_parse_args`: `--all`, `--suite`, `--bucket`, `--case`, `--dry-run`, `--scope`, `--show-pass`, `--pass-floor`, `--build-runner`, `--sut={python,kotlin}`, `--repeat N`.
-- Mutually-exclusive scope group (`--all` vs `--suite`), `--case` cross-suite discovery, and `--build-runner` build-only shortcut (forces `--sut=kotlin`).
-- Summary printing + exit-code policy (`_print_summary`) and repeat-mode reliability badges (`_print_repeat_summary`: reliable/flaky/broken).
+The module bootstraps `sys.path` so `python evals/run.py ...` behaves identically to `python -m evals.run ...` — the repo root is inserted so the absolute `from evals.X import ...` statements resolve regardless of how the script was launched. It also reconfigures `sys.stdout` to UTF-8 with `errors="replace"` up front, so the box-drawing characters in the verdict tree can't crash `_print_summary` with a `UnicodeEncodeError` on a cp1252 Windows console after the run has already completed.
 
-<Note>
-Scaffold generated from the codebase map — expand with full detail, examples, and specifics.
-</Note>
+```bash
+# dry-run — print what would run + estimated cost, no live calls
+python evals/run.py --suite=kb_chat --dry-run
+
+# cheap iteration cycle — small bucket only
+python evals/run.py --suite=kb_chat --bucket=small
+
+# one specific case
+python evals/run.py --case=capabilities_loop_basic
+
+# full pre-release run
+python evals/run.py --all
+```
+
+## Flags
+
+Parsed by `_parse_args` (`evals/run.py`). `--all` and `--suite` are a mutually-exclusive group; the rest compose freely.
+
+| Flag | Value | Purpose |
+| --- | --- | --- |
+| `--all` | boolean | Run every suite, every bucket — the pre-release safety net. Mutually exclusive with `--suite`. |
+| `--suite` | suite name | Run one suite (e.g. `kb_chat`). Mutually exclusive with `--all`. |
+| `--bucket` | `small` / `med` / `large` | Token-bucket filter. Cheapest iteration cycle is `--bucket=small`. Composes with `--suite` and `--all`. |
+| `--case` | bare case id | Run only this case id (not the fully-qualified id). Discovers the owning suite by scanning `SUITES_ROOT`. |
+| `--dry-run` | boolean | Print what would run plus estimated cost; issues no live ai-engine calls. Still opens and finalizes an `l_eval_run` analytics row. |
+| `--scope` | string | Free-form scope label written to `l_eval_run.scope`. Defaults to the most specific filter applied (see below). |
+| `--show-pass` | boolean | Also expand the verdict tree + response snippet for PASSing cases, for spot-checking what the model actually returned. |
+| `--pass-floor` | float `0.0`–`1.0` | Minimum pass rate for the run to count as a successful build. Defaults to `DEFAULT_PASS_FLOOR` (`0.95`). See [Pass floor](/rollingrecord/evals/operations/pass-floor). |
+| `--build-runner` | boolean | Compile + install the Kotlin agentrunner (`cd app && ./gradlew :agentrunner:installDist`) with live Gradle output before running. Implies and forces `--sut=kotlin`. |
+| `--sut` | `python` / `kotlin` | System-under-test driver for SESSION cases only. Default `python`. |
+| `--repeat` | int `N` | Run each case `N` times to measure reliability. Total case-runs = `N × number_of_cases`. |
+
+There is no `--workers` flag — it was removed deliberately (see [Runner](/rollingrecord/evals/harness/runner)). There is no `--update-baseline` flag in the current parser either, despite the reference in `baseline.py`'s docstring (see [Cost, baselines & regressions](/rollingrecord/evals/harness/cost-baseline)).
+
+## Suite and case resolution
+
+`_resolve_suites_and_cases` walks `SUITES_ROOT` (`evals/suites/`) and returns `(suite_names, cases)`:
+
+- `--case` scans each suite directory in turn, calling `load_suite_cases(..., case_filter=args.case)`, and returns the first suite that contains the id. A miss raises `SystemExit("--case '<id>' not found in any suite")`.
+- `--suite` loads that one suite, applying the `--bucket` filter if present.
+- Default / `--all` iterates every suite directory, skipping any whose name starts with `_` or `.` (so `__pycache__` is never mistaken for a suite).
+
+See [Cases, suites & loading](/rollingrecord/evals/harness/cases) for the directory layout and per-case validation.
+
+## `--sut`: choosing the session driver
+
+`--sut` selects how SESSION cases are driven; single-shot cases always use the Python `AiEngineHttp` client regardless.
+
+| Value | Session driver | What it exercises |
+| --- | --- | --- |
+| `python` (default) | `SessionRunner` (`evals/core/session.py`) | The in-harness imitation of the client agent loop. |
+| `kotlin` | `KotlinSessionDriver` (`evals/ai_engine/kotlin_runner.py`) | Shells out to the `app/agentrunner` CLI, which drives the REAL production agent loop (`app/agentcore` `AgentLoop`) against the dev ai-engine. |
+
+`--sut=kotlin` requires the runner binary — build it with `cd app && ./gradlew :agentrunner:installDist`, or point `EVAL_KOTLIN_RUNNER` at the launcher path. `find_runner_command()` is resolved up front so a missing build fails the whole run immediately with the fix, rather than on the first session case. `--build-runner` builds it for you and forces `--sut=kotlin`; with no suite/case/`--all` it is a build-only shortcut that exits after a successful build. See [Kotlin SUT contract](/rollingrecord/evals/kotlin-sut/contract).
+
+## Run flow
+
+`main()` wires the run together:
+
+1. If `--build-runner`, set `args.sut = "kotlin"` and call `build_runner()`; exit early if no run scope was requested.
+2. `from_env()` builds the immutable `EvalConfig` (see [Configuration](/rollingrecord/evals/harness/configuration)).
+3. Resolve suites + cases. No matching cases prints a message to stderr and returns `0` — nothing to do is not an error.
+4. If `--repeat N > 1`, multiply the case list by `N` before handing it to the runner; per-case aggregation happens after the run.
+5. Build the `AnalyticsClient`, a shared `AnthropicMessages` client (only when `ANTHROPIC_API_KEY` is set — otherwise `None`), the per-suite judge resolvers, and one combined `Baseline`.
+6. On `--dry-run`, construct the `Runner` with a `_DryRunSystem` stub; otherwise `mint_tokens(cfg)`, build `AiEngineHttp`, and attach a `KotlinSessionDriver` when `--sut=kotlin`.
+7. Call `runner.run(...)`, then close the system, analytics, and Anthropic clients in a `finally`.
+8. Print the summary and return its exit code.
+
+Worker count is fixed at `Runner.DEFAULT_WORKERS` (4). The header prints the effective worker count for multi-case, non-dry runs so it is obvious whether parallelism is on.
+
+## Scope label
+
+`_scope_label` derives the `l_eval_run.scope` string when `--scope` is not passed, appending the most specific filter first:
+
+| Applied filter | Emitted segment |
+| --- | --- |
+| `--case` | `case:<id>` |
+| `--suite` | `suite:<name>` |
+| `--all` (or multi-suite default) | `all` |
+| `--bucket` | `bucket:<value>` |
+| `--dry-run` | `dry_run` |
+| `--repeat N` (N>1) | `repeat:<N>` |
+| `--sut=kotlin` | `sut:kotlin` |
+
+## Exit codes
+
+`_print_summary` computes the exit code (RR-433). Pass rate is `cases_passed / (cases_run − cases_flaked)` — flake-marked cases are excluded from the denominator so a known-noisy case can't drag the rate below floor.
+
+| Code | Condition |
+| --- | --- |
+| `0` | Run completed, pass rate ≥ pass floor, no regressions. |
+| `1` | Pass rate < pass floor, OR at least one regression (a previously-passing case that now fails). |
+| `2` | Runner aborted or failed (`status != "completed"`) — e.g. a quota-gate abort. |
+
+Dry runs, zero-case runs, and all-flake runs skip the floor check (there is nothing meaningful to evaluate). A regression always breaks the build regardless of pass rate. `--repeat` uses a separate summary, `_print_repeat_summary`, described below.
+
+## Repeat mode
+
+With `--repeat N`, `_print_repeat_summary` groups the `N × M` case-runs by fully-qualified id and badges each unique case by its pass rate:
+
+| Badge | Pass rate | Meaning |
+| --- | --- | --- |
+| `RELIABLE` | ≥ 95% | Safe to trust. |
+| `FLAKY` | 50–94% | Worth investigating; a warning, not a build break. |
+| `BROKEN` | < 50% | Consistently failing. |
+
+Repeat mode exits `1` if any non-flake case is `BROKEN`; `FLAKY` cases pass with warnings. Flake-marked cases that come out `BROKEN` are reported but ignored for the exit code.
+
+Every run prints its `RUN` id and the results `FILE` path (`RESULTS_ROOT/<YYYY-MM-DD>/<run_id>.json`) at the bottom so it can be pasted into a follow-up triage prompt — see [Results files](/rollingrecord/evals/operations/results-files).

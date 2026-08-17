@@ -1,16 +1,79 @@
 ---
 title: "--sut=kotlin & KotlinSessionDriver"
-description: "The frozen JSON contract that drives the Kotlin agent runner."
+description: "The frozen JSON stdin/stdout contract that drives the real production agent loop for session cases."
 ---
 
-`KotlinSessionDriver` runs SESSION cases through the real Kotlin agent loop via a frozen JSON stdin/stdout contract.
+`KotlinSessionDriver` (`evals/ai_engine/kotlin_runner.py`) runs SESSION cases through the LITERAL production client agent loop instead of the Python `SessionRunner` imitation. It shells out to the `agentrunner` CLI once per case, handing it one JSON payload on stdin and reading a session-trace JSON on stdout. Both sides co-own a frozen wire contract so a case, its auth, and its config cross the process boundary unambiguously.
 
-## What this covers
+## Selecting the Kotlin SUT
 
-- `KotlinSessionDriver` (`evals/ai_engine/kotlin_runner.py`): the frozen JSON stdin envelope (`case`/`auth`/`config`) → subprocess → `_session` trace on stdout.
-- `build_runner()` (`:agentrunner:installDist`) and `find_runner_command()` (`$EVAL_KOTLIN_RUNNER` or the installDist launcher); `DEFAULT_SERVER_CONFIG`/`DEFAULT_CLIENT_CONFIG` dials.
-- Deliberate fidelity differences vs the Python SessionRunner (production turn-opener, raw-text tool results, `after_round` ignored); transport-failure mapping.
+`--sut={python,kotlin}` (`evals/run.py`) chooses the session driver; `python` is the default. Under `--sut=kotlin`, `run.py` resolves the runner binary up front with `find_runner_command()` so a missing build fails the whole run immediately (with the fix) rather than on the first session case, then builds the `Runner` with a `KotlinSessionDriver`. Single-shot cases still use the Python HTTP client either way. `--build-runner` implies and forces `--sut=kotlin`, and with no suite or case it just builds and exits.
 
-<Note>
-Scaffold generated from the codebase map — expand with full detail, examples, and specifics.
-</Note>
+## The frozen wire contract
+
+The stdin envelope and stdout trace shapes are frozen and mirrored in the runner's own `Main.kt` header.
+
+```json
+// stdin
+{ "case":   { "input": { ... }, "session": { ... } },
+  "auth":   { "ai_engine_url", "supabase_anon_key", "app_check_jwt",
+              "bearer_jwt", "app_version" },
+  "config": { "server": { ... }, "client": { ... } } }
+
+// stdout
+{ "text", "tool_calls": [], "_session": { ... }, "turns": [ ... ] }
+```
+
+`KotlinSessionDriver.run()` assembles this payload per case. The `auth.bearer_jwt` field is filled from `tokens.force_fresh_bearer_jwt()` — the runner holds one token for every turn of the case, so starting on a near-expired token would fail long multi-turn cases mid-run with `invalid_jwt`. The subprocess is invoked with `subprocess.run(..., timeout=RUNNER_TIMEOUT_SECONDS)`, where `RUNNER_TIMEOUT_SECONDS` is 30 minutes (the Python SUT's 15-minute per-round ceiling with headroom for multi-turn).
+
+## Config dials
+
+The driver seeds two config maps that flow into the runner's real `ServerConfig` / `ClientConfig` objects before any turn runs.
+
+| Constant | Value | Applied to |
+| --- | --- | --- |
+| `DEFAULT_SERVER_CONFIG` | `{"kb_chat_max_tool_rounds": "5"}` | `ServerConfig.update()` in the runner |
+| `DEFAULT_CLIENT_CONFIG` | `{"kb_chat_max_history_pairs": "15"}` | `ClientConfig.update()` in the runner |
+
+These are set explicitly because the Kotlin config objects' cold-start defaults are deliberately conservative — lower than the live server/Firebase dials, as an overusage guard. Without seeding, the eval loop would bind at those conservative values (`kbChatMaxToolRounds` defaults to 3, `kbChatMaxHistoryPairs` to 9) instead of what production clients actually run with. Keep them in step with the live `server_config` / Firebase values.
+
+## Result mapping
+
+On a clean exit the driver parses `_session` and `rounds` from stdout and builds the `(ActualOutput, trace_dict)` pair the runner expects:
+
+- **Cost** — when a `cost_ledger` is supplied, each round that surfaces both a `model` and non-zero tokens is priced via `CostLedger.record_production(AnthropicUsage(...))`. Rounds with no model are skipped rather than mis-priced.
+- **`ActualOutput`** — `body` carries `text`, `tool_calls`, and the full `_session`; `input_tokens`/`output_tokens` come from `total_input_tokens`/`total_output_tokens`; `stop_reason` is the last round's.
+- **Error propagation** — `error` is set to `session.error` only when `terminal_reason` is in `_ERROR_TERMINALS` = `{transport_error, mock_not_found, upstream_error}`. `max_rounds_exceeded` is a NORMAL terminal and must not short-circuit judging.
+- **Diagnostics** — the runner's `stderr` tail is persisted onto the trace as `runner_stderr`, because the harness drops `raw_response`; this is the only channel that surfaces the real `DeveloperError`/`Validation` code behind a generic "Something went wrong" `upstream_error`.
+
+Any `OSError`, `TimeoutExpired`, non-zero exit code, or unparseable stdout becomes a `_transport_failure()` — an `ActualOutput` with `error` set and a trace of `{terminal_reason: "transport_error", error: <message>}`.
+
+## Deliberate fidelity differences vs the Python SessionRunner
+
+The Kotlin driver is production-faithful by design, so it diverges from the Python `SessionRunner` imitation in three ways:
+
+| Difference | Kotlin runner | Rationale |
+| --- | --- | --- |
+| Turn opening | Production wrapper: `Use your tools to find relevant information and answer: …` | Exercising the real message-assembly is the point of the Kotlin SUT. |
+| Mock tool results | Sent as raw text | Matches the production handler shape; the Python runner `json.dumps`-wraps them. |
+| `follow_ups` gating | Fired strictly in declaration order; `after_round` is ignored | A user turn only begins after the previous turn fully completes, so round-gated injection has no production analog. |
+
+Thread-safety: the driver holds only immutable config and tokens; each `run()` builds its own payload and subprocess, so there is no shared mutable state.
+
+## Building the runner
+
+`build_runner()` and `find_runner_command()` both live in `kotlin_runner.py`.
+
+| Function | What it does |
+| --- | --- |
+| `build_runner(repo_root=None)` | Runs `./gradlew :agentrunner:installDist` from `app/` (there is no root Gradle build), streaming Gradle output live. Returns `True` on exit 0. Because `agentrunner` depends on `:agentcore`, this single task always ships the latest agent-loop code into the runner. |
+| `find_runner_command(repo_root=None)` | Resolves the launcher: `$EVAL_KOTLIN_RUNNER` if set, else the installDist launcher under `app/agentrunner/build/install/agentrunner/bin/`. Raises `SystemExit` with the build command when the launcher is missing. |
+
+Always rebuild after touching `:agentcore` or `:agentrunner` so evals drive the latest loop.
+
+## Where to go next
+
+- [agentrunner CLI (Main.kt)](/rollingrecord/evals/kotlin-sut/agentrunner) — the binary this driver invokes, and how it turns a case into turns.
+- [agentcore Shared Agent Loop](/rollingrecord/evals/kotlin-sut/agentcore) — the production `AgentLoop` the runner drives.
+- [Token Minting & Auth](/rollingrecord/evals/sut/auth) — `force_fresh_bearer_jwt()`, which fills the payload's `auth.bearer_jwt`.
+- [Session cases](/rollingrecord/evals/harness/sessions) — the case shape (history, follow-ups, mock tools) this contract carries.

@@ -1,16 +1,74 @@
 ---
 title: "Session-Aware Judges"
-description: "Judges that grade the multi-round trace, not just the final answer."
+description: "Judges that grade the multi-round trace: which tools were called, in what order, and within what round budget."
 ---
 
-Session-aware judges read the `_session` trace to assert on which tools were called, in what order, and within what round budget.
+Session-aware judges read `actual.body['_session']` — the multi-round trace the `SessionRunner` synthesizes — and grade behavior across the whole agent loop rather than just the final answer. Every one is opt-in: it SKIPs cleanly when its `expected` key is absent or the case is single-shot (no `_session` block), so they compose into a broad `AllOf` without penalizing cases that don't declare them.
 
-## What this covers
+## Reading the session block
 
-- `MustCallToolJudge`, `MustNotCallToolJudge`, `RoundBudgetJudge`, `ToolCallSequenceJudge` (`evals/judges/session_judges.py`) reading `_session.all_tool_calls`/`terminal_reason`.
-- The `expected` keys they consume (`must_call_tools`, `must_not_call_tools`, `round_budget`, `tool_call_sequence`) and their opt-in SKIP behavior.
-- Why the multi-round trace (not just the final answer) is what these grade.
+All five judges (`evals/judges/session_judges.py`) route through two helpers: `_session_block()` returns the `_session` dict or `None` for a non-session case, and `_called_tool_names()` flattens `_session['all_tool_calls']` into an ordered list of tool names. The block also carries `round_count` and `terminal_reason`, which the budget and waste judges read. See [Sessions](/rollingrecord/evals/harness/sessions) for how `SessionRunner` populates it.
+
+## The judges
+
+| Judge | `expected` key | PASSes when |
+| --- | --- | --- |
+| `MustCallToolJudge` | `must_call_tools` | every required tool was called at least once (or any, in `any_of` mode). |
+| `MustNotCallToolJudge` | `must_not_call_tools` (list) | none of the listed tools were called. |
+| `RoundBudgetJudge` | `round_budget` (object) | round count is within `[min, max]` and the terminal reason is allowed. |
+| `ToolCallSequenceJudge` | `tool_call_sequence` (list) | the named tools were called in order (subsequence match). |
+| `WasteThresholdJudge` | `waste_threshold` (int) | round count is at or below the threshold. |
 
 <Note>
-Scaffold generated from the codebase map — expand with full detail, examples, and specifics.
+This is the full set of five. Earlier scaffolding listed only four — `WasteThresholdJudge` is a fifth session judge and is exported from `evals/judges/__init__.py` alongside the others.
 </Note>
+
+## `MustCallToolJudge`
+
+Catches "the bot answered without searching" regressions. `must_call_tools` accepts two forms:
+
+- A list — `["searchRecordings"]` — where **all** listed tools must be called.
+- An object — `{names: ["searchRecordings", "listNotes"], any_of: true}` — where **any** listed tool counts as a hit.
+
+It SKIPs when `must_call_tools` is absent, empty, malformed, or the case has no `_session` block. `details` carries `hits`, `misses`, and the full `called` list.
+
+## `MustNotCallToolJudge`
+
+The inverse — PASSes iff none of the listed tools were called. It catches over-eager tool use on questions that should be answered from conversation context (capability questions, follow-up clarifications). `details` names the `offenders` when it fails.
+
+## `RoundBudgetJudge`
+
+Validates both the round count and the terminal reason. Its `round_budget` object accepts `min`, `max`, and `allowed_terminals`:
+
+```
+expected.round_budget = { "min": 1, "max": 4, "allowed_terminals": ["end_turn", "scripted_end"] }
+```
+
+When omitted, `min` and `max` are unchecked (no lower/upper bound enforced — `max = unlimited`); only `allowed_terminals` falls back to a default, `_DEFAULT_OK_TERMINALS`, which is `(TERMINAL_END_TURN, TERMINAL_SCRIPTED_END, TERMINAL_MAX_ROUNDS_SERVER)` — the wire strings `end_turn`, `scripted_end`, and `max_rounds_exceeded` (imported from `evals/core/session.py`). `max_rounds_exceeded` is in the default allow-list because hitting the **server** round cap is still a clean termination from the harness's perspective — the bot was capped by infra, not by a bug. A case can pass a tighter `allowed_terminals` to forbid that path. It reports each violation (too few rounds, too many rounds, disallowed terminal) in the failure reason.
+
+### Terminal reasons
+
+The full set of terminal reasons `SessionRunner` can record (`evals/core/session.py`), for reference when tightening `allowed_terminals`:
+
+| Constant | Wire string | Meaning |
+| --- | --- | --- |
+| `TERMINAL_END_TURN` | `end_turn` | Bot ended its turn normally. |
+| `TERMINAL_SCRIPTED_END` | `scripted_end` | All scripted follow-ups were consumed. |
+| `TERMINAL_MAX_ROUNDS_SERVER` | `max_rounds_exceeded` | The server's round budget was hit. |
+| `TERMINAL_MAX_ROUNDS_HARNESS` | `harness_round_cap` | The harness's own safety cap was hit. |
+| `TERMINAL_COST_CAP` | `harness_cost_cap` | The harness cost cap was hit. |
+| `TERMINAL_TOOL_NOT_FOUND` | `mock_not_found` | A tool call had no matching mock. |
+| `TERMINAL_TRANSPORT_ERROR` | `transport_error` | Transport-level failure. |
+| `TERMINAL_UPSTREAM_ERROR` | `upstream_error` | Upstream provider error. |
+
+## `ToolCallSequenceJudge`
+
+PASSes iff the named tools were called in the given order as a **subsequence** — other tools may interleave between them. For example `tool_call_sequence = ["listContexts", "searchRecordings"]` requires that `listContexts` was called at some point and `searchRecordings` was called later. It walks the `called` list once, advancing through it to match each expected name, and fails at the first name it can't find in order (naming the actual call order in the reason).
+
+## `WasteThresholdJudge`
+
+A one-sided efficiency gate: FAIL if `round_count` exceeds `waste_threshold`, PASS otherwise. It's designed for the "clearly wasteful" boundary, not the optimum — the intent is to catch egregious over-searching (5–6 tool calls when 1 was enough), so these tests should pass the vast majority of the time and fire only on obviously excessive behavior. It SKIPs when `waste_threshold` is absent, the case has no `_session` block, or the value isn't an integer.
+
+## In practice
+
+`rag_real_content` (`evals/suites/rag_real_content/judges.py`) puts `RoundBudgetJudge`, `MustCallToolJudge`, `MustNotCallToolJudge`, and `ToolCallSequenceJudge` in one structural `AllOf` alongside `ContainsJudge` and the [retrieval judges](/rollingrecord/evals/judges/retrieval). Because each SKIPs when its key is undeclared, a case is graded only against the constraints it actually specifies. See [Chain primitives](/rollingrecord/evals/judges/chains) for how the `AllOf` combines their verdicts.

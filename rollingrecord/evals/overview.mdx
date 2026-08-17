@@ -1,16 +1,51 @@
 ---
 title: "Eval System Overview"
-description: "What the AI evaluation harness grades and how it is structured."
+description: "What the AI evaluation harness grades, its two runtimes, and where the deep pages live."
 ---
 
-The eval harness evaluates the AI behavior of RollingRecord's KB-chat bot and related operations, and runs in two places that share the same case format.
+The eval harness grades the AI behavior of RollingRecord's `ai-engine` operations — above all the KB-chat agent loop (`kb_query`) — by running a fixed set of golden cases against the live dev backend and scoring each response with a judge chain.
 
-## What this covers
+## What the harness evaluates
 
-- What the harness evaluates: AI behavior of the KB-chat bot (`kb_query`) plus `template_moderation`/`extract`; graded model is `claude-haiku-4-5` (`evals/config.py` `PRODUCTION_MODEL`), judged by Sonnet/Opus.
-- The two runtimes that share the same case format: the Python harness in `evals/` and the on-device Kotlin port in `app/app/src/debug/.../evalmode/`.
-- The Python→Kotlin parity direction: `--sut=kotlin` drives the LITERAL production loop via `app/agentrunner` + `app/agentcore`.
+The system-under-test is the production `ai-engine` Edge Function, driven with real cases. A case is a golden example (`TestCase` in `evals/core/case.py`): a payload handed to the operation and an `expected` specification the judges grade against. Cases are grouped into suites under `evals/suites/` — `kb_chat`, `kb_chat_session`, `rag_real_content`, `template_moderation`, `extract_template`, `tool_correctness`, `security`, `abstention`, `efficiency`, `source_attribution`, and more. See the [suites catalog](/rollingrecord/evals/authoring/suites-catalog) for the full list.
 
-<Note>
-Scaffold generated from the codebase map — expand with full detail, examples, and specifics.
-</Note>
+The model under test and the models that judge it are hardcoded constants in `evals/config.py`, not env vars — bumping one is a reviewed code change:
+
+| Constant | Value | Role |
+| --- | --- | --- |
+| `PRODUCTION_MODEL` | `claude-haiku-4-5-20251001` | The model the suite tests — mirrors what the app uses for `ai-engine`. |
+| `JUDGE_MODEL` | `claude-sonnet-4-6` | Default LLM-as-judge model (used by `LlmJudge`). |
+| `ARBITER_MODEL` | `claude-opus-4-6` | Tiebreaker/arbiter for ambiguous verdicts and bootstrapping golden data. |
+
+The design rule is that the judge model must be meaningfully smarter than the model it grades.
+
+## The pipeline in one line
+
+`run.py` resolves which cases to run, hands each to a `SystemUnderTest`, captures the response, runs the suite's judge chain to produce a `Verdict`, tallies the run, and writes a results JSON plus an analytics row. See [Architecture & Data Flow](/rollingrecord/evals/architecture) for the full path.
+
+## The two runtimes
+
+The same case format is executed in two independent places:
+
+- **The Python harness** (`evals/`) — the CLI in `run.py`, the orchestrator `Runner` (`evals/core/runner.py`), and the default `AiEngineHttp` system-under-test. This is the pre-release safety net run from a developer machine or CI.
+- **The on-device Kotlin port** (`app/app/src/debug/.../evalmode/`) — a debug-only in-app module that runs the same suites against a seeded local corpus, driving the real client through `OnDeviceSystemUnderTest` (`evalmode/systemundertest/OnDeviceSystemUnderTest.kt`). See the [on-device overview](/rollingrecord/evals/on-device/overview).
+
+Within the Python harness there is a further parity dimension. The `--sut` flag chooses how SESSION (multi-round) cases are driven:
+
+- `--sut=python` (default) uses the in-harness `SessionRunner` (`evals/core/session.py`), an imitation of the client agent loop.
+- `--sut=kotlin` shells out to the `app/agentrunner` CLI, which drives the **literal** production agent loop in `app/agentcore` (`AgentLoop`) — same tool definitions, instructions, message assembly, and caps as the shipping app. See the [Kotlin SUT contract](/rollingrecord/evals/kotlin-sut/contract).
+
+Single-shot (non-session) cases always use the Python HTTP client regardless of `--sut`.
+
+## Where to go next
+
+- [Architecture & Data Flow](/rollingrecord/evals/architecture) — the end-to-end path a case takes from `run.py` to results JSON and analytics.
+- [Core Concepts & Glossary](/rollingrecord/evals/concepts) — the vocabulary: cases, buckets, judges, verdicts, baselines, flakes.
+- [The `run.py` CLI](/rollingrecord/evals/harness/run-cli) — every flag, scope filter, and exit code.
+- [Configuration](/rollingrecord/evals/harness/configuration) — `EvalConfig`, the required env vars, and the model/pricing constants.
+- [The Runner](/rollingrecord/evals/harness/runner) — orchestration, the parallel worker pool, and quota-abort handling.
+- [Judges overview](/rollingrecord/evals/judges/overview) — the `Judge` ABC and how chains compose verdicts.
+- [System-under-test concept](/rollingrecord/evals/sut/concept) — the `SystemUnderTest` ABC and `ActualOutput`.
+- [Kotlin SUT contract](/rollingrecord/evals/kotlin-sut/contract) — how `--sut=kotlin` drives the real production agent loop.
+- [On-device overview](/rollingrecord/evals/on-device/overview) — the in-app `evalmode` runtime.
+- [Authoring a suite](/rollingrecord/evals/authoring/suite-layout) — the on-disk layout of cases and judge resolvers.

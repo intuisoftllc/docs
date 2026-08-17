@@ -1,16 +1,75 @@
 ---
 title: "Cases, Suites & Loading"
-description: "The TestCase model and how suites and cases are loaded from disk."
+description: "The TestCase model, the suite/bucket directory layout, and how cases are loaded and filtered."
 ---
 
-Cases are JSON records grouped into suites and buckets, loaded and validated by the harness.
+A test case is one golden example — a triple of input, expected output, and metadata. `TestCase` (`evals/core/case.py`) is the loaded, validated shape; `load_suite_cases` walks a suite directory and produces a list of them. The runner hands `input` to the system-under-test, then runs the suite's judge chain against `(actual, expected)`.
 
-## What this covers
+## `TestCase`
 
-- `TestCase` dataclass fields and `load_suite_cases` directory walk (`suites/<suite>/<bucket>/*_{n}.json`, each file a JSON array) in `evals/core/case.py`.
-- Required fields (`id`/`input`/`expected`), duplicate-id detection, `tags`, `notes`, `is_flake`, and the optional `session` spec schema.
-- How the `--bucket` and `--case` filters resolve.
+`TestCase` is a `frozen=True` dataclass so the runner can hand the same case to multiple judges without worrying about mid-run mutation.
 
-<Note>
-Scaffold generated from the codebase map — expand with full detail, examples, and specifics.
-</Note>
+| Field | Source | Purpose |
+| --- | --- | --- |
+| `id` | JSON `id` (required) | Unique within the suite; the results key and spinner label. Convention: `snake_case` starting with the section name. |
+| `suite` | loader | Suite name from the parent directory (e.g. `kb_chat`). |
+| `bucket` | loader | `TokenBucket` from the bucket directory. |
+| `input` | JSON `input` (required) | Payload handed to the SUT — for `kb_query`, the body ai-engine accepts directly. |
+| `expected` | JSON `expected` (required) | Free-form expected-output spec; each judge reads only the keys it cares about. |
+| `tags` | JSON `tags` | Categorical labels for slicing results; a tuple so the dataclass stays frozen. |
+| `notes` | JSON `notes` | Free-form annotation — source URL, why the case exists, what it catches. |
+| `session` | JSON `session` | Optional session-mode spec; when present the runner delegates to a session driver instead of a single call. |
+| `source_file` | loader | Relative path of the JSON file the case came from, for error messages. |
+| `is_flake` | JSON `is_flake` | Marks a case as known-noisy — FAIL/UNCERTAIN routes to `cases_flaked` and does not affect the exit code. |
+
+`fully_qualified_id` returns `<suite>.<id>` — the baseline key, so two suites can share short ids without colliding.
+
+`expected` is intentionally free-form: a `KeywordsJudge` might read `{"must_contain_keywords": [...]}` while an extraction suite reads `{"fields": {...}}`. Multiple judges can read the same `expected` dict and each interpret different keys. See [Judges overview](/rollingrecord/evals/judges/overview).
+
+## Token buckets
+
+`TokenBucket` is a `str`-backed enum whose members mirror the directory layout. The bucket bounds a case's rough input-token cost so `--bucket=small` stays cheap.
+
+| Bucket | Value | Rough input size |
+| --- | --- | --- |
+| `SMALL` | `small` | < 500 input tokens |
+| `MED` | `med` | 500–5,000 input tokens |
+| `LARGE` | `large` | 5,000+ input tokens |
+
+## Suite layout
+
+`load_suite_cases(suite_root, suite_name, *, bucket_filter=None, case_filter=None)` assumes:
+
+```
+suites/<suite>/
+  small/   *_{n}.json      (each file = a JSON array of cases)
+  med/     *_{n}.json
+  large/   *_{n}.json
+  judges.py                (ignored by the loader)
+  baseline.json            (ignored by the loader)
+  README.md                (ignored by the loader)
+```
+
+Only files under `small/`, `med/`, and `large/` are loaded; non-`.json` files in those directories are skipped. A `judges.py`, `baseline.json`, or `README.md` at the suite root is ignored by the loader — `judges.py` is imported separately by the CLI's judge resolver, and `baseline.json` by `load_baseline`. See [Suite layout](/rollingrecord/evals/authoring/suite-layout).
+
+## Loading and validation
+
+Each bucket file must be a JSON array; each entry must be an object. `_parse_case_dict` enforces the case shape:
+
+- `id`, `input`, and `expected` are required — a missing one raises a `ValueError` naming the file and the missing field(s).
+- `id` must be a non-empty string.
+- `session`, if present, must be an object (validated only structurally here; the session driver re-validates its contents with case-aware messages).
+- `is_flake`, if present, must be a boolean.
+
+Across a suite, a duplicate `id` raises a `ValueError` identifying both source files — ids are the baseline and results key, so collisions are fatal.
+
+## Filters
+
+`--bucket` and `--case` map to the loader's two filter arguments:
+
+| Filter | Argument | Effect |
+| --- | --- | --- |
+| `--bucket=<b>` | `bucket_filter` | Only cases in bucket `<b>` are returned; other bucket directories are skipped. |
+| `--case=<id>` | `case_filter` | Only the case whose bare `id` matches exactly is returned. Duplicate-id detection still runs across the whole suite first. |
+
+`--case` discovery scans every suite directory until a suite yields the id — see [run.py CLI](/rollingrecord/evals/harness/run-cli). Session cases and the optional `tools` / `mock_tools` inside `input` are covered in [Session runner](/rollingrecord/evals/harness/sessions) and [Mock tool registry](/rollingrecord/evals/harness/mock-tools).

@@ -1,16 +1,38 @@
 ---
 title: "Retrieval Judges"
-description: "Recall, MRR, and precision judges over retrieved chunks."
+description: "Recall@k, Precision@k, and MRR over the chunks the agent's tools pulled back."
 ---
 
-Retrieval judges score how well the agent's tool results retrieved the expected source chunks.
+The retrieval judges (RR-379, `evals/judges/retrieval.py`) score the information-retrieval layer of a session: did the search-and-embed pipeline pull back the chunk(s) that actually contain the answer? All three read the gold chunk set from `expected.gold_chunk_ids` and the retrieved set from the session's tool results, then expose their metric in `Verdict.details` regardless of PASS/FAIL so downstream analysis can aggregate across the suite.
 
-## What this covers
+## Where retrieved chunk IDs come from
 
-- Recall@k / MRR / Precision@k (`evals/judges/retrieval.py`) computed from `_session.all_tool_results` chunk identifiers vs `expected.gold_chunk_ids`.
-- How mock tool results feed chunk-id parsing.
-- Suites that use them (e.g. `rag_real_content`).
+`_extract_retrieved_chunk_ids()` walks `actual.body['_session']['all_tool_results']` in order — the rendered tool results across every round, populated by `SessionRunner` — and pulls chunk identifiers out of headers matching the convention `=== chunk <id> ===`. The regex `_CHUNK_HEADER_RE` (`===\s*chunk\s+(\S+)`, case-insensitive) captures the first non-whitespace token after `chunk `, so a header with a trailing description like `=== chunk c1 — symptoms ===` still yields `c1`. Structured (dict/list) tool results are JSON-flattened first so the same regex applies. Duplicates are kept — a chunk may appear in multiple tool results.
 
-<Note>
-Scaffold generated from the codebase map — expand with full detail, examples, and specifics.
-</Note>
+All three judges SKIP when `gold_chunk_ids` is missing or empty (the case-opt-in pattern — anti-freestyle cases have empty gold lists by design), and also SKIP when no retrieved chunks are found because the mock results don't follow the `=== chunk <id> ===` convention.
+
+## The three metrics
+
+| Judge | `expected` config key | Metric | Default `k` | Default threshold |
+| --- | --- | --- | --- | --- |
+| `RetrievalRecallAtK` | `retrieval_recall_at_k` | `\|gold ∩ retrieved[:k]\| / \|gold\|` | `5` | `1.0` (all gold chunks must be retrieved) |
+| `RetrievalPrecisionAtK` | `retrieval_precision_at_k` | `\|gold ∩ retrieved[:k]\| / k` | `5` | `0.0` (informational) |
+| `RetrievalMRR` | `retrieval_mrr` | `1 / rank_of_first_gold` | — | `0.0` (informational) |
+
+Each config key is an optional object; omit it to use the defaults, or set `{k?, threshold?}` (Recall/Precision) or `{threshold?}` (MRR) per case.
+
+## `RetrievalRecallAtK`
+
+Recall@k answers "was the right chunk in the top K retrieved?". It PASSes when the recall fraction meets `threshold` (default `1.0` — every gold chunk must appear within the top `k=5`). Confidence equals the recall value on PASS and `1 - recall` on FAIL, and `details` carries `k`, `recall`, the `gold` / `topk` sets, and the `hits` / `misses` breakdown so a missed retrieval names exactly which gold chunk fell out of the window.
+
+## `RetrievalPrecisionAtK`
+
+Precision@k answers "of the top K retrieved, what fraction were gold?". Its default threshold is `0.0`, meaning it's **informational by default** — Precision is sensitive to a `k`-vs-`|gold|` imbalance (a single gold chunk against `k=5` caps at `0.2` even for perfect retrieval), so it exposes the metric in `details` without gating the verdict unless a case sets a meaningful `{k, threshold}` (typically `k = number-of-gold-chunks`).
+
+## `RetrievalMRR`
+
+MRR is the reciprocal rank of the first gold chunk in the retrieved list: `1.0` if the first retrieved was gold, `0.5` for second, `0` if no gold chunk was retrieved. For a single case this is technically reciprocal rank, not a mean — the name is kept for discoverability, and true mean-reciprocal-rank aggregation is left to downstream analysis of the per-case `details.rr` values. Its default threshold is also `0.0` (informational): with mocked retrieval the chunk order is fixed by the mock, so a case whose gold is the third chunk always has `rr ≈ 0.33`, reflecting mock structure rather than retrieval quality. Cases that want pass/fail set `retrieval_mrr.threshold` (e.g. `0.5` to require top-2). `details` records `rr`, `first_gold_rank`, and the full `gold` / `retrieved` lists.
+
+## In practice
+
+The `rag_real_content` suite (`evals/suites/rag_real_content/judges.py`) drops all three into its structural `AllOf` — `RetrievalRecallAtK()`, `RetrievalPrecisionAtK()`, `RetrievalMRR()` — where they SKIP cleanly on anti-freestyle cases (empty gold lists) and score fact-recall cases that declare `gold_chunk_ids`. The chunk-header convention they parse is emitted by the suite's mock tool results; see [Mock tools](/rollingrecord/evals/harness/mock-tools) for that format and [Sessions](/rollingrecord/evals/harness/sessions) for how `all_tool_results` is assembled. A future ticket may add structured chunk-ID emission to the mock format in place of the regex.

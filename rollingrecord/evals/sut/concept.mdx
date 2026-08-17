@@ -1,16 +1,58 @@
 ---
 title: "System-Under-Test Concept"
-description: "The SUT abstraction that decouples judges from how output is produced."
+description: "The SystemUnderTest ABC and ActualOutput shape that decouple judges from how output is produced."
 ---
 
-The `SystemUnderTest` ABC lets the same judges grade output regardless of which backend produced it.
+Every judge in the harness grades an `ActualOutput`, never a live backend. The `SystemUnderTest` abstract base class is the seam in between: it names the one method the runner calls to produce that output, so the same judge chain runs unchanged whether the output came from the live `ai-engine` Edge Function, the Kotlin agent loop, or a future fixture replayer.
 
-## What this covers
+## `SystemUnderTest`
 
-- The `SystemUnderTest` ABC + `ActualOutput` shape (`evals/core/system.py`) that decouples judges from how output was produced.
-- Single-shot cases always use the HTTP client; SESSION cases route to either `SessionRunner` (python) or `KotlinSessionDriver` (kotlin) via `Runner.session_driver`.
-- `_DryRunSystem` stub used on `--dry-run` (`evals/run.py`).
+`SystemUnderTest` (`evals/core/system.py`) is an `ABC` with a minimal surface — a name and a single call method. Concrete implementations own their own transport and retry policy; the runner treats them as opaque.
 
-<Note>
-Scaffold generated from the codebase map — expand with full detail, examples, and specifics.
-</Note>
+| Member | Shape | Contract |
+| --- | --- | --- |
+| `name` | `@property` → `str` | Identifier shown in run logs, e.g. `ai-engine@dev`. |
+| `call(case_input, *, extra_headers=None)` | → `ActualOutput` | Synchronous. Issues the production call and returns the result. Impls bound their own retries — the runner never retries; a transient failure is recorded as an error verdict for that case. |
+| `close()` | → `None` | Release resources (HTTP client, etc.). Default no-op so suites with no cleanup skip it. |
+
+The `extra_headers` parameter is how the `SessionRunner` threads continuation headers — notably `X-Query-Session-Token` — across the rounds of a `kb_query` session. Single-shot cases pass `None`.
+
+Why the abstraction exists rather than calling `ai-engine` directly: a future suite might test a code path that does not live behind the HTTP boundary. The docstring anticipates a `FixtureReplayer` (replay a recorded `ActualOutput` from disk for judge-only iteration, no model cost) and an `InProcessSimulator` (call extraction logic directly when a suite is purely about prompt structure). Phase 1 ships one concrete implementation: [`AiEngineHttp`](/rollingrecord/evals/sut/ai-engine-http).
+
+## `ActualOutput`
+
+`ActualOutput` (`evals/core/system.py`) is the flat, backend-agnostic result a `SystemUnderTest` returns. Judges read `body` freely; the token and latency fields populate the cost ledger.
+
+| Field | Type | Purpose |
+| --- | --- | --- |
+| `body` | `dict[str, Any]` | The response payload. For `ai-engine`, the parsed JSON of whatever the operation returned. |
+| `latency_ms` | `int` | Wall-clock latency of the call. |
+| `input_tokens` / `output_tokens` | `int` | Token counts for the cost ledger. |
+| `cache_creation_input_tokens` / `cache_read_input_tokens` | `int` | Anthropic prompt-cache tokens (cached system prompt + tool defs), reported separately from `input_tokens`. The ledger prices them at creation 1.25x / read 0.10x of the input rate; `0` for SUTs or ops that do not cache. |
+| `model` | `Optional[str]` | Which model the SUT actually used, kept separate from the ledger so per-case detail survives aggregation. |
+| `raw_response` | `Optional[dict]` | Unparsed response shape for debugging when `body` can't be made sense of. Optional. |
+| `response_headers` | `dict[str, str]` | Lower-cased HTTP header map. Empty for SUTs with no transport layer. |
+| `stop_reason` | `Optional[str]` | Anthropic-style termination reason: `end_turn`, `tool_use`, `max_tokens`, `stop_sequence`. `None` for post-processed ops. |
+| `error` | `Optional[str]` | Set when the call itself failed (HTTP 5xx, timeout). |
+
+A non-`None` `error` short-circuits judging: the runner records the case as `FAIL` with a synthetic `system_error` verdict and moves on. `response_headers` is load-bearing beyond diagnostics — the `SessionRunner` reads `x-query-session-token` from it so each `kb_query` continuation round binds to the same server-side session row.
+
+## How the runner selects a SUT
+
+The kind of case decides which implementation runs, and `--sut={python,kotlin}` (`evals/run.py`) decides which driver handles session cases.
+
+| Case kind | `--sut=python` (default) | `--sut=kotlin` |
+| --- | --- | --- |
+| Single-shot | `AiEngineHttp` HTTP client | `AiEngineHttp` HTTP client (unchanged) |
+| SESSION | `SessionRunner` — in-harness imitation of the client loop | `KotlinSessionDriver` — shells out to the real `agentcore` agent loop |
+
+Single-shot cases always use the Python HTTP client regardless of `--sut`. Session routing is wired in `run.py`: when `args.sut == "kotlin"`, the runner is built with a `KotlinSessionDriver` (resolved up front via `find_runner_command()` so a missing build fails immediately), otherwise `Runner.session_driver` stays `None` and sessions fall through to the Python `SessionRunner`.
+
+On `--dry-run`, `run.py` instantiates `_DryRunSystem` instead of minting tokens or hitting a backend. It satisfies the runner's type but is never actually invoked — the runner short-circuits before the call, opening an analytics row so the audit trail stays complete.
+
+## Where to go next
+
+- [Live Dev Backend Client](/rollingrecord/evals/sut/ai-engine-http) — `AiEngineHttp`, the one concrete SUT: headers, response normalization, and retry policy.
+- [Token Minting & Auth](/rollingrecord/evals/sut/auth) — how the harness mints App Check and Clerk tokens for the dev backend.
+- [`--sut=kotlin` & KotlinSessionDriver](/rollingrecord/evals/kotlin-sut/contract) — the session path that drives the real production agent loop.
+- [The runner](/rollingrecord/evals/harness/runner) — how cases, judges, and the SUT come together per run.

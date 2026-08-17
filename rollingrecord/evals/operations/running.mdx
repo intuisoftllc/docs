@@ -1,16 +1,78 @@
 ---
 title: "Running Evals"
-description: "Standard workflows for running the harness, and the cost/safety reality."
+description: "The run.py CLI flags, standard workflows, and the cost and safety reality of a live run."
 ---
 
-Common workflows range from a cheap dry-run cost preview to a full pre-release run across both the Python and Kotlin SUTs.
+`evals/run.py` is the harness entry point. It resolves suites and cases from its flags, runs them through the system under test, grades each with the suite's judge chain, prints a one-screen summary, and returns an exit code. Every non-dry run makes **live** calls to the dev `ai-engine` and (when grading with an LLM) to Anthropic — there is no offline mode.
 
-## What this covers
+<Warning>
+Do not run evals autonomously. Runs hit the live dev server and cost real money, and stale results appear if the code under test isn't deployed. Ask the user to run them and paste results back.
+</Warning>
 
-- Standard workflows from the `run.py` docstring: `--dry-run` cost preview, `--bucket=small` cheap iteration, single `--case`, full `--all` pre-release; Kotlin path via `--build-runner`/`--sut=kotlin`.
-- Cost & safety reality: every non-dry run makes live dev ai-engine + Anthropic judge calls and requires the eval user's `developer` RC entitlement (quota-abort otherwise); fixed 4 workers (raising it fabricates failures).
-- Rebuild `:agentrunner` after any `:agentcore`/`:agentrunner` change so `--sut=kotlin` drives the latest loop.
+## CLI flags
 
-<Note>
-Scaffold generated from the codebase map — expand with full detail, examples, and specifics.
-</Note>
+Parsed by `_parse_args`. `--all` and `--suite` are mutually exclusive.
+
+| Flag | Purpose |
+| --- | --- |
+| `--all` | Run every suite, every bucket — the pre-release safety net. |
+| `--suite <name>` | Run one suite (e.g. `--suite=kb_chat`). |
+| `--case <id>` | Run one case by bare id; the harness discovers which suite it lives in. |
+| `--bucket {small,med,large}` | Filter to one cost tier; `--bucket=small` is the cheapest iteration cycle. |
+| `--dry-run` | Print what would run plus estimated cost; no live `ai-engine` calls. Still writes a row to `l_eval_run`. |
+| `--scope <label>` | Free-form scope label stamped onto `l_eval_run.scope`; defaults to the most specific filter applied. |
+| `--show-pass` | Also print the verdict tree and response snippet for PASSing cases (spot-checking). |
+| `--pass-floor <float>` | Minimum pass rate for the run to count as a successful build; default `0.95`. See [Pass Floor, Flakes & Exit Codes](/rollingrecord/evals/operations/pass-floor). |
+| `--sut {python,kotlin}` | System-under-test driver for **session** cases; default `python`. |
+| `--build-runner` | Compile + install the Kotlin `agentrunner` first (streams Gradle output live); implies and forces `--sut=kotlin`. |
+| `--repeat <N>` | Run each case N times and report per-case reliability badges (RR-384). |
+
+## Standard workflows
+
+<Steps>
+<Step title="Preview cost without spending">
+`python evals/run.py --suite=kb_chat --dry-run` prints the cases that would run and an estimate. No live `ai-engine` calls; the floor check is skipped for dry runs.
+</Step>
+<Step title="Cheap iteration">
+`python evals/run.py --suite=kb_chat --bucket=small` runs just the small bucket — the tightest edit-run loop.
+</Step>
+<Step title="One case">
+`python evals/run.py --case=capabilities_loop_basic` runs a single case; a single-case run collapses to one worker.
+</Step>
+<Step title="Full pre-release run">
+`python evals/run.py --all` runs every suite and bucket. This is the gate before promoting a prompt change.
+</Step>
+</Steps>
+
+## The Kotlin SUT path
+
+By default, session cases run through the in-harness `SessionRunner` — a Python imitation of the client loop. `--sut=kotlin` instead shells out to the `app/agentrunner` CLI, which drives the **real production agent loop** (`:agentcore` `AgentLoop` — the same tool definitions, instructions, message assembly, and caps the app uses) against the dev `ai-engine`. Single-shot cases always use the Python HTTP client either way.
+
+```bash
+# Build the runner once (and after any :agentcore / :agentrunner change), then run:
+cd app && ./gradlew :agentrunner:installDist
+python evals/run.py --suite=kb_chat_session --bucket=small --sut=kotlin
+
+# Or build + run in one step:
+python evals/run.py --suite=kb_chat_session --bucket=small --build-runner
+```
+
+`--build-runner` with no suite/case/`--all` is a build-only shortcut that exits after compiling. The runner binary is resolved by `find_runner_command` (`evals/ai_engine/kotlin_runner.py`): it honors `EVAL_KOTLIN_RUNNER` (an explicit launcher path) or falls back to the standard `installDist` location, and fails the run up front with the fix if the build is missing. Always rebuild after touching `:agentcore` or `:agentrunner` so evals drive the latest loop. See the [Kotlin SUT contract](/rollingrecord/evals/kotlin-sut/contract).
+
+## Cost and safety reality
+
+- **Live server.** Every non-dry run calls the dev `ai-engine` for production (Haiku) responses and Anthropic for LLM judging (Sonnet, with an Opus arbiter on low-confidence cases). Costs are tallied per run and printed as `production + judge = total`.
+- **Developer entitlement required.** The eval user must hold the `developer` RC entitlement so runs bypass quota and rate-limit gates. Without it the server returns a quota gate and the run **aborts** with `status="aborted"`; the summary reminds you to verify the entitlement.
+- **Fixed worker count.** The runner always uses `Runner.DEFAULT_WORKERS` (4); the old `--workers` override was removed deliberately. Raising it overloads `ai-engine` and fabricates failures (empty output, HTTP 400, missed tools). Single-case runs collapse to one worker.
+- **`ANTHROPIC_API_KEY` is optional.** When unset, resolvers degrade to structural-only grading; suites that require LLM grading (`security`, and `kb_chat`'s free-text tags) raise a clear error instead.
+
+## Configuration
+
+`from_env` (`evals/config.py`) loads `.env.local` at the repo root and fails fast, naming every missing variable at once — Supabase dev URL/anon key, the eval test user, Clerk keys, Firebase App Check secrets, and `ANALYTICS_INGEST_SECRET`. See [Harness configuration](/rollingrecord/evals/harness/configuration) and [Auth](/rollingrecord/evals/sut/auth).
+
+## Where to go next
+
+- [Pass Floor, Flakes & Exit Codes](/rollingrecord/evals/operations/pass-floor) — how the run decides success and its exit code.
+- [Result Files & Analytics](/rollingrecord/evals/operations/results-files) — where results land and what `l_eval_run` records.
+- [Daily Eval Analysis File](/rollingrecord/evals/operations/daily-analysis) — the per-day iteration log you keep alongside runs.
+- [run.py CLI](/rollingrecord/evals/harness/run-cli) — the entry point in depth.

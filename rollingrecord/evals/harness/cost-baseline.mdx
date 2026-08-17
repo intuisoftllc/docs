@@ -1,16 +1,70 @@
 ---
-title: "Cost Ledger, Baselines & Regressions"
-description: "Cost tracking, baseline diffing, and flake handling."
+title: "Cost, Baselines & Regressions"
+description: "The two-channel cost ledger with cache pricing, per-suite baselines, regression diffing, and flake handling."
 ---
 
-The harness tracks spend per run and diffs each result against a per-suite baseline to detect regressions.
+The harness tracks dollar spend per run and diffs each case's verdict against a per-suite baseline to detect regressions. `CostLedger` (`evals/core/cost.py`) accumulates spend across two channels; `Baseline` (`evals/core/baseline.py`) records last-known-good verdicts; the runner ties them together.
 
-## What this covers
+## Cost ledger
 
-- `CostLedger`/`AnthropicUsage` (`evals/core/cost.py`) splitting production vs judge spend, cache-token pricing, and where per-round session cost is recorded.
-- Baseline diffing in `Runner._baseline_diff` (`suites/<suite>/baseline.json`): `new`/`unchanged`/`regression`/`fix`/`changed`; regressions always break the build.
-- Flake handling: `is_flake` routes FAIL/UNCERTAIN to `cases_flaked`, excluded from exit-code and regression signal.
+`CostLedger` keeps two channels separate — the whole point of the ledger is to answer "how much did I spend testing" versus "how much did I spend evaluating the results":
+
+| Channel | Fed by | Fields |
+| --- | --- | --- |
+| Production | The system-under-test's calls (`record_production`) | `production_model`, `production_calls`, input/output/cache tokens, `production_cost_usd`. |
+| Judge | LLM-as-judge calls (`record_judge`) | `judge_calls`, input/output tokens, `judge_cost_usd`. |
+
+The ledger is thread-safe: every mutator and read is guarded by an internal `threading.Lock` so the parallel runner's worker threads can feed one shared instance without losing increments. The lock is a plain `threading.Lock` kept out of equality/repr via `field(default_factory=..., repr=False, compare=False)`. `to_dict()` snapshots under the lock so a concurrent `record_*` can't tear the values mid-read.
+
+Production cost is recorded once per single-shot case from the returned `ActualOutput`, and per-round inside the session driver for session cases — the runner does not double-count. A run that mixes production models keeps the LAST model in `production_model`; per-case model detail lives in the results JSON.
+
+## Prompt-cache accounting
+
+Anthropic reports prompt-cache tokens — the cached system prompt and tool definitions — in separate usage fields (`cache_creation_input_tokens`, `cache_read_input_tokens`), never folded into `input_tokens`. A cost computed from `input_tokens` alone silently undercounts every cached call, often by a large margin because the cached system prompt is the bulk of the input. `AnthropicUsage.cost_usd()` and `anthropic_call_cost_usd()` price the cache tokens explicitly:
+
+| Token class | Rate |
+| --- | --- |
+| Input | model input rate from `MODEL_PRICING` |
+| Output | model output rate from `MODEL_PRICING` |
+| Cache creation (write) | input rate × `CACHE_CREATION_MULTIPLIER` (1.25) |
+| Cache read | input rate × `CACHE_READ_MULTIPLIER` (0.10) |
+
+An unknown model prices at `$0` with a stderr warning rather than raising — the run still produces a cost row, and real budget control comes from server-side allowlisting. Pricing constants live in [config.py](/rollingrecord/evals/harness/configuration).
+
+## Baselines
+
+A suite has one `baseline.json` at its root — the last-known-good verdict per case, committed alongside the suite so the runner can say "this case PASSed last release; today it FAILs".
+
+- `BaselineEntry` — one case's state: `case_fqid`, `verdict_kind`, `confidence`, `recorded_at` (ISO8601 UTC), and the `run_id` that produced it (so a baseline traces back to a row in `l_eval_run`).
+- `Baseline` — all entries for a suite, indexed by fully-qualified id.
+- `load_baseline(path, suite)` returns an empty `Baseline` when the file is absent — the first-run case where there's nothing to diff against.
+
+The CLI loads each suite's `baseline.json`, then upserts every entry into one `combined` Baseline. Because the key is the fully-qualified id (`<suite>.<id>`), cross-suite collisions are impossible, so a single `Runner.run()` can span multiple suites in `--all` mode and still diff each case correctly.
 
 <Note>
-Scaffold generated from the codebase map — expand with full detail, examples, and specifics.
+`save_baseline()` exists in `baseline.py`, and its module docstring references updating the baseline with `run.py --update-baseline` after a green run. That flag is NOT present in the current `run.py` argument parser — the baseline is a committed artifact updated out of band, not through a wired-in CLI subcommand.
 </Note>
+
+## Regression diffing
+
+`Runner._baseline_diff` compares each case's fresh verdict against its baseline entry and stamps a `baseline_kind` on the `CaseResult`:
+
+| `baseline_kind` | Transition |
+| --- | --- |
+| `new` | No baseline entry for this case. |
+| `unchanged` | Verdict kind matches the baseline. |
+| `regression` | `PASS` → `FAIL` or `PASS` → `UNCERTAIN`. |
+| `fix` | `FAIL`/`UNCERTAIN` → `PASS`. |
+| `changed` | Any other kind change. |
+
+A regression always breaks the build regardless of pass rate — `_print_summary` returns exit `1` when `RunResult.regressions` is non-empty, even if the pass rate clears the floor. That is real signal worth flagging immediately. See [Pass floor](/rollingrecord/evals/operations/pass-floor) and the exit-code table in [run.py CLI](/rollingrecord/evals/harness/run-cli).
+
+## Flake handling
+
+A case marked `is_flake: true` is known to occasionally fail from LLM-judge or bot non-determinism, not a real regression. The flag suppresses noise on non-pass outcomes only:
+
+- A flake-marked case that produces `FAIL` or `UNCERTAIN` routes to `RunResult.cases_flaked`, and is excluded from `cases_failed` / `cases_uncertain`.
+- Such a case does NOT contribute to the exit code, and a flake-marked `PASS`→`FAIL` transition is excluded from `regressions` — a flake flipping is expected noise.
+- A `PASS` verdict on a flake-marked case still counts as a normal PASS.
+
+Pass rate is therefore `cases_passed / (cases_run − cases_flaked)`, so a known-noisy case can't drag the rate below floor; flake rate is reported separately. The flag is used sparingly — the bar is "we've confirmed the bot's behavior is correct AND retries pass cleanly; judge variance is the only failure source." Reliability of a case across repeated runs is measured with `--repeat`, whose badges are described in [run.py CLI](/rollingrecord/evals/harness/run-cli).

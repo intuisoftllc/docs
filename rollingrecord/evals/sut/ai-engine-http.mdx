@@ -1,16 +1,64 @@
 ---
 title: "Live Dev Backend Client"
-description: "The HTTP client that calls the live dev ai-engine Edge Function."
+description: "AiEngineHttp — the Python SUT that POSTs eval requests to the live dev ai-engine and normalizes the response."
 ---
 
-`AiEngineHttp` is the Python SUT that posts eval requests to the live dev `ai-engine` Edge Function and normalizes the response.
+`AiEngineHttp` (`evals/ai_engine/client.py`) is the one concrete [`SystemUnderTest`](/rollingrecord/evals/sut/concept) that Phase 1 ships. It POSTs a case's request body to the live `ai-engine` Edge Function on the dev Supabase project, retries only on upstream provider throttling, and flattens the operation-specific response into a single `ActualOutput` shape.
 
-## What this covers
+## Request headers
 
-- `AiEngineHttp` (`evals/ai_engine/client.py`) POSTing to the dev `ai-engine` Edge Function; required headers (`apikey`, `X-Firebase-AppCheck`, `Authorization`, `X-App-Version=999999`).
-- Response normalization into `ActualOutput` (text/tool_calls/model/usage), client-side token estimation for post-processed ops, and `provider_rate_limited` retry backoff.
-- Canonical-tool injection (`_inject_canonical_tools`) for bare `kb_query` cases.
+Every request carries the four headers `ai-engine` validates, plus `Content-Type`. They are assembled in `call()` from the `EvalConfig` and the harness-minted `EvalTokens`; a caller may pass `extra_headers` (used by the `SessionRunner` for continuation rounds) which override defaults if the same key is present.
 
-<Note>
-Scaffold generated from the codebase map — expand with full detail, examples, and specifics.
-</Note>
+| Header | Value | Notes |
+| --- | --- | --- |
+| `apikey` | `config.supabase_anon_key` | The dev project's anon key. |
+| `X-Firebase-AppCheck` | `tokens.app_check_jwt` | Firebase App Check debug-token exchange. |
+| `Authorization` | `Bearer <bearer_jwt>` | Clerk session JWT, refreshed on access. |
+| `X-App-Version` | `EVAL_APP_VERSION` = `999999` | Must clear the server's `min_supported_app_version_code` floor. |
+| `Content-Type` | `application/json` | |
+
+`EVAL_APP_VERSION` is deliberately far above any realistic floor. `ai-engine`'s app-version gate rejects callers below the floor with `410 client_too_old`, and a missing, blank, or non-numeric header counts as `0`. These evals exercise AI behavior, not the version gate (that is the smoketest suite's job), so the harness always presents as a current client. Raise the floor in `server_config` to test version-gating; bump `EVAL_APP_VERSION` only if a future eval needs to impersonate an older client. The target URL is `config.ai_engine_url` — `{supabase_url}/functions/v1/ai-engine`.
+
+## Canonical tool-set injection
+
+Before serializing the request, `call()` runs `_inject_canonical_tools(case_input)`. `kb_query` cases used to hand-write a tiny two-tool sandbox; the bot behaves differently under the real tool set, so the harness injects the production tools from the generated fixture `evals/fixtures/kb_query_tools.json` into any `kb_query` request that omits both `tools` and `tool_instructions`.
+
+The fallback rule is conservative so un-migrated cases keep working:
+
+- Operation is not in `_CANONICAL_TOOL_OPERATIONS` (only `kb_query` today) → untouched.
+- Case supplies `tools` or `tool_instructions` explicitly → untouched (an old sandbox case).
+- Round is a final-answer round (`is_final == true`) → untouched; the server omits tools on the final round anyway.
+- Otherwise → deep-copy the request and splice in the fixture's `tools` + `tool_instructions`.
+
+The helper never mutates the caller's dict — the runner hands the same `case.input` to multiple judges and a session spans many rounds off one inner dict. See [Tool fixtures](/rollingrecord/evals/harness/tool-fixtures) for how the fixture is loaded and validated, and [`KbToolSpec`](/rollingrecord/evals/kotlin-sut/kb-tool-spec) for where it is generated.
+
+## Provider-rate-limit retry
+
+`call()` retries only on `provider_rate_limited` — the upstream AI provider's per-API-key throttle, distinct from the per-user `rate_limited` gate. The backoff schedule `_PROVIDER_RETRY_BACKOFF_SECS` is `[2, 3, 5, 8]` seconds (about 18s total), sleeping before each retry. Any other outcome — success, validation error, the per-user quota gate firing — returns immediately from the first attempt.
+
+The short backoffs are by design: the harness simulates a real client, and a real client should never sit on a multi-minute wait. If a 429 does not clear in that window the last result is returned, which the runner records as a `system_error` FAIL. Because provider throttling is transient infra (not a user-quota signal), it does not trigger the quota-cascade abort. Distinguishing the two is `_is_provider_rate_limited()`, which matches `provider_rate_limited` in the result's lowercased `error`. The per-request timeout is `REQUEST_TIMEOUT_SECONDS` = 15 minutes — `kb_query` multi-round and synthesis can run long.
+
+## Response normalization
+
+`_post_once()` handles one POST. On any non-200 it returns an `ActualOutput` whose `error` is `HTTP <status> — <error-from-body>`; on a non-JSON 200 body it returns `response not JSON`. A transport-level exception (`httpx.RequestError` / `TimeoutException`) becomes `error="<ExceptionType>: <msg>"`. A clean 200 is handed to `_normalize_payload()`.
+
+`ai-engine` returns operation-specific shapes, which `_normalize_payload()` flattens to three predictable fields:
+
+| Operation | Server shape | Normalized to |
+| --- | --- | --- |
+| `kb_query` | `content` array (mostly text blocks) + `model`, `usage`, `stop_reason`, `provider` | `body['text']`, `body['tool_calls']` |
+| `extract` | `content` array of `tool_use` blocks (`saveSection` / `saveTasks` / `completeTasks` / `replaceSection`) | `body['tool_calls']` |
+| `thread_naming`, `keywords`, `context_summary` | a `text` field | `body['text']` |
+| `template_moderation` | `{result, reason}` object | preserved on `body` (judges read `body['result']`) |
+
+`body['text']` is the concatenation of every `type == "text"` content block (falling back to a top-level `text` field); `body['tool_calls']` is a list of `{name, input, id}` from every `type == "tool_use"` block, always set (empty for non-tool ops). The full payload is preserved on `body` so a judge can reach raw fields like `body['result']`.
+
+### Client-side token estimation
+
+`template_moderation`, `keywords`, `thread_naming`, and `context_summary` post-process the AI response and return only the parsed verdict — no `usage` and no `model`. Without a fallback those ops would ledger as `$0`, hiding real spend. When `input_tokens`, `output_tokens`, and `model` are all absent, `_normalize_payload()` estimates tokens from request and response body size at `_CHARS_PER_TOKEN_ESTIMATE` = 4 chars/token, stamps `config.PRODUCTION_MODEL`, and sets `body['_token_count_estimated'] = True`. The estimate undercounts (server-side system-prompt overhead is invisible to the harness) but is directionally correct — acceptable for informal spend tracking.
+
+## Where to go next
+
+- [System-Under-Test Concept](/rollingrecord/evals/sut/concept) — the `SystemUnderTest` ABC and `ActualOutput` fields this client returns.
+- [Token Minting & Auth](/rollingrecord/evals/sut/auth) — the App Check and Clerk tokens these headers carry.
+- [Tool fixtures](/rollingrecord/evals/harness/tool-fixtures) — the `evals/fixtures/kb_query_tools.json` fixture injected into bare `kb_query` cases.
