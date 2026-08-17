@@ -1,15 +1,61 @@
 ---
 title: "AI Corrections & Proposals"
-description: "AI-proposed edits with undo, and context architecture coaching."
+description: "AI write actions in KB chat — additive edits with a 12-second undo window, plus create-context / blueprint / recording-membership proposals the user must confirm."
 ---
 
-The AI can propose targeted edits and context structure, which the user accepts, edits, regenerates, or rejects — with undo.
+In Knowledge Base chat the AI can change the knowledge base two different ways. **Additive writes** happen immediately within a turn — create a task, add a note, create a section, or apply a whole-card correction — and are reversible for 12 seconds via an undo toast. **Proposals** are offers the user must confirm before anything executes — create a context, create a custom blueprint, or add / remove / move a recording's context membership. Confirmation is always the user's job; nothing auto-executes.
 
-## What this covers
+## Additive writes: `KbWrite`
 
-- AI correction / targeted edits with undo (`V2ProposalCards`, `V2UndoToast`, `V2UndoDetailsSheet`, `PersistedProposal`).
-- Context architecture coaching: the AI proposes a context name and scope to accept/edit/regenerate/reject.
+`KbWrite` (`data/repository/ContextCardRepository.kt`) tracks one additive AI write so it can be reverted within the same thread:
 
-<Note>
-Scaffold generated from the codebase map — expand with full detail, examples, and specifics.
-</Note>
+| Variant | Executes | Undo |
+| --- | --- | --- |
+| `TaskCreated(taskId, contextId, text)` | immediately | delete the row by id |
+| `NoteAdded(contextId, sectionId, text)` | immediately | remove the last matching insight in the section |
+| `SectionCreated(contextId, sectionId, title)` | immediately | drop the section by its UUID |
+| `CorrectionApplied(contextId, previousSectionsJson)` | immediately | restore the snapshotted sections JSON verbatim |
+
+Writes are emitted via `ask()`'s `onWritePerformed` callback and reverted by `ContextCardRepository.revertWrites(writes)`, which undoes the batch in reverse order and re-syncs FTS for every affected context.
+
+A whole-card correction goes through `ContextCardRepository.applyCorrection(contextId, correctedSections)`, which replaces **all** sections with the AI-corrected list and returns the previous sections JSON — that returned JSON is what `KbWrite.CorrectionApplied` carries, so undo restores the card exactly. Note-add and section-create are the only two paths that set `InsightOrigin.USER` (`addNoteToSection` / `createNewSection`).
+
+## The undo toast
+
+`V2UndoToast` (`ui/v2/screens/knowledgebase/components/V2UndoToast.kt`) floats above the input bar after Claude's additive writes in a turn. It lists what changed (each `KbWrite.changeLabel()`), runs a numeric countdown and a draining bar over the `UNDO_WINDOW_SECONDS = 12` window (mirrored to the ViewModel's `UNDO_TIMEOUT_MS`), and offers a single Undo that reverts the whole batch. The `epoch` parameter restarts the countdown on each new write. Up to `MAX_CHANGE_LINES = 3` changes are shown inline, with the rest collapsed into a "+N more" line; tapping the summary opens the details sheet.
+
+`V2UndoDetailsSheet` (`ui/v2/screens/knowledgebase/components/V2UndoDetailsSheet.kt`) is the full "what changed" bottom sheet — the untruncated list of every `KbWrite` this turn — with a single "Undo all changes" action. The host pauses the toast's auto-dismiss while this sheet is open.
+
+## Runtime proposal types
+
+The three runtime proposal types also live in `ContextCardRepository.kt` and are surfaced on `AskResult.Success` (at most one proposal of any kind per turn):
+
+- `ContextProposal(name, scopeDescription, suggestedBlueprintId)` — the "context architecture coaching" path: the AI proposes a **new** context but does not create it. Rendered with Create / Edit / Try again / Cancel.
+- `BlueprintProposal(name, description, systemPrompt)` — the AI drafted a custom blueprint. Accept is **async**: it runs the real `save_user_blueprint` (moderation + validation) and can be rejected, in which case the card stays editable for retry.
+- `RecordingMembershipProposal` — a sealed `Add` / `Remove` / `Move` proposing a change to a recording's context membership (RR-417 / 418 / 419). Confirm wires through to `ContextRepository` writes; `Remove` and `Move` are destructive on the source side (they drop the recording from every insight's source list, delete matching action items, and unlink it).
+
+None of these are `@Serializable` — serialization lives on a separate DTO layer.
+
+## Persisted proposals
+
+`PersistedProposal` (`data/repository/PersistedProposal.kt`) is the durable, synced serialization layer. It wraps a `ProposalStatus` (`PENDING` / `ACCEPTED` / `REJECTED`), a sealed `ProposalPayload`, and an optional `resultContextId` for the resolved card's "View" deep-link. The payload kinds carry stable `@SerialName` discriminators — `create_context`, `recording_add`, `recording_remove`, `recording_move`, `create_blueprint` — which **are** the wire contract, never the Kotlin class names.
+
+The whole envelope is `encode()`d to an opaque JSON string stored in `SearchMessageEntity.proposalJson` (encrypted on the wire), so a resolved card survives reload and syncs across devices; the DB column, Supabase column, and wire transforms never inspect it. `decodeProposalOrNull()` returns `null` on any failure — including an unknown discriminator from a newer client — so an unrecognized proposal renders as plain text rather than crashing. Runtime↔payload converters bridge the two layers, and `toHistoryNote()` emits a compact, never-shown AI-facing scratchpad line so the bot knows what it already proposed and the outcome.
+
+## Rendering proposal cards
+
+`V2ProposalBlock` (`ui/v2/screens/knowledgebase/components/V2ProposalCards.kt`) renders a `PersistedProposal` under an AI message. A `PENDING` proposal becomes an actionable card — `V2ContextProposalCard`, `V2RecordingMembershipCard`, or `V2BlueprintProposalCard`, each with an in-card submit spinner, a server-rejection error, and edit dialogs (which validate via `BlueprintValidation`). An `ACCEPTED` / `REJECTED` proposal becomes a muted `ResolvedProposalCard` with a "View" deep-link. Confirm / edit / cancel route to `V2KnowledgeBaseViewModel` handlers.
+
+## Summary of write actions
+
+| Kind | Executes when | Undo / confirm |
+| --- | --- | --- |
+| `TaskCreated` / `NoteAdded` / `SectionCreated` / `CorrectionApplied` | immediately (additive write) | reversible for 12s via `V2UndoToast` → `revertWrites` |
+| Create context (`ContextProposal`) | only on user Confirm | proposal card; context-architecture coaching |
+| Create blueprint (`BlueprintProposal`) | only on user Confirm (async `save_user_blueprint`, can be rejected) | proposal card stays editable on rejection |
+| Recording Add / Remove / Move (`RecordingMembershipProposal`) | only on user Confirm | proposal card; Remove / Move destructive |
+
+## Related pages
+
+- [Context Extraction Pipeline](/rollingrecord/app/ai/context-extraction) — the sections and tasks these writes edit.
+- [Extraction Templates (Blueprints)](/rollingrecord/app/ai/templates-blueprints) — the blueprint a `BlueprintProposal` creates.

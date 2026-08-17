@@ -1,15 +1,49 @@
 ---
 title: "Identity Resolution"
-description: "Mapping the Clerk identity to the backend user id."
+description: "IdentityRepository upserts the canonical_users row via the resolve-identity Edge Function and caches the server-echoed auth_user_id in AuthUserStore."
 ---
 
-The Clerk identity is resolved to the backend's canonical user id and wired into session switching.
+`IdentityRepository` (`data/repository/IdentityRepository.kt`) calls the `resolve-identity` Edge Function to upsert a `canonical_users` row for the caller and cache the server-echoed `auth_user_id` in `AuthUserStore` — the sync-readable `SharedPreferences` that every per-user-scoped singleton consults at Koin init to decide which user's directory to open.
 
-## What this covers
+## `resolveIdentity()`
 
-- `IdentityRepository` and `ResolveIdentityDto` mapping the Clerk identity to the backend `auth_user_id`.
-- Multi-account switching hooks into `UserSessionManager`.
+`resolveIdentity(): String?` reads a stable caller id, POSTs it, caches the echoed id, and returns it — or returns null on any failure (network error, non-2xx, empty body). It is safe to call multiple times per launch; each call is a fresh round-trip.
 
-<Note>
-Scaffold generated from the codebase map — expand with full detail, examples, and specifics.
-</Note>
+The stable id it sends today is `RevenueCatManager.customerId`, **not** the Clerk identity. Per the class KDoc, this is the pre-auth arrangement (RR-137): the Clerk `sub` claim travels separately as the Bearer JWT on Edge Function calls, and post-auth the server will derive the canonical id from that verified JWT rather than trusting a body field. If the RC customer id isn't available yet (SDK not configured), the call logs and returns null.
+
+An **account switch** — a different identity between launches — is detected by comparing the cached id against the server-echoed id. A mismatch logs an `"account switch detected"` warning and overwrites `AuthUserStore`; the local per-user wipe is an explicit TODO (a follow-up story), so today only the cached id changes. `IdentityRepository` does **not** call `UserSessionManager.switchTo` — that is driven by the `V2App` auth observer (and the legacy V1 `AppNavHost`).
+
+## `resolve-identity` wire shape
+
+The request and response DTOs live in `data/remote/dto/ResolveIdentityDto.kt`. The Retrofit method is `SupabaseApi.resolveIdentity` (`data/remote/SupabaseApi.kt`): `@POST "functions/v1/resolve-identity"` tagged `@EdgeTag(resolve-identity)`, returning `Response<ResolveIdentityResponse>`. It rides the `supabase` OkHttp client, so the App Check + Bearer JWT interceptors apply automatically — see [Auth Token Injection & Refresh](/rollingrecord/app/auth/jwt-interceptors).
+
+| Symbol field | JSON key | Type | Meaning |
+| --- | --- | --- | --- |
+| `ResolveIdentityRequest.authUserId` | `auth_user_id` | `String` | Stable caller id sent today = `RevenueCatManager.customerId` |
+| `ResolveIdentityResponse.authUserId` | `auth_user_id` | `String` | Server-echoed canonical id; cached in `AuthUserStore` |
+| `ResolveIdentityResponse.status` | `status` | `String` | `canonical_users` upsert status |
+| `ResolveIdentityResponse.subscriptionLapsedAt` | `subscription_lapsed_at` | `String?` (ISO 8601) | Recurring-cloud lapse timestamp → grace banner |
+| `ResolveIdentityResponse.subscriptionLapsedTier` | `subscription_lapsed_tier` | `String?` | Lapse tier (`pro_cloud` / `pro_cloud_ai`); banner copy |
+
+The two `subscription_lapsed_*` fields are paired by a server-side `CHECK` constraint (both NULL or both non-NULL), so any populated pair is internally consistent.
+
+## `GraceState` and the lapse banner
+
+On every successful call, `resolveIdentity` refreshes an in-memory `GraceState?` from the lapse fields, exposed as `graceState: StateFlow<GraceState?>`. `GraceState` is a `data class(lapsedAtEpochMs: Long, lapsedTier: String)`. Null means an active subscription **or** never-subscribed (banner hidden); non-null means the recurring cloud subscription lapsed within the 30-day grace window, driving a tier-aware lapse banner with a day-count countdown. It is deliberately not persisted — the server is the source of truth and is always called on launch, so a stale banner outliving a resubscribe would be worse than a brief cold-start gap. `cachedAuthUserId()` returns the last cached id via `AuthUserStore.getCurrentUserId`.
+
+## Session isolation
+
+`IdentityRepository` is an app-level Koin `single` (`di/RepositoryModule.kt`) — it tells the app *who* the user is, so it can't itself be user-scoped. Because it survives a session switch, it implements `UserScopedCache`; `clearForUserSwitch()` resets `graceState` to null so a prior user's lapse banner doesn't follow the next account for the life of the process.
+
+## When it runs
+
+On the active V2 surface, `resolveIdentity` runs **only on cold start**, launched from `App.onCreate` (`App.kt`) on `Dispatchers.IO` (comment: "Resolve RC customer ID → canonical user UUID"). The V2 sign-in observer in `V2App` does **not** call it — confirmed by the class KDoc: "which the V2 sign-in path does NOT call (only cold start does)". Only the legacy V1 `AppNavHost` additionally calls it at sign-in, awaiting the upsert before the new scope opens.
+
+The actual session-scope swap that consumes the cached `auth_user_id` is `UserSessionManager.switchTo` (`data/session/UserSessionManager.kt`), invoked by the auth observer — see [Known Accounts / Account Switching](/rollingrecord/app/auth/known-accounts) for what that teardown does.
+
+## Related
+
+- [Authentication (Clerk)](/rollingrecord/app/auth/clerk) — `AuthUserStore` and the auth observer
+- [Login & Sign-Up Flow](/rollingrecord/app/auth/login-flow) — the sign-in that precedes resolution
+- [Auth Token Injection & Refresh](/rollingrecord/app/auth/jwt-interceptors) — the client the call rides on
+- [Known Accounts / Account Switching](/rollingrecord/app/auth/known-accounts) — session-scope teardown

@@ -1,15 +1,71 @@
 ---
 title: "Cloud Prefetch & Download"
-description: "Warming the local cache and fetching cloud audio on demand."
+description: "Background warming of cloud-only recordings (CloudPrefetchWorker) and on-demand fetch (AudioCloudRepository.downloadRecording → CloudDownloadManager), with per-version undecryptable-blob tracking."
 ---
 
-Cloud audio is prefetched to warm the local cache and fetched on demand when needed.
+A cloud-only recording (`cloudOnly = true`, empty `filePath`) is a placeholder created by `sync-pull` — its metadata is local but its audio lives only in Storage. It becomes locally playable two ways: on demand when the user taps it, and in the background via a prefetch worker. Both route through `AudioSyncClient.download` (server-unwrapped DEK) and `CloudDownloadManager`.
 
-## What this covers
+## On-demand: `downloadRecording`
 
-- `CloudPrefetchWorker` / `CloudPrefetchScheduler` warming the local cache; `CloudDownloadManager` on-demand fetch.
-- `CloudDecryptFailureStore` for undecryptable-blob tracking.
+`AudioCloudRepository.downloadRecording(recordingId)` (`data/sync/audio/AudioCloudRepository.kt`) is the on-demand entry point. Two mechanisms make it robust to a user tapping around:
 
-<Note>
-Scaffold generated from the codebase map — expand with full detail, examples, and specifics.
-</Note>
+- **Per-id dedup** — an `inFlight` `ConcurrentHashMap<String, Deferred<DownloadResult>>` keyed by recording id. The actual work runs as a `Deferred` inside a long-lived `downloadScope` (`SupervisorJob + Dispatchers.IO`), so **the download outlives the caller** — backing out of the Playback screen (cancelling its `viewModelScope`) cancels only the `await()`, not the fetch. A re-tap or the prefetch worker joins the existing `Deferred` and shares its result.
+- **Concurrency cap** — a `Semaphore(MAX_PARALLEL_DOWNLOADS = 10)`. Excess callers each get their own `Deferred` but suspend on `withPermit` until a permit frees, preserving user-driven enqueue order via the semaphore's fair acquisition.
+
+`close()` (called by Koin on session teardown) cancels `downloadScope` and clears `inFlight` so the prior user's downloads never write into the new session.
+
+### Download outcomes
+
+`downloadRecordingLocked` short-circuits before acquiring a permit for the cheap cases (row missing, already local, known-undecryptable) and classifies the rest:
+
+| `AudioDownloadResult` | `DownloadResult` | Local effect |
+| --- | --- | --- |
+| `Success` | `Ready(path)` | `markDownloaded` (clears `cloudOnly`) + enqueue waveform pre-generation |
+| (already local) | `AlreadyLocal` | no network |
+| `NotFound` (row gone) | `Permanent` | delete local placeholder + transcript + context links |
+| `BlobMissing` (row alive, object gone) | `Permanent` | **keep** the row; mark this version failed in `CloudDecryptFailureStore` |
+| `DecryptFailed` | `Permanent` | mark this version failed |
+| `RateLimited` / `Transient` | `Retry` | next run retries |
+| (ENOSPC) | `StorageFull` | stop; no corrupt leftovers |
+
+The `NotFound` vs `BlobMissing` split is load-bearing: `NotFound` means the row is gone (tombstoned), so deleting the local placeholder is correct; `BlobMissing` means the row is alive but its Storage object is missing, and deleting the local row here was the vanishing-recording bug (the recording disappeared from every list while its context links survived, then drift-reconcile re-pulled it "from nowhere").
+
+## Background: `CloudPrefetchWorker`
+
+`CloudPrefetchWorker` (`data/sync/audio/CloudPrefetchWorker.kt`) warms the local cache. It:
+
+- Re-checks Wi-Fi-only at execution time and lowers its thread priority to `THREAD_PRIORITY_BACKGROUND` so the scheduler favors UI threads (no foreground-state gate — foreground-but-idle is exactly when the user expects prefetch to run).
+- Guards on a `SAFETY_FLOOR_BYTES = 1GB` device-free floor, checked before the run and again before each download (Android force-kills apps as free space nears zero).
+- Prechecks the cloud entitlement and defers on a `sync-audio` rate-limit cooldown.
+- Walks `getCloudOnlyPrefetchCandidates(MAX_CANDIDATES_PER_RUN = 200)` — cloud-only rows sorted favorites-first then most-recent — calling `downloadRecording` on each.
+
+There is no cache-size budget: the user paid for cloud sync, so if they have 25 GB of audio and 50 GB free, all 25 GB download over successive runs. Explicit per-item cloud-exclude is the user's local-space control, never silent deletion.
+
+`MAX_CANDIDATES_PER_RUN` bounds runtime against WorkManager's ~10-minute wall. When a **full** batch makes **real** progress (`downloaded > 0`, not stopped for a terminal reason), the worker self-chains via `CloudPrefetchScheduler.chainContinuation()` so a large backlog drains continuously rather than waiting for the 6-hour periodic.
+
+## `CloudPrefetchScheduler`
+
+`CloudPrefetchScheduler` (`data/sync/audio/CloudPrefetchScheduler.kt`) owns the worker at app scope. `ensurePeriodic()` enqueues a 6-hour periodic (`PERIODIC_INTERVAL_HOURS = 6`, 2-hour flex; network + battery-not-low + storage-not-low). `triggerNow()` and `chainContinuation()` enqueue one-shots — the latter with `ExistingWorkPolicy.APPEND_OR_REPLACE` so the follow-up queues *after* the currently-running worker instead of cancelling it. Gates on `tier.atLeast(UserTier.PRO_CLOUD)`. Triggered from `ON_RESUME`, `onStop`, and connectivity-restore. `WORKER_TAG = "cloud_prefetch_worker"`.
+
+## `CloudDownloadManager` — fetch → decrypt → move
+
+`CloudDownloadManager` (`data/cloud/CloudDownloadManager.kt`) is the lower-level mechanism the repository delegates to. `downloadWithUnwrappedDek` (the server-unwrap flow used by `sync-audio`) fetches ciphertext, stream-decrypts, and atomically moves the plaintext into the recordings directory. Every downstream consumer sees the result as indistinguishable from a locally-recorded file — there is no "is this cloud?" branch in playback.
+
+| Stage | Path | Lifetime |
+| --- | --- | --- |
+| ciphertext | `cacheDir/cloud-downloads/{segment}/{id}.partial` | deleted after decrypt |
+| plaintext temp | `filesDir/download-staging/{segment}/{id}.decrypting` | atomic-moved, then gone |
+| destination | `filesDir/recordings/{segment}/{destFileName}` | durable |
+
+The decrypted temp stages under `filesDir` (not `cacheDir`) deliberately: the final move into `recordings/` stays a `filesDir → filesDir` rename that preserves the DATA quota tag, so the recording doesn't count as "Cache" in Android's storage breakdown. The move uses `Files.move(..., ATOMIC_MOVE, REPLACE_EXISTING)` with a non-atomic fallback. `CloudDownloadResult` variants: `Success`, `DekUnavailable`, `SubscriptionRequired`, `DownloadFailed`, `DecryptFailed`, `MoveFailed`, `StorageFull`. `isDeviceStorageFull()` inspects the throwable chain for ENOSPC so an out-of-space write is classified as `StorageFull` (deleting any half-written file) rather than a retriable failure. `wipeStagingFor(segment)` clears both staging areas on app start and sign-out.
+
+## `CloudDecryptFailureStore` — self-healing skip list
+
+`CloudDecryptFailureStore` (`data/cloud/CloudDecryptFailureStore.kt`) is a process-singleton DataStore (`cloud_decrypt_failures`) of `"recordingId|committedAt"` keys for permanently-undecryptable or missing blobs, so prefetch and play-tap stop hammering an unrecoverable blob. The key includes `cloudBackupCommittedAt`, so a healed re-upload (which bumps `committedAt`) no longer matches and the download retries automatically — no manual reset. It implements `UserScopedCache` (`clearForUserSwitch` removes the keys) because the ids belong to one user's database in a device-wide store. API: `markFailed` / `isFailed` / `clear` / `failedKeys`.
+
+## Where to go next
+
+- [Audio Cloud Backup](/rollingrecord/app/sync/audio-sync) — the upload side of `AudioCloudRepository`.
+- [Sync & Cloud Overview](/rollingrecord/app/sync/overview) — prefetch as part of the audio family.
+- [Trash Sync & Free Up Space](/rollingrecord/app/sync/trash-and-free-up) — why cloud-only placeholders can't preview from Trash.
+- [Pull & Reconciliation](/rollingrecord/app/sync/reconcile-engine) — how cloud-only placeholders are created on pull.

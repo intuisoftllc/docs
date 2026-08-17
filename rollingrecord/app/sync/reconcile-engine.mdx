@@ -1,15 +1,88 @@
 ---
 title: "Pull & Reconciliation"
-description: "Applying server changes and resolving conflicts."
+description: "The pull side: SyncEngine.runPull's paginated cursor drain, the FK-deferred apply queue, full-pass orphan reconciliation, and the ReconcileEngine count-based drift handshake."
 ---
 
-The pull side reconciles server changes into the local database, resolving conflicts by outcome.
+The pull path applies server rows to the local database and, on a clean full pass, deletes local recordings the server no longer has. A separate count-based handshake detects drift and forces a full re-pull. Neither the pull nor the reconcile path resolves push conflicts — merge outcomes (`accepted` / `server_wins` / `rejected`) belong to the [outbox push path](/rollingrecord/app/sync/outbox-engine).
 
-## What this covers
+## `SyncEngine.runPull` — the cursor drain
 
-- `ReconcileEngine` merge outcomes (accepted / server_wins / rejected); `PendingPullApplyDao`/`Entity` deferral.
-- `SyncEpisodeProgress` tracking and `SyncRejectionDebugLogger` diagnostics.
+`SyncEngine.runPull` (`data/sync/SyncEngine.kt`) drives the pull. In one call it:
 
-<Note>
-Scaffold generated from the codebase map — expand with full detail, examples, and specifics.
-</Note>
+1. **Drains the FK-deferred queue first** via `transform.drainPending()` — children stashed last cycle whose parents may now exist locally.
+2. **Loops `sync-pull` pages** until `has_more = false`, capped at `MAX_PULL_PAGES = 100`. Each page's rows go through `WireTransform.tryApplyOrDefer`; the opaque `next_cursor` is committed after every page so an interruption resumes from there.
+3. **Paces** `~750ms` (`INTER_PAGE_PACING_MS`, ±20% jitter) between pages so a fresh device draining many pages doesn't trip the pull rate limit.
+4. **Reconciles orphans** only on a clean full pass.
+
+A from-empty start (`startCursor.isEmpty()`) is a **full pass** — the only context in which the accumulated server-id set is complete, hence the only context in which orphan reconciliation is safe.
+
+### Page-loop status handling
+
+| Server signal | `runPull` response |
+| --- | --- |
+| `status = resync_required` | `resetSyncCursor`, cursor = `""`, `isFullPass = true`, clear seen ids, continue |
+| 429 `RateLimited` | surface `rateLimitedUntilSec` (the typed `reset_at_sec`), keep the committed cursor, resume next trigger |
+| other `ApiError.Failure` | keep cursor, resume next trigger |
+| `has_more = false` | `cleanCompletion = true`, break; orphan reconcile runs if it was a full pass |
+| hit `MAX_PULL_PAGES` | commit progress, continue next trigger, **skip** orphan reconcile (id set incomplete) |
+
+Each page's `remaining` updates `SyncState.remaining` (the "N items left" card) and clears any prior rate-limit flag; the final page reports 0.
+
+## `WireTransform.tryApplyOrDefer` and the FK-deferred queue
+
+`sync-pull` paginates and does **not** guarantee parents arrive before children — a page may carry an `action_item` before its `context_card`. The local Room schema enforces FKs at insert time, so the child INSERT throws. `WireTransform.tryApplyOrDefer` (`data/sync/WireTransform.kt`) handles this with an outcome enum:
+
+| Apply result | `ApplyOutcome` | Handling |
+| --- | --- | --- |
+| apply succeeds | `Applied` | counted |
+| `SQLiteConstraintException` (missing FK parent) | `Deferred` | wire-row JSON stashed in `pending_pull_apply` |
+| any other throwable | (rethrown) | engine logs and drops the row |
+
+The third case is intentional — a non-FK exception is a real bug to surface, not a row to retry-loop.
+
+`PendingPullApplyEntity` (`data/local/db/entity/PendingPullApplyEntity.kt`) backs table `pending_pull_apply`. Columns: `id` (autogen PK), `entityType`, `rowId`, `wireRowJson` (replayed verbatim), `missingParentEntity`, `missingParentId` (indexed), `enqueuedAt`. Storing the whole `JsonObject` keeps the queue agnostic of the 14 entity shapes and defers decryption to apply time when the DEK is available.
+
+`WireTransform.drainPending()` replays every entry: success → delete; still-FK → leave for a future drain; non-FK error → delete (don't loop on a broken row); unknown entity or corrupt JSON → delete. `PendingPullApplyDao` (`data/local/db/dao/PendingPullApplyDao.kt`) caps the queue at `PENDING_PULL_APPLY_CAP = 1000`, dropping oldest (via `WireTransform.defer` → `deleteOldest(...)` + an `AppLogger.w(save = true)` line, no Crashlytics report) when crossed — a full queue signals the server is emitting orphan children or a code bug.
+
+## `reconcileOrphans` — full-pass deletion
+
+`SyncEngine.reconcileOrphans(serverRecordingIds)` deletes a local recording only when **all three** hold:
+
+1. `cloudBackupCommittedAt != null` — it was synced before, so its absence is a real server-side deletion, not a never-pushed local row;
+2. no pending outbox entry (`outbox.hasPending(WireEntity.RECORDING, id)` is false) — we aren't racing an un-pushed local write;
+3. the id is absent from `serverRecordingIds` — the complete set accumulated during the clean from-empty drain.
+
+New / never-pushed rows fail (1); locally-edited rows fail (2). The delete is local-only via `recordingRepository.deleteOrphanLocally(id)` and enqueues **no tombstone** (the server row is already gone). Server recording ids are canonicalized to the `rec-` prefix (`IdPrefix.formatRecording`) exactly like the apply path, so a bare-uuid server row can't read as "not on the server" and false-delete a live local row.
+
+## Stalled-drain detection
+
+`SyncEngine.noteDrainProgress(pulled)` watches the outcome the user cares about — rows applied — rather than HTTP status. After `STALLED_DRAIN_THRESHOLD = 3` consecutive cycles that pulled 0 rows while the server still reports a backlog, it files a one-per-process `SyncStalledException` Crashlytics non-fatal. This catches the failure mode HTTP reporting can't see: cycles that "succeed" (no exception, overlay clears, app reads as synced) while the drain has permanently wedged behind a page the server can't build.
+
+## `ReconcileEngine` — the drift handshake
+
+`ReconcileEngine` (`data/sync/ReconcileEngine.kt`) is a separate, periodic drift detector. `reconcile()` POSTs the `sync-reconcile` `counts` operation, compares each server count to the local Room `COUNT(*)`, and on any per-table mismatch resets the pull cursor and triggers a fresh `SyncEngine.sync()`.
+
+It is **count-only** on the client because Room rows carry no `updated_at` / `deleted_at` (server-only columns — the client hard-deletes and tracks acks via `remoteSyncedAt`), so a "count AND max_updated_at" comparison isn't possible without schema changes. Content-drift (same count, different rows) is not caught in v1; the outbox and `sync-push` LWW handle the push-side write races that matter.
+
+| Wire name | Local table |
+| --- | --- |
+| `recording` | `recordings` |
+| `recording_session` | `recording_sessions` |
+| `recording_note` | `recording_notes` |
+| `transcript` | `transcripts` |
+| `category` | `categories` |
+| `context` | `contexts` |
+| `context_card` | `context_cards` |
+| `action_item` | `action_items` |
+| `scheduled_recording` | `scheduled_recordings` |
+| `search_thread` | `search_threads` |
+| `search_message` | `search_messages` |
+
+Composite-PK junctions (`context_recording`, `context_session`) are intentionally absent from this map — their drift recovers when the parent context re-pulls. `countLocal` runs a raw `SELECT COUNT(*)` through Room's `SupportSQLiteDatabase` and returns `-1` on failure so a query error surfaces as drift rather than a silent match.
+
+## Where to go next
+
+- [Sync & Cloud Overview](/rollingrecord/app/sync/overview) — where pull sits in the cycle.
+- [Sync Outbox & Enqueue](/rollingrecord/app/sync/outbox-engine) — the push half and the `not_found` outcome the orphan sweep pairs with.
+- [Wire Format & Transforms](/rollingrecord/app/sync/wire-transforms) — `applyPulledRow` and the per-entity apply logic.
+- [Trash Sync & Free Up Space](/rollingrecord/app/sync/trash-and-free-up) — why trash state must round-trip through pull.

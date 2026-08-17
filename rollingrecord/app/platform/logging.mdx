@@ -1,15 +1,50 @@
 ---
 title: "Diagnostic Logging"
-description: "The shareable on-device diagnostic log and its safety policy."
+description: "The AppLogger facade and the per-user rolling on-device log file, with the save=true persistence policy and the no-user-content safety rule."
 ---
 
-A rolling on-device log captures field diagnostics that users can share for support, under a strict safety policy.
+`AppLogger` is a zero-cost-in-release log facade. `save = false` lines go to logcat only (eliminated by R8 in release); `save = true` lines are appended to a per-user rolling file via `FileLogger`, which a user can email to support. Because a shared log leaves the device, a HARD RULE forbids any user content in a `save = true` line.
 
-## What this covers
+## `AppLogger`
 
-- `AppLogger` + `FileLogger` rolling on-device log (the `save = true` policy from `CLAUDE.md`) shareable for support.
-- What is and isn't safe to persist.
+`util/AppLogger.kt` is an object exposing `v` / `d` / `i` / `w` / `e(tag, save = false) { msg }` inline methods, plus `w` / `e` overloads that also take a `Throwable`. Every method is gated by `if (BuildConfig.DEBUG || save)`, so in a release build R8 sees `if (false || false)` for a `save = false` call and eliminates the entire branch — including the message lambda, which never runs in production.
 
-<Note>
-Scaffold generated from the codebase map — expand with full detail, examples, and specifics.
-</Note>
+| Build | `save = false` | `save = true` |
+| --- | --- | --- |
+| Debug | logcat only | logcat + rolling file |
+| Release | eliminated by R8 (no message built) | rolling file only (no logcat) |
+
+`save = true` lines route to `fileLogger?.append(...)`. The `@Volatile var fileLogger: FileLogger?` is set by `App.onCreate`; until then, `save = true` lines silently fall back to logcat, which keeps the first-tick path safe.
+
+## `FileLogger`
+
+`util/FileLogger.kt` is the per-user rolling writer. Files live under `filesDir/app_logs/`, named `app_log_{segment}_{0..2}.txt`, where the segment is `AuthUserStore.getActiveUserSegment` — the active auth user id, or the literal `"anonymous"` for signed-out sessions — sanitized to a filesystem-safe string. Per-user separation keeps one account's noise out of another's diagnostics on the same device.
+
+The rolling buffer is defined by two constants, so the file is **not** a single 2 MB cap — 2 MB is the per-file rotation size, and the real per-user ceiling is ~6 MB:
+
+| Constant | Value | Effect |
+| --- | --- | --- |
+| `MAX_FILE_BYTES` | 2 MB | per-file cap before rotation |
+| `FILE_COUNT` | 3 | rotating files per user segment |
+| total | ~6 MB | per-user ceiling (`MAX_FILE_BYTES` × `FILE_COUNT`) |
+
+`append()` captures the user segment at call time (so a session switch in flight can't misroute the line) and schedules a serialized single-thread IO write with a UTC ISO-8601 timestamp. When the active file would overflow it rotates to the next index, truncating it on the way in; the active index is discovered lazily by mtime so a process restart resumes the freshest file. A failed write is logged to logcat and swallowed — the logger can never crash the app.
+
+Beyond `append`, the class exposes `appendNowSync` (a synchronous crash-path write that bypasses the dispatcher), `mergedLogForUser` (concatenate every file for a user into one temp file in `cacheDir`), `logFilesForUser` (the raw rolling files, oldest → newest, for attaching individually), `readEntriesForUser` (parses `LogEntry` rows for the dev log screen), and `clearLogsForUser`. `FileLogger.LogEntry` is `(id, utcTimestampMs, level, tag, message)`, with stack-trace lines folded into the preceding entry's message.
+
+## Crash-path integration
+
+`data/analytics/CrashReporter.kt` registers an uncaught-exception handler that calls `AppLogger.fileLogger?.appendNowSync(...)` with the crash's class, its message truncated to 500 chars, and the full stack trace. This runs on the crash path so a user's shared app log includes the crash even without logcat access; it is best-effort and wrapped in a catch-all so a logger fault never blocks the OS handler chain.
+
+## The share path
+
+`ui/v2/util/UnlockSupportEmail.kt` (`sendUnlockSupportEmail`) builds the support-email intent, attaching the files from `AppLogger.fileLogger?.logFilesForUser()` as `FileProvider` URIs via `ACTION_SEND` / `ACTION_SEND_MULTIPLE`. This — plus the equivalent contact-support path in Help & Support — is the field route by which `save = true` diagnostics leave the device, and is exactly why the no-user-content rule exists.
+
+## The safety rule
+
+Anything written with `save = true` is shareable, so every value in the line must be safe to share. Log only IDs (auth user id, recording ids, session ids), counts, outcomes, error codes (the canonical strings from `_shared/errors.ts` / `AppError`), byte sizes, HTTP status codes, durations, DB schema versions, and worker lifecycle events. Never log recording titles, transcript text, notes, search queries, prompt or AI-response content, user emails, or a full file path to user content (a filename often encodes a user-chosen title — log the recording UUID instead). Thrown exception messages that reach a `save = true` line must not embed user content either. The rule is enforced as a HARD RULE in `CLAUDE.md`.
+
+## Related pages
+
+- [Analytics & Crash Reporting](/rollingrecord/app/platform/analytics) — `CrashReporter`, `OsKillSentinel`, and the Crashlytics path.
+- [Networking & Edge API Layer](/rollingrecord/app/platform/networking) — the transport interceptors that log with `save = true`.

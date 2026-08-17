@@ -1,23 +1,82 @@
 ---
-title: "Android App Overview"
-description: "The RollingRecord Android client at a glance."
+title: "Overview"
+description: "The RollingRecord Android client at a glance — the two capture modes, the tiered feature set, and the map into every subsystem."
 ---
 
-RollingRecord is a battery-efficient audio recorder that works like a dashcam, with two capture modes and a tiered feature set.
+RollingRecord is a battery-efficient audio recorder that works like a dashcam: alongside a standard **manual** record mode, its **rolling** mode records indefinitely within a user-defined storage limit by pruning the oldest recordings to make room for new ones. On top of capture sit playback, on-device and cloud transcription, an AI knowledge base, encrypted cross-device sync, and a four-tier feature set.
 
-## What this covers
+## Where the client lives
 
-- What RollingRecord is: a battery-efficient audio recorder with **manual** and **rolling** record modes.
-- The four tiers at a glance (Free, Pro, Pro+Cloud, Cloud+AI) defined in `UserTier.kt`, each a strict superset of the one below.
-- Where the client lives in the monorepo: `app/app` (application), `app/crypto`, `app/agentcore`, `app/agentrunner`.
+The whole Android client is the `app/` part of the monorepo, split into four Gradle modules:
+
+| Module | What it is |
+| --- | --- |
+| `app/app` | The Android application — single-Activity Jetpack Compose (the V2 UI is the active surface), min SDK 26 / target SDK 36. |
+| `app/crypto` | Pure Kotlin/JVM encryption primitives, shared with the backend smoke tests by source inclusion for crypto parity. |
+| `app/agentcore` | The pure-JVM KB-chat agent loop (`AgentLoop`, wire models, tool contract) shared by the app and the eval runner. |
+| `app/agentrunner` | A pure-JVM CLI that drives the real agent loop for the eval harness. |
+
+Inside `app/app`, code is organized by concern: `service` (foreground recording), `audio` (capture + encoding), `data` (Room, repositories, session), `ui/v2` (Compose screens, navigation, theme, gating), `worker` (WorkManager jobs), `handlers`, `tiles` (Quick Settings), `notification`, `receiver`, `config`, and `di` (Koin).
+
+## The feature domains
 
 <CardGroup cols={2}>
-  <Card title="Recording" icon="microphone" href="/rollingrecord/app/recording/overview">Manual & rolling capture, formats, recovery.</Card>
-  <Card title="AI & Intelligence" icon="wand-magic-sparkles" href="/rollingrecord/app/ai/overview">Extraction, KB chat, templates, search.</Card>
-  <Card title="Sync & Cloud" icon="cloud" href="/rollingrecord/app/sync/overview">Cross-device sync and encrypted backup.</Card>
-  <Card title="Security" icon="lock" href="/rollingrecord/app/security/overview">App Lock, encryption, recovery.</Card>
+  <Card title="Recording" icon="microphone" href="/rollingrecord/app/recording/overview">
+    Manual and rolling capture, the foreground service and state machine, formats, segment rotation, tiles, and interruption recovery.
+  </Card>
+  <Card title="Playback" icon="play" href="/rollingrecord/app/playback/overview">
+    Session detail, the waveform, notes and live marks, trim, and rolling-session continuations.
+  </Card>
+  <Card title="AI & Intelligence" icon="wand-magic-sparkles" href="/rollingrecord/app/ai/overview">
+    The KB-chat agent loop, semantic search, on-device embeddings, extraction jobs, templates, tasks, and synthesis.
+  </Card>
+  <Card title="Transcription" icon="closed-captioning" href="/rollingrecord/app/transcription/overview">
+    The local engine, cloud transcription, and the transcript UI.
+  </Card>
+  <Card title="Sync & Cloud" icon="cloud" href="/rollingrecord/app/sync/overview">
+    The outbox engine, reconcile engine, audio sync, cloud prefetch, sync preferences, and trash / free-up.
+  </Card>
+  <Card title="Security" icon="lock" href="/rollingrecord/app/security/overview">
+    App Lock, PIN and biometrics, envelope encryption, the DB key, backup/restore, and database recovery.
+  </Card>
+  <Card title="Auth & Account" icon="user" href="/rollingrecord/app/auth/login-flow">
+    Clerk login, identity resolution, JWT interceptors, profile, account settings, health, and deletion.
+  </Card>
+  <Card title="Monetization" icon="credit-card" href="/rollingrecord/app/monetization/tiers">
+    The four tiers, RevenueCat entitlements, feature gating, usage metering, and client-side rate limiting.
+  </Card>
+  <Card title="Platform" icon="gear" href="/rollingrecord/app/platform/settings">
+    App Check, networking, logging, analytics, notifications, WorkManager, settings, permissions, and system monitors.
+  </Card>
+  <Card title="Architecture" icon="sitemap" href="/rollingrecord/app/architecture/app-shell">
+    The app shell, Compose navigation, Koin DI, the user-session scope, the local database, and shared modules.
+  </Card>
 </CardGroup>
 
-<Note>
-Scaffold generated from the codebase map — expand with full detail, examples, and specifics.
-</Note>
+## The four tiers
+
+The feature set is defined in `UserTier.kt` (`data/models/UserTier.kt`) as four tiers, each a strict superset of the one below:
+
+| Tier | Adds |
+| --- | --- |
+| **Free** | Manual + rolling recording, playback, local transcription — a finished product, not a crippled one. |
+| **Pro** | Scheduled recordings, trim, and the other paid on-device features. |
+| **Pro+Cloud** | Encrypted cross-device sync and cloud audio backup. |
+| **Cloud+AI** | Cloud transcription, the AI knowledge base, extraction, and synthesis. |
+
+Tier is resolved from RevenueCat entitlements and enforced both client-side (feature gating) and server-side (the Edge Function gate chain). See [Tiers](/rollingrecord/app/monetization/tiers) and [Feature gating](/rollingrecord/app/monetization/feature-gating).
+
+## Cross-cutting foundations
+
+- **Single-Activity Compose.** One Activity hosts the V2 Compose UI; navigation, theme, and gating live under `ui/v2`. See [UI & navigation](/rollingrecord/app/architecture/ui-and-navigation).
+- **Per-user session isolation.** Koin app-level singles plus a `UserSessionScope` that is torn down and rebuilt on every sign-in / sign-out, so no account's state leaks into the next. See [User-session scope](/rollingrecord/app/architecture/user-session-scope).
+- **Encrypted at rest.** Audio and the Room database are sealed with per-recording data keys and a database key, wrapped by envelope encryption. See [Envelope encryption](/rollingrecord/app/security/envelope-crypto).
+- **The agent loop is shared code.** The KB-chat loop runs the same `app/agentcore` code the eval harness drives, so what ships is what's tested. See [Agent loop](/rollingrecord/app/ai/agent-loop).
+
+## Where to go next
+
+- [Recording overview](/rollingrecord/app/recording/overview) — the capture pipeline, the two modes, and recovery.
+- [AI overview](/rollingrecord/app/ai/overview) — the knowledge base, extraction, and search.
+- [Sync overview](/rollingrecord/app/sync/overview) — how recordings move across devices and to the cloud.
+- [Security overview](/rollingrecord/app/security/overview) — App Lock, encryption, and recovery.
+- [Architecture: app shell](/rollingrecord/app/architecture/app-shell) — how the app is wired together.

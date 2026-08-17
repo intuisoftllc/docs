@@ -1,15 +1,96 @@
 ---
 title: "Wire Format & Transforms"
-description: "The wire shape and per-entity transforms used by sync."
+description: "The WireEntity registry, the WireTransform dispatcher, per-entity build/apply extension functions, encrypted ciphertext/IV column pairs, and liberal ISO timestamp handling."
 ---
 
-Sync converts between local rows and the wire shape through per-entity transforms.
+The transform layer converts between local Room rows and the server wire shape. `WireEntity` is the client mirror of the server registry; `WireTransform` dispatches each `(entity, row)` to per-entity extension functions; `SyncTransformHelpers` owns the crypto and timestamp primitives they all share. There is no `WireToRoom.kt` file — the dispatcher is `WireTransform.kt`, and per-entity logic lives in `data/sync/transform/<Entity>Transform.kt` as DAO extension functions.
 
-## What this covers
+## `WireEntity` registry
 
-- `WireEntity` / `WireTransform` and the per-entity transforms under `data/sync/transform` (`RecordingTransform`, `ContextTransform`, `TranscriptTransform`, `SettingsTransform`, etc.).
-- `SyncApi` endpoints and `SyncTransformHelpers`.
+`WireEntity` (`data/sync/WireEntity.kt`) enumerates the 14 wire entities. Each carries a `wireName` (must match the server registry exactly — `sync-pull` keys `entities` by it and `sync-push` requires it on every op), a local `tableName`, and a `group`. `fromWireName` does the reverse lookup.
 
-<Note>
-Scaffold generated from the codebase map — expand with full detail, examples, and specifics.
-</Note>
+| `wireName` | local `tableName` | group | PK shape |
+| --- | --- | --- | --- |
+| `recording` | `recordings` | `RECORDINGS` | single `id` |
+| `recording_session` | `recording_sessions` | `RECORDINGS` | single `id` |
+| `transcript` | `transcripts` | `RECORDINGS` | `id` = `recordingId` |
+| `recording_note` | `recording_notes` | `RECORDINGS` | single `id` |
+| `context` | `contexts` | `CONTEXTS` | single `id` |
+| `context_card` | `context_cards` | `CONTEXTS` | `id` = `contextId` |
+| `action_item` | `action_items` | `CONTEXTS` | single `id` |
+| `context_recording` | `context_recordings` | `CONTEXTS` | composite (`context_id`, `recording_id`) |
+| `context_session` | `context_sessions` | `CONTEXTS` | composite (`context_id`, `session_id`) |
+| `category` | `categories` | `CATEGORIES` | single `id` |
+| `scheduled_recording` | `scheduled_recordings` | `SCHEDULES` | single `id` |
+| `search_thread` | `search_threads` | `THREADS` | single `id` |
+| `search_message` | `search_messages` | `THREADS` | single `id` |
+| `settings` | `user_settings_datastore` (placeholder) | `SETTINGS` | DataStore blob |
+
+The `settings` `tableName` is a placeholder string — SETTINGS lives in DataStore, not Room, and is handled via `SettingsTransform` (see [Sync Preferences](/rollingrecord/app/sync/sync-preferences)). The same file defines `data.sync.SyncGroup` (`RECORDINGS`, `CONTEXTS`, `CATEGORIES`, `SCHEDULES`, `THREADS`, `SETTINGS`).
+
+## `WireTransform` dispatcher
+
+`WireTransform` (`data/sync/WireTransform.kt`) routes `(entity, wireRow)` on pull and `(entity, rowId)` on push to the matching DAO extension:
+
+- **Pull:** `applyPulledRow` → `applyPulled<Entity>(wireRow, dek)` per DAO.
+- **Push:** `buildPushRow` → `build<Entity>WireRow(rowId, dek)` per DAO.
+
+It obtains the user DEK from `SessionDekHolder` via `requireUserDek()`, which throws `DekUnavailableException(reason)` when the DEK can't be obtained (offline `network_error`, or `subscription_required`). This is a **transient, whole-batch** condition — callers must treat it as "retry later" and leave the outbox intact, never as a reason to drop or orphan-sweep an entry (see the pack-loop invariant in [Sync Outbox & Enqueue](/rollingrecord/app/sync/outbox-engine)).
+
+`tryApplyOrDefer`, `drainPending`, and the `pending_pull_apply` FK-defer queue live here too — covered on the [Pull & Reconciliation](/rollingrecord/app/sync/reconcile-engine) page.
+
+## `SyncTransformHelpers` — shared primitives
+
+Each `<Entity>Transform.kt` file has an `applyPulled<Entity>` and a `build<Entity>WireRow` extension; `SyncTransformHelpers` (`data/sync/transform/SyncTransformHelpers.kt`) owns the primitives they share:
+
+- **Crypto:** `freshIv()` (12-byte AES-GCM IV), `decryptWireField` / `decryptOptionalWireField`, `putEncryptedField` / `putOptionalEncryptedField`.
+- **Composite ids:** `encodeCompositeRowId` / `decodeCompositeRowId` with `COMPOSITE_DELIM = "::"` (a delimiter that can't occur inside a UUID).
+- **Field extraction:** `requireStr` / `optStr` / `requireLong` / `optIso...` and friends, treating JSON `null` as absent.
+- **Tombstone detection:** `isTombstoned()` — true iff a non-null `deleted_at` is present.
+- **Timestamps:** `parseIsoMillis` / `isoFromMillis`, plus the builder helpers `putIso` / `putOptIso` / `putIsoIfSet` / `putOptStr`.
+
+### Encrypted column pairs
+
+Every encrypted field on the wire is a `{field}_ct` + `{field}_iv` pair — base64 AES-256-GCM ciphertext and the 12-byte IV. `putEncryptedField(baseName, plaintext, dek)` generates a fresh IV, encrypts, and writes both halves; `decryptWireField(wireRow, baseName, dek)` reverses it. `putOptionalEncryptedField` emits explicit JSON `null` for both halves when the plaintext is null, so the server sees an intentional unset rather than a missing field.
+
+### Liberal ISO parsing
+
+`parseIsoMillis` is deliberately liberal on input (Postel) but strict on failure, because these values feed last-write-wins conflict resolution — substituting a made-up time for a corrupt row risks silent data loss, whereas failing the row is recoverable.
+
+| Form | Parser |
+| --- | --- |
+| `2026-06-24T03:25:26.273Z` | `Instant.parse` |
+| `2026-06-24T03:25:26.273+00:00` | `OffsetDateTime.parse` (the numeric-offset form once threw at index 23 and stalled an entire pull) |
+| `2026-06-24T03:25:26.273` (no offset) | `LocalDateTime.parse` as UTC |
+| anything else | throws `DateTimeParseException` (row fails rather than risk LWW data loss) |
+
+### Absent vs explicit-null on push
+
+`putIsoIfSet(key, millis)` omits the key entirely when null, whereas `putOptIso` emits an explicit JSON null. The difference is the whole point: an explicit null tells the server "clear this", an absent key tells it "I have nothing to say". For a field this device may simply not know yet (another device set it, or our own commit hasn't landed), absent is the only honest encoding — a pushed null would overwrite server state this device never observed. `RecordingTransform` uses `putIsoIfSet` for `cloud_backup_committed_at` precisely because an errant null there once let a sweeper destroy a real backup's crypto columns.
+
+## Server-authoritative fields in `RecordingTransform`
+
+`RecordingTransform` (`data/sync/transform/RecordingTransform.kt`) is the most involved transform because the recording row carries both content and cloud-lifecycle state. `applyPulledRecording`:
+
+- **Canonicalizes ids** to the `rec-` prefix via `IdPrefix.formatRecording` (idempotent) so a bare-uuid server row and its prefixed junction don't miss on exact match.
+- **Detects the demote signal** — a rolling row arriving with `protected_at == null` and *not* tombstoned means another device un-protected it; handled before the tombstone check (see the [rolling demote](/rollingrecord/app/sync/audio-sync)).
+- **Reads `cloud_excluded_at`, `trashed_at`, and `cloud_backup_committed_at` from the wire** and applies them server-authoritatively (via `optIsoMillis`) so a "keep local" / trash / commit on any device propagates on the next pull. These are the fields that would be silently nulled if the transform didn't read them.
+- **Merge-protects the name** — when a row is cloud-excluded and the pulled `name` is null (the cloud copy was stripped to keep the title private to the origin device), it preserves the existing local name rather than erasing the title the user still holds.
+- **Invalidates a stale local blob** — if the wire `cloud_backup_committed_at` is newer than the local one, it clears `filePath` and flips `cloudOnly` so the download path re-fetches the current audio.
+
+`buildRecordingWireRow` mirrors this on push, encrypting the name via `putOptionalEncryptedField` and using `putOptIso` / `putIsoIfSet` per the absent-vs-null distinction above.
+
+## Composite-PK junctions
+
+`ContextRecordingTransform` (`data/sync/transform/ContextRecordingTransform.kt`) and its sibling `ContextSessionTransform` break the single-`id` assumption. They emit **both** PK halves (`context_id` + `recording_id` / `session_id`) and no top-level `id`, decode the outbox rowId via `decodeCompositeRowId`, and carry no encrypted fields (all UUIDs + timestamps). The buildTombstone path in `SyncEngine` has matching special cases so a junction tombstone emits the composite parts the server's registry-driven validation expects.
+
+## The transform files
+
+The 14 per-entity files under `data/sync/transform/` are: `RecordingTransform`, `RecordingSessionTransform`, `RecordingNoteTransform`, `TranscriptTransform`, `CategoryTransform`, `ContextTransform`, `ContextCardTransform`, `ActionItemTransform`, `ContextRecordingTransform`, `ContextSessionTransform`, `ScheduledRecordingTransform`, `SearchThreadTransform`, `SearchMessageTransform`, and `SettingsTransform` — plus `SyncTransformHelpers` and `SettingsBlob`. Adding an entity means writing its transform file, adding a `when` branch in `WireTransform`, and injecting its DAO.
+
+## Where to go next
+
+- [Sync & Cloud Overview](/rollingrecord/app/sync/overview) — where the transform layer sits.
+- [Sync Outbox & Enqueue](/rollingrecord/app/sync/outbox-engine) — how `buildPushRow` and `DekUnavailableException` drive the push.
+- [Pull & Reconciliation](/rollingrecord/app/sync/reconcile-engine) — `applyPulledRow`, `tryApplyOrDefer`, and the FK-defer queue.
+- [Sync Preferences](/rollingrecord/app/sync/sync-preferences) — the SETTINGS entity and `SettingsTransform`.

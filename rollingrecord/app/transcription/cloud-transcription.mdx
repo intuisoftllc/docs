@@ -1,15 +1,108 @@
 ---
-title: "Cloud Transcription (AssemblyAI)"
-description: "Server-side transcription, allotments, and Medical Mode."
+title: "Cloud Transcription"
+description: "The client side of RollingRecord's cloud transcription: a four-step async AssemblyAI flow (upload_init → PUT → submit → poll fetch) driven by TranscriptionWorker through the ai-engine Edge Function, with upload dedupe, adaptive polling, retries, Medical Mode, and monthly minute allotments."
 ---
 
-Cloud transcription sends audio to a server-side AssemblyAI pipeline, metered by monthly minute allotments.
+Cloud transcription is the app's only real transcription path. `TranscriptionWorker` (`worker/TranscriptionWorker.kt`) runs a four-step async webhook flow against the backend `ai-engine` Edge Function via `AiEngineClient`, then persists the resulting text and per-word timing. The specific AssemblyAI model is a server-side detail — the client only knows it is the "Cloud AI" engine and forwards the user's diarization, Medical Mode, and language choices.
 
-## What this covers
+## The four-step async flow
 
-- Server-side AssemblyAI Universal-2 via the `AiEngineClient` transcribe path; `TranscribeModels`, `InMemoryTranscribeUploadCache`.
-- Monthly minute allotments (Pro+Cloud vs Cloud+AI), Medical Mode, and the re-transcribe usage warning for long recordings.
+The old synchronous server-side polling design was killed by Supabase Edge Function wall-clock limits on long AssemblyAI jobs. The server now submits the job with a webhook callback and returns immediately; the `assemblyai-webhook` Edge Function writes the encrypted result row, and the client fetches it. `TranscriptionWorker.transcribeViaProxy` is the entry point.
 
-<Note>
-Scaffold generated from the codebase map — expand with full detail, examples, and specifics.
-</Note>
+| Step | Operation | Client action | Key result |
+| --- | --- | --- | --- |
+| 1 | `transcribe_upload_init` | `AiEngineClient.transcribeUploadInit(ext, recordingId, diarize, medical, lang)` | signed `upload_url` + `transcribe_job_id`, or `deduplicated = true` (skip the PUT) |
+| 2 | out-of-band PUT | PUT audio bytes to `upload_url` via the `audio_signed_url` OkHttpClient | audio lands in Storage `transcribe-inbox/` |
+| 3 | `transcribe_submit` | `transcribeSubmit(jobId, diarize, medical, lang)` | server submits to AssemblyAI with a webhook, returns `duration_ms` immediately (no text) |
+| 4 | `transcribe_fetch` (poll) | poll on an adaptive cadence until the status resolves | `completed` → text + words, else `error` / `cancelled` / `still_processing` |
+
+`uploadAudio` does steps 1 and 2; `submitOrAcceptAlreadyProcessing` does step 3; `pollUntilDone` does step 4. `tryPreflightFetch` short-circuits a cached job that already completed during a gap between attempts.
+
+## Retrofit surface
+
+`AiEngineApi` (`data/remote/aiengine/AiEngineApi.kt`) exposes three transcribe methods — `transcribeUploadInit`, `transcribeSubmit`, `transcribeFetch` — each a `@POST("functions/v1/" + FN_AI_ENGINE)` (`FN_AI_ENGINE = "ai-engine"`) tagged `@EdgeTag(FN_AI_ENGINE)` and returning `Response<ResponseBody>`. All three operations share the single `ai-engine` endpoint; the `operation` field in the request body selects behavior.
+
+`AiEngineClient` (`data/remote/aiengine/AiEngineClient.kt`) wraps each in a suspend function that builds the typed body and returns an `AiEngineResult<T>`:
+
+- `transcribeUploadInit(fileExtension, recordingId?, diarize?, medicalMode?, languageCode?)`
+- `transcribeSubmit(transcribeJobId, diarize, medicalMode, languageCode?)`
+- `transcribeFetch(transcribeJobId)`
+
+## Wire types
+
+The request/response shapes live in `data/remote/aiengine/model/TranscribeModels.kt`.
+
+- **`TranscribeUploadInitInput`** — `file_extension`; `recording_id?` (enables cross-device dedup, RR-434); `diarize?` / `medical_mode?` / `language_code?` (display metadata declared early so the ops console has something to show before submit). **`TranscribeUploadInitResponse`** — `transcribe_job_id`, `upload_url` (empty when deduplicated), `storage_path`, `deduplicated` (true ⇒ another device already uploaded; skip the PUT).
+- **`TranscribeSubmitInput`** — `transcribe_job_id`; `diarize` (→ AssemblyAI `speaker_labels`); `language_code?` (null ⇒ auto-detect; never send the literal `"auto"`); `medical_mode` (RR-467). **`TranscribeSubmitResponse`** — `transcribe_job_id`, `assemblyai_transcript_id?` (informational), `duration_ms` (server-measured).
+- **`TranscribeFetchResponse`** — `status` (see table below), plus `transcript_text?`, `words?`, `billed_ms?`, `duration_ms?` / `duration_seconds?`, `error_message?`, `error_code?`, and `job_status?`. A genuine missing/expired job surfaces as HTTP 404 `transcribe_result_not_found`, not as a `status`.
+
+### `transcribe_fetch` status values
+
+| `status` | Meaning | Worker handling |
+| --- | --- | --- |
+| `completed` | transcript ready | `extractTranscript` → `markDone`; evict cache; enqueue embedding reconcile |
+| `error` | provider/drain failure | `PermanentAiEngineException` → `markError`; a `provider_rate_limited` code also tracks `TranscriptionRateLimited` |
+| `cancelled` | operator/support stopped the job | `TranscriptionCancelledException` → `markNotStarted` — not an error, re-runnable |
+| `still_processing` | not done yet | keep polling until `MAX_POLL_DURATION_MS`, then transient retry |
+
+## Word mapping
+
+`TranscribeWord` (in `TranscribeModels.kt`) is the server word shape: `text` (punctuation preserved), `start`/`end` (milliseconds, `Int`), `confidence` (`Float`, 0–1), and `speaker?` (`"A"`, `"B"`, … when diarization is on). `TranscriptionWorker.serializeWordsJson` maps each to the persisted `TranscriptWord` (`data/remote/TranscriptWord.kt`) — `start`/`end` divided by 1000 to seconds, and `mapSpeakerTag` converting `"A"` → `0`, `"B"` → `1`, etc. — before saving to `TranscriptEntity.wordsJson`.
+
+## The upload PUT and its dedicated client
+
+Step 2 PUTs the raw audio to the signed Storage URL using an OkHttpClient injected as `named("audio_signed_url")` — connect 30s / read 2m / write 15m. The default `OkHttpClient()` uses 10s timeouts everywhere, which is far too tight for multi-MB audio on cellular and was the cause of a `SocketTimeoutException` on a 71 MB upload.
+
+Before uploading, `mimeTypeFor` sniffs the file's magic bytes (MPEG-4 `ftyp`, RIFF, OggS, ID3, fLaC, ADTS) to pick the container-accurate extension and content-type — so a `.aac` file that is actually MPEG-4 gets stored as `.m4a` and Storage serves AssemblyAI something it can read. `validateAudioFile` runs a `MediaExtractor` up front to reject 0-track / corrupt files (e.g. a recording interrupted before its `moov` atom was written) before spending an upload on them.
+
+## Upload dedupe cache
+
+`InMemoryTranscribeUploadCache` (`data/remote/aiengine/transcribe/InMemoryTranscribeUploadCache.kt`) is a per-user (`UserSessionScope`) `ConcurrentHashMap` of `recordingId → Entry(transcribeJobId, storagePath, uploadedAtMs, submitSucceeded)`. On a retry the worker reuses an already-uploaded job instead of re-uploading the whole file. This is a cost/battery optimization, not a correctness feature — if the cache is bypassed, behavior falls back to re-upload-every-retry.
+
+- `markSubmitted` flips `submitSucceeded` so a retry after a poll failure resumes polling instead of re-submitting (re-submitting an in-flight job made the server handler throw).
+- Entries evict on terminal success or terminal failure, and expire after `TTL_MS = 20 hours` — comfortably under the server's 24-hour `transcribe_jobs` cleanup, so a cached job id is essentially never swept server-side before the client expires it.
+
+## Adaptive polling and retries
+
+`pollUntilDone` uses an adaptive cadence because every fetch is a billed Edge Function invocation. A fresh submit seeds the first wait from audio duration (AssemblyAI can't be done 3s after a long file is submitted); subsequent gaps ramp geometrically from the base to the cap. The internal retry loop keeps the foreground service (and its "Transcribing…" notification) alive across transient failures instead of tearing it down between `Result.retry()` attempts.
+
+| Constant (`TranscriptionWorker` companion) | Value | Purpose |
+| --- | --- | --- |
+| `POLL_RAMP_BASE_MS` | `5000` | base poll gap |
+| `POLL_RAMP_FACTOR` | `1.6` | geometric ramp multiplier |
+| `POLL_RAMP_CAP_MS` | `30000` | max poll gap |
+| `INITIAL_POLL_DURATION_FRACTION` | `0.15` | first-poll delay = 15% of audio duration (clamped) |
+| `INITIAL_POLL_DELAY_CAP_MS` | `60000` | cap on the duration-seeded first delay |
+| `MAX_POLL_DURATION_MS` | 5 min | ceiling per poll attempt; timeout ⇒ transient |
+| `MAX_INTERNAL_ATTEMPTS` | `3` | internal retries before handing off to WorkManager |
+| `MAX_TOTAL_WORK_MS` | 25 min | wall-clock budget, under Android's 30-min FGS limit |
+| `InMemoryTranscribeUploadCache.TTL_MS` | 20 h | cached-upload reuse window |
+
+### Error classification
+
+The worker classifies each failure against the `AiEngineResult` / exception types (`data/remote/aiengine/`):
+
+- **Permanent** (`markError`): `Cap`, `SubscriptionRequired`, `Forbidden`, permanent `Upstream` (< 500), non-auth `DeveloperError`.
+- **Transient** (internal retry, then WorkManager retry): `ServiceUnavailable`, `RateLimited`, `Network`, `Upstream` (≥ 500), transient-auth `DeveloperError` (missing bearer / invalid JWT / invalid App Check — short-lived auth-state races), and a mid-poll `NotFound`.
+- **Connectivity errors** (via `NetworkErrorClassifier`) fail fast — skipping the internal retry loop — and stamp the `NETWORK_ERROR_MESSAGE = "transcription_network_error"` sentinel so the UI can show offline-specific copy. A poll *timeout* is deliberately wrapped as `ServiceUnavailable` (server slowness, device is online) rather than `Network`, so it is not treated as offline and still allows a late webhook to be picked up on a later attempt.
+
+## Metering and minute allotments
+
+On a completed transcription the worker calls `UsageRepository.invalidate()` immediately before `markDone`, dropping the usage cache's freshness stamp so the next cap read refetches the server-consumed quota. **Only successful transcriptions bill** — failures and support-cancellations do not consume minutes, and the server is authoritative for the `TRANSCRIPTION_MS` counter.
+
+The monthly minute caps come from `ServerConfig` (`app/agentcore/src/main/kotlin/com/intuisoftllc/rollingrecord/config/ServerConfig.kt`). `V2PlaybackViewModel` picks `cloudAiTranscriptionMinutesPerMonth` when the tier is at least `PRO_CLOUD_AI`, otherwise `proCloudTranscriptionMinutesPerMonth`. These are cold-start defaults — the live `server_config` value overrides them, so treat the numbers as defaults, not fixed guarantees.
+
+| Tier | Default minutes/month | Constant |
+| --- | --- | --- |
+| Pro+Cloud | 480 | `proCloudTranscriptionMinutesPerMonth` |
+| Cloud+AI | 1200 | `cloudAiTranscriptionMinutesPerMonth` |
+
+## Medical Mode
+
+Medical Mode is a per-user setting (`medicalModeEnabled`, default `false`) forwarded to the server as `medical_mode: Boolean`. When on, the server routes transcription through a domain-specialized medical model, and it is a per-op cost **multiplier**: the settings copy (`settings_medical_confirm_body`) tells the user each minute counts as some multiple against their monthly transcription hours while Medical Mode is on. The client only forwards the flag; the multiplier is applied and billed server-side.
+
+## Where to go next
+
+- [Transcription Overview](/rollingrecord/app/transcription/overview) — the subsystem map: data model, worker, triggers, gating.
+- [On-Device Transcription](/rollingrecord/app/transcription/local-engine) — why there is no local engine.
+- [Transcript UI](/rollingrecord/app/transcription/transcript-ui) — how a finished transcript is displayed.

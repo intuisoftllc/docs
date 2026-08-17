@@ -1,15 +1,72 @@
 ---
 title: "Account Deletion"
-description: "The account-deletion flow and its server cascade."
+description: "The OTP-gated confirm sheet, the AccountDeletionCoordinator server + local wipe cascade, its result states, and the local-only Remove-from-device variant."
 ---
 
-Account deletion drives the server delete cascade and tears down local data, aligned with GDPR erasure.
+`AccountDeletionCoordinator` (`data/account/AccountDeletionCoordinator.kt`, RR-344) mirrors the server `/delete-user` cascade in client scope. It runs the server delete first, aborts on any failure with local state untouched, then signs out and recursively wipes every per-user artifact on disk. A local-only variant does the same wipe without the server call.
 
-## What this covers
+## `coordinate(otpTicket)` ordering
 
-- `AccountDeletionCoordinator` and `DeleteUserRequest` driving the server `delete-user` cascade.
-- Local teardown and GDPR erasure alignment.
+The server call happens **first**, and a non-2xx aborts before any local state is touched — so a server failure never leaves the user with wiped-local, intact-cloud state. The `authUserId` is captured before the server call because the file paths to delete live under `{authUserId}/`.
 
-<Note>
-Scaffold generated from the codebase map — expand with full detail, examples, and specifics.
-</Note>
+| Step | Action | On failure |
+| --- | --- | --- |
+| 1 | Capture `authUserId` (`AuthUserStore.getCurrentUserId`) | `null` → `NoSignedInUser`, nothing touched |
+| 2 | `SupabaseApi.deleteUser(DeleteUserRequest(otpTicket))` | throw → `NetworkError`; non-2xx → `ServerFailed(code, body)`; local untouched |
+| 3 | Handle reset: Clerk `signOut`, RevenueCat `logOut`, `AuthUserStore` clear, session `switchTo(null)` | error collected, continue |
+| 4 | Recursive filesystem wipe of every per-user path | each error collected → `PartialSuccess` |
+
+Steps 3 and 4 are the shared tail (`wipeLocalAndSignOut`). The coordinator does **not** clear the `viewModelStore` or navigate — on any non-failure result its sign-out makes `authState` emit `SignedOut`, and V2App swaps to the login host on its own.
+
+## Local wipe targets
+
+Step 4 walks every per-user root recursively, so it removes untracked strays alongside the rows the DB knows about. Each step continues on failure and collects the error — a partial wipe beats no wipe — and `auditResidualBytes` reports any leftover bytes.
+
+| Target | Path / mechanism |
+| --- | --- |
+| Room DB | `databases/{authUserId}/` (+ WAL/SHM sidecars) |
+| Recordings | `filesDir/recordings/{authUserId}/` |
+| Cloud-download staging | `cacheDir/cloud-downloads/{authUserId}/` + `filesDir/download-staging/{authUserId}/` |
+| Coil image cache | `filesDir/image_cache/{authUserId}/` |
+| Per-user DataStore | `filesDir/datastore/user/{authUserId}.preferences_pb` |
+| App logs | `FileLogger.clearLogsForUser(authUserId)` |
+| Cache artifacts | backup/restore ZIPs, trim previews, exports, `profile_photos`, merged log bundles |
+| Crypto keys | `DekKeyStore.clear(context, authUserId)` |
+
+## `removeFromDevice()` — the local-only variant
+
+`removeFromDevice()` runs the identical sign-out + filesystem wipe from Step 3 onward but deliberately **skips** the `/delete-user` server call: the cloud account and all its server-side data stay intact, and the user can sign back in here or on any device to re-download. It is surfaced by `V2RemoveFromDeviceSheet`, whose body copy warns that any not-yet-synced local data is permanently lost. Because there is no server round-trip, its only reachable results are `Success`, `PartialSuccess`, and `NoSignedInUser`.
+
+## `AccountDeletionResult`
+
+| Result | Meaning | Reachable from |
+| --- | --- | --- |
+| `Success` | Server + local wipe fully clean | `coordinate`, `removeFromDevice` |
+| `PartialSuccess(localWipeErrors)` | Server deleted / detach done; local wipe had non-fatal errors | `coordinate`, `removeFromDevice` |
+| `ServerFailed(httpCode, body)` | Server rejected the delete; local untouched | `coordinate` only |
+| `NetworkError(cause)` | Couldn't reach the server; local untouched | `coordinate` only |
+| `NoSignedInUser` | No signed-in user (defensive) | `coordinate`, `removeFromDevice` |
+
+## The OTP-gated confirm sheet
+
+The UI gate for full deletion is `V2DeleteAccountSheet` (`ui/v2/screens/accountsettings/components/V2DeleteAccountSheet.kt`), a cancel-only, non-swipeable 3-step flow that cannot be dismissed by swipe, scrim, or back — only an explicit Cancel exits. `DeleteStep { CONFIRM, OTP, TYPE }`:
+
+1. **CONFIRM** — "Are you sure?", before any email is sent, so a mis-tap costs nothing.
+2. **OTP** — a fresh email code entered via `V2OtpCodeStep` with `OtpPurpose.ACCOUNT_DELETION`; verifying it mints the single-use ticket.
+3. **TYPE** — the user types the required phrase (`DELETE`) exactly, case-sensitive.
+
+`onConfirm(otpTicket)` fires only after OTP verify AND a matching typed phrase. `OtpPurpose` (`data/remote/accountotp/OtpPurpose.kt`) is the client mirror of the server OTP allowlist — `APP_LOCK_PIN_RESET("app_lock_pin_reset")` and `ACCOUNT_DELETION("account_deletion")`; deletion uses the latter.
+
+## The wire call
+
+`DeleteUserRequest` (`data/remote/dto/DeleteUserRequest.kt`) is the `@Serializable` body carrying a single field, `@SerialName("otp_ticket") otpTicket: String` — the single-use step-up ticket the server consumes before wiping. `SupabaseApi.deleteUser` (`data/remote/SupabaseApi.kt`) is `@POST("functions/v1/delete-user")` with `@EdgeTag(FN_DELETE_USER)`, `suspend fun deleteUser(@Body DeleteUserRequest): Response<Unit>`. A missing/expired ticket returns 403 → `AccountDeletionResult.ServerFailed`, local state untouched.
+
+## Screen triggers
+
+`runDeletion` / `runRemoval` (`ui/v2/screens/accountsettings/V2AccountSettingsScreen.kt`) are the screen-level triggers. Both block if `RecordingService` is `RECORDING` / `PAUSED` (snackbar), run the coordinator under `withContext(NonCancellable)` behind a blocking wipe veil, and rely on the coordinator's sign-out (→ V2App routes to login) instead of manual navigation. Deletion maps `ServerFailed` / `NetworkError` / `NoSignedInUser` to snackbars; `Success` / `PartialSuccess` are silent because the screen swaps out.
+
+## Related pages
+
+- [Account Settings](/rollingrecord/app/auth/account-settings)
+- [Account Health & Freeze](/rollingrecord/app/auth/account-health)
+- [Account Profile](/rollingrecord/app/auth/profile)

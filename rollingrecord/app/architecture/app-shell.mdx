@@ -1,16 +1,113 @@
 ---
 title: "Application Shell & Entry Points"
-description: "The Application class, single-Activity host, and cold-start responsibilities."
+description: "The Application class, the single-Activity host, and cold-start / entry-point responsibilities in the V2 app."
 ---
 
-The app boots through a single Application class and a single-Activity host that own startup, entry points, and the app-lock overlay.
+RollingRecord boots through two classes: `App` (the `Application`) does all process-wide wiring in `onCreate`, and `MainActivity` (a single, `singleTask`, LAUNCHER `FragmentActivity`) hosts the entire UI and reads a device preference to branch into the active V2 Compose tree.
 
-## What this covers
+## `App` — the Application
 
-- `App.kt` Application class (Koin startup, Clerk/Firebase init) and the single-Activity host `MainActivity.kt`.
-- `AuthCallbackActivity.kt` for OAuth / deep-link callbacks; share-intent admission in `MainActivity.handleShareIntent` (`ACTION_SEND` / `ACTION_SEND_MULTIPLE`, gated to Pro).
-- Cold-start responsibilities: config-fetch kickoff, version gate, and app-lock overlay hosting.
+`App` (`App.kt`) is the `Application`, and also a `KoinComponent` and a `coil3.SingletonImageLoader.Factory`. Its `onCreate` runs a fixed initialization order — logging and crash reporting come up before Koin, SDKs are configured before the code that touches them, and the encrypted database is warmed off-thread so the first DAO query doesn't block on SQLCipher key derivation:
 
-<Note>
-Scaffold generated from the codebase map — expand with full detail, examples, and specifics.
-</Note>
+| # | Step | What it does |
+| --- | --- | --- |
+| 1 | `AppLogger.fileLogger = FileLogger(this)` | Wire the per-user file logger first so later init can persist with `save = true`. |
+| 2 | `AgentLog.warn/error/errorWithThrowable/debug` | Bind `:agentcore`'s pure logging hooks to `AppLogger` (no-op outside the app). |
+| 3 | `AppLogger.i("App")` `PROCESS_STARTED` | Cold-start marker with `BuildConfig.VERSION_NAME` / `VERSION_CODE`. |
+| 4 | `SessionMonitor.install(this)` | Must run before Koin/Firebase — detects whether the previous process was OS-killed. |
+| 5 | `installAppCheckProvider(appCheck)` | Firebase App Check, installed before any other Firebase call (source-set duplicated). |
+| 6 | `Purchases.configure(...)` | RevenueCat SDK, from `BuildConfig.REVENUECAT_API_KEY` (skipped + logged if empty). |
+| 7 | `DevFlags.init` + `DevChatTraceCapture.init` | Force `DevFlags` construction on the main thread outside any Compose snapshot. |
+| 8 | `Clerk.initialize(...)` | Clerk Auth, before Koin so `AuthRepository`'s `combine()` is valid at first collect. |
+| 9 | `CrashReporter.install(this)` | Crash handler, no Koin dependency. |
+| 10 | `startKoin { modules(...) }` | Start DI with the 12 modules below. |
+| 11 | `AppCheckWarmup.start()` | Warm the App Check token cache to beat the cold-start network race. |
+| 12 | DB warm (IO) | `ensureDekForRestoredSession()` then `userSession().get<AppDatabase>()` off-thread. |
+| 13+ | Observers + recovery | `registerAnalyticsLifecycleObserver`, `registerConnectivityRestoreCallback`, `flushPendingCrash`, OS-kill recovery, `recoverOrphanedMergeJobs`, `runPerUserRecovery`, `observeSessionSwitchesForRecovery`, config fetches, RevenueCat / App-Lock / tiles observers, `identityRepository.resolveIdentity()`. |
+
+The two config fetches at the end are best-effort — `ClientConfigManager.fetchAndApply(...)` (Firebase) and `serverConfigManager.fetchAndApply(force = true) { AppVersionGate.reevaluate() }` (Supabase). The app is fully functional on the baked-in `DEFAULT_*` values if either fetch fails. See [Client vs Server Configuration](/rollingrecord/app/architecture/config-split).
+
+### Per-user vs app-wide dependency reads
+
+`App` outlives every session switch, so a captured lazy would leak the previous user's instances into recovery coroutines that fire on sign-in. Per-user deps are declared with `by userProperty()` — a non-caching delegate that re-resolves from the current `UserSessionScope` on **every** read (`scheduleRepository`, `blueprintRepository`, `contextCardRepository`, `contextRepository`, `userSettingsDataSource`, `recordingRepository`, `storageManager`). App-wide deps that survive session switches use plain `by inject()` (`analyticsTracker`, `embeddingReconcileScheduler`, `revenueCatManager`, `identityRepository`, `serverConfigManager`, `userSessionManager`, `authRepository`, `appLockController`, `appLockConnectivity`). See [Per-User Session Scope](/rollingrecord/app/architecture/user-session-scope).
+
+### `newImageLoader` — per-user Coil cache
+
+`App.newImageLoader(context)` builds a Coil `ImageLoader` whose disk cache lives at `filesDir/image_cache/{authUserId|anonymous}` — the segment comes from `AuthUserStore.getActiveUserSegment`. Each user's avatar/thumbnail cache is isolated in its own folder (account deletion wipes only that folder), and the singleton is reset via `SingletonImageLoader.reset()` on every session switch so the loader rebuilds against the new user's directory.
+
+### `runPerUserRecovery`
+
+Every per-user recovery scan the app needs after a **session boundary** — cold start OR sign-in / sign-out — runs from `runPerUserRecovery()`. A sign-in is treated as semantically equivalent to "the app was force-stopped and is starting fresh for this user," so `observeSessionSwitchesForRecovery` re-invokes the same block on each `UserSessionManager.switchTo`. The scans: `reEnqueueSchedules`, `seedBlueprints`, `pullBlueprints`, `reconcileEmbeddings`, `wipeCloudDownloadStaging`, `recoverMissedEnqueues`, `auditMissingLocalFiles`, `auditOrphanedLocalFiles`, `recoverUnregisteredLocalFiles`, `runTrashSweeper`, `revertOrphanedExtractionSnapshots`, `cancelOrphanedExtractionWork`, `observeTierAndManageSchedulers`, `startSettingsSyncObserver`, `startProfileCache`. Each of these launches its work on `userSessionManager.sessionScope`, which cancels cleanly on the next switch — the exception is `wipeCloudDownloadStaging`, which runs **synchronously with no coroutine** (it iterates the two staging dirs and calls `deleteRecursively()` inline).
+
+## Koin modules loaded in `onCreate`
+
+`startKoin { modules(...) }` loads twelve modules in this order:
+
+| # | Module | `val` name |
+| --- | --- | --- |
+| 1 | Auth | `authModule` |
+| 2 | User session | `userSessionModule` |
+| 3 | Database | `databaseModule` |
+| 4 | DAOs | `daoModule` |
+| 5 | Data sources | `dataSourceModule` |
+| 6 | Repositories | `repositoryModule` |
+| 7 | Workers | `workerModule` |
+| 8 | Network | `networkModule` |
+| 9 | Services | `serviceModule` |
+| 10 | V1 ViewModels | `viewModelModule` |
+| 11 | V2 (VMs + `V2OnboardingSignals`) | `v2Module` |
+| 12 | Analytics | `analyticsModule` |
+
+See [Koin Dependency Injection](/rollingrecord/app/architecture/dependency-injection) for how bindings split by lifetime.
+
+## `MainActivity` — the single-Activity host
+
+`MainActivity` (`MainActivity.kt`) is the sole UI host. It extends `FragmentActivity` (RR-492) so the App-Lock `BiometricPrompt` has a `FragmentActivity` host — all `ComponentActivity` APIs (`setContent`, `enableEdgeToEdge`, `onNewIntent`) are inherited unchanged. It is declared `launchMode="singleTask"` and is the exported LAUNCHER.
+
+`onCreate` calls `enableEdgeToEdge()`, installs `AppLockBiometricGate.install(this)`, handles a tile-start intent, then reads the UI generation synchronously:
+
+```kotlin
+currentUiVersion = runBlocking {
+    UiVersion.fromString(deviceSettings.uiVersion.first())
+}
+```
+
+Blocking here (on the main thread, in `onCreate`, before `setContent`) makes the very first frame branch into the correct top-level tree with no flash of the prior generation. When `currentUiVersion == UiVersion.V2` it calls `setContent { V2App(...) }` and returns; otherwise it falls through to the legacy V1 `AppNavHost` path. **This documentation covers only the V2 branch** — see [UI & Navigation](/rollingrecord/app/architecture/ui-and-navigation).
+
+### One-shot nav latches into `V2App`
+
+Several `mutableStateOf` latches are hoisted on the Activity and threaded into `V2App` so both the cold-start (`onCreate`) and warm (`onNewIntent`) paths can drive navigation: `v2ScheduleListPending`, `v2RecordingRoutePending`, `v2ExternalAudioUriPending`, `v2AllRecordingsPending`, `v2ShareNeedsUpgradePending`. Each is paired with an `onConsumed` callback so a later launch can't re-route.
+
+The lifecycle callbacks drive App-Lock and the recording-route latch: `onStart`/`onStop` call `appLockController.onActivityStarted()`/`onActivityStopped()` (immediate, unlike ProcessLifecycle's debounced stop), and `onResume` re-arms `v2RecordingRoutePending` when `isRecordingActive()` reports a live recording.
+
+### Intent handling
+
+Companion extras: `EXTRA_NAVIGATE_TO_SETTINGS`, `EXTRA_START_ROLLING_RECORD`, `EXTRA_NAVIGATE_TO_SCHEDULE`, `EXTRA_NAVIGATE_TO_SCHEDULE_LIST`, plus the constant `ACCESS_RESOLVE_TIMEOUT_MS = 2_000`.
+
+- **`handleTileStartIntent`** — when a Quick Settings tile can't start the mic foreground service directly (Samsung / Android 14+ "eligible state" restriction) it opens `MainActivity` with `EXTRA_START_ROLLING_RECORD`, which routes through `gatekeeper.requestStart(RecordStartRequest(mode = ROLLING, source = TILE, requestForegroundRoute = true))`.
+- **`handleShareIntent`** — the sole tier-enforcement point for audio shares (`ACTION_SEND` / `ACTION_SEND_MULTIPLE`). `sharedAudioUris` reads `EXTRA_STREAM` with a `ClipData` fallback. Admission is decided here and nowhere else — the component-disable approach was removed because a reinstall wipes component-enabled state. Refusals fail closed: an anonymous session drops the share and opens sign-in; below Pro routes to `V2Upgrade`; Pro+ (`proAccessFlow == ProAccess.ALLOWED` within `ACCESS_RESOLVE_TIMEOUT_MS`) calls `RecordingImporter.import` and lands on All Recordings. Import is delivered through the `ShareReceiverAlias` activity-alias, not a second `MainActivity` intent-filter.
+- **`onNewIntent`** — routes tile-start, share, settings, schedule, schedule-list, and external-audio (`ACTION_VIEW`) intents to the matching V2 latch or V1 nav call.
+
+## `AuthCallbackActivity`
+
+`AuthCallbackActivity` (`AuthCallbackActivity.kt`) is a transparent trampoline for Clerk OAuth deep-link callbacks (Google OAuth and email OTP). `onCreate` passes `intent.data` to `Clerk.auth.handle(uri)`, then starts `MainActivity` with `FLAG_ACTIVITY_NEW_TASK | FLAG_ACTIVITY_CLEAR_TOP` and `finish()`. In the manifest it runs in its own task with `noHistory=true`; its deep-link scheme is `com.intuisoftllc.rollingrecord://auth-callback/`.
+
+## Manifest components
+
+| Component | Type | Role |
+| --- | --- | --- |
+| `MainActivity` | activity (`singleTask`, LAUNCHER) | Single UI host; MAIN + `ACTION_VIEW` `audio/*`. |
+| `ShareReceiverAlias` | activity-alias → `MainActivity` | `ACTION_SEND` / `ACTION_SEND_MULTIPLE` audio-share intake. |
+| `AuthCallbackActivity` | activity (`noHistory`, own task) | Clerk OAuth deep-link trampoline. |
+| `TileStartActivity` | activity | QS tile fallback launcher. |
+| `RecordingTileService` / `ProtectedModeTileService` | TileService | Quick Settings tiles. |
+| `RecordingService` | foreground service | Microphone recording FGS. |
+| `BootReceiver` / `ScheduleAlarmReceiver` / `PlaybackActionReceiver` | BroadcastReceiver | Boot, schedule alarms, notification playback actions. |
+
+## Where to go next
+
+- [UI & Navigation](/rollingrecord/app/architecture/ui-and-navigation) — the `V2App` composition root and the signed-in nav graph.
+- [Koin Dependency Injection](/rollingrecord/app/architecture/dependency-injection) — the twelve modules and the binding-lifetime split.
+- [Per-User Session Scope](/rollingrecord/app/architecture/user-session-scope) — how sign-in / sign-out rebuilds every per-user dependency.
+- [Room Database & SQLCipher](/rollingrecord/app/architecture/local-database) — the encrypted per-user database warmed off-thread here.
+- [Client vs Server Configuration](/rollingrecord/app/architecture/config-split) — the two config stores the shell fetches at startup.

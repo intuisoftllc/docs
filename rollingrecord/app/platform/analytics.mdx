@@ -1,15 +1,66 @@
 ---
 title: "Analytics & Crash Reporting"
-description: "Content-free analytics and crash/kill reporting."
+description: "Content-free typed analytics events, the Firebase/Crashlytics client, and the crash and OS-kill sentinels that survive process death."
 ---
 
-Analytics and crash reporting capture operational signals only — never customer content.
+`AnalyticsTracker` is the single entry point: it consent-gates a local Room event log and forwards typed `AnalyticsEvent`s to an `AnalyticsClient`. The bound implementation is `SupabaseFirebaseAnalyticsClient` — Firebase Analytics events, Crashlytics breadcrumbs, and non-fatals are live; the batch upload to a future Supabase `analytics_events` table is a Phase-6 stub. Crash and OS-kill survivability come from `CrashReporter` and `OsKillSentinel`, both writing to `SharedPreferences` with `commit()` during teardown and replaying on next launch.
 
-## What this covers
+## `AnalyticsTracker`
 
-- `AnalyticsTracker` / `AnalyticsClient` / `AnalyticsEvent`, `SupabaseFirebaseAnalyticsClient`, `AnalyticsDao` buffering.
-- `CrashReporter`, `OsKillSentinel`, `FlushTrigger`; content-free metrics only (per the privacy HARD RULE).
+`data/analytics/AnalyticsTracker.kt` is the single tracking entry point. `track(event, logToCrashlytics = false)` is fire-and-forget: it consent-gates (via `UserSettingsDataSource.analyticsTrackingEnabled`) the Room insert and `analyticsClient.logEvent`, always logs a Crashlytics breadcrumb, and optionally records a non-fatal. Per-user dependencies (the DAO and settings) resolve through `UserSessionManager.currentScope` on every call, so a session swap picks up the new user's instances without scoping the tracker itself. The tracker also holds the KB-chat draft `DataStore` (`saveDraft` / `loadDraft` / `clearDraft`) at `filesDir/datastore/device/analytics.preferences_pb`. `flush(trigger)` is currently a no-op — the Supabase send is commented out.
 
-<Note>
-Scaffold generated from the codebase map — expand with full detail, examples, and specifics.
-</Note>
+## `AnalyticsClient` and its implementation
+
+`data/analytics/AnalyticsClient.kt` is the interface over the remote backends: `sendEvents` (batch → Supabase, Phase 6), `logEvent` (typed → Firebase), `logException` (non-fatal), `logCustomEvent`, and `logBreadcrumb`. `NoOpAnalyticsClient` is an inert fallback, but the KDoc claiming it is what's injected is stale — `di/AnalyticsModule.kt` binds `SupabaseFirebaseAnalyticsClient` as the `AnalyticsClient` single, so the Firebase and Crashlytics paths are live in production.
+
+`data/analytics/SupabaseFirebaseAnalyticsClient.kt` caches the consent flag (`analyticsEnabled`) and fails *closed* the instant a session switches, re-reading the new user's preference before re-enabling. Live behavior:
+
+- `logEvent` maps ~14 event types to Firebase param maps (cost-metering-only events return `null` from `firebaseParams` and are skipped).
+- `logScreenView` fires a Firebase `SCREEN_VIEW`, but it is called **only** from `AppNavHost` (`ui/v1/navigation/AppNavHost.kt`) — the legacy V1 nav host. The active V2 surface (`V2LoginNavHost` / `V2MainNavHost` via `V2App`) never calls it, so `SCREEN_VIEW` does not fire on the current app surface.
+- `logException` records an `AnalyticsNonFatal` so the event surfaces in the Firebase Crashes tab.
+- `logBreadcrumb` appends to Crashlytics' rolling 64 KB buffer.
+- `sendEvents` is a Phase-6 stub that returns `true` without POSTing.
+
+There is no analytics Edge Function. The remote batch path targets a future Supabase `analytics_events` **table**, not a function, and is not yet wired.
+
+## `AnalyticsEvent`
+
+`data/analytics/AnalyticsEvent.kt` is the sealed set of every trackable event, each `@Serializable` with a `@SerialName` discriminator that becomes the `eventType` column. Fields are IDs, counts, durations, and enums only — no recording titles or transcript text. Events span cost (`KbChatTokensUsed`, `ThreadNamingTokensUsed`), transcription (`TranscriptionStarted` / `Completed` / `Failed` / `RateLimited`), KB chat (`KbChatMessageSent`, `KbWritePerformed`, `KbUndoPerformed`, `KbChatError`, `KbToolError`), extraction (`ExtractionTriggered` / `Failed`, `ExtractionTemplateUsed`), recordings (`RecordingStarted` / `Completed`), adoption (`ScopeFilterApplied`, `ThreadCreated`), and device/crash (`DeviceStorageFull`, `AppCrash`).
+
+| Event (`@SerialName`) | Firebase `logEvent` | Crashlytics non-fatal |
+| --- | --- | --- |
+| `recording_started` / `recording_completed` | yes | `RecordingCompleted` only |
+| `transcription_started` / `completed` / `failed` / `rate_limited` | yes | `TranscriptionFailed` only |
+| `extraction_triggered` / `extraction_failed` | yes | `ExtractionFailed` only |
+| `kb_message_sent` / `kb_chat_error` / `kb_write` / `kb_undo` / `thread_created` | yes | `KbChatError` only |
+| `app_crash` / `device_storage_full` | yes | yes |
+| `kb_chat_tokens` / `thread_naming_tokens` / `template_used` / `scope_filter_applied` / `kb_tool_error` | no (cost-metering only, `firebaseParams` returns `null`) | `KbToolError` as needed |
+
+"Content-free" holds for what leaves the device — Firebase params and Crashlytics messages are IDs, counts, and enums. The **local** `analytics_events.payloadJson` stores the full serialized event fields, but those are still only IDs, durations, and error types.
+
+## Local storage
+
+`AnalyticsEventEntity` (`data/local/db/entity/AnalyticsEventEntity.kt`) is the Room `@Entity("analytics_events")`, indexed on `userId` / `eventType` / `timestamp` / `isFlushed`: a UUID PK, the `eventType`, the full `payloadJson`, a `userId`, a `timestamp`, and `isFlushed` (false until POSTed). `AnalyticsDao` (`data/local/db/dao/AnalyticsDao.kt`) exposes `insert` (REPLACE), `getUnflushed`, `markFlushed`, `getByType`, `getForUserInRange`, `pruneFlushed`, `pruneOlderThan` (rolling retention window), and `count`.
+
+## `CrashReporter`
+
+`data/analytics/CrashReporter.kt`'s `install()` registers an `UncaughtExceptionHandler` that (1) writes the crash and stack to the rolling log via `appendNowSync`, then (2) `commit()`s crash metadata (type, file, line, message truncated to 200 chars) to a `crash_report` `SharedPreferences`, then chains to the previous handler so Android still shows the dialog and creates a tombstone. `SharedPreferences.commit()` is used because it is the only storage write guaranteed to flush before process death — Room and DataStore both need a functioning thread pool that a crash may have broken. `flushIfPending()`, called after Koin init, returns the saved `AnalyticsEvent.AppCrash` and clears the prefs.
+
+## `OsKillSentinel`
+
+`data/analytics/OsKillSentinel.kt` detects when the OS or a force-stop killed the recording foreground service while it was active, using an `os_kill_sentinel` `SharedPreferences` flag committed synchronously. `markRecordingStarted` / `markStandbyStarted` set it; `markServiceStopped` clears it on a clean exit; `markFinalizedDuringShutdown` / `wasFinalizedDuringShutdown` track whether the interrupted recording's file was saved in the shutdown window. `checkAndReportIfKilled` (called in `App.onCreate`) logs a Crashlytics `OsKillException` with service-state / mode / duration / battery custom keys and returns a `KillResult` of `NONE`, `RECORDING`, or `STANDBY`. It clears the flag *before* logging so a Crashlytics throw can't create an infinite report loop.
+
+## `FlushTrigger`
+
+`data/analytics/FlushTrigger.kt` is passed to `AnalyticsTracker.flush` and wired in `App.kt`:
+
+| Trigger | When |
+| --- | --- |
+| `SESSION_END` | App went to background — captures churners |
+| `FOREGROUND` | App returned after a ≥ 30 min gap |
+| `MANUAL` | Dev screen / test |
+
+## Related pages
+
+- [Diagnostic Logging](/rollingrecord/app/platform/logging) — the rolling file `CrashReporter` writes to.
+- [Networking & Edge API Layer](/rollingrecord/app/platform/networking) — `EdgeErrorReporter`, the server-failure side of Crashlytics.

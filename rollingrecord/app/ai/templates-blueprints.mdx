@@ -1,16 +1,81 @@
 ---
 title: "Extraction Templates (Blueprints)"
-description: "Built-in and custom extraction templates."
+description: "Built-in server-owned blueprints seeded locally, plus user-authored custom blueprints created and synced through ai-engine with server moderation."
 ---
 
-Extraction is driven by blueprints — built-in server-owned templates plus user-created custom ones.
+Extraction is driven by "blueprints" (the V1 name was extraction templates). Built-ins are proprietary, server-owned templates seeded locally as metadata only; custom blueprints are user-authored and created, edited, and deleted through the `ai-engine` Edge Function with server-side moderation. At extraction time the client sends a single `blueprint_id` string, and the server resolves the actual prompt.
 
-## What this covers
+## Built-in blueprints
 
-- `BuiltInBlueprints` + `BlueprintRepository` / `BlueprintEntity` / `BlueprintDao`; `ContextPermissions`.
-- Custom template creation/editing (`V2BlueprintEditorScreen`, `UserTemplateModels`) with AI-assisted drafting.
-- Built-in template IDs are append-only (server-owned; see the `CLAUDE.md` HARD RULE).
+`BuiltInBlueprints` (`data/local/db/entity/BuiltInBlueprints.kt`) is an `object` whose `all(now)` returns the seeded built-in `BlueprintEntity` rows. Each carries a name, a description, an `isMultiSpeaker` hint, and a stable `serverBuiltinId` — but its `systemPrompt` is `""`. The prompts live exclusively on the server at `supabase/functions/ai-engine/blueprints/builtin/` and are never duplicated on-device (a decompiled APK would leak them). Once shipped, the numeric ids are append-only per the CLAUDE.md HARD RULE.
 
-<Note>
-Scaffold generated from the codebase map — expand with full detail, examples, and specifics.
-</Note>
+| `serverBuiltinId` | Name | Multi-speaker | Default |
+| --- | --- | --- | --- |
+| 1 | General Notes | no | yes |
+| (2) | retired pre-launch (consolidated into General Notes) | — | — |
+| 3 | Sales Call | yes | no |
+| 4 | Developer | yes | no |
+| 5 | 1:1 Meeting | yes | no |
+| 6 | Personal Voice Memo | no | no |
+| 7 | Sprint / Standup | yes | no |
+| 8 | Brainstorming Session | yes | no |
+| 9 | Coaching Session | yes | no |
+| 10 | Lecture Notes | no | no |
+| 11 | Medical Appointment | no | no |
+| 12 | Interview | yes | no |
+
+The list order is the server id contract. `BlueprintRepository.seedIfNeeded()` seeds these on first launch and, on later launches, backfills descriptions and adds any newly-introduced built-ins for upgrading clients.
+
+## `BlueprintEntity`
+
+`BlueprintEntity` (`data/local/db/entity/BlueprintEntity.kt`) is the Room `@Entity("blueprints")` (PK `id`, prefixed via `IdPrefix.formatBlueprint`). Key fields:
+
+- `serverBuiltinId` — set for built-ins (their stable client→server identity), `NULL` for custom.
+- `serverCustomId` — the server-assigned UUID for a custom blueprint, `NULL` for built-ins and for unsaved drafts.
+- `name`, `description`, `systemPrompt` (`""` for every built-in).
+- `structuredFields` — Guided-mode authoring JSON (`meeting_type` / `capture_goal` / `ignore_items` / `output_format`), or `NULL` for Raw / built-in.
+- `autoDescription` — whether the description is AI-generated ("Auto") vs user-authored ("Manual").
+- `isBuiltIn`, `isDefault`, `isMultiSpeaker`, `lastUsedAt`, `remoteSyncedAt`.
+
+`BlueprintDao` (`data/local/db/dao/BlueprintDao.kt`) provides the reads and writes: `getAll` / `getById` / `getDefault` / `getCustom` (`isBuiltIn = 0`), `insert` / `upsert` / `insertAll` (all REPLACE-on-conflict), `setDefault` (transactional clear-all-then-set), `updateLastUsed`, `updateBuiltInDescription` / `updateBuiltInPrompt`, and `deleteUserBlueprint` (guarded to `isBuiltIn = 0`) vs `deleteById`. The DAO has no `seed` method — seeding (`seedIfNeeded()`) lives on `BlueprintRepository`.
+
+## Built-in vs custom
+
+| Aspect | Built-in | Custom (user) |
+| --- | --- | --- |
+| Prompt storage | server-side only (`systemPrompt = ""` on-device) | user-authored, sent to the server, stored server-side (moderated plaintext) |
+| Identity | stable numeric `serverBuiltinId` | server-assigned UUID (`blueprint_id`, stored as both the PK and `serverCustomId`) |
+| Editable / deletable | no | yes — create / edit / delete via `ai-engine`, Cloud+AI FULL access |
+| Sync | never pushed (IP) | all-or-nothing pull via `list_user_blueprints` |
+| Cap | none | `custom_templates` count cap |
+
+## `BlueprintRepository`
+
+`BlueprintRepository` (`data/repository/BlueprintRepository.kt`) owns both classes of blueprint. `create` / `update` / `delete` / `duplicate` route through the `ai-engine` `save_user_blueprint` and `delete_user_blueprint` operations with a fresh idempotency key; the server is authoritative for the row's `blueprint_id`, its description (in Auto mode), and its `structuredFields`, all of which the client persists from the response. `pullFromServer()` reconciles custom blueprints from `list_user_blueprints` (insert new, update changed, delete rows the server no longer returns; offline-only drafts with a null `serverCustomId` are left alone). `setDefault` and `markUsed` are local-only. Failures surface as `BlueprintModerationRejectedException` or `BlueprintSaveFailedException`.
+
+Custom blueprints are intentionally outside the normal encrypted-at-rest sync model — the server must see the plaintext to moderate it and to feed it to the model, so `list_user_blueprints` is a dedicated pull channel rather than a per-row include/exclude sync.
+
+The wire types for these operations live in `UserTemplateModels` (`data/remote/aiengine/model/UserTemplateModels.kt`): `SaveUserBlueprintInput` / `Response`, `ListUserBlueprintsResponse`, `DeleteUserBlueprint*`, `UserBlueprint` (the server row), and `BlueprintStructuredFields` with `encodeToJson` / `decodeBlueprintStructuredFields` helpers for the Room boundary.
+
+## Blueprint resolution at extraction time
+
+`ContextExtractionWorker.resolveBlueprintWireId` sends a single `blueprint_id` string: the numeric id as a string for a built-in, the UUID for a custom blueprint, or `"default"` when the context has no blueprint of its own (the runner maps any unrecognized value to its default prompt). For a custom blueprint that was never saved and moderated server-side it returns `null`, and extraction fails with a "re-save the template" error. The old `blueprint_source="inline"` fallback that shipped a raw client prompt was removed — an unmoderated prompt must never reach extraction. (Some in-code doc comments in `BuiltInBlueprints.kt` and `BlueprintEntity.kt` still describe the retired inline path; those are stale.)
+
+## Validation and moderation
+
+`BlueprintValidation` (`app/agentcore` — `data/repository/BlueprintValidation.kt`) is the single source of raw-field validation, shared so the app editor, the chat proposal edit dialog, and the AI's `proposeBlueprint` tool all use the same caps and messages: `NAME_MAX = 50`, `DESCRIPTION_MIN = 40`, `DESCRIPTION_MAX = 250`, and `systemPromptMaxChars = ServerConfig.blueprintMaxTokens × 3`. `nameError` / `descriptionError` / `systemPromptError` / `validate` return the first human/AI-facing message. The server (`save_user_blueprint`) remains the authoritative gate on accept; this is the fast shared pre-check.
+
+`BlueprintModerationService` (`data/moderation/BlueprintModerationService.kt`) is a local keyword/Levenshtein jailbreak pre-check run before the network round-trip (patterns in `JailbreakPatterns.kt`), gated by `ClientConfig.blueprintModerationEnabled`. Its result is `Approved` / `Rejected`, but the server's Haiku moderation is the authoritative decision on every content change.
+
+## The editor
+
+`V2BlueprintEditorScreen` (`ui/v2/screens/contexts/V2BlueprintEditorScreen.kt`) is the full-screen create/edit surface for a **custom** blueprint — built-ins never open here. It offers a swipeable Guided⇄Raw pager and reuses the V1 `BlueprintEditorViewModel` / `BlueprintEditorMode` / `BlueprintSaveState`. Save is gated to `FeatureAccess.FULL` (`GatedFeature.CUSTOM_BLUEPRINT`); a downgraded user views it read-only. It never embeds a built-in prompt body, since those are `""` on-device. The same `GatedFeature.CUSTOM_BLUEPRINT` gate governs the Delete affordance in `ContextIntelligencePreExtraction`.
+
+## The `custom_templates` cap
+
+Custom blueprints count against a server-enforced **count** cap. `CapType.CUSTOM_TEMPLATES` (`app/agentcore` — `data/remote/aiengine/CapType.kt`) maps to the wire string `custom_templates` with unit `COUNT`. The `ai-engine` `save_user_blueprint` handler increments it; there is no client-side numeric constant for the max. When the cap is hit, `BlueprintRepository` surfaces "You've reached the maximum number of blueprints." from the save-failure mapper.
+
+## Related pages
+
+- [Context Extraction Pipeline](/rollingrecord/app/ai/context-extraction) — how a blueprint drives an extraction run.
+- [AI Corrections & Proposals](/rollingrecord/app/ai/ai-corrections-proposals) — the AI's `proposeBlueprint` chat proposal.

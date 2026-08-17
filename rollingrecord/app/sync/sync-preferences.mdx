@@ -1,15 +1,68 @@
 ---
 title: "Sync Preferences"
-description: "Per-group sync toggles and device-settings sync."
+description: "Two distinct systems: the six per-group sync toggles (user-sync-preferences Edge Function) and the encrypted c_settings user-preferences blob (SETTINGS entity) — and what deliberately does not sync."
 ---
 
-Users control what syncs via per-group toggles, and device settings sync across devices too.
+"Sync preferences" is two separate mechanisms that are easy to conflate. One is the six per-group toggles that decide *which entity groups* sync at all. The other is the SETTINGS entity — a user's app preferences serialized into an encrypted `c_settings` row that syncs through the ordinary outbox/pull path like any other entity. Device settings (Wi-Fi-only, dark mode, storage location) are a third thing entirely and deliberately sync **nowhere**.
 
-## What this covers
+## Two systems, side by side
 
-- `SyncPreferencesRepository`, `SyncPreferencesApi`/`Client`, `SyncPreferencesResponse`; `SettingsSyncObserver`.
-- `SettingsBlob` device-settings sync and cross-device consistency.
+| System | Storage | Sync mechanism |
+| --- | --- | --- |
+| Per-group toggles | server `user_sync_preferences` row | `SyncPreferencesRepository` + `user-sync-preferences` Edge Function (GET/PATCH) |
+| User settings blob | `UserSettingsDataSource` (DataStore) → `c_settings` | `SETTINGS` `WireEntity` via `SettingsSyncObserver` + `SettingsTransform` (encrypted, LWW) |
+| Device settings (**not synced**) | `DeviceSettingsDataSource` | none — per-device by design (`wifiOnly`, dark mode, storage config) |
+
+## The six per-group toggles
+
+`SyncPreferencesRepository` (`data/repository/SyncPreferencesRepository.kt`) holds six booleans and is the value `SyncEngine.runPush` and `AudioSyncWorker` read to skip ops in a disabled group locally (the server also rejects with `sync_disabled_for_group`; the local filter avoids the round trip). It is an **app-level single** — not user-session-scoped — so it outlives the session, which is why its session-isolation design matters.
+
+| `SyncGroup` (UI) | `serverKey` | `WireEntity`s in group |
+| --- | --- | --- |
+| Recordings | `sync_recordings` | `recording`, `recording_session`, `transcript`, `recording_note` |
+| Contexts | `sync_contexts` | `context`, `context_card`, `action_item`, `context_recording`, `context_session` |
+| Categories | `sync_categories` | `category` |
+| Schedules | `sync_schedules` | `scheduled_recording` |
+| Threads | `sync_threads` | `search_thread`, `search_message` |
+| Settings | `sync_settings` | `settings` (the `c_settings` blob) |
+
+### Session isolation via owner-stamping
+
+Because the repository is app-scoped, its cached value would otherwise follow a session switch: if user A disabled recording sync and user B signed in behind them, B's recordings would be silently skipped by the outbox filter. So it implements `UserScopedCache` with **owner-stamping** (mirroring `UsageRepository`):
+
+- `clearForUserSwitch()` wipes the cache (`reset()`) on every session change.
+- Each stored value is stamped with `ownerUserId`; `dropForeignCacheLocked()` discards a cache belonging to a different session on both read and store, so a fetch already in flight across a switch can't repopulate it with the wrong account's preferences.
+
+`preferences` is a `StateFlow<SyncPreferences?>` (null until first fetch, never back to null on failure). `fetch(force)` has a 60s TTL; `setGroup(group, enabled)` optimistically flips the flag, PATCHes the flipped subset, and rolls back on rejection. A `Mutex` serializes outbound calls so spammy taps don't fan out parallel PATCHes.
+
+`SyncPreferencesApi` (`data/remote/syncprefs/SyncPreferencesApi.kt`) is the Retrofit interface — `get` (GET) and `patch` (HTTP PATCH with a `JsonObject` body of only the flipped keys); `FN_USER_SYNC_PREFERENCES = "user-sync-preferences"`. `SyncPreferencesApiClient` wraps it through the shared `apiCall` pipeline. `SyncPreferencesResponse` (`data/remote/syncprefs/model/SyncPreferencesResponse.kt`) is the full-row DTO returned by both GET and PATCH.
 
 <Note>
-Scaffold generated from the codebase map — expand with full detail, examples, and specifics.
+There are **two** `SyncGroup` enums. `data.repository.SyncGroup` (`serverKey` + `label`) is the UI/pref side; `data.sync.SyncGroup` (`wireName`, attached to each `WireEntity`) is the wire side. `SyncPreferences.isEnabled` has an overload bridging the wire-side enum to the toggles so sync-engine code with a `WireEntity` in hand can ask "is this entity's group enabled?" directly.
 </Note>
+
+## The SETTINGS entity — an encrypted `c_settings` blob
+
+The second system is a real sync entity. `SettingsBlob` (`data/sync/transform/SettingsBlob.kt`) is the `@Serializable` JSON shape of the `c_settings` encrypted blob — recording defaults, behavior toggles, "don't show again" flags, analytics, and collapsed settings-sections. Every field is nullable so a partial blob from an older client can't write `false`/`0` over a value a newer device set; on apply only non-null fields overwrite the local DataStore. `CURRENT_SCHEMA_VERSION = 1`; merge semantics are blob-level last-write-wins.
+
+`SettingsBlob` **deliberately excludes** device- and runtime-scoped values: `activeRecordingMode`, `embeddingCacheVersionApplied`, `syncLastPullCursor`, `wifiOnly`, dark mode / storage config, and subscription tier. Those are per-device (in `DeviceSettingsDataSource`) or server-authoritative (via RevenueCat) and must never travel in a user's synced blob.
+
+### `SettingsSyncObserver`
+
+`SettingsSyncObserver` (`data/sync/SettingsSyncObserver.kt`) is a `UserSessionScope` `Closeable` that watches `UserSettingsDataSource.rawPreferences`, projects each snapshot to a `SettingsBlob`, and enqueues a `WireEntity.SETTINGS` upsert on any synced-field change. Two subtleties:
+
+- **Cold-start drop** — `.drop(1)` skips the emission that fires just because the DataStore opened.
+- **Apply-vs-edit suppression** — when a pulled row is applied it writes the blob into DataStore, which would trigger an emission the observer treats as a local change and push back (a feedback loop). The transform calls `markApplied(blob)` before writing; the observer compares the projected blob against `lastApplied` and skips if equal.
+
+On the very first write it mints a fresh `SETTINGS_ROW_ID` UUID and persists it; the server's `UNIQUE(auth_user_id)` resolves cross-device first-write races through the standard `server_wins` path on `sync-push`.
+
+### `SettingsTransform`
+
+`SettingsTransform` (`data/sync/transform/SettingsTransform.kt`) is the wire↔DataStore transform (the SETTINGS entity has no Room table). Apply is two-phase so the observer's `markApplied` lands between decode and write: `decodePulledSettings` returns a `PulledSettings` sealed result (`Apply(blob)` or `Tombstone`), then `applyDecodedSettings` / `applyTombstonedSettings` write to DataStore. `buildSettingsWireRow` encrypts the JSON blob under the user DEK into the `settings_ct` / `settings_iv` pair of the `c_settings` row.
+
+## Where to go next
+
+- [Sync & Cloud Overview](/rollingrecord/app/sync/overview) — where preferences gate the two families.
+- [Sync Outbox & Enqueue](/rollingrecord/app/sync/outbox-engine) — the disabled-group filter `runPush` applies.
+- [Wire Format & Transforms](/rollingrecord/app/sync/wire-transforms) — the SETTINGS entity in the registry and the encrypted-field round-trip.
+- [Audio Cloud Backup](/rollingrecord/app/sync/audio-sync) — the Recordings-group precheck `AudioSyncWorker` applies.

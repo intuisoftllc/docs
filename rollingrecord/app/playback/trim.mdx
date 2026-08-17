@@ -1,15 +1,62 @@
 ---
 title: "Trim & Splice"
-description: "Trimming recordings and the splice/merge utilities behind it."
+description: "The V2 trim editor — a keepSegments model over the shared trim logic — and the AudioSplicer decode/encode pipeline that writes the final trimmed file."
 ---
 
-Trimming lets users cut recordings, backed by splice and merge utilities.
+`V2TrimScreen` is a V2-styled surface over `V2TrimViewModel`, which is an exact V2-package duplicate of the proven V1 `TrimViewModel` logic (only the package and class name changed). The trim math is shared, proven code, not a V2 rewrite. Trimming opens from the player's options sheet (`onNavigateToTrim`, Pro-gated).
 
-## What this covers
+## The keepSegments model
 
-- `V2TrimScreen` / `V2TrimViewModel` / `V2TrimSheets`.
-- `AudioSplicer` and `AudioMerger` utilities backing trim and segment edits.
+The core state in `V2TrimViewModel` (`ui/v2/screens/trim/V2TrimViewModel.kt`) is `_keepSegments: List<Pair<Long, Long>>` — a list of `(startMs, endMs)` pairs in **original-file time**, starting as `[(0, origDur)]`. Each trim edits this list without touching the file until Save. Two operations both enforce `MIN_REMAINING_MS = 500`:
+
+- `applyTrimHighlighted()` — keep only `[trimStart, trimEnd]`, discarding everything outside.
+- `applyTrimDimmed()` — remove that region, keeping everything outside (splitting a segment into left/right tails).
+
+Handle positions (`trimStartMs`, `trimEndMs`, `cursorMs`) are in **effective** (display) time; `effectiveMsToOriginalMs` / `originalMsToEffectiveMs` map between display and source time so multi-segment playback seeks across the removed gaps on the original file. `durationMs` is the sum of the kept spans; `hasChanges`, `canTrimHighlighted`, and `canTrimDimmed` drive the buttons.
+
+Duration is measured from the file's **real decoded duration** via `probeFileDurationMs`, not the stored `Recording.durationMs` (which is wall-clock elapsed time and can overcount the encoded audio, placing handles past the real end).
+
+## Preview
+
+A multi-segment edit generates a passthrough preview so the play button previews the joined result seamlessly. `commitTrim` calls `generatePreview(segs)` when `segs.size > 1`, which runs `AudioSplicer.spliceFast` into a unique per-run temp file (`previewRunSeq` baked into the name) so a superseded run can only ever delete its own output. Preview state (`previewFile` / `previewReady` / `previewJob` / `previewRunSeq`) is main-thread confined; only the splice hops to the injected `dispatcher`.
+
+`synthesizeWaveform` samples the original waveform at the kept positions so the editor's bars reflect the current `keepSegments`.
+
+## Blocking errors
+
+`TrimError` is `RecordingMissing` (the row is gone) or `AudioUnreadable` (the audio can't decode). Either sets a blocking full-pane overlay that replaces the editor — because preview playback and the save splice both decode the same source file, a live-looking editor with dead controls would be dishonest.
+
+## Save
+
+`triggerSave(mode)` → `performSave(mode)` wraps `AudioSplicer.splice` in `busyGuard.withBusy(BlockingOp.CLIP_RESAVE, rec.id)`. `TrimSaveMode` has two modes:
+
+| Mode | File effect | DB effect |
+| --- | --- | --- |
+| `OVERRIDE_ORIGINAL` | Invalidate the waveform cache, rename the temp splice over the original file. | `updateRecordingDurationAndSize` + `touchRecording` (bumps recency) + `clearCloudBackupSizeExceededFlag` on the same row. |
+| `SAVE_AS_COPY` | Splice written to a new `Base - Copy(.N).ext` file. | `insertRecording` of a new `Recording` (new UUID, `createdAt = now`, new name/duration/size); the original is untouched. |
+
+`generateCopyFile` produces `"Base - Copy"`, `"Base - Copy (2)"`, … stripping any existing copy suffix from the base name first.
+
+## `AudioSplicer`
+
+`AudioSplicer` (`util/AudioSplicer.kt`) is an `object`. It never loads the whole file into memory.
+
+| Function | Technique | Use |
+| --- | --- | --- |
+| `splice` (single range) | Decode → AAC/Opus re-encode → `MediaMuxer`, sample-accurate; `SEEK_TO_PREVIOUS_SYNC` skips the pre-cut head, per-frame clipping at the boundaries. | Final Save of a single kept region. |
+| `splice` (multi-segment) | `spliceRange` each part, then `concatenateFiles` (passthrough). | Final Save of multiple kept regions. |
+| `spliceFast` | Passthrough copy of encoded frames with PTS remap (~23 ms AAC-frame granularity). | Live multi-segment preview — not for final save. |
+
+The single-range path preserves the source container: a trimmed Opus-in-OGG stays Opus-in-OGG (a hardcoded AAC output previously broke server-side OGG parsing during transcription).
+
+## Screen and sheets
+
+`V2TrimScreen.kt` hosts the interactive editor: a blue card (readout + `TrimWaveform`) over a `ControlsCard` (repeat / play / scissors) and Save. `TrimWaveform` supports pinch-zoom from 1× up to a dynamic `maxZoom()` derived from `TRIM_MAX_ZOOM_VISIBLE_MS = 5000f` (the visible span at full zoom), pan, draggable handles/cursor, tap-to-seek, rolling-max bars, blue handles + pills, and a red cursor. A `BackHandler` guards discard when `hasChanges`. `TrimProcessingOverlay` and `V2TrimErrorOverlay` also live in this file.
+
+`V2TrimSheets.kt` defines `V2TrimActionSheet` (Keep/Remove, rows dimmed when not meaningful), `V2TrimSaveSheet` (Override vs Save copy), and `V2TrimDiscardSheet` (unsaved-changes Discard/Save).
 
 <Note>
-Scaffold generated from the codebase map — expand with full detail, examples, and specifics.
+Trim is backed by `AudioSplicer` only. `AudioMerger` backs the continuation **merge** (a separate flow) — see [Continuations & Merge](/rollingrecord/app/playback/continuations-merge).
 </Note>
+
+Related: [Playback Overview](/rollingrecord/app/playback/overview) · [Session Detail](/rollingrecord/app/playback/session-detail) · [Waveform Visualization](/rollingrecord/app/playback/waveform) · [Notes & Timestamp Marks](/rollingrecord/app/playback/notes-and-marks)

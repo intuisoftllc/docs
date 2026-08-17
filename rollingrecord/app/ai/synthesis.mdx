@@ -1,14 +1,37 @@
 ---
 title: "Context Synthesis"
-description: "Deep-reasoning synthesis across a whole context."
+description: "A one-shot deep-reasoning digest produced when a context is completed, bounding the size of future extraction prompts."
 ---
 
-Synthesis runs a deep-reasoning pass across an entire context, metered monthly.
+When a context transitions to `COMPLETED`, `ContextSynthesisWorker` runs once and distills the context's accumulated sections and tasks into a compact `digest` stored on the context card. That digest — not the full raw sections — becomes the "existing context" baseline for future incremental extractions, keeping prompt size bounded regardless of how large the context has grown. The raw sections are never removed and remain visible in the UI.
 
-## What this covers
+## `ContextSynthesisWorker`
 
-- `ContextSynthesisWorker` deep-reasoning synthesis across a context and its monthly metering.
+`ContextSynthesisWorker` (`worker/ContextSynthesisWorker.kt`) is a `CoroutineWorker` triggered once on `COMPLETED` (`KEY_CONTEXT_ID`; `tag(contextId)`). It reads the card and its tasks and skips when there are no sections and no tasks. It maps each task to a minimal `SynthesisTaskDto {text, owner, isDone}` (the Room `ActionItemEntity` is not `@Serializable` and the server only needs those three fields), then calls `aiEngineClient.synthesis(sectionsJson, tasksJson, useDeepReasoning = true)` and saves the returned digest via `ContextCardRepository.saveDigest`. It runs under a foreground notification ("Finalizing context…").
 
-<Note>
-Scaffold generated from the codebase map — expand with full detail, examples, and specifics.
-</Note>
+Failure is non-fatal: the context stays `COMPLETED` with its sections intact. Transient errors (`TransientAiEngineException` / `IOException`) retry up to 3 times; a permanent error ends in `Result.failure()`.
+
+## `AiEngineClient.synthesis`
+
+`AiEngineClient.synthesis` (`data/remote/aiengine/AiEngineClient.kt`) is the `ai-engine` call the worker invokes with `sectionsJson`, `tasksJson`, and `useDeepReasoning`. It returns an `AiEngineResult` whose success payload carries the `digest` text. The client always **requests** deep reasoning; the server owns the prompt, model selection, and `max_tokens`, and decides whether deep reasoning is permitted this period.
+
+## `ContextCardEntity.digest`
+
+`ContextCardEntity.digest` (`data/local/db/entity/ContextCardEntity.kt`) is the nullable `String` column holding the dense synthesis. It serves as the bounded "existing context" baseline for future incremental extractions instead of the full raw-sections dump, so prompt size stays bounded as a context ages.
+
+## Metering and model selection
+
+The client never meters synthesis — it always requests deep reasoning. The server decides the actual model based on a monthly deep-reasoning budget:
+
+| Concern | Owner |
+| --- | --- |
+| Whether deep reasoning is requested | client (always `true`) |
+| Actual model (Sonnet vs Haiku fallback) | server, per the monthly `usage.deep_reasoning_syntheses` (Sonnet) budget |
+| Prompt + `max_tokens` | server |
+| Failure impact | non-fatal — context stays `COMPLETED`, sections intact; transient errors retry up to 3 |
+
+The server tracks a monthly Sonnet budget in `usage.deep_reasoning_syntheses` and falls back to Haiku when the cap is hit; that budget resets on the first of each calendar month at 00:00 UTC per the usage-period HARD RULE.
+
+## Related pages
+
+- [Context Extraction Pipeline](/rollingrecord/app/ai/context-extraction) — the extraction runs whose baseline the digest replaces.

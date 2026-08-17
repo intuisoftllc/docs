@@ -1,15 +1,58 @@
 ---
 title: "Account Health & Freeze"
-description: "The account-health roll-up, banners, and live support access."
+description: "The client-derived account-health roll-up: a worst-case severity dot from four local signals, the persisted freeze signal, the status-detail sheet, and the lapse/grace/quota banners."
 ---
 
-A client-side account-health roll-up drives status indicators, lapse/freeze banners, and live support access.
+Account health is a client-only derived roll-up — never a server concept — that folds four independent local signals into one worst-case indicator surfaced as a small colored dot next to the user's name. The freeze arm is persisted and owner-stamped so it never bleeds across accounts.
 
-## What this covers
+## `AccountHealth` and the severity resolver
 
-- `AccountHealthProvider` / `AccountHealthRepository` / `AccountHealth` and `AccountStatusDot`.
-- Subscription-lapse and freeze banners; `SupportTokenRepository` / `GenerateSupportTokenDto` for live support access.
+`AccountHealth` (`data/models/AccountHealth.kt`) is the enum `{ HEALTHY, OFFLINE, SUBSCRIPTION_LAPSED, SYNC_ERROR, FROZEN }`. The highest-severity active condition wins, and `HEALTHY` is the absence of every condition (no dot):
 
-<Note>
-Scaffold generated from the codebase map — expand with full detail, examples, and specifics.
-</Note>
+```
+FROZEN > SYNC_ERROR > SUBSCRIPTION_LAPSED > OFFLINE > HEALTHY
+```
+
+There is one exception: **OFFLINE suppresses SYNC_ERROR**. A sync failure while the device has no connectivity is expected, not a real problem, so `SYNC_ERROR` only ever appears for an online device.
+
+`AccountHealthState` is the `data class { health, frozenReason? }`. Its companion `from(frozen, frozenReason, syncError, subscriptionLapsed, offline)` is the pure severity resolver — the single place the precedence and the offline-suppresses-syncError rule live — with a `HEALTHY` sentinel.
+
+## `AccountHealthProvider` — combining the signals
+
+`AccountHealthProvider` (`data/repository/AccountHealthProvider.kt`) is **user-session-scoped** because it reads the per-user `SyncEngine`. It exposes `health: Flow<AccountHealthState>` (distinct-until-changed) combining the four real signals plus a debug-only `DevFlags` override, and `healthEnum: Flow<AccountHealth>` for callers that ignore the reason.
+
+| State | Source signal | Dot color / opacity | Detail-sheet CTA |
+| --- | --- | --- | --- |
+| FROZEN | `AccountHealthRepository.frozenState` (persisted 403 `account_frozen`, owner-stamped) | `StatusFrozen`, full | Contact support (pre-filled email) |
+| SYNC_ERROR | `SyncEngine.state` `isSyncError()` — only when ONLINE | `StatusError`, full | Retry sync |
+| SUBSCRIPTION_LAPSED | RevenueCat `customerInfo` (expired known entitlement, none active) | `StatusWarning`, full | Manage subscription |
+| OFFLINE | `ConnectivityMonitor.isOnline` inverted | `StatusWarning`, 0.45 alpha | none (informational) |
+| HEALTHY | no condition active | no dot | none |
+
+`isSyncError()` mirrors the V1 `SyncStatusViewModel` predicate exactly: `lastError` set, `lastAttemptAt` set, and `lastSuccessAt < lastAttemptAt`. `isSubscriptionLapsed()` checks RevenueCat's `entitlements.all` vs `.active` — a recognized `RcEntitlement` that has expired with no active paid entitlement. Never-subscribed Free users have an empty `.all` and never trip it.
+
+The provider also blends in a debug-only override: `DevFlags.forcedAccountHealth` / `DevFlags.forcedFrozenReason` (inert `null` in release, so R8 collapses the branch) let the dot, sheet, and CTAs be exercised without a real lapse / freeze / offline / sync failure.
+
+## `AccountHealthRepository` — the persisted freeze signal
+
+`AccountHealthRepository` (`data/repository/AccountHealthRepository.kt`) is **app-scoped** (a Koin `single`), backed by a DataStore file under `datastore/device/account_health`. It is app-scoped, not user-scoped, because the write side is `AccountFreezeInterceptor` — an OkHttp interceptor on the app-wide clients that fires on the dispatcher thread and must always reach a live instance.
+
+The frozen flag is **owner-stamped** (`OWNER_USER_ID`): `frozenState` only reports frozen when the persisted owner matches the signed-in `authUserId`, so a frozen flag whose owner doesn't match is treated as not-frozen. `setFrozen(reason)` is called on a 403 `account_frozen`, `clearFrozen()` on any 2xx (proving the freeze gate was passed), and `reset()` wipes the row. The repository self-observes `AuthRepository.authState` and resets on every user-identity transition, so a different account never inherits the previous account's lock. `FrozenState` is the `data class { frozen, reason? }` with a `NOT_FROZEN` sentinel.
+
+Persisting the freeze means the dot appears on the next cold start without waiting for the first authed round-trip to re-discover the 403.
+
+## Rendering — the dot and the detail sheet
+
+`AccountStatusDot` (`ui/v2/components/AccountStatusDot.kt`) is a small filled circle drawn next to the name on both the main account card and the settings header card. It renders nothing for `HEALTHY` (callers guard on the same condition), and draws OFFLINE at a soft `OFFLINE_DOT_ALPHA` of 0.45 while every other state is full opacity.
+
+Both account VMs read `AccountHealthProvider.health`: `AccountUiState.accountHealth` (main screen — glance-only, no sheet) and `AccountSettingsUiState.accountHealth` + `frozenReason` (settings). On the settings screen, tapping the header card when not `HEALTHY` opens `V2AccountHealthSheet` (`ui/v2/screens/accountsettings/components/V2AccountHealthSheet.kt`). The sheet mirrors the tapped dot, shows a plain-English title + body, and offers the per-state CTA from the table above; FROZEN centers its title, leads the admin reason with a snowflake glyph, and each CTA dismisses the sheet before firing. The FROZEN "Contact support" opens a pre-filled account-access email (`sendFrozenAccountSupportEmail`) — no support token is minted.
+
+## Lapse, grace, and quota banners
+
+The lapse/grace/quota surfaces render on the [Account Settings](/rollingrecord/app/auth/account-settings) screen, not on the dot itself. `V2GraceBanner` and `V2QuotaBanner` (`ui/v2/screens/accountsettings/components/V2CloudPressureBanners.kt`) and `V2LapsedAccessNotice` (`ui/v2/screens/accountsettings/components/V2LapsedAccessNotice.kt`) are the cards; grace state comes from `IdentityRepository.graceState` (a `StateFlow<GraceState?>` carrying the lapse timestamp and paid tier). Exactly one lapse card shows — the cloud grace countdown wins over the quieter `SUBSCRIPTION_LAPSED` notice — and `V2QuotaBanner` opens the free-up-space sheet.
+
+## Related pages
+
+- [Account Profile](/rollingrecord/app/auth/profile)
+- [Account Settings](/rollingrecord/app/auth/account-settings)
+- [Account Deletion](/rollingrecord/app/auth/account-deletion)

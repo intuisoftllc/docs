@@ -1,16 +1,78 @@
 ---
-title: "Data Encryption Key & DB Key Lifecycle"
-description: "The DEK model, DB key management, and KEK rotation."
+title: "DEK & Database Key Lifecycle"
+description: "How the per-user DEK is fetched, cached, Keystore-wrapped, and derived into the SQLCipher database key."
 ---
 
-A per-user data encryption key (DEK) protects content and derives the database key, exchanged securely and rotated over time.
+Every account has one 32-byte Data Encryption Key (DEK). It is fetched from the `get-user-key` Edge Function, cached in RAM for the session, persisted Keystore-wrapped for offline opens, and derived — via `HKDF(DEK, "rr-db-key-v1")` — into the raw key SQLCipher uses to open the local database. Because the derivation is deterministic, the same account opens the same encrypted database on any device.
 
-## What this covers
+## The account DEK: `get-user-key`
 
-- `DekKeyStore`, `SessionDekHolder`, `DatabaseKeyManager`; `DatabaseKeyTransition` / `DatabaseKeyTransitionDecision` KEK rotation.
-- Remote wrapped-DEK exchange: `UserKeyApi` / `UserKeyApiClient`, `GetUserKeyResponse`.
-- DEK-unavailable handling: `V2DekUnavailableScreen`.
+`UserKeyApi` (`data/remote/userkey/UserKeyApi.kt`) is an internal Retrofit interface with a single `POST functions/v1/get-user-key` (`FN_GET_USER_KEY`) call. The body is an empty `{}` — identity comes from the Bearer JWT stamped by the shared `aiengine` OkHttp client (App Check + Bearer + app-version interceptors), which this endpoint reuses rather than duplicating transport plumbing. The endpoint lazy-provisions the `user_crypto` row on first call.
 
-<Note>
-Scaffold generated from the codebase map — expand with full detail, examples, and specifics.
-</Note>
+`UserKeyApiClient` (`data/remote/userkey/UserKeyApiClient.kt`) wraps that call in `fetch()`, returning a `UserKeyFetchResult`: `Success(dekBase64, kekVersion, …)`, `SubscriptionRequired(entitlement)` (default `pro_cloud`), `RateLimited`, or `Transient(reason, cause)` for network / 5xx / decode failures. It holds no cache of its own — that belongs to `SessionDekHolder`.
+
+`GetUserKeyResponse` (`data/remote/userkey/model/GetUserKeyResponse.kt`) is the internal `@Serializable` shape. `dek` is base64 and decodes to exactly 32 bytes; `kek_version` is informational. The same response also carries RR-492 App-Lock PIN sync fields (`pin_verifier_ct` / `pin_verifier_iv`, `pin_settings.auto_lock_ms`, `pin_updated_at`), all nullable and defaulted — the endpoint is not DEK-only. The model mirrors the `smoketest` `UserKeyResponses` type by convention.
+
+## `SessionDekHolder` — the session cache
+
+`SessionDekHolder` (`data/session/SessionDekHolder.kt`) is a `Closeable` scoped in the `UserSessionScope`. It caches the plaintext DEK in RAM for the session and resolves `requireDek()` through three tiers under a `Mutex` (so N concurrent cold-start callers collapse into a single fetch):
+
+| Tier | Source | Network? | Notes |
+| --- | --- | --- | --- |
+| 1 | In-RAM `cachedDek` | no | Populated by a prior call this session |
+| 2 | `DekKeyStore.loadDek` (Keystore-wrapped) | no | Makes the DB openable **offline** after the first fetch |
+| 3 | `UserKeyApiClient.fetch` (`get-user-key`) | yes | On success, persists via `DekKeyStore` for the next cold start |
+
+`requireDek()` returns a `DekResult`: `Available(dek, kekVersion)`, `SubscriptionRequired(requiredEntitlement)` (non-cloud features stay usable), or `Unavailable(reason)` where `reason` is one of `rate_limited`, `network_error`, `decode_failed`, `invalid_dek_size`, or an upstream code. `currentDekFingerprint()` returns the `SHA-256` hex of the resolved DEK, or `null` when it can't be resolved. The holder proactively warms the DEK when a network with internet capability becomes available. `invalidate()` zero-fills the RAM copy (keeping the persisted one); `close()` zero-fills, unregisters the `ConnectivityManager` callback, and cancels the refresh scope. The plaintext DEK is never persisted in the clear or logged.
+
+## `DekKeyStore` — Keystore-wrapped persistence
+
+`DekKeyStore` (`data/local/security/DekKeyStore.kt`) is the on-device, per-user (`authUserId`-keyed) store of the DEK plus the metadata the key layer needs. It uses two Keystore layers: an `EncryptedSharedPreferences` file (master-key alias `rr_dek_prefs_master_key`) whose entries are themselves an AES-256-GCM Keystore-wrapped DEK (wrapping-key alias `rr_dek_master_key`). Every preference key is suffixed `__<authUserId>` so two accounts on one device never collide.
+
+| Key | Holds |
+| --- | --- |
+| `dek_ct` / `dek_iv` | Keystore-wrapped DEK ciphertext + GCM IV (base64) |
+| `dek_fp` | `SHA-256(DEK)` hex fingerprint |
+| `dek_kek_version` | Server KEK version the DEK was wrapped under |
+| `db_structure_version` | `1` (legacy random passphrase) or `2` (DEK-derived) |
+| `db_keyed_dek_fp` | Fingerprint of the DEK the DB is **currently** encrypted under |
+
+Reads (`loadDek`, `getDekFingerprint`, `getDbStructureVersion`, `getDbKeyedDekFingerprint`) swallow Keystore failures and return `null` / the default — a missing DEK is a recoverable "re-fetch / sign-in" state, never a corruption signal, so it can never reach the wipe path. `persistDek` is best-effort. `commitRekey` is synchronous and **propagates** failure, since a half-written commit would desync the stored fingerprint from the on-disk cipher key. Constants: `DB_STRUCTURE_VERSION_LEGACY = 1`, `DB_STRUCTURE_VERSION_DEK_DERIVED = 2`, `DEK_BYTES = 32`.
+
+## The signed-in database key
+
+For a signed-in session the SQLCipher passphrase is resolved by `DatabaseKeyTransition` (`data/local/security/DatabaseKeyTransition.kt`). Its `resolvePassphraseOrTransition(context, authUserId, dek, dekFingerprint)` structurally validates the DEK, derives `HKDF(DEK, "rr-db-key-v1")` into the raw-key literal `x'<64 hex>'` (SQLCipher uses the 32 bytes verbatim — no KDF — which is what makes the DB deterministic across devices), reads the persisted structure version and keyed fingerprint, and delegates the branch to the pure `decideTransition`.
+
+`decideTransition(dbFileExists, structureVersion, keyedFp, liveFp)` (`data/local/security/DatabaseKeyTransitionDecision.kt`) is Android-free and unit-tested. It returns a `TransitionDecision`:
+
+| Decision | Precondition | Action |
+| --- | --- | --- |
+| `CreateFreshV2` | no DB file | Room creates a fresh DB under `HKDF(DEK)`; commit v2 metadata |
+| `SteadyStateV2` | structure v2 & `keyedFp == liveFp` | Open as-is, no re-key |
+| `Unavailable("keyed_fp_unreadable")` | structure v2 & `keyedFp == null` | Refuse — can't prove the key; recoverable |
+| `Unavailable("dek_changed_old_key_unavailable")` | structure v2 & `keyedFp != liveFp` | Refuse; recoverable |
+| `Unavailable("legacy_db_unsupported")` | a non-v2 file exists | Refuse; RR-489 removed the legacy re-key |
+
+<Warning>
+`DatabaseKeyTransition` performs **no KEK rotation and no in-place re-key**. RR-489 removed the old legacy(v1) → DEK-derived(v2) re-key entirely: the transition now only *resolves* a passphrase, and a database that isn't provably v2 fails **safe** — the file is left 100% untouched and routed to the recoverable DEK-unavailable surface, never wiped. Re-wrapping the DEK under a new KEK generation does not change the DEK plaintext, so `HKDF(DEK)` — and therefore the SQLCipher key — is stable across KEK versions; there is no local re-key on rotation.
+</Warning>
+
+## The anonymous database key
+
+The signed-out (anonymous) database is never cloud-portable and has no account DEK, so it stays on a random device-bound passphrase produced by `DatabaseKeyManager` (`data/local/security/DatabaseKeyManager.kt`) — a **live** path, not legacy. `getOrCreatePassphrase(context)` generates a 256-bit `SecureRandom` passphrase once, wraps it with an AES-256-GCM Keystore key (alias `rr_db_master_key`) inside `EncryptedSharedPreferences` (`rr_security_prefs`, master alias `rr_prefs_master_key`), and unwraps it on later launches. If the Keystore is unavailable it throws `DatabaseKeyException` — there is no in-app recovery; the user must clear app data.
+
+## `buildAppDatabaseForSession` orchestration
+
+`buildAppDatabaseForSession` in `di/DatabaseModule.kt` runs before Room opens the file. For the anonymous segment it uses the `DatabaseKeyManager` passphrase directly. For a signed-in segment it heals any interrupted restore swap, resolves the persisted DEK via `DekKeyStore.loadDek` (with an off-main-thread inline `SessionDekHolder.requireDek()` self-heal for the cold-start race), runs `DatabaseKeyTransition`, and either opens on `Result.Ready` or — on `Result.DekUnavailable` — calls `DatabaseRecoveryState.flagDekUnavailable(reason)` and throws `DekUnavailableException` **without opening or wiping** the DB. The freshly unwrapped DEK copy is zero-filled after derivation.
+
+## The DEK-unavailable surface
+
+When the DEK can't be resolved, `V2DekUnavailableScreen` (`ui/v2/screens/recovery/V2DekUnavailableScreen.kt`) is rendered at the root instead of the nav host. It is recoverable: the DB is neither opened nor wiped, and `onRetry` re-attempts the open once the DEK is resolvable (the retry button is disabled while `isRetrying`). See [Database Recovery States](/rollingrecord/app/security/database-recovery) for the full routing.
+
+## Where to go next
+
+- [Envelope Encryption Primitives](/rollingrecord/app/security/envelope-crypto) — the `KeyDerivation` HKDF and AES-256-GCM engines underneath
+- [Database Recovery States](/rollingrecord/app/security/database-recovery) — where a missing DEK, wrong key, or migration failure each route
+- [Backup & Restore](/rollingrecord/app/security/backup-restore) — the second key HKDF-derived from the same DEK
+- [Local database](/rollingrecord/app/architecture/local-database) — the per-user Room/SQLCipher layout
+- [User session scope](/rollingrecord/app/architecture/user-session-scope) — the lifetime `SessionDekHolder` is scoped to

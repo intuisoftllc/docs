@@ -1,14 +1,55 @@
 ---
 title: "Firebase App Check"
-description: "Attaching App Check tokens to backend requests."
+description: "Attaching Firebase App Check tokens and the Supabase apikey to backend requests, warmed at startup, with source-set-duplicated provider selection."
 ---
 
-Backend requests carry a Firebase App Check token, warmed at startup.
+Every Edge Function call carries two headers stamped by `AppCheckTokenInterceptor`: `apikey` (the public Supabase anon key) and `X-Firebase-AppCheck` (a fresh App Check token proving a legitimate install). A startup warmup hydrates the SDK's token cache so the first request out of cold-start doesn't race the SDK's first fetch, and provider selection is resolved at compile time by source set.
 
-## What this covers
+## Headers stamped by `AppCheckTokenInterceptor`
 
-- `AppCheckTokenInterceptor` attaching `X-Firebase-AppCheck`; `AppCheckWarmup` and `AppCheckBootstrap` (debug provider).
+`AppCheckTokenInterceptor` (`data/remote/AppCheckTokenInterceptor.kt`) is an OkHttp interceptor constructed with an `AppCheckWarmup`. On each request it adds `apikey`, blocks on the warmup (bounded), fetches an App Check token, and adds `X-Firebase-AppCheck`:
 
-<Note>
-Scaffold generated from the codebase map — expand with full detail, examples, and specifics.
-</Note>
+| Header | Value | Purpose |
+| --- | --- | --- |
+| `apikey` | `BuildConfig.SUPABASE_ANON_KEY` | Routes the request to the Supabase project; public-by-design (RLS + service-role protect the data) |
+| `X-Firebase-AppCheck` | fresh App Check token | Proves a legitimate app install; verified by each Edge Function against Firebase's JWKS |
+
+The sequence is: add `apikey`, then `runBlocking { withTimeoutOrNull(WARMUP_AWAIT_TIMEOUT_MS) { warmup.warmup.await() } }` (`WARMUP_AWAIT_TIMEOUT_MS = 15000`), then `FirebaseAppCheck.getInstance().getAppCheckToken(false)` awaited with `Tasks.await(..., TOKEN_FETCH_TIMEOUT_SECONDS)` (15s). The App Check SDK caches tokens for ~1 hour, so once warmup completes the per-request fetch is a hot cache hit adding roughly zero latency. On failure the interceptor logs (with `save = true`) a hint to register the device's debug token in Firebase Console, and proceeds **without** the header — Edge Functions then reply `401 invalid_app_check`.
+
+## `AppCheckWarmup`
+
+`AppCheckWarmup` (`data/remote/AppCheckWarmup.kt`) is an app single that coordinates the cold-start token warmup so the first real request doesn't race the SDK's first token fetch (a chained Firebase Installations → App Check dance that can be slow on a fresh install). It exposes `warmup: Deferred<Unit>`, which the interceptor awaits.
+
+`start()` is idempotent (guarded by an `AtomicBoolean`) and launches on a single-thread IO scope with backoff `listOf(0, 500, 1500)` ms, calling `tryFetchToken()` (a `getAppCheckToken(false)` success/failure listener). The `Deferred` completes on the first success OR after the final failure — so a permanently-broken Firebase never blocks the interceptor forever; it just falls back to the per-request fetch. It is kicked from `App.onCreate` right after Koin starts.
+
+## Provider selection
+
+Provider selection is source-set-duplicated via the top-level `installAppCheckProvider(appCheck: FirebaseAppCheck)` function in `AppCheckBootstrap.kt` — a function, not a class. Resolving it at compile time by source set deliberately avoids a `BuildConfig.DEBUG` runtime fork, which broke when `releaseDev` set `isDebuggable = true` and flipped `BuildConfig.DEBUG`.
+
+| Build variant | Source set | Emulator | Real device |
+| --- | --- | --- | --- |
+| `debug` | `src/debug` | Debug provider (register token in Firebase Console) | Play Integrity |
+| `release` / `releaseDev` | `src/release` | Play Integrity | Play Integrity |
+
+The debug variant (`app/app/src/debug/java/.../AppCheckBootstrap.kt`) uses `isRunningOnEmulator()` — a `Build.FINGERPRINT` / `MODEL` / `PRODUCT` / `HARDWARE` heuristic — to install `DebugAppCheckProviderFactory` on emulators (whose first-run token must be registered in Firebase Console) and `PlayIntegrityAppCheckProviderFactory` on real devices (the dev Firebase project accepts `UNRECOGNIZED_VERSION` / `UNLICENSED` verdicts for sideloaded builds, so no per-device registration is needed). The release variant (`app/app/src/release/java/.../AppCheckBootstrap.kt`), wired into both `release` and `releaseDev`, always installs Play Integrity.
+
+## Startup wiring
+
+`App.onCreate` installs App Check **first**, before any other Firebase service, so Remote Config, Analytics, and Crashlytics all send App Check tokens: it resolves `FirebaseAppCheck.getInstance()` and calls `installAppCheckProvider(appCheck)`. After Koin starts it kicks `getKoin().get<AppCheckWarmup>().start()`, and it also dumps a fresh token to Logcat via `AppLogger.d` (stripped in release) for curl-testing Edge Functions.
+
+## Interceptor chain
+
+Both authed ai-engine OkHttp clients in `NetworkModule` (`di/NetworkModule.kt`) chain the interceptors in a fixed order:
+
+1. `RateLimitInterceptor`
+2. `AppCheckTokenInterceptor` — `apikey` + `X-Firebase-AppCheck`
+3. `BearerJwtInterceptor`
+4. `AccountFreezeInterceptor`
+5. `AppVersionHeaderInterceptor` — `X-App-Version` (see [App Version Gate](/rollingrecord/app/platform/version-gate))
+6. `ClientTooOldInterceptor` — the `410 client_too_old` catch
+7. `HttpLoggingInterceptor`
+
+## Related
+
+- [App Version Gate](/rollingrecord/app/platform/version-gate) — the `X-App-Version` header and `410` catch on the same clients
+- [Background Work (WorkManager)](/rollingrecord/app/platform/workmanager)

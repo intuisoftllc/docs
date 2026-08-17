@@ -1,15 +1,80 @@
 ---
 title: "Account Settings"
-description: "The account settings surface and its actions."
+description: "Tier-gated storage / sync sections, the live sync-status card, subscription-lapse surfaces, and the two destructive flows — delete account vs. remove from device."
 ---
 
-Account settings collect account-level actions, including support access and destructive operations.
+The V2 Account Settings screen is a full-screen surface above the tabs. Its defining behavior is tier gating: the cloud sections collapse entirely below Pro+Cloud, while the account header and management rows render for everyone. It also owns both destructive flows — server-side account deletion and local-only device removal — but never sign-out, which lives only on the main account screen.
 
-## What this covers
+## `V2AccountSettingsScreen` and its view model
 
-- `V2AccountSettingsScreen` / `ViewModel` and its components.
-- Free-up-space entry, support-token generation, and destructive-action confirmation sheets.
+`V2AccountSettingsScreen` (`ui/v2/screens/accountsettings/V2AccountSettingsScreen.kt`, Figma 1809:63707) draws its own back header and hosts the account header card, the subscription-lapse surface, the cloud sections, the Account Management card, a Free-tier upgrade nudge, and the standalone red Delete Account button. It owns `runDeletion(otpTicket)` / `runRemoval()` and a blocking wipe veil, and it blocks either wipe while a recording is active.
 
-<Note>
-Scaffold generated from the codebase map — expand with full detail, examples, and specifics.
-</Note>
+`V2AccountSettingsViewModel` (`ui/v2/screens/accountsettings/V2AccountSettingsViewModel.kt`) does a 13-way `combine` into `AccountSettingsUiState` from tier, auth state, effective sync prefs, the Wi-Fi-only toggle, effective storage, account health, cached profile, `SyncEngine.state`, the two refresh-failed flags, the pending-audio-download count, the auto-sync-pause reason, and the audio rate-limit reset. `deriveSyncStatus` folds those into a `SyncStatusUi`. It also exposes `refreshUsage`, `refreshSyncPreferences`, `refreshOnResume`, `setSyncGroup`, `setSyncWifiOnly` (which re-schedules all three periodic workers so the network constraint takes effect immediately), and `retrySync`.
+
+`AccountSettingsUiState` carries `tier`, `showCloudSections` (`PRO_CLOUD`+), `syncStatus`, `displayName`, `email`, `syncPreferences?`, `syncWifiOnly`, `storage: StorageUsage?`, `syncPrefsFailed`, `usageRefreshFailed`, `accountHealth`, and `frozenReason?`.
+
+## Section and row visibility by tier
+
+Section visibility is tier-driven: the Storage, Sync, and Sync-over-Wi-Fi blocks are collapsed (not rendered) below `PRO_CLOUD`, since those tiers have no cloud account to configure.
+
+| Surface | Shown for |
+| --- | --- |
+| Account header card + status dot | All tiers |
+| Subscription-lapse card (grace / lapsed) | Whenever the lapse signal is present (any tier, including dropped-to-Free) |
+| Storage section | `PRO_CLOUD`+ (`showCloudSections`) |
+| Sync section (status + Wi-Fi-only + 6 toggles) | `PRO_CLOUD`+ |
+| View usage row | `PRO_CLOUD`+ (metered cloud usage) |
+| App Lock / Security row | All tiers |
+| Manage Subscription row | All tiers (Coming-Soon stub) |
+| Remove from device row | All tiers |
+| Export Data row | Hidden — commented out for launch (RR-211 deferred) |
+| Upgrade nudge card | Never-subscribed users below Pro only |
+| Delete Account button | All tiers (bottom, standalone red) |
+
+The "Manage Subscription" row is a Coming-Soon stub — the in-code comment notes the former support code moved to Help & Support, and this row now routes to that stub. There is no support-token generation on this screen; the only "support" action here is the FROZEN health sheet's email intent (see below).
+
+## The unified Sync card
+
+The Sync section is one grouped card with a "Status" zone on top and a "Content" zone (the Wi-Fi-only behavior toggle plus the six per-type toggles) below. The status zone renders `SyncStatusUi`:
+
+| State | Meaning |
+| --- | --- |
+| `Hidden` | Never synced / non-cloud tier — the status zone is omitted. |
+| `Syncing(itemsLeft?, progress?)` | Metadata pull in progress (line bar + %, or indeterminate when the total isn't known). |
+| `DownloadingAudio(itemsLeft, progress?)` | Metadata settled; audio blobs still downloading. |
+| `Paused(resumeAtSec)` | Rate-limited — "Sync paused · Resumes at T". |
+| `AutoSyncPaused(reason, itemsLeft)` | Background workers gated (`LOW_BATTERY` / `WAITING_FOR_WIFI`); manual sync + tap-to-play still work. |
+| `UpToDate` | Metadata and audio backlog both at 0 — check + "Up to date". |
+
+"Up to date" is a conjunction: metadata rows AND audio blobs must both be local, and permanently-undecryptable rows are excluded from the pending count so one bad blob can't wedge the indicator. `AutoSyncPauseReason` is the enum `{ LOW_BATTERY, WAITING_FOR_WIFI }` behind the gated state. The six toggles are the `SyncGroup` values from `data/repository/SyncPreferencesRepository.kt`, rendered in order: Recordings, Contexts, Categories, Schedules, Threads, Settings.
+
+`SyncRetryMessage { FAILED, WIFI_ONLY_BLOCKED }` is the one-shot snackbar enum for the health sheet's Retry-sync CTA.
+
+## Subscription-lapse surfaces
+
+Exactly one lapse card shows under the header, chosen by priority off the existing lapse signals — a cloud grace countdown wins over the quieter lapsed notice:
+
+- `V2GraceBanner` (`ui/v2/screens/accountsettings/components/V2CloudPressureBanners.kt`) — the loud 30-day deletion countdown, driven by `IdentityRepository.graceState` and reconciled against the live tier so it drops the instant the user holds an active cloud tier again.
+- `V2LapsedAccessNotice` (`ui/v2/screens/accountsettings/components/V2LapsedAccessNotice.kt`) — the quieter "features are view-only, restore access" row for any other paid lapse, shown when `accountHealth == SUBSCRIPTION_LAPSED`.
+- `V2QuotaBanner` (`ui/v2/screens/accountsettings/components/V2CloudPressureBanners.kt`) — the storage-pressure banner above the storage card; its CTA opens `V2FreeUpSpaceSheet`.
+
+The Free-tier upgrade nudge is deliberately *not* one of these — it stays a calm bottom-of-screen entry point for never-subscribed users and is suppressed whenever either lapse signal is present.
+
+## The two destructive flows
+
+This screen owns both wipes, and they are distinct:
+
+- **Delete Account** (bottom red button) — full server-side deletion. It opens `V2DeleteAccountSheet` (`ui/v2/screens/accountsettings/components/V2DeleteAccountSheet.kt`), a cancel-only, non-swipeable 3-step gate: CONFIRM → email OTP (`V2OtpCodeStep`, `OtpPurpose.ACCOUNT_DELETION`) → type-`DELETE`-to-confirm. Confirm fires only after OTP verify AND a matching typed phrase, carrying the single-use OTP ticket.
+- **Remove from this device** (in-row) — local-only. It opens `V2RemoveFromDeviceSheet` (`ui/v2/screens/accountsettings/components/V2RemoveFromDeviceSheet.kt`), a Cancel / Remove confirm whose body warns that not-yet-synced data is lost while the cloud account stays intact and can be re-downloaded on sign-in.
+
+Both route through `AccountDeletionCoordinator` (`data/account/AccountDeletionCoordinator.kt`), injected via `koinInject`: `coordinate(otpTicket)` for the server delete + local wipe, `removeFromDevice()` for the local-only wipe. Each runs under `withContext(NonCancellable)` behind a blocking veil, is blocked mid-recording with a snackbar, and relies on the coordinator's sign-out (V2App swaps to the login host) rather than manual navigation. See [Account Deletion](/rollingrecord/app/auth/account-deletion) for the full cascade.
+
+## Health sheet and frozen support email
+
+Tapping the account header card when the account is not `HEALTHY` opens `V2AccountHealthSheet` (`ui/v2/screens/accountsettings/components/V2AccountHealthSheet.kt`) with a per-state CTA: SYNC_ERROR → Retry sync, SUBSCRIPTION_LAPSED → Manage subscription, FROZEN → Contact support, OFFLINE / HEALTHY → informational. The FROZEN CTA calls `sendFrozenAccountSupportEmail` (a screen-local function), which launches a `mailto:` email intent pre-addressed to support with an account-access subject/body and every app-log file attached — the same mechanism as Help & Support's Contact Support, not a support-token flow. See [Account Health & Freeze](/rollingrecord/app/auth/account-health).
+
+## Related pages
+
+- [Account Profile](/rollingrecord/app/auth/profile)
+- [Account Health & Freeze](/rollingrecord/app/auth/account-health)
+- [Account Deletion](/rollingrecord/app/auth/account-deletion)

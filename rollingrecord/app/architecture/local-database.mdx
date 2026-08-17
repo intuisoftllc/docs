@@ -1,16 +1,89 @@
 ---
 title: "Room Database & SQLCipher"
-description: "The encrypted per-user Room database and migration discipline."
+description: "The encrypted per-user Room database: entities, DAOs, migration discipline, DEK-derived keying, and the classify-then-recover open-failure routing."
 ---
 
-Local data lives in a per-user Room database encrypted at rest with SQLCipher.
+Local data lives in a per-user, SQLCipher-encrypted Room database — `AppDatabase`, version 78, 19 entities and 19 DAOs. Each user's file is isolated at `databases/{auth_user_id | anonymous}/rolling_record_db`, built inside `UserSessionScope`. An anonymous session uses a legacy device-bound passphrase; a signed-in session is keyed from the account's DEK. Open failures are classified so only a genuine key mismatch ever wipes the file.
 
-## What this covers
+## `AppDatabase`
 
-- `AppDatabase`, the full DAO set (`RecordingDao`, `ContextDao`, `TranscriptDao`, `SyncOutboxDao`, `EmbeddingDao`, etc.) and entities under `data/local/db/entity`.
-- Encrypted-at-rest via SQLCipher keyed by `DatabaseKeyManager`; the database is per-user.
-- Migration discipline: `data/local/db/migrations`, `allMigrations` in `DatabaseModule`, and the index-name rules (see the migration HARD RULE in `CLAUDE.md`).
+`AppDatabase` (`data/local/db/AppDatabase.kt`) is `@Database(version = 78, exportSchema = false)` with 19 entities and 19 abstract DAO accessors (`recordingDao()` … `pendingPullApplyDao()`). It is registered as a `scoped<AppDatabase>` in `UserSessionScope` (see [Koin Dependency Injection](/rollingrecord/app/architecture/dependency-injection)), so closing the scope on sign-in/out releases Room's file handle and the next scope opens a fresh DB against the new user's directory.
 
-<Note>
-Scaffold generated from the codebase map — expand with full detail, examples, and specifics.
-</Note>
+### Entities → table names
+
+| Entity | Table | DAO |
+| --- | --- | --- |
+| `RecordingEntity` | `recordings` | `RecordingDao` |
+| `RecordingSessionEntity` | `recording_sessions` | `RecordingSessionDao` |
+| `CategoryEntity` | `categories` | `CategoryDao` |
+| `NoteEntity` | `recording_notes` | `NoteDao` |
+| `ScheduledRecordingEntity` | `scheduled_recordings` | `ScheduledRecordingDao` |
+| `TranscriptEntity` | `transcripts` | `TranscriptDao` |
+| `ContextEntity` | `contexts` | `ContextDao` |
+| `ContextRecordingEntity` | `context_recordings` | `ContextRecordingDao` |
+| `ContextSessionEntity` | `context_sessions` | `ContextSessionDao` |
+| `ContextCardEntity` | `context_cards` | `ContextCardDao` |
+| `ActionItemEntity` | `action_items` | `ActionItemDao` |
+| `BlueprintEntity` | `blueprints` | `BlueprintDao` |
+| `SearchThreadEntity` | `search_threads` | `SearchThreadDao` |
+| `SearchMessageEntity` | `search_messages` | `SearchMessageDao` |
+| `AnalyticsEventEntity` | `analytics_events` | `AnalyticsDao` |
+| `KeywordIndexEntity` | `keyword_index` | `KeywordIndexDao` |
+| `EmbeddingEntity` | `embeddings` | `EmbeddingDao` |
+| `SyncOutboxEntity` | `sync_outbox` | `SyncOutboxDao` |
+| `PendingPullApplyEntity` | `pending_pull_apply` | `PendingPullApplyDao` |
+
+All 19 DAOs are `scoped {}` in `daoModule`.
+
+## Building the DB for a session
+
+`buildAppDatabaseForSession(context, scope)` (`di/DatabaseModule.kt`) resolves the key for the active segment, then delegates to `buildRoomDatabase`. The DB file path is absolute — `databases/{segment}/rolling_record_db` — and the builder attaches `SupportOpenHelperFactory` (net.zetetic SQLCipher, after `System.loadLibrary("sqlcipher")`), `addMigrations(*allMigrations)`, and `addCallback(FtsTableCallback())`.
+
+Two key paths:
+
+- **Anonymous (signed-out) session** — there is no account DEK and the anonymous DB is never cloud-portable, so it stays on the legacy random device-bound passphrase from `DatabaseKeyManager.getOrCreatePassphrase` (`data/local/security/DatabaseKeyManager.kt`).
+- **Signed-in session** — the DB key is derived from the account DEK so the same account opens the same DB on any device. `BackupRestorer.recoverInterruptedRestore` heals any half-finished restore swap, then `DekKeyStore.loadDek` reads the persisted, Android-Keystore-wrapped DEK offline (self-healing the cold-start race via `SessionDekHolder.requireDek` off the main thread). A null DEK is the recoverable `DekUnavailable` state — the DB is **never** opened and **never** wiped; instead `DatabaseRecoveryState.flagDekUnavailable(...)` is raised and `DekUnavailableException` is thrown. Otherwise `DatabaseKeyTransition.resolvePassphraseOrTransition` produces the DEK-derived (structure-v2) SQLCipher raw key and the DB is built and verified.
+
+`DatabaseKeyTransition` (`data/local/security/DatabaseKeyTransition.kt`) returns `Result.Ready(passphrase)` or `Result.DekUnavailable(reason)`. RR-489 removed the legacy v1→v2 in-place re-key, so a non-v2 file now fails safe to the recovery surface rather than the wipe path.
+
+## Open-failure routing
+
+`openVerifiedOrRecover` verifies `writableDatabase` (exercising the `DevFlags.forceFatalDbErrorOnOpen` synthetic-failure hook), and on failure `classifyOpenFailure(e)` string-matches the cause chain into a `DbOpenFailure`:
+
+| `DbOpenFailure` | Signature matched | Action | Data safe? |
+| --- | --- | --- | --- |
+| `KEY_MISMATCH` | SQLCipher "file is not a database" | `handleKeyMismatch`: derive the rebuild key **before** wiping, flag recovery, wipe `*.db`/`-wal`/`-shm`, rebuild under the same current key | File wiped; audio on disk re-imported via the `KeyMismatchWiped` dialog |
+| `SCHEMA_MISMATCH` | "Room cannot verify" / "identity hash" / "expected:…found:" | `handleFatalDbError`: log, Crashlytics `db.open.wipe=false`, flag fatal, rethrow — file untouched | Yes — fatal error screen |
+| `MIGRATION_MISSING` | "migration from … was required but not found" | Fatal, file untouched | Yes — fatal error screen |
+| `UNKNOWN` | anything else | Fatal, file untouched | Yes — fatal error screen |
+| (DEK unavailable) | resolved before build | Recoverable, never opened or wiped | Yes — retry screen |
+
+<Warning>
+Only `KEY_MISMATCH` wipes. The `SCHEMA_MISMATCH` / `MIGRATION_MISSING` / `UNKNOWN` cases are fatal and leave the file untouched, and a missing DEK is a separate recoverable path that never opens or wipes. The older narrative that `DatabaseModule` catches all exceptions and wipes the whole database describes pre-RR-109 behavior; the live code narrows the wipe path to a genuine key mismatch on an already-resolved key.
+</Warning>
+
+`handleKeyMismatch` derives the rebuild key before any destructive wipe, so if the DEK has somehow become unavailable in the interim, the derive throws and the DB file is left 100% untouched (the recoverable surface handles it). The rebuild always happens under the current session's key.
+
+## Migrations
+
+`allMigrations` is an `Array<Migration>` of all 77 sequential migrations, `MIGRATION_1_2` through `MIGRATION_77_78`, imported from `data/local/db/migrations/*`. Version bumps are atomic across three places: `AppDatabase.version`, the `allMigrations` array in `DatabaseModule.kt`, and `DevBackupManager.CURRENT_DB_SCHEMA_VERSION`.
+
+`MIGRATION_77_78` (`data/local/db/migrations/Migration77To78.kt`) is a representative example — a purely additive change adding a nullable `audioFormat TEXT` column to `recording_sessions`. Each migration file carries a plain-English risk statement and the version-bump checklist inline.
+
+## FTS tables
+
+`FtsTableCallback` is a `RoomDatabase.Callback` that creates non-Room-managed tables on `onCreate`/`onOpen` — they are not declared as `@Entity` / `@Fts` tables:
+
+- `fts_section_index` (with `idx_fsi_contextId`) — a plain lookup table.
+- `context_fts` — an `fts4` virtual table over `contextName, keywords, sectionTitle, sectionContent` with `tokenize=porter`.
+
+## Recovery state
+
+`DatabaseRecoveryState` (`states/DatabaseRecoveryState.kt`) is the process-static flag consumed by `V2App`/`MainActivity`. `RecoveryState` variants: `FatalError(errorCode, message)`, `DekUnavailable(reason)`, `KeyMismatchWiped`. The `flagFatalError` / `flagDekUnavailable` / `flagRecoveryNeeded` / `clearRecovery` calls drive the matching recovery screens (see [UI & Navigation](/rollingrecord/app/architecture/ui-and-navigation)).
+
+## Where to go next
+
+- [Per-User Session Scope](/rollingrecord/app/architecture/user-session-scope) — the scope this DB lives in, and `SessionDekHolder`.
+- [Koin Dependency Injection](/rollingrecord/app/architecture/dependency-injection) — the `databaseModule` / `daoModule` bindings.
+- [Shared JVM Modules](/rollingrecord/app/architecture/shared-modules) — `KeyDerivation`, which derives the SQLCipher key from the DEK.
+- [Application Shell & Entry Points](/rollingrecord/app/architecture/app-shell) — the off-thread DB warm at startup.

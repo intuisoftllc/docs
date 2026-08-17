@@ -1,15 +1,54 @@
 ---
 title: "Client Rate-Limit Handling"
-description: "How the client reacts to server rate-limit responses."
+description: "The per-user cooldown coordinator and the OkHttp interceptor that respects server 429 rate_limited responses."
 ---
 
-The client detects server rate-limit responses and backs off gracefully.
+Client rate-limit handling is a transport-level circuit breaker. When the server answers an over-quota call with a `429 rate_limited`, the client records the reset and short-circuits every later call to that Edge Function until the window lifts — never hammering a rate-limited endpoint, and never even fetching an App Check or JWT token for a call it already knows will be rejected. Cooldowns are per-user and persist across process death.
 
-## What this covers
+## The server contract
 
-- `RateLimitCoordinator` and `RateLimitInterceptor` reacting to server rate-limit responses.
-- How buckets surface to the user and back off.
+The server's shared rate-limit gate answers an over-quota call with:
 
-<Note>
-Scaffold generated from the codebase map — expand with full detail, examples, and specifics.
-</Note>
+```json
+429 {"error":"rate_limited","reset_at_sec":<epoch>,"bucket":<name>}
+```
+
+`reset_at_sec` is the absolute epoch second the window lifts; `bucket` names the tripped server bucket. This body is decoded into `RateLimitedError` (`data/remote/api/EdgeErrorBody.kt`) — a `@Serializable` `EdgeErrorBody` whose `error` defaults to the registry `rate_limited` code, with nullable `bucket` and `@SerialName("reset_at_sec") resetAtSec`. The shared `parseErrorEnvelope` (`data/remote/api/ApiResult.kt`) picks it from the 429 body by its registry code — the same typed decode every call site uses.
+
+## Endpoint identity — `@EdgeTag`
+
+Cooldowns are keyed on the Edge Function **name**, which comes from the Retrofit method's `@EdgeTag` (`data/remote/api/EdgeTag.kt`), not from any object. Each API interface declares its function name once as a companion `const`, and both the invoke path and the tag derive from it so they can never disagree. `Request.edgeFunctionName()` reads the tag off the request's `Invocation` — the sole identity source. A Retrofit method whose URL is an Edge Function invoke (`…/functions/v1/{fn}`) but which carries no `@EdgeTag` throws `MissingEdgeTagException` on its first call, so a forgotten tag cannot ship.
+
+## `RateLimitCoordinator`
+
+`RateLimitCoordinator` (`data/remote/ratelimit/RateLimitCoordinator.kt`) is an app-scoped single that persists cooldowns per user. The whole store — `authUserId → (functionName → resetAtSec)` — is a single JSON structure in one SharedPreferences key (`cooldowns_by_user`, inside the `rate_limit_cooldowns` prefs file), loaded once at construction and rewritten on change; expired entries are pruned whenever the store is touched.
+
+| Member | Behavior |
+| --- | --- |
+| `setActiveUser(authUserId?)` | Points the in-memory view at that user's slice (null = signed out, empty view), pruning expired entries store-wide. |
+| `record(function, resetAtSec)` | `@Synchronized`, **max-wins** — never downgrades a longer cooldown already on record. |
+| `resetAtSecFor(function)` | The reset epoch-second if the function is still cooling down, else null (pruning the expired entry). |
+| `isCoolingDown(function)` | True when `resetAtSecFor(function) != null`. |
+| `cooldowns` | `StateFlow<Map<String, Long>>` — the lock-free read side the interceptor, workers, and UI observe. |
+
+Dividing by user matters because server rate limits are per-user: one account's cooldown must never block another on the same device, while a user's own cooldown survives their sign-out and return. Mutating methods are `@Synchronized` because they are called from both OkHttp threads and the auth observer.
+
+## `RateLimitInterceptor`
+
+`RateLimitInterceptor` (`data/remote/ratelimit/RateLimitInterceptor.kt`) is the outermost interceptor on both authed Edge clients (`supabase` + `aiengine`). Endpoint identity comes from `request.edgeFunctionName()`; a null (not an Edge invoke) passes straight through. It does two jobs:
+
+1. **Pre-call short-circuit.** If the coordinator reports the target function is still cooling down, it returns a synthetic 429 **without touching the network** — and before the inner App Check / JWT interceptors run, so no token is fetched either. This is the hard guarantee against hammering a rate-limited endpoint. The synthetic 429 is serialized from the same `RateLimitedError` type, so downstream mappers can't tell it from a real one.
+2. **Post-response record.** When a real `429` with the `rate_limited` envelope comes back, it decodes the body through `parseErrorEnvelope` and calls `coordinator.record(fn, resetAtSec)` so job (1) engages for every subsequent call to that function.
+
+## DI and activation
+
+`RateLimitCoordinator` is registered app-scoped in `di/NetworkModule.kt` (`single { RateLimitCoordinator(androidContext()) }`), and `RateLimitInterceptor(get())` is added as the outermost interceptor on both authed Edge OkHttp clients. `App.kt`'s auth observer calls `coordinator.setActiveUser(authUserId)` on sign-in and `setActiveUser(null)` on sign-out, so cooldowns follow the active user across every transition.
+
+## Consumers
+
+The audio-sync workers (`AudioSyncWorker`, `CloudPrefetchWorker`) read the coordinator to back off — a 429 is a sleep, never a job failure — and the account-settings status card observes `cooldowns` to surface a "resumes at T" state. The extraction job repository treats a 429 the same way (`ExtractionJobRepository`).
+
+## Related pages
+
+- [Usage Metering & Caps](/rollingrecord/app/monetization/usage-metering) — the sibling monthly-cap system.
+- [Entitlements & RevenueCat](/rollingrecord/app/monetization/entitlements-revenuecat) — the developer entitlement that bypasses server rate limits entirely.

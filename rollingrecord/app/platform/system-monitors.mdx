@@ -1,15 +1,62 @@
 ---
 title: "Connectivity, Battery & Session Monitors"
-description: "System monitors that gate background work."
+description: "The util/ helpers for connectivity, low-battery signalling, the recording battery gate, OS-kill detection, and connectivity-error classification."
 ---
 
-System monitors gate background work on connectivity, battery, and session state.
+Six helpers in the `util/` package observe or classify device state. They serve distinct jobs and are easy to mistake for one another: connectivity has both a reactive monitor and a one-shot probe; battery has both a reactive sync-status flow and a recording safety gate; and there is an OS-kill diagnostic and a connectivity-error classifier that are not gates at all.
 
-## What this covers
+| Symbol | Kind | Reactive? | Role |
+| --- | --- | --- | --- |
+| `ConnectivityMonitor` | class (app single) | Yes (`isOnline` / `isUnmetered`) | Reactive device connectivity + metered state for sync UI and gating |
+| `NetworkConnectivity` | object | No (one-shot) | Synchronous tap-time online probe |
+| `BatteryMonitor` | class | Yes (`isLow`) | Low-battery hint mirroring WorkManager's battery-not-low constraint |
+| `BatteryGate` | object | No | Recording start / auto-stop safety floor (15% / 5% charging) |
+| `SessionMonitor` | object | n/a | OS-kill detector: `PREVIOUS_SESSION_KILLED` diagnostic |
+| `NetworkErrorClassifier` | object | No | Distinguish connectivity failure from server transient for fail-fast |
 
-- `ConnectivityMonitor` / `NetworkConnectivity`, and `BatteryGate` / `BatteryMonitor` gating background work.
-- `SessionMonitor` and `NetworkErrorClassifier`.
+## `ConnectivityMonitor`
 
-<Note>
-Scaffold generated from the codebase map — expand with full detail, examples, and specifics.
-</Note>
+`ConnectivityMonitor` (`util/ConnectivityMonitor.kt`) is an app-scoped Koin `single` — connectivity is a device-global fact, so it survives session switches. It exposes two `Flow<Boolean>` streams built on `registerNetworkCallback`:
+
+- **`isOnline`** tracks a set of usable networks (`onAvailable` / `onLost` / `onCapabilitiesChanged`, where "usable" requires both `NET_CAPABILITY_INTERNET` and `NET_CAPABILITY_VALIDATED`), is seeded synchronously from `NetworkConnectivity.isOnline`, and is `distinctUntilChanged`. Tracking a set of networks means a handover that drops one network while another is still up never falsely reports offline.
+- **`isUnmetered`** drives the "Waiting for Wi-Fi" sync-status hint, seeded synchronously and `distinctUntilChanged` the same way.
+
+Two synchronous probes back the flows: `isOnlineNow()` delegates to `NetworkConnectivity`, and `isCurrentNetworkUnmetered()` checks `NET_CAPABILITY_NOT_METERED` fail-closed so it matches WorkManager's `UNMETERED` constraint. The companion `SHARE_WHILE_SUBSCRIBED` is `WhileSubscribed(5000)` for downstream `stateIn` hoists. `App.kt` uses this monitor for the App Lock offline-retry path.
+
+## `NetworkConnectivity`
+
+`NetworkConnectivity` (`util/NetworkConnectivity.kt`) is a stateless `object` with a single synchronous `isOnline(context)` probe used at tap time (RR-368) — for example, fast-failing an operation before firing the network call. It returns `true` only when the active network has both `NET_CAPABILITY_INTERNET` and `NET_CAPABILITY_VALIDATED`, and `false` on any uncertainty. It is distinct from the reactive `ConnectivityMonitor` and from the process-wide restore callback in `App.kt`.
+
+## `BatteryMonitor`
+
+`BatteryMonitor` (`util/BatteryMonitor.kt`) is a device-global class exposing `isLow: Flow<Boolean>` via a `callbackFlow` over `ACTION_BATTERY_LOW` / `ACTION_BATTERY_OKAY` (registered `RECEIVER_NOT_EXPORTED`), seeded from a sticky `ACTION_BATTERY_CHANGED` read against `LOW_THRESHOLD_PCT = 15`. Its purpose is UI, not gating: WorkManager pauses the three sync workers on `setRequiresBatteryNotLow(true)` when the system enters its low-battery state, and this flow lets the sync-status card say "Auto-sync paused — low battery" instead of showing a stalled progress bar. It mirrors the same system transitions that flip the WorkManager constraint.
+
+## `BatteryGate`
+
+`BatteryGate` (`util/BatteryGate.kt`) is the single source of truth for the low-battery **recording** gate — a safety floor, unrelated to background work. It is a stateless `object` with `STOP_THRESHOLD = 15` and `CHARGING_FLOOR = 5`. `canRecord(pct, isCharging)` / `tooLow(...)` encode the rule:
+
+| Battery state | Recording |
+| --- | --- |
+| `pct > 15` | Always allowed |
+| `pct 5..15` while charging | Allowed (charging exception) |
+| `pct 5..15` while unplugged | Blocked (unplugging a sub-15% charging recording auto-stops it) |
+| `pct < 5` | Blocked even while charging |
+| `pct` unknown (`-1`) | Allowed — never block on missing data |
+
+`requiredPercent(isCharging)` derives the refusal copy from the same constants so the number shown to a refused user can never drift from what the gate enforces. Helpers `batteryPercent(context)`, `isCharging(context)`, `percentFromIntent`, and `isChargingFromIntent` read the current state. The gate is consumed by the `RecordingService` start gate and mid-recording auto-stop, the Quick Settings tile, and the V1/V2 record button.
+
+## `SessionMonitor`
+
+`SessionMonitor` (`util/SessionMonitor.kt`) is an `object` that detects silent OS process kills — the case that `CrashReporter`'s uncaught-exception handler and Crashlytics both miss because no JVM exception is thrown. `install(application)` is called from `App.onCreate` **before** Koin and Firebase: it reads the previous session's "alive" `SharedPreferences` marker and, if still set, logs a `PREVIOUS_SESSION_KILLED` entry carrying the dead session's lifecycle state, last screen, active foreground service, and duration. It then re-arms the marker with `commit()` and wires a `ProcessLifecycleOwner` observer, `ActivityLifecycleCallbacks`, and a 30-second heartbeat tick.
+
+`setForegroundService(label)` and `setScreen(label)` keep the marker fresh so the next-launch diagnostic captures accurate state — for example, telling "killed during recording" apart from "killed during transcribe." The marker uses `SharedPreferences` (not Room/DataStore) because `commit()` is the only synchronous primitive guaranteed to flush before an abrupt process death. This is a diagnostic, not a work-gating monitor.
+
+## `NetworkErrorClassifier`
+
+`NetworkErrorClassifier` (`util/NetworkErrorClassifier.kt`) is an `object` whose `isConnectivityError(throwable)` walks the cause chain (bounded to depth 12) and returns `true` for `UnknownHostException`, `ConnectException`, `NoRouteToHostException`, `PortUnreachableException`, `SocketTimeoutException`, `InterruptedIOException`, `SSLException`, and a `TransientAiEngineException` whose result is `AiEngineResult.Network`. This lets workers fail fast on genuine connectivity loss (RR-491) — surfacing the offline error on the first failed call — while still retrying real server transients (5xx / 429 / auth races), which are deliberately not matched. It exists because a point-in-time `isOnline()` probe reports `true` on a captive portal or WAN-less router; the only dependable offline signal in that state is the request itself throwing a connectivity exception.
+
+## Related
+
+- [Background Work (WorkManager)](/rollingrecord/app/platform/workmanager) — the sync workers whose constraints these signals mirror
+- [Notifications](/rollingrecord/app/platform/notifications) — the battery-low and battery-saver alerts
+- [App Version Gate](/rollingrecord/app/platform/version-gate)

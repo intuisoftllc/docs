@@ -1,15 +1,109 @@
 ---
 title: "Sync Outbox & Enqueue"
-description: "How local writes are enqueued for sync."
+description: "The pointer-based outbox: how local writes enqueue upserts and tombstones, how SyncEngine.runPush drains and packs them, and how accepted / server_wins / rejected outcomes and backoff are handled."
 ---
 
-Every local write is enqueued into an outbox that drives the push side of sync.
+Every user-facing repository write calls the outbox after its DB write. The outbox stores **pointers only** — an `(entityType, rowId, operation)` triple, never row content — so at drain time the engine re-reads current Room state and intermediate edits coalesce naturally.
 
-## What this covers
+## `SyncEnqueuer` — the façade repositories call
 
-- `SyncOutboxRepository` / `SyncOutboxDao` / `SyncOutboxEntity`; `SyncEnqueuer` and `SyncEnqueueRecovery`.
-- Per-entity enqueue on writes and `UserWorkTag` scoping.
+`SyncEnqueuer` (`data/sync/SyncEnqueuer.kt`) is the typed front door the 10+ user-facing repositories call after every write. It lives in `UserSessionScope`.
+
+| Method | For |
+| --- | --- |
+| `upsert(entity, rowId)` | single-PK entity insert/update |
+| `tombstone(entity, rowId)` | single-PK entity delete |
+| `upsertComposite(entity, parentId, childId)` | junctions (`CONTEXT_RECORDING`, `CONTEXT_SESSION`) — encodes `"parentId::childId"` via `encodeCompositeRowId` |
+| `tombstoneComposite(entity, parentId, childId)` | junction delete |
+
+Enqueue failures are logged and **swallowed** — the user's primary action (saving a recording, deleting a note) already succeeded by the time enqueue runs, so throwing would undo nothing. A missed entry only delays that row's sync until its next write, which re-enqueues successfully.
+
+## The outbox table
+
+`SyncOutboxEntity` (`data/local/db/entity/SyncOutboxEntity.kt`) backs table `sync_outbox`. Columns: `id` (autogen PK), `entityType`, `rowId`, `operation`, `enqueuedAt`, `attempt_count`, `last_rejected_code`, `last_attempt_at`, `next_attempt_at`. The load-bearing constraint is `UNIQUE(entityType, rowId)` — the **squash index**.
+
+`SyncOutboxDao` (`data/local/db/dao/SyncOutboxDao.kt`) enqueues via `insertReplace` (`OnConflictStrategy.REPLACE`) so repeated writes to one row collapse to a single entry carrying the latest operation. `OP_UPSERT = "upsert"`, `OP_TOMBSTONE = "tombstone"`.
+
+| Operation | Meaning | Squash behavior |
+| --- | --- | --- |
+| `upsert` | server INSERTs or UPDATEs the current Room row (revives tombstone-GC'd rows as INSERT naturally) | repeated edits collapse to one entry |
+| `tombstone` | server marks the row deleted (client already set the delete intent locally) | REPLACES a pending upsert — latest op wins, so a short-lived insert-then-delete never reaches the server |
+
+Why pointers, not snapshots: a content snapshot taken at enqueue time would push stale bytes whenever the user edited again before drain. Reading current state at drain time dedupes to whatever is current.
+
+## `SyncOutboxRepository`
+
+`SyncOutboxRepository` (`data/sync/SyncOutboxRepository.kt`) is a thin typed wrapper over the DAO:
+
+| Method | Purpose |
+| --- | --- |
+| `enqueueUpsert` / `enqueueTombstone` | type-safe enqueue taking the `WireEntity` enum |
+| `drainableNow(limit)` | rows eligible right now — `next_attempt_at IS NULL OR <= now`, capped at `limit` |
+| `pendingOps()` | full list including backed-off rows (resync recovery / dev observability) |
+| `markProcessed(entity, rowId)` | drop an entry after a successful push-ack |
+| `removeOrphan(entity, rowId)` | drop an entry whose source row is gone (logically distinct from `markProcessed`) |
+| `hasPending(entity, rowId)` | protects a locally-edited row from the pull orphan sweep |
+| `recordRejection(entity, rowId, code, nextAttemptAt)` | bump `attempt_count`, stamp the code, set the backoff deadline |
+| `clearAllBackoff()` | connectivity-restore wake — null out every `next_attempt_at` (keeps `attempt_count`) |
+| `getStuck(threshold)` | snapshot of entries past the retry threshold, for Crashlytics |
+
+## `SyncEngine.runPush` — the drain driver
+
+There is no dedicated "push worker" class beyond the generic `SyncWorker`; the drain logic is `SyncEngine.runPush` (`data/sync/SyncEngine.kt`). Each `runPush` call sends at most one batch; a single `sync()` drives the drain loop up to `MAX_DRAIN_ITERATIONS` (3) times, calling `runPush` once per iteration while the prior push processed `>0` rows, so one `sync()` can send up to three `sync-push` batches. `runPush`'s steps:
+
+1. **Fetch** `drainableNow(MAX_BATCH_OPS_CLIENT = 450)` — backoff-eligible rows only, capped so a 5000-row backlog doesn't load entirely into memory.
+2. **Pack** ops until the op count or byte budget is reached. `MAX_BATCH_BYTES_CLIENT = 4_718_592` (4.5 MB) with a 10-byte wrapper allowance; the server rejects `> 500` ops or `> 5 MB` with `batch_too_large`, so the client self-caps below that. Leftover rows defer to the next sync.
+3. **Skip disabled groups.** Ops whose `WireEntity.group` is disabled in the user's sync preferences are left on the outbox (so they drain when re-enabled) rather than sent to be rejected. See [Sync Preferences](/rollingrecord/app/sync/sync-preferences).
+4. **Build each row** via `transform.buildPushRow(entity, rowId)` (or `buildTombstoneRow` for deletes). `opsIndexToEntry` is built in lockstep with the ops array so a rejection's `index` maps back to the originating outbox row.
+5. **POST** `sync-push`, then walk `results[]`.
+
+The pack loop has one critical safety invariant: a `DekUnavailableException` from `buildPushRow` (offline, can't unwrap the DEK to encrypt) **aborts the entire batch and leaves the whole outbox intact**. It is never treated as an orphan — letting an offline send fall through to the orphan sweep would wipe every pending change. A per-entry build error (non-DEK) skips just that entry, keeping it on the outbox; a non-tombstone entry whose `buildPushRow` returns `null` (source row deleted before push) is the one case that gets `removeOrphan`.
+
+### Per-op outcomes
+
+| Outcome | Action on outbox | Notes |
+| --- | --- | --- |
+| `accepted` | `markProcessed` by the **sent** id | authoritative row applied via `tryApplyOrDefer` |
+| `server_wins` | `markProcessed` by the **sent** id | may return a *different* row (the `c_settings` `UNIQUE(auth_user_id)` reinstall case) — drain by the `opsIndexToEntry` id, adopt the server row |
+| `rejected`, `code = not_found` | `markProcessed`, no retry | server row hard-deleted after its tombstone was purged; local row left for the pull orphan sweep this same cycle |
+| `rejected` (other) | left with `recordRejection` + backoff | `attempt_count++`, `last_rejected_code` set, `next_attempt_at = now + backoff` |
+| unknown | left unchanged | logged |
+
+### Draining by the sent id
+
+`drainRowIdFor(responseIndex, opsIndexToEntry, echoedRowId)` (a free function in the same file) resolves which outbox key to drain by. The outbox entry is filed under the id **this client minted**; `server_wins` is precisely the outcome where the server may hand back a *different* row. On the `c_settings` reinstall path a fresh client mints a new settings id, collides with `UNIQUE(auth_user_id)`, and the server returns its stored row so the client adopts that id and content. Draining by the echoed id matched nothing, so the entry survived and re-pushed forever (`23505 → server_wins → still undrained`). Mapping index N back through `opsIndexToEntry` drains the right entry; for an ordinary `accepted` op the two ids are identical.
+
+## Backoff schedule
+
+`SyncEngine.backoffMillis(attemptCount)` computes the cool-down applied on rejection, with ±20% jitter so a server hiccup that rejects many rows at once doesn't queue them all for the same instant.
+
+| `attempt_count` | cool-down (±20% jitter) |
+| --- | --- |
+| 1 (first rejection) | 30 seconds |
+| 2 | 2 minutes |
+| 3+ | 10 minutes (cap) |
+
+Connectivity-restore and manual sync override this entirely by clearing `next_attempt_at` via `clearAllBackoff()`.
+
+## Stuck-row telemetry
+
+When an entry crosses `CRASHLYTICS_THRESHOLD = 10` attempts, `reportCrashlyticsForStuck()` files a single non-fatal, deduped per process by an `entityType:rowId:last_rejected_code` fingerprint (a restart re-logs a still-stuck entry, which is desired). The UI surfaces a lower "stuck" threshold via `SyncOutboxDao.stuckCountFlow`.
+
+## Diagnostics: `SyncRejectionDebugLogger`
+
+`SyncRejectionDebugLogger` (`data/sync/SyncRejectionDebugLogger.kt`) dumps the rejected row's local NOT-NULL fields to the rolling app log (tag `SyncReject`, `save = true`) so a stuck-sync report can be diagnosed without server logs. It is PII-safe by construction — UUIDs, enums, counts, and lengths only; recording/transcript/recording-session get full field dumps, other entities get an existence check. The call site in `runPush` runs unconditionally — it is not debug-gated, so rejection dumps land in release builds too (safe by the PII contract above; written via `AppLogger` `save = true`).
+
+## Safety net: `SyncEnqueueRecovery`
+
+`SyncEnqueueRecovery` (`data/sync/SyncEnqueueRecovery.kt`) is a **permanent** safety-net — explicitly excluded from the backfill-cleanup sweep, not a one-shot migration. `enqueueAllUnsynced()` walks all 13 synced tables (11 single-PK + 2 composite junctions; `SETTINGS` is excluded — it lives in DataStore with no `getUnsynced*` accessor) via `getUnsyncedIds()` / `getUnsyncedPairs()` (`remoteSyncedAt IS NULL`) and re-enqueues, catching any repository write that missed its enqueuer call. It is idempotent (already-synced rows are skipped; the squash index collapses duplicates) and cheap on hot start (13 indexed scans returning empty once everything is synced).
 
 <Note>
-Scaffold generated from the codebase map — expand with full detail, examples, and specifics.
+Per-user worker scoping is done by the `addUserTag(userSessionManager)` extension applied in the schedulers — there is no `UserWorkTag` class. `UserSessionManager.switchTo` cancels work by that tag on sign-out.
 </Note>
+
+## Where to go next
+
+- [Sync & Cloud Overview](/rollingrecord/app/sync/overview) — the two families and the trigger set.
+- [Pull & Reconciliation](/rollingrecord/app/sync/reconcile-engine) — the pull half and the orphan sweep that pairs with `not_found`.
+- [Wire Format & Transforms](/rollingrecord/app/sync/wire-transforms) — `buildPushRow` and the `DekUnavailableException` source.
+- [Sync Preferences](/rollingrecord/app/sync/sync-preferences) — the per-group filter `runPush` applies.

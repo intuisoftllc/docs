@@ -1,15 +1,45 @@
 ---
 title: "Storage & File Utilities"
-description: "Storage accounting and file utilities."
+description: "Per-user recordings directory management, the storage floor and rolling pruner, audio-file probing, orphan recovery, content hashing, and the share/download utilities."
 ---
 
-Storage accounting and file utilities underpin recordings, sharing, and device-global settings.
+`StorageManager` owns the per-user recordings directory, filename generation and parsing, the device free-space floor, and the rolling pruner that deletes the oldest unprotected segments to stay under the user's cap. Around it sit a set of file utilities: `AudioFileProbe` reads real audio parameters from a file's own bytes, `OrphanedAudioScanner` re-imports on-disk audio that lost its DB row, `ContentHash` gives the embedding reconciler a stable source version, and `ShareUtils` drives the native share sheet and save-to-Downloads.
 
-## What this covers
+## `StorageManager`
 
-- `StorageManager` storage accounting; `OrphanedAudioScanner`, `AudioFileProbe`, `ContentHash`, `ShareUtils`.
-- `DeviceSettingsDataSource` for device-global (non-user) settings.
+`service/StorageManager.kt` (in the `service/` package, not `util/`) is the user-scoped file manager. `getRecordingsDir()` returns `files/recordings/{segment}/`, where the segment is the active auth user id or `"anonymous"` — recordings are stored **per user**, parallel to the per-user Room DB path, not in one flat directory. `isStorageAccessible()` probes for read/write; `getFreeStorageBytes()` / `hasMinimumFreeStorage()` enforce the device free-space floor.
 
-<Note>
-Scaffold generated from the codebase map — expand with full detail, examples, and specifics.
-</Note>
+Filename work: `generateSegmentFile` builds `{name}_{ts}` / `{name}_seg{N}_{ts}` / `manual_{ts}` (guarding against timestamp collisions), `renameRecordingFile` / `renameSessionSegmentFile` rename in place while preserving the epoch suffix, and `parseFilenameInfo` / `parseDisplayName` recover the structured name from a filename. The companion holds `sanitizeForFilename`, `downloadFileName` (deterministic naming for a cloud-pulled recording, derived from its synced `createdAt` rather than `now()`), and `extractEpoch`.
+
+The rolling pruner is `ensureSpaceForNextSegment`, which deletes the oldest unprotected segments to make room and returns a `PruneResult` (`prunedBytes`, `outOfPrunableSpace`) — it logs the sweep with `save = true` so a "where did my recordings go?" complaint is answerable straight from the user's log file. `sessionOutOfPrunableSpace` is the non-mutating pre-flight for continue-recording, checking whether current free room plus everything prunable is under `MIN_CONTINUE_BYTES`.
+
+| Constant | Value | Purpose |
+| --- | --- | --- |
+| `MIN_FREE_STORAGE_BYTES` | 250 MB | Refuse to start or rotate a recording below this device free-space floor |
+| `MIN_CONTINUE_BYTES` | 1 MiB | Minimum freeable room to bother starting a rolling continue |
+| `FULL_HEADROOM_BYTES` | 1 KB | Prune target sits just under the user's cap so a session lands under, not over |
+
+## `AudioFileProbe`
+
+`util/AudioFileProbe.kt` reads a recording's real audio parameters directly from its bytes, because the file on disk is authoritative and any value cached at record time could drift (Opus is force-captured at 48 kHz regardless of the user's setting; merges and header recovery can leave stored values stale). `probe(filePath)` returns `AudioFileInfo(format, sampleRate, channels, bitsPerSample, bitRate, durationMs)`: it sniffs the first 12 bytes, routes RIFF/WAVE through `parseWavHeader` (the **one** WAV parser in the app, also used by `AudioMerger`) and everything else through `MediaExtractor`. It is blocking by design and must run off the main thread. It returns `null` only when the file is genuinely unreadable; an unrecognized codec returns `format = "unknown"`.
+
+## `OrphanedAudioScanner`
+
+`util/OrphanedAudioScanner.kt` recovers audio files that exist on disk but have no DB row — for example after a key-mismatch DB wipe, where the audio survives but the metadata is lost. `scan()` walks both the internal `filesDir/recordings` and the external `getExternalFilesDir(...)/recordings` for known audio extensions, minus paths the DB already knows; `probeAudioFile` reads duration and sample rate via `MediaMetadataRetriever`. `reimport` / `importFiles` rebuild `Recording` rows and reconstruct `RecordingSession`s from grouped segments. Only `importFiles()` returns the per-bucket `ImportSummary` (`imported`, `alreadyKnownPath`, `probeFailed`, `insertFailed`, `sessionInsertFailed`) so a partial import is never silent; `reimport()` returns a plain `Int` — the imported count — delegating to `reimportWithFailureCounts(...).imported`. Failures are logged with `save = true`.
+
+## `ContentHash`
+
+`util/ContentHash.kt`'s `sha256(text)` returns the lowercase-hex SHA-256 of whitespace-normalized text. It is the embedding reconciler's `sourceVersion` (RR-487): a stored vector satisfies the reconciler's predicate permanently and only flips back to "needs embedding" when the content genuinely changes, which is the structural guard against an unbounded re-embed loop.
+
+## `ShareUtils`
+
+`util/ShareUtils.kt` handles getting audio off the device. `shareFiles()` launches the native `ACTION_SEND` / `ACTION_SEND_MULTIPLE` share sheet for audio paths via `FileProvider` (`"${packageName}.provider"`), deduplicating by canonical path. `saveToDownloads()` copies files into Downloads via `MediaStore` (API 29+) or the public Downloads directory on older devices, returning the count saved; `mimeTypeFor` maps the extension to a MIME type.
+
+## Storage location
+
+Which partition recordings live on is a device-scoped choice, not a per-user one. `data/local/DeviceSettingsDataSource.kt` holds `STORAGE_LOCATION` (default `"internal"`) — the SAF tree URI is a per-device grant — alongside other device-global keys (`DARK_MODE`, `PERMISSIONS_SETUP_DONE`, `TILE_*`, `SYNC_WIFI_ONLY`, `UI_VERSION`). It implements `UserScopedCache` so `clearForUserSwitch` resets the tile pinned-session pair and `TILE_MODE` on an account change while leaving the genuinely device-level values intact.
+
+## Related pages
+
+- [Settings Surface](/rollingrecord/app/platform/settings) — where the storage location and rolling cap are configured.
+- [Diagnostic Logging](/rollingrecord/app/platform/logging) — the `save = true` pruner and import log lines.

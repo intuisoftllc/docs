@@ -1,15 +1,58 @@
 ---
 title: "Auth Token Injection & Refresh"
-description: "Attaching, refreshing, and reacting to auth tokens."
+description: "The OkHttp interceptor chain that stamps the Clerk JWT + App Check headers on Edge Function calls, refreshes on 401, and reacts to account freeze and version gates."
 ---
 
-Network requests attach the Clerk JWT and refresh it on expiry, with account-freeze handling.
+Both authed Supabase OkHttp clients — `supabase` and `aiengine` — are built in `di/NetworkModule.kt` with the **identical** ordered interceptor chain plus a 401 authenticator. The dedicated `audio_signed_url` client carries none of these interceptors because a Supabase Storage signed URL self-authenticates via its `token` query param, and stamping the user's JWT onto a third-party storage host would be wrong.
 
-## What this covers
+## The authed chain
 
-- `BearerJwtInterceptor` attaches the Clerk JWT; `TokenRefreshAuthenticator` refreshes on 401.
-- `AccountFreezeInterceptor` and account-freeze responses.
+Interceptors run outermost-first on the way out. The chain short-circuits client-side cooldowns before any token is fetched, stamps App Check and the Clerk JWT, then observes the response for freeze and version signals.
 
-<Note>
-Scaffold generated from the codebase map — expand with full detail, examples, and specifics.
-</Note>
+| Order | Component | Kind | Responsibility |
+| --- | --- | --- | --- |
+| 1 (outermost) | `RateLimitInterceptor` | Interceptor | Short-circuit endpoints in a client 429 cooldown with a synthetic 429; record new 429s |
+| 2 | `AppCheckTokenInterceptor` | Interceptor | `apikey` + `X-Firebase-AppCheck` (blocks on the cold-start warmup) |
+| 3 | `BearerJwtInterceptor` | Interceptor | `Authorization: Bearer <Clerk JWT>` via `awaitAccessToken` |
+| 4 | `AccountFreezeInterceptor` | Interceptor | Set/clear FROZEN from a 403 `account_frozen` / any 2xx (authed requests only) |
+| 5 | `AppVersionHeaderInterceptor` | Interceptor | `X-App-Version` = real `versionCode` |
+| 6 | `ClientTooOldInterceptor` | Interceptor | Flip `AppVersionGate` on a 410 `client_too_old` |
+| 7 | `HttpLoggingInterceptor` | Interceptor | `HEADERS` in debug, `NONE` in release |
+| on 401 | `TokenRefreshAuthenticator` | Authenticator | Re-fetch the token, retry once (loop-guarded) |
+
+## `BearerJwtInterceptor`
+
+`BearerJwtInterceptor` (`data/remote/aiengine/BearerJwtInterceptor.kt`) adds `Authorization: Bearer <jwt>` from `runBlocking { authRepository.awaitAccessToken() }` (5s timeout). Clerk's Kotlin SDK has no synchronous token snapshot, and calling `fetchToken` is also what refreshes a near-expiry token — so going through it per request is correct, and `runBlocking` on the OkHttp dispatcher thread is the right place to block for I/O-shaped work. If the token is null it proceeds **without** the header and logs a warning; the server's 401 plus the worker retry path take over. Server-side, `_shared/gates/jwt.ts` verifies the JWT against Clerk's JWKS and extracts `auth_user_id` from the verified `sub` claim.
+
+## `TokenRefreshAuthenticator`
+
+`TokenRefreshAuthenticator` (`data/remote/aiengine/TokenRefreshAuthenticator.kt`) is an OkHttp `Authenticator`, which OkHttp runs **only** on a 401. It fires on a bearer-auth failure — `isBearerAuthFailure` peeks up to 1KB of the body for `missing_bearer_token` / `invalid_jwt` (or an empty body) — re-calls `awaitAccessToken(8s)`, and retries the original request once with the fresh token. There is no explicit Supabase refresh; Clerk refreshes internally, so a second `awaitAccessToken` after a 401 returns the newest token. The loop guard is `response.priorResponse != null` — if the retried request 401s again, it bails and propagates the 401 (e.g. account revoked, server key rotation).
+
+## `AppCheckTokenInterceptor` and warmup
+
+`AppCheckTokenInterceptor` (`data/remote/AppCheckTokenInterceptor.kt`) stamps two headers required by every Edge Function: `apikey` (`BuildConfig.SUPABASE_ANON_KEY`, intentionally public and shipped in the APK — RLS on every table plus service-role Edge Functions protect the data) and `X-Firebase-AppCheck` (a fresh App Check token proving a legitimate install). Before the per-request fetch it blocks on `AppCheckWarmup.warmup` (15s cap), then fetches with `getAppCheckToken(false)` (15s cap). On failure it proceeds header-less and the Edge Function returns `401 invalid_app_check`; the failure is persisted to the file log for field diagnosis (the common debug-build cause is an unregistered device debug token).
+
+`AppCheckWarmup` (`data/remote/AppCheckWarmup.kt`) is an app-scoped cold-start gate — a `Deferred` kicked from `App.onCreate` with up to three attempts and exponential backoff — that eliminates the race where the first real request and the SDK's first token fetch are in flight simultaneously. Once warmup completes, every subsequent `getAppCheckToken(false)` is a hot cache hit and the await is a no-op. It completes the `Deferred` even after a final failure so the interceptor never blocks forever on a broken Firebase.
+
+## `AccountFreezeInterceptor`
+
+`AccountFreezeInterceptor` (`data/remote/aiengine/AccountFreezeInterceptor.kt`) runs **after** `BearerJwtInterceptor` and acts only on requests that actually carry an `Authorization` header (an un-authed request never reaches the server's per-user freeze gate). It peeks up to 64KiB without draining the body and hand-rolls a tiny top-level JSON field extraction (`extractStringField`) rather than pulling a serializer into the hot path:
+
+- **403** with `error == account_frozen` → `repository.setFrozen(reason)` — the only positive freeze signal.
+- **2xx** → `repository.clearFrozen()` — a success proves the freeze gate was passed.
+- **everything else** (401, App-Check 403, 410/426, other 4xx/5xx, network failure) → no-op; those are inconclusive about freeze.
+
+The matched code is `AiEngineErrorCode.ACCOUNT_FROZEN` (`"account_frozen"`) in `app/agentcore/src/main/kotlin/com/intuisoftllc/rollingrecord/data/remote/aiengine/AiEngineErrorCode.kt`, a mirror of the server's `_shared/errors.ts` registry.
+
+## Rate-limit and version interceptors
+
+`RateLimitInterceptor` (`data/remote/ratelimit/RateLimitInterceptor.kt`) is outermost on both authed clients. It identifies the endpoint from the Retrofit method's `@EdgeTag`; if that function is in a client-side cooldown (a prior 429's `reset_at_sec` hasn't passed) it synthesizes a 429 **before** any token fetch or network I/O, and on a real `429 rate_limited` it records the cooldown into `RateLimitCoordinator`. The synthetic 429 is serialized from the same typed envelope as a real one, so downstream mappers can't tell them apart.
+
+`AppVersionHeaderInterceptor` (`data/version/AppVersionHeaderInterceptor.kt`) stamps `X-App-Version` with the real `BuildConfig.VERSION_CODE` so the server's min-supported floor compares correctly — a missing header is read as version 0 and fails the check the moment the floor is raised above 0. Its paired `ClientTooOldInterceptor` (`data/version/ClientTooOldInterceptor.kt`) catches a `410 client_too_old` (peeking 256 bytes for the needle) and flips `AppVersionGate` to `NeedsUpdate`, which surfaces the blocking update overlay.
+
+## Related
+
+- [Authentication (Clerk)](/rollingrecord/app/auth/clerk) — `awaitAccessToken`, the token source both callers use
+- [Identity Resolution](/rollingrecord/app/auth/identity-resolution) — a Supabase-client call that rides this chain
+- [Login & Sign-Up Flow](/rollingrecord/app/auth/login-flow) — how the session that mints the JWT is established
+- [Known Accounts / Account Switching](/rollingrecord/app/auth/known-accounts) — device account registry

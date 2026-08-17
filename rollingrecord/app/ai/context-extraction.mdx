@@ -1,16 +1,110 @@
 ---
 title: "Context Extraction Pipeline"
-description: "Turning recordings into sections, insights, and action items."
+description: "How the client submits a server-side extraction job, polls it, applies the merged results into Room, and surfaces the Intelligence pane."
 ---
 
-Extraction distills a recording into structured context — sections, insights, and action items — metered in true audio minutes.
+Extraction is a server-side asynchronous pipeline. The client's only job is to gather a context's pending sources, submit one job, watch it to a terminal state, apply the fully-merged results into Room, and acknowledge it. `ContextExtractionWorker` (`worker/ContextExtractionWorker.kt`) is that client leg — it no longer chunks transcripts, assembles prompts, calls the model, or parses tool blocks; the server runner does all of that and returns a single merged accumulator blob.
 
-## What this covers
+## `ContextExtractionWorker`
 
-- `ContextExtractionWorker` plus `ExtractionPlanner`, `ExtractionResultsApplier`, `ExtractionResultsMapper`.
-- Extraction metered in true audio minutes with internal chunking; over-cap recordings stay pending and auto-resume.
-- Output types: sections, insights, action items (`ContextCardRepository`, `ActionItemRepository`).
+`ContextExtractionWorker` is a `CoroutineWorker` that drives exactly one server extraction. It runs on a single global unique-work chain (`QUEUE_NAME = "context_extraction_queue"`, `APPEND_OR_REPLACE`), so a second context queues locally behind the head rather than racing into a server-side 409. The companion object exposes `enqueue(...)` (mints a fresh job id) and `enqueueAttach(...)` (resumes a supplied job id — see [Extraction Job Lifecycle](/rollingrecord/app/ai/extraction-jobs)).
 
-<Note>
-Scaffold generated from the codebase map — expand with full detail, examples, and specifics.
-</Note>
+Input `Data` keys:
+
+| Key | Meaning |
+| --- | --- |
+| `KEY_CONTEXT_ID` (`context_id`) | The context being extracted. Absent → `Result.failure()`. |
+| `KEY_BLUEPRINT_ID` (`blueprint_id`) | The chosen blueprint id, or absent for the context's own / default blueprint. |
+| `KEY_IS_REBUILD` (`is_rebuild`) | Rebuild wipes the card and resets incorporation before running. |
+| `KEY_JOB_ID` (`extraction_job_id`) | The server job's primary key, minted client-side once at enqueue and preserved across every WorkManager retry. |
+
+`MAX_RUN_ATTEMPTS = 3` bounds WorkManager retries before a transient failure becomes terminal; `ACK_MAX_ATTEMPTS = 3` bounds the ack retry.
+
+## The run: `runJob`'s eight steps (0–7)
+
+The worker takes the card's exact pre-run state (`snapshotForExtraction`) before any write, then runs the pipeline. Each step publishes an [`ExtractionJobPhase`](/rollingrecord/app/ai/extraction-jobs) so the Intelligence pane can narrate progress.
+
+| Step | What happens |
+| --- | --- |
+| 0. Resume probe | `statusOnce(jobId)`: if the server already knows this id, settle/watch it to terminal instead of re-planning. Runs **before** the budget gate so a process-killed job's already-paid results still apply. |
+| 1. Gather | `gatherSources()` resolves pending recordings + pooled sessions into `ExtractionUnit`s. Recordings without a `DONE` transcript are enqueued for transcription and left pending; silent (empty-transcript) sources are left pending, never billed. |
+| 2. Budget partition | `ExtractionPlanner.partition()` splits units into authorized/deferred against the remaining extraction-minutes budget (from `UsageRepository`; dev override via `DevFlags.extractionsCapOverride`). |
+| 3. Prior state | Builds `ExtractionPriorState` from the card at this instant so the runner can `replaceSection` / `completeTasks` instead of re-extracting. |
+| 4. Size trim | `ExtractionPlanner.fitByBytes()` drops units from the tail until the serialized payload fits `ExtractionPayload.MAX_INLINE_PAYLOAD_BYTES` (8 MiB). |
+| 5. Submit / attach | `submitOrAttach()` POSTs `extract-submit`; `Queued` → watch, `AlreadyRunning` → attach if the job belongs to this context, else retry. |
+| 6. Watch | `awaitTerminal()` polls `extract-results {operation:"status"}` to a terminal `ExtractionJobStatus`, publishing a phase each tick. |
+| 7. Settle | `DONE` → `applyDoneJob` (fetch → ownership checks → apply → ack); `FAILED` / `CANCELLED` / `ACKED` / `NOT_FOUND` handled with snapshot restore + a card sentinel. |
+
+The client never runs an admission gate for context fullness — the server decides. A doomed batch costs one ~2s call that returns `chunks=0` and bills nothing, so the client is deliberately never the one saying "too full".
+
+## Error sentinels
+
+Terminal outcomes stamp a sentinel string into `ContextCardEntity.errorMessage`, which the Intelligence pane maps to a state and a retry affordance:
+
+| Sentinel | Meaning |
+| --- | --- |
+| `CAP_ERROR_MESSAGE` (`extraction_cap_reached`) | Monthly extraction budget exhausted; sources stay pending and resume after a reset/upgrade. |
+| `CONTEXT_FULL_ERROR_MESSAGE` (`extraction_context_full`) | Server stopped at the context size ceiling — a **partial** success; completed recordings applied, the rest stay pending and are named in the review sheet. |
+| `CONTEXT_TOO_LARGE_ERROR_MESSAGE` (`extraction_context_too_large`) | A single unit's transcript is too large to submit. |
+| `NETWORK_ERROR_MESSAGE` (`extraction_network_error`) | Connection dropped / retries exhausted. |
+| `UNRECOVERABLE_ERROR_MESSAGE` (`extraction_unrecoverable`) | Failed in a way a retry cannot fix (undecryptable blob, vanished job row, rejected submit). Recovery is a fresh extraction. |
+
+## `ExtractionPlanner`
+
+`ExtractionPlanner` (`worker/extraction/ExtractionPlanner.kt`) is a pure, I/O-free planning object that replaced the retired `TranscriptChunker` and the server's `extract_preflight` op. The plan is **advisory** — the server's per-recording reserve is the authoritative charge, so a mis-estimate defers server-side rather than over-billing.
+
+- `chunkCountFor` / `chunksTotalFor` — `ceil(chars / (chunkTokens × CHARS_PER_TOKEN))`, mirroring the server's arithmetic so the progress denominator matches. `CHARS_PER_TOKEN = 4`.
+- `billableMsFor` — a trusted audio duration is authoritative and billed as-is; the transcript-token floor is a fallback only when no duration exists (never an inflator on top of it).
+- `partition` — greedy budget fit in list order; a null `remainingMs` degrades open and authorizes everything.
+- `fitByBytes` — tail-first serialize-and-measure trim to `MAX_INLINE_PAYLOAD_BYTES`, because an over-cap request body surfaces as an opaque network failure, not a clean 413.
+
+Units can be deferred by **two** gates — the budget partition and the payload byte-size trim. Deferred units stay pending (never marked incorporated), are re-gathered on the next run, and resume when the user next extracts or after a cap reset/upgrade. There is no timer.
+
+## `ExtractionResultsApplier`
+
+`ExtractionResultsApplier` (`worker/extraction/ExtractionResultsApplier.kt`) writes a finished results blob into Room under one `db.withTransaction` + `NonCancellable`. Inside the transaction, in order: `mergeContent` (sections as replacements via `applyReplacements`, `syncIndexes = false`), `insertTasks`, `completeTasksByIds` (validated against the context's own task ids), `saveExtractionBudget` (the RR-497 calibration pair), `markRecordingsIncorporated` / `markSessionsIncorporated`, and `clearExtractionSnapshot`. After the commit it rebuilds the derived indexes (`refreshFts`) — outside the transaction because that ends in a WorkManager enqueue. It does NOT call `enrich`: enrichment (keywords + summary, two network calls) is a separate `ExtractionResultsApplier.enrich(contextId)` method the worker invokes from `ContextExtractionWorker.applyDoneJob` after the apply returns, not part of `apply()` itself.
+
+The apply is safe to run twice: sections are applied as replacements (not an additive merge) and task ids are derived (not random), so a repeat apply converges instead of duplicating. That is what makes the apply→ack window interruptible.
+
+## `ExtractionResultsMapper`
+
+`ExtractionResultsMapper` (`worker/extraction/ExtractionResultsMapper.kt`) is a pure wire↔Room translator in both directions. `map()` produces a `Mapped(sections, newTasks, completedClientTaskIds)`; `toPriorState()` builds the `ExtractionPriorState` the runner seeds its accumulator from, splitting user-authored insights into `userNotes` (readable but unwritable, since no extraction tool addresses that field). Section ids are derived from `contextId` + the lowercased title; task ids from `jobId` + the server task id — so a repeated apply overwrites the same rows rather than minting new ones. The mapper does not re-validate; the runner already did that server-side.
+
+## `ContextCardEntity` and `ContextStatus`
+
+`ContextCardEntity` (`data/local/db/entity/ContextCardEntity.kt`) is the Room `@Entity("context_cards")` (PK `contextId`) that holds the extraction output and its lifecycle metadata:
+
+- `sections` — JSON `List<ExtractedSection>`, each with `title`, `category`, and a list of `Insight`s (`text`, `status`, `confidence`, `origin`, `sourceRecordingIds`, `dateRef`).
+- `status` — a `ContextStatus`: `NOT_STARTED` / `PROCESSING` / `DONE` / `ERROR`. This is the card's extraction status, distinct from the context lifecycle (`ACTIVE` / `COMPLETED` / `ARCHIVED`) and from the server job status.
+- `errorMessage`, `keywords`, `contextSummary`, `digest` (see [Context Synthesis](/rollingrecord/app/ai/synthesis)).
+- `extractionSnapshotJson` — the pre-run snapshot used for verbatim restore.
+- `lastExtractionInputTokens` / `lastExtractionEstimatedTokens` — the RR-497 size calibration pair.
+- `remoteSyncedAt`, `cloudExcludedAt` — sync / cloud-exclusion metadata.
+
+## Idempotency and durability
+
+| Mechanism | Guarantee |
+| --- | --- |
+| Client-minted job id in `inputData` (`KEY_JOB_ID`) | Survives process death / retry; a resend resolves to `queued` or `already_running`, never a duplicate job. |
+| Incorporation flips only after results land | A retry after a successful apply finds nothing pending and exits before submitting. |
+| Sections applied as replacements + derived task ids | A repeated apply overwrites instead of duplicating. |
+| Pre-extraction snapshot (`extractionSnapshotJson`) | Cancel / failure / process-death restores the card verbatim; `App.revertOrphanedExtractionSnapshots` sweeps orphans at the next launch. |
+| Server `recording_ids` from results | Only sources the job actually **processed** are marked incorporated; an empty list means it processed nothing (never "assume all"). |
+
+## The Intelligence pane
+
+There is no single `ContextCardSheet` composable — the extraction surface is the Intelligence pane inside `V2ContextDetailScreen`, driven by the card's `ContextStatus`:
+
+- `ContextIntelligencePreExtraction` (`ui/v2/screens/contexts/components/ContextIntelligencePreExtraction.kt`) — shown while status is `NOT_STARTED`: a masonry grid of blueprint picker cards plus source chips and the Extract / custom-blueprint CTAs. Custom cards get Edit/Delete (Delete gated to Cloud+AI); built-ins have no long-press menu.
+- `ExtractionDistillAnimation` (`ui/v2/screens/contexts/components/ExtractionDistillAnimation.kt`) — the in-progress "distillation" visual, keyed off `ExtractionJobPhase`: a particle field, a phase label, and a determinate bar (Extracting / Uploading with a fraction) or an indeterminate sweep.
+- `ContextIntelligenceResults` (`ui/v2/screens/contexts/components/ContextIntelligenceResults.kt`) — shown for status `DONE` with topics: a source-chip row, a `{n} Topics found` summary with select-all, the topic cards, and a footer with Tasks plus the mode-driven primary action (Extract / Export). Per-topic detail opens in `ContextTopicDetailSheet`. `TopicSelection` drives multi-select export.
+
+`V2ContextDetailViewModel.extract(rebuild)` (`ui/v2/screens/contexts/V2ContextDetailViewModel.kt`) is the UI entry point. It pre-checks `ServerConfig.aiExtractionEnabled`, `FeatureAccess.FULL`, the context lifecycle's `canExtract`, online connectivity, that no linked recording is still transcribing, and that extraction isn't capped, then calls `ContextExtractionWorker.enqueue(...)`. `cancelExtraction()` reads the live job id, cancels the WorkManager tag, asks the server to cancel the job, and restores the card from its snapshot under `NonCancellable`. The pane's live phase is derived via `ExtractionProgress.fold` over the context's `WorkInfo`s.
+
+## Related pages
+
+- [Extraction Job Lifecycle](/rollingrecord/app/ai/extraction-jobs) — the polling / phase / reconcile state layer.
+- [Extraction Templates (Blueprints)](/rollingrecord/app/ai/templates-blueprints) — what drives the extraction.
+- [Tasks & Action Items](/rollingrecord/app/ai/tasks-action-items) — the action items extraction emits.
+- [Context Synthesis](/rollingrecord/app/ai/synthesis) — the digest produced when a context completes.
+- [Context Export](/rollingrecord/app/ai/context-export) — exporting extracted topics.

@@ -1,15 +1,48 @@
 ---
 title: "App Version Gate"
-description: "The minimum-supported-version kill switch."
+description: "The minimum-supported-version kill switch: local re-evaluation against server_config, the X-App-Version header, and the 410 client_too_old catch."
 ---
 
-A version gate enforces the server's minimum-supported build floor and blocks under-floor clients.
+`AppVersionGate` (RR-222) is an app-scoped state machine that hard-blocks a build whose `versionCode` has fallen below the server-enforced floor. It flips through two converging triggers — a local floor check and a server `410 client_too_old` catch — and once blocked it cannot un-block in-process.
 
-## What this covers
+## `AppVersionGate`
 
-- `AppVersionGate` enforcing the server min-supported floor; `AppVersionHeaderInterceptor` (`X-App-Version`) and `ClientTooOldInterceptor`.
-- Kill-switch re-evaluation on Remote Config changes.
+`AppVersionGate` (`data/version/AppVersionGate.kt`) is an app-scoped singleton that lives outside the user session, because a pre-auth Edge Function call can hit the floor before anyone is signed in. It exposes `state: StateFlow<State>` where `State` is a sealed interface:
 
-<Note>
-Scaffold generated from the codebase map — expand with full detail, examples, and specifics.
-</Note>
+- `State.Ok`
+- `State.NeedsUpdate(source)` with `source` being `Source.LOCAL_RC` or `Source.SERVER_410`
+
+| Method | Behavior |
+| --- | --- |
+| `reevaluate()` | Compares `ServerConfig.minSupportedAppVersionCode` (the floor) against `BuildConfig.VERSION_CODE`; flips to `NeedsUpdate(LOCAL_RC)` when `floor > 0 && running < floor`. No-op once already blocked. |
+| `markBlocked(source)` | Idempotent flip called by `ClientTooOldInterceptor` on a server `410`. |
+
+Both paths converge on the same blocked state, and there is no production un-block path — the user must update and relaunch.
+
+## How the gate flips
+
+| Trigger | Symbol | Source | Timing |
+| --- | --- | --- | --- |
+| Local floor check | `AppVersionGate.reevaluate()` | `LOCAL_RC` | After `ServerConfigManager` applies cached, then fresh, `server_config` values in `App.onCreate` |
+| Server rejection | `ClientTooOldInterceptor` → `markBlocked` | `SERVER_410` | On any ai-engine `410 client_too_old` response |
+
+### Local re-evaluation
+
+The floor lives in Supabase `server_config`, mirrored onto `ServerConfig.minSupportedAppVersionCode` in the shared pure-JVM agentcore module (`app/agentcore/src/main/kotlin/com/intuisoftllc/rollingrecord/config/ServerConfig.kt`) — a `@Volatile var` defaulting to `0`, keyed `min_supported_app_version_code`, mapped in `update()` via `toIntOrNull()`. `App.onCreate` calls `serverConfigManager.fetchAndApply(force = true) { getKoin().get<AppVersionGate>().reevaluate() }`, so the gate re-evaluates after **both** the cached apply (which blocks an under-floor build instantly on relaunch, even offline) and the fresh fetch (so a newly-raised floor blocks within a moment of launch).
+
+### Server 410 catch
+
+`ClientTooOldInterceptor` (`data/version/ClientTooOldInterceptor.kt`) is an internal OkHttp interceptor holding the gate. On a `410` response it `peekBody(256)` and substring-matches the needle `client_too_old` — peeking rather than draining so the downstream client can still parse the body, and substring-matching rather than JSON-parsing to keep kotlinx.serialization out of the interceptor hot path. On a match it calls `gate.markBlocked(SERVER_410)`. This is the defense-in-depth path for clients that missed the local check.
+
+## `X-App-Version` header
+
+`AppVersionHeaderInterceptor` (`data/version/AppVersionHeaderInterceptor.kt`) is an internal OkHttp interceptor that stamps `X-App-Version: <versionCode>` (from `BuildConfig.VERSION_CODE.toString()`) on every ai-engine request. The server compares it as a plain integer; a missing header is treated as version `0`, which fails the check only when the floor is raised above `0`. Both this interceptor and `ClientTooOldInterceptor` are wired specifically onto the authed ai-engine OkHttp clients in `NetworkModule` — not globally onto every network client.
+
+## Blocking UI
+
+`V2App` collects `appVersionGate.state` (via `koinInject`) and, when the state is `AppVersionGate.State.NeedsUpdate`, overlays `V2BlockingUpdateScreen` (`ui/v2/screens/version/V2BlockingUpdateScreen.kt`) on top of the entire V2 tree — including onboarding. The screen fills the viewport, swallows the system back button, and offers a single "Update now" affordance that deep-links to the Play Store (`market://` with an HTTPS fallback). No Retry, Skip, or Later exists by design — the floor moved, so the only fix is updating and relaunching. V2 is the active surface; the `AppVersionGate` KDoc still references V1's `AppNavHost` overlay, which is legacy wording.
+
+## Related
+
+- [Firebase App Check](/rollingrecord/app/platform/app-check) — the sibling header stamped on the same ai-engine clients
+- [Background Work (WorkManager)](/rollingrecord/app/platform/workmanager)

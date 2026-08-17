@@ -1,15 +1,69 @@
 ---
 title: "Envelope Encryption Primitives"
-description: "The pure-JVM crypto primitives shared with smoketest."
+description: "The pure-JVM app/crypto AES-256-GCM primitives that encrypt on-device content and derive the domain keys."
 ---
 
-Content encryption uses envelope primitives from the shared crypto module, mirroring the backend column convention.
+Every byte RollingRecord encrypts on-device flows through `app/crypto`, a pure Kotlin/JVM module with no Android or I/O dependencies. It holds the AES-256-GCM primitives (streaming for files, one-shot for small values), the HKDF key schedule, and the ciphertext container types — the same source is compiled into the `smoketest` module so client and test crypto stay in lock-step.
 
-## What this covers
+## The `app/crypto` module
 
-- crypto module: `EnvelopeCrypto` (AES-256-GCM), `TextCrypto`, `KeyDerivation`, `EncryptedField`.
-- The `_ct`/`_iv` column convention mirrored on the client; parity with smoketest.
+The module exposes four cooperating pieces:
 
-<Note>
-Scaffold generated from the codebase map — expand with full detail, examples, and specifics.
-</Note>
+| Symbol | Kind | Role |
+| --- | --- | --- |
+| `encryptStream` / `decryptStream` / `encryptBytes` / `decryptBytes` / `zero` | top-level functions in `app/crypto/EnvelopeCrypto.kt` | Raw AES-256-GCM engines |
+| `TextCrypto` | `object` in `app/crypto/TextCrypto.kt` | Small text/JSON column encryption |
+| `EncryptedField` | `data class` in `app/crypto/EncryptedField.kt` | The ciphertext + IV pair |
+| `KeyDerivation` | `object` in `app/crypto/KeyDerivation.kt` | HKDF into the DB key and backup key |
+
+There is no class or object named `EnvelopeCrypto` — `EnvelopeCrypto.kt` is a file of top-level functions.
+
+## AES-256-GCM parameters
+
+All primitives use one parameter set, chosen to match the server's `_shared/crypto/envelope.ts` so ciphertext produced on-device decrypts server-side unchanged and vice versa.
+
+| Parameter | Value |
+| --- | --- |
+| Key size | AES-256 (32-byte DEK) |
+| IV / nonce | 96-bit (12 bytes), random per encryption |
+| Auth tag | 128-bit (16 bytes), appended to the ciphertext |
+| Streaming engine | BouncyCastle `GCMBlockCipher` — `O(chunk)` memory, 64 KB chunk |
+| One-shot engine | JCA `Cipher` (`AES/GCM/NoPadding`) — small payloads only |
+
+The wire format is always `ciphertext || 16-byte tag` as a single contiguous byte run.
+
+## Streaming file crypto
+
+`encryptStream(plaintext, ciphertext, dek, iv)` and `decryptStream(ciphertext, plaintext, dek, iv)` are the paths for audio recordings and backup payloads. Both `require` `dek.size == 32` and `iv.size == 12`, then drive a stateful BouncyCastle `GCMBlockCipher` in a `STREAM_CHUNK_BYTES` (64 KB) read loop. The 16-byte GCM tag is written at end-of-stream on encrypt and verified at end-of-stream on decrypt; a truncated or tampered ciphertext surfaces as a thrown integrity error from the final read, and the caller **must discard** any plaintext already written (it came from a not-yet-authenticated region). Neither stream is closed by the function — the caller owns both.
+
+The streaming path deliberately uses BouncyCastle rather than Android's default Conscrypt provider. Conscrypt implements AES-GCM by buffering the whole plaintext inside `Cipher.doFinal()`, so a 128 MB recording needs a 128 MB contiguous allocation and OOMs even on flagship phones; `CipherOutputStream` only *looks* like it streams. `GCMBlockCipher.processBytes(...)` produces ciphertext synchronously per chunk with bounded memory, so 1 GB+ files process without issue. The output byte layout is identical to Conscrypt's, so the server decrypt path is unchanged.
+
+## One-shot byte crypto
+
+`encryptBytes(plaintext, dek, iv)` and `decryptBytes(ciphertext, dek, iv)` are the concise JCA `Cipher` variants for small payloads — DEK-wrapping fixtures, tests, and `TextCrypto`'s backing. They return / consume `ciphertext || 16-byte tag` in one `ByteArray` and are **not** for files.
+
+`zero(buf)` best-effort zero-fills a DEK, IV, or derived-key `ByteArray` after use (`buf.fill(0)`). The JVM cannot guarantee the bytes leave memory before GC, but the key layer calls it everywhere a key buffer goes out of scope to shrink the window.
+
+## Small-value encryption: `TextCrypto` and `EncryptedField`
+
+The sync engine encrypts user-content **columns** (a recording title, a context summary, a chat message) before pushing rows to the cloud. `TextCrypto.encryptString(plaintext, dek)` / `encryptJson(json, dek)` generate a fresh random 12-byte `SecureRandom` IV **per call** and return an `EncryptedField`. `decryptString(ciphertext, iv, dek)` / `decryptJson(...)` reverse it; UTF-8 is the canonical encoding so an encrypt on one device decrypts byte-identically on another. Because AES-GCM is AEAD, a tampered ciphertext, wrong IV, or wrong DEK all raise `AEADBadTagException` — the sync-pull path catches it and skips the row rather than overwriting good local data.
+
+`EncryptedField(ciphertext, iv)` is a `data class` with content-based `equals`/`hashCode`. Its `ciphertext` is the `ct || tag` run; its `iv` is the 12-byte per-call nonce. It maps directly to the cloud table's `<field>_ct` / `<field>_iv` column pair. Construct one only via `TextCrypto`'s encrypt functions — never by hand — so the fresh-IV invariant holds.
+
+## HKDF and the two domain keys
+
+Using the raw account DEK for multiple purposes would be a key-reuse footgun, so `KeyDerivation` runs RFC 5869 HKDF-SHA256 (`hkdfSha256`, extract-then-expand) to split one 32-byte DEK into cryptographically independent 32-byte keys bound to distinct `info` labels.
+
+| Function | HKDF `info` label | Consumer |
+| --- | --- | --- |
+| `deriveDbKey(dek)` | `rr-db-key-v1` (`DB_KEY_INFO`) | SQLCipher raw key, hex-encoded via `toSqlCipherRawKey` into the `x'<hex>'` literal |
+| `deriveBackupKey(dek)` | `rr-db-backup-v1` (`BACKUP_KEY_INFO`) | AES-256-GCM key for the `.rrbackup` container payload |
+
+Both take a 32-byte DEK, use an **empty salt** (RFC 5869 substitutes 32 zero bytes), and output 32 bytes (`KEY_BYTES`). The derivation is deterministic — the same DEK always yields the same DB key and backup key on any device, which is what makes a signed-in library portable across a user's devices. `toSqlCipherRawKey(dbKey)` lowercase-hex-encodes the 32 bytes for SQLCipher's raw-key passphrase; the functions are pure, with no Android, I/O, or randomness.
+
+## Where to go next
+
+- [DEK & Database Key Lifecycle](/rollingrecord/app/security/dek-and-db-key) — how the DEK is fetched, cached, and turned into the SQLCipher key
+- [Backup & Restore](/rollingrecord/app/security/backup-restore) — the `.rrbackup` container built on `deriveBackupKey`
+- [Shared modules](/rollingrecord/app/architecture/shared-modules) — why `app/crypto` is source-shared with `smoketest`
+- [Audio sync](/rollingrecord/app/sync/audio-sync) — the streaming encrypt/decrypt path for cloud audio

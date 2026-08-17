@@ -1,15 +1,73 @@
 ---
 title: "Login & Sign-Up Flow"
-description: "The email-OTP and Google sign-in flow."
+description: "The V2 email-OTP + Google sign-in step flow: landing, email, name, and OTP screens on a login-scoped NavHost driven by one shared ViewModel."
 ---
 
-Sign-in is a step flow supporting email OTP and Google, on a login-scoped navigation graph.
+V2 requires sign-in. While the session is anonymous, `V2App` (`ui/v2/V2App.kt`) mounts a self-contained four-route sign-in flow; once Clerk establishes a session the auth observer swaps the whole tree to `V2MainNavHost`. Sign-in is email OTP first, Google second — there is no password.
 
-## What this covers
+## `V2LoginNavHost` — the four-route flow
 
-- `V2LoginScreen` and step screens: `V2EmailEntryScreen`, `V2OtpScreen` (magic-link 6-digit OTP), `V2NameEntryScreen`.
-- Google sign-in via `GoogleCredentialProvider`; login-scoped nav (`V2LoginNavHost`).
+`V2LoginNavHost` (`ui/v2/navigation/V2LoginNavHost.kt`) is a Compose `NavHost` with `startDestination = V2LoginRoot`. It creates **one** `V2LoginViewModel` via `koinViewModel()` and passes that single instance to all four routes — the email, name, and OTP screens read and mutate the same `LoginUiState`, so a per-route ViewModel would lose state across navigations. A `LaunchedEffect` collects `viewModel.navEvents` and drives `navController`. The four destinations are `@Serializable` objects in `ui/v2/navigation/V2LoginRoutes.kt`.
+
+| Route | Screen | VM action | Next |
+| --- | --- | --- | --- |
+| `V2LoginRoot` | `V2LoginScreen` | `onContinueWithEmail` (nav callback) / `onContinueWithGoogle` (VM) | Email entry, or (Google success) session swap |
+| `V2EmailEntry` | `V2EmailEntryScreen` | `onEmailNext` → `checkAndStartV2` | OTP entry (existing user, code already sent) OR name entry (new user) |
+| `V2NameEntry` | `V2NameEntryScreen` | `onNameNext` → `createSignUpAndSendOtpV2` | OTP entry (code sent) |
+| `V2OtpEntry` | `V2OtpScreen` | `onOtpSubmit` → `verifySignInOtpV2` / `verifySignUpOtpV2` | No nav event — Clerk emits `SignedIn`, `V2App` swaps to `V2MainNavHost` (new accounts get the recovery-code overlay first) |
+
+Back-stack rules are deliberate: `V2LoginRoot` has no back (it's the front door); email-entry back pops to root; name-entry back pops to email (preserving the typed email); OTP-entry back pops **all the way** to root, skipping the intermediates, because by the time the user is on OTP the Clerk attempt already exists and re-entering the same email re-sends a code. `V2OtpScreen` binds system back to the same pop via `BackHandler`.
+
+## `V2LoginViewModel` and `LoginUiState`
+
+`V2LoginViewModel` (`ui/v2/screens/login/V2LoginViewModel.kt`) orchestrates the flow against `AuthRepository`. It implements `V2LoginViewModelContract` (`ui/v2/screens/login/V2LoginViewModelContract.kt`), the interface the screens depend on so a debug-only `PreviewLoginViewModel` can render them without Clerk or the network.
+
+All step screens read one immutable snapshot, `LoginUiState`:
+
+| Field | Type | Meaning |
+| --- | --- | --- |
+| `email` / `firstName` / `lastName` / `otpCode` | `String` | Bound field values |
+| `isLoading` | `Boolean` | A network call is in flight (drives the CTA spinner) |
+| `pendingAttempt` | `AuthAttempt?` | `SignInPending` or `SignUpPending` — tells the OTP screen which verify method to call |
+| `otpError` | `Boolean` | True after a verify rejects the code; flips the OTP screen into its inline error variant. Cleared on typing, resend, and the next submit |
+
+`AuthAttempt` (`SignInPending` / `SignUpPending`) is only a tag; the real Clerk attempt lives in `Clerk.auth.currentSignIn` / `currentSignUp`. Navigation is emitted as `V2LoginNavigation` (`ToEmailEntry`, `ToNameEntry`, `ToOtpEntry`, `PopToRoot`, `FlowComplete(isNewUser)`) — the production NavHost ignores `FlowComplete` (the `V2App` auth observer handles the session swap); only the dev preview NavHost consumes it.
+
+Every entry point first calls `offlineAndEmitted()`, which fast-fails via `ConnectivityMonitor` and emits `SnackbarMessage.NoInternet` before doing any work — the DEK-provisioning leg alone can hang ~60s against a dead connection, and on the OTP step this avoids consuming a code against a doomed request. `emitErrorSnackbar` maps exceptions to a `SnackbarMessage`:
+
+| Exception | `SnackbarMessage` |
+| --- | --- |
+| `InvalidOtpException` | `InvalidCode` |
+| `DekProvisioningException` | `SecureStorageSetupFailed` |
+| `IOException` | `NoInternet` |
+| anything else | `SignInFailed` |
+
+## The step screens
+
+All three step screens share `LoginStepScaffold` (`ui/v2/screens/login/LoginStepScaffold.kt`): a back chevron, a centered icon/title/subtitle header, a caller-provided content slot, and a full-width pill CTA pinned to the bottom that rises with the keyboard. The header is fully parameterized (icon painter, tint, title, subtitle) so the OTP and name screens can swap the whole header into a red error variant rather than layering a separate error UI.
+
+- **`V2LoginScreen`** (`ui/v2/screens/login/V2LoginScreen.kt`) — the landing screen. Renders the real launcher icon resolved from `PackageManager` (adaptive-icon layers composited and rounded-square clipped), the wordmark, and the slogan, then two bottom CTAs: "Continue with email" (filled primary pill → `onContinueWithEmail`) and "Continue with Google" (white outlined pill → `viewModel.onContinueWithGoogle(activity)`), plus a `LegalAgreementText` footer.
+- **`V2EmailEntryScreen`** (`ui/v2/screens/login/V2EmailEntryScreen.kt`) — one `OutlinedTextField` bound to `state.email`. The Next pill is enabled only when `EmailValidator.isValid(email) && !isLoading`; Next calls `onEmailNext`.
+- **`V2NameEntryScreen`** (`ui/v2/screens/login/V2NameEntryScreen.kt`) — the new-user first/last name step. Validation is press-triggered: Next stays enabled and tapping it with a missing field flips the screen into the error variant (red header icon, red field borders, inline error) rather than disabling the button. On both-valid it calls `onNameNext`.
+- **`V2OtpScreen`** (`ui/v2/screens/login/V2OtpScreen.kt`) — a six-box `OtpInput` (`OTP_LENGTH = 6`) under an "Enter code" label. A rejected code (`otpError`) flips the whole screen into its error variant: red header/boxes, an inline "request a new code" action, an expiry-note banner, and the CTA relabelled "Try again". A 30-second countdown gates the Resend link before it becomes tappable.
+
+## OTP verification and the account handoff
+
+`onOtpSubmit` reads `pendingAttempt` and calls `verifySignInOtpV2` (existing user) or `verifySignUpOtpV2` (new user) on `AuthRepository`. For the sign-up path it pre-flags `onboardingSignals.nextSignInIsNewAccount = true` **before** verifying, so `V2App` can mount the recovery-code save overlay immediately on the `SignedIn` emission instead of flashing the home screen first.
+
+On success the ViewModel resets `LoginUiState` to a clean slate (so the next sign-in after a sign-out doesn't inherit this attempt's email/code) and emits `FlowComplete`; no navigation happens here — Clerk emits `SignedIn` on its `userFlow` and the `V2App` auth observer performs the session swap. On a wrong or expired code (`InvalidOtpException`) it clears the entered code and flips `otpError` with no snackbar (the screen itself carries the error). A `DekProvisioningException` is special: verify already succeeded and consumed the code, but the account key couldn't be provisioned so `AuthRepository` signed the session back out — the ViewModel resets state and emits `PopToRoot` so the user gets a fresh code from email entry. See [Authentication (Clerk)](/rollingrecord/app/auth/clerk) for the DEK gate.
+
+## Google sign-in
+
+`onContinueWithGoogle(activity)` calls `AuthRepository.signInWithGoogle(activity)` (`data/auth/AuthRepository.kt`), which **inlines** the AndroidX Credential Manager call — `GetSignInWithGoogleOption` builds the system account picker, and the resulting Google ID token is handed to `Clerk.auth.signInWithIdToken(GOOGLE)`. A rejected native token falls back to a browser OAuth flow (`Clerk.auth.signInWithOAuth`); a user-cancelled picker aborts with no fallback. Like OTP success, Google success emits no nav event — the auth observer swaps the tree. (The standalone `GoogleCredentialProvider` helper is not wired into this path.)
 
 <Note>
-Scaffold generated from the codebase map — expand with full detail, examples, and specifics.
+The active V2 flow uses the four granular `AuthRepository` methods above. The older combined `signInWithMagicLink` / `verifyOtpCode` methods are legacy V1 (marked `TODO V1-DELETE`); despite the "magic link" name the mechanism has always been a typed six-digit `email_code` OTP, never a tappable link.
 </Note>
+
+## Related
+
+- [Authentication (Clerk)](/rollingrecord/app/auth/clerk) — the `AuthRepository` wrapper, auth state, and the DEK gate
+- [Identity Resolution](/rollingrecord/app/auth/identity-resolution) — provisioning the `canonical_users` row
+- [Auth Token Injection & Refresh](/rollingrecord/app/auth/jwt-interceptors) — how the JWT reaches Edge Functions
+- [Known Accounts / Account Switching](/rollingrecord/app/auth/known-accounts) — the device account registry

@@ -1,15 +1,79 @@
 ---
 title: "Sync & Cloud Overview"
-description: "Cross-device sync via an outbox push/pull architecture."
+description: "The client sync subsystem map: two parallel families (metadata push/pull and audio blobs), the tier gate, and the six triggers that fire them."
 ---
 
-Pro+Cloud enables cross-device access through a push/pull sync engine built on an outbox and reconcile model.
+Cross-device sync is a per-user subsystem, scoped to `UserSessionScope` so signing out tears it down and the next user gets a fresh copy. It splits into **two parallel pipelines**: a metadata family (`SyncEngine` push/pull of Room rows) and an audio-blob family (`AudioCloudRepository` upload/download of encrypted files). Both are gated to `tier.atLeast(UserTier.PRO_CLOUD)` and honor the device-level Wi-Fi-only preference.
 
-## What this covers
+## Two parallel families
 
-- Pro+Cloud cross-device access; the overall push/pull architecture (`SyncEngine`, `SyncWorker`, `SyncScheduler`).
-- The outbox model and reconcile flow.
+The sync system is not one pipeline but two, each with its own workers, schedulers, and Edge Functions. Conflating them is the most common misreading of this subsystem.
 
-<Note>
-Scaffold generated from the codebase map — expand with full detail, examples, and specifics.
-</Note>
+| Family | Orchestrator | Worker / scheduler | Edge Functions | What it moves |
+| --- | --- | --- | --- | --- |
+| **Metadata** | `SyncEngine` (`data/sync/SyncEngine.kt`) | `SyncWorker` / `SyncScheduler` | `sync-push`, `sync-pull`, `sync-reconcile` | The 14 wire entities (recording rows, transcripts, contexts, categories, threads, settings) — encrypted field pairs, never audio bytes |
+| **Audio** | `AudioCloudRepository` (`data/sync/audio/AudioCloudRepository.kt`) | `AudioSyncWorker` / `AudioSyncScheduler`, `CloudPrefetchWorker` / `CloudPrefetchScheduler` | `sync-reserve`, `sync-audio` (+ `sync-push` to commit the crypto columns) | Encrypted audio blobs to/from Supabase Storage |
+
+The audio commit reuses the same `sync-push` Edge Function as metadata — the crypto columns (`storage_path`, `dek_ct`, `dek_iv`, `audio_iv`, `kek_version`, `cloud_backup_committed_at`) ride the ordinary recording wire row. See [Audio Cloud Backup](/rollingrecord/app/sync/audio-sync).
+
+## `SyncEngine` — the metadata coordinator
+
+`SyncEngine.sync(force)` is the single entry point every metadata trigger calls. It is `Mutex`-coalesced (single-flight): overlapping triggers collapse into one in-flight run, observable through the `state: StateFlow<SyncState>`.
+
+Within each `sync()` call the engine runs a bounded **push-then-pull** loop:
+
+- **Push before pull.** Flushing local writes first narrows conflict scope — the server sees the latest client intent (and answers `server_wins` where needed) before the following pull delivers authoritative state.
+- The loop repeats push+pull while a push processed `>0` rows, capped at `MAX_DRAIN_ITERATIONS = 3`; anything left stays in the outbox for the next trigger. The first round always runs a pull, so pull-only triggers (`ON_RESUME`, connectivity-restore) work even when the outbox is empty.
+
+`SyncState` carries `isRunning`, `lastAttemptAt`, `lastSuccessAt`, `remaining` (server backlog for the "Syncing N items" card), `rateLimitedUntilSec` (429 reset), and `waitingForWifi`. See [Sync Outbox & Enqueue](/rollingrecord/app/sync/outbox-engine) for the push half and [Pull & Reconciliation](/rollingrecord/app/sync/reconcile-engine) for the pull half.
+
+### Cooldowns and the Wi-Fi gate
+
+`sync()` enforces two guards before doing any work:
+
+- **Cooldown** — `MIN_SYNC_INTERVAL_MS = 10s`. A trigger arriving within that window of the last attempt is a no-op returning the prior result. `force = true` (explicit "Retry sync" / first-pull "Try again") bypasses the cooldown.
+- **Wi-Fi-only** — when `deviceSettings.syncWifiOnly` is on and the current network is metered, the whole cycle is skipped and `waitingForWifi` is set. This is the **single choke point** for every metadata trigger: WorkManager constraints cover only scheduled runs, so direct `sync()` calls would otherwise sync over cellular on every app open. `force = true` does **not** override the Wi-Fi gate — a manual "Sync now" tap surfaces a message via `SyncResult.skippedWifiOnly` instead.
+
+## `SyncWorker` and `SyncScheduler`
+
+`SyncWorker` (`data/sync/SyncWorker.kt`) is a deliberately thin `CoroutineWorker` — it just calls `engine.sync()` and maps the outcome to `Result.success` / `retry`. Constants: `UNIQUE_PERIODIC_NAME = "rr_sync_periodic"`, `UNIQUE_ONESHOT_NAME = "rr_sync_oneshot"`, `TAG_SYNC = "rr_sync"`.
+
+`SyncScheduler` (`data/sync/SyncScheduler.kt`) owns the worker's WorkManager lifecycle at app scope (WorkManager is a process singleton). `ensurePeriodic()` enqueues a 30-minute periodic (`PERIODIC_INTERVAL_MINUTES = 30`, 10-minute flex, battery-not-low); `triggerNow()` enqueues an expedited one-shot with `ExistingWorkPolicy.REPLACE`. Both read `syncWifiOnly` to shape the network constraint (`UNMETERED` vs `CONNECTED`) and add a per-user tag via `addUserTag(userSessionManager)` so `UserSessionManager.switchTo` cancels the schedule on sign-out. `shouldSync()` is the tier gate:
+
+```kotlin
+val tier = currentTierOrFree()
+if (!tier.atLeast(UserTier.PRO_CLOUD)) { /* skip — no work scheduled */ }
+```
+
+Both Pro+Cloud **and** Cloud+AI satisfy `atLeast(UserTier.PRO_CLOUD)` (`data/models/UserTier.kt`) — the gate is a floor, not an exact-tier match.
+
+## `ReconcileEngine`
+
+`ReconcileEngine` (`data/sync/ReconcileEngine.kt`) is a separate drift detector, not part of a `sync()` cycle. It POSTs the `sync-reconcile` `counts` operation and compares each server count to the local Room `COUNT(*)`; any mismatch resets the pull cursor and triggers a full `SyncEngine.sync()`. It is count-only in v1 because client Room rows carry no `updated_at`. Full mechanics on the [Pull & Reconciliation](/rollingrecord/app/sync/reconcile-engine) page.
+
+## Sync triggers
+
+Six triggers are designed; five are active pre-launch (FCM wake is deferred). All metadata triggers funnel through the same Wi-Fi-only choke point in `SyncEngine.sync()`.
+
+| Trigger | Wiring | Notes |
+| --- | --- | --- |
+| `ON_RESUME` | App lifecycle `onResume` → `SyncEngine.sync()` | 30s coalesce vs `lastSuccessAt` (`ON_RESUME_COALESCE_MS`); also fires `CloudPrefetchScheduler.triggerNow()` |
+| Post-push retrigger | internal to `SyncEngine.sync()` drain loop | capped at `MAX_DRAIN_ITERATIONS = 3` |
+| Manual "Sync now" | account settings / sync-status card → `force` sync | `force = true` bypasses the 10s cooldown (not the Wi-Fi gate) |
+| Connectivity restore | `App.registerConnectivityRestoreCallback` | clears outbox backoff, then triggers metadata + audio + prefetch |
+| 30-min periodic | `SyncScheduler.ensurePeriodic` via WorkManager | battery-not-low; Wi-Fi-only shapes the network constraint |
+| FCM wake | deferred post-launch (RR-220) | not wired pre-launch |
+
+## `SyncEpisodeProgress`
+
+`SyncEpisodeProgress` (`data/sync/SyncEpisodeProgress.kt`) is a `UserSessionScope` single that gives the sync-status card a stable denominator for its progress bar. The server reports only work *remaining*, so the total is remembered as the episode's high-water mark. Separate `metadata` and `audio` `Phase` objects track the two families; a phase resets its peak when the backlog hits zero so the next episode re-baselines instead of snapping the bar back to 0%. Hoisting this out of the ViewModel (where it died on navigation) is what fixed the bar that never advanced past a few percent.
+
+## Where to go next
+
+- [Sync Outbox & Enqueue](/rollingrecord/app/sync/outbox-engine) — how local writes queue and how push drains them.
+- [Pull & Reconciliation](/rollingrecord/app/sync/reconcile-engine) — the cursor drain, FK-deferred apply, orphan sweep, and drift handshake.
+- [Audio Cloud Backup](/rollingrecord/app/sync/audio-sync) — encrypted upload via reserve → PUT → commit.
+- [Cloud Prefetch & Download](/rollingrecord/app/sync/cloud-prefetch-download) — warming cloud-only recordings onto the device.
+- [Sync Preferences](/rollingrecord/app/sync/sync-preferences) — per-group toggles and the encrypted settings blob.
+- [Trash Sync & Free Up Space](/rollingrecord/app/sync/trash-and-free-up) — soft-delete and cloud-exclude.
+- [Wire Format & Transforms](/rollingrecord/app/sync/wire-transforms) — the wire↔Room transform layer and encrypted column pairs.

@@ -1,15 +1,48 @@
 ---
 title: "Context Size Meter & Budget"
-description: "The on-device context-size meter and its budget."
+description: "ContextBudget — the on-device meter that reproduces a context's contribution to the extraction input, measured in characters against extraction_max_input_tokens with one transcript chunk held in reserve."
 ---
 
-Each context shows a size meter computed on-device against the extraction input-token budget — informational, not a hard gate.
+`ContextBudget` (`agentcore/.../data/repository/ContextBudget.kt`) computes how much of a context's extraction input budget it consumes. Every incremental extraction re-sends everything the context already holds plus the new transcript chunk; if the assembled request exceeds `extraction_max_input_tokens` the server returns `EXTRACTION_INPUT_TOO_LARGE` and the recording is silently NOT extracted — nothing committed, nothing charged. The meter reproduces that check exactly so the app can show a capacity bar before the wall is hit.
 
-## What this covers
+## Why it counts characters
 
-- `ContextBudget` (agentcore) computed on-device from sections + tasks vs `extraction_max_input_tokens`.
-- The context options sheet meter (`ContextOptionsSheet`); informational only, no gate.
+The server's ceiling check is not a tokenizer — it compares the assembled string's CHARACTER length against `extraction_max_input_tokens * 4`:
 
-<Note>
-Scaffold generated from the codebase map — expand with full detail, examples, and specifics.
-</Note>
+```
+if (userMessage.length > maxInputTokens * CHARS_PER_TOKEN) -> too large
+```
+
+So the meter counts characters (`CHARS_PER_TOKEN = 4`), reproducing the literal template lengths in the server's `_shared/extraction/messages.ts`. Every constant is measured from that file — `PREAMBLE_CHARS` 161, `OUTRO_CHARS` 182, `SECTION_FIXED_CHARS` 23, `INSIGHT_FIXED_CHARS` 3, and the task-block constants — so a change to that template must change these in step or the meter drifts from what it predicts. It is pure apart from `ServerConfig` reads and is pinned by `ContextBudgetTest`.
+
+## `estimate` and `Usage`
+
+`estimate(sections: List<SectionSize>, tasks: List<TaskSize>): Usage` walks the sections and tasks the same way `buildUserMessage` does — the task block is summed only when tasks exist, and the open / done sub-headers only when that bucket is non-empty. `SectionSize(titleChars, insightChars: List<Int>)` and `TaskSize(textChars, ownerChars?, isDone)` describe a section and a task as the server renders them.
+
+`Usage(usedChars, availableChars, ceilingChars, fraction)` exposes derived values: `percent`, `barFraction` (clamped, since a bar can't draw past full), `reserveZoneStart`, `reserveZoneFraction`, `inReserveZone`, `isFull`, and `describe()`. `fraction` is `usedChars / ceilingChars` and is NOT clamped — a context whose own content exceeds the ceiling genuinely reads past 100%, which is the honest state; only the bar clamps.
+
+## The transcript is reserved, not counted
+
+The transcript chunk varies per recording and isn't a property of the context, so it is EXCLUDED from `usedChars` and instead RESERVED — subtracted from the ceiling. `availableChars() = (extractionMaxInputTokens - extractionChunkTokens) * 4`. Because every chunk is capped at `extraction_chunk_tokens` regardless of recording length, the reserve is exact, not a guess.
+
+## Budget zones
+
+`fraction = usedChars / ceilingChars`. The reserve-zone left edge is dynamic (`availableChars / ceilingChars`, both from server config):
+
+| Range | State |
+| --- | --- |
+| 0%–75% | normal |
+| 75%–~88.2% | approaching (the reserve zone's left edge) |
+| reserve zone–100% | a full recording no longer fits; a short one still might (`inReserveZone`, the red trigger — `usedChars >= availableChars`) |
+| 100%+ | context alone meets or exceeds the ceiling; nothing fits (`isFull` — `usedChars >= ceilingChars`; `fraction` not clamped) |
+
+Entering the reserve zone is the meaningful moment (a normal recording stops fitting); 100% is the absolute wall. The client meter is INFORMATIONAL — it is the on-device predictor, rendered by `ContextOptionsSheet` (`ui/v2/screens/contexts/components/ContextOptionsSheet.kt`) with no client-side gate. The underlying limit IS a hard server gate: exceeding it returns `EXTRACTION_INPUT_TOO_LARGE`.
+
+## Server config
+
+`ServerConfig.extractionMaxInputTokens` (default 72000) is the ceiling and `ServerConfig.extractionChunkTokens` (default 8500) is the reserved-chunk size — both server-authoritative, so the meter moves with no app release.
+
+## Related
+
+- [AI & Context Intelligence Overview](/rollingrecord/app/ai/overview)
+- [Knowledge Base Chat](/rollingrecord/app/ai/knowledge-base-chat)

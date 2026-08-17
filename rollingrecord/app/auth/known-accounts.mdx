@@ -1,15 +1,64 @@
 ---
-title: "Known Accounts / Account Switching"
-description: "Remembering signed-in accounts and switching between them."
+title: "Known Accounts & Account Switching"
+description: "The device-scoped registry of accounts that have signed in, its DataStore repository, and how a session switch enforces per-user isolation."
 ---
 
-The device remembers signed-in accounts for quick switching, with strict session isolation.
+`KnownAccountsRepository` (`data/accounts/KnownAccountsRepository.kt`) is a device-scoped registry of every account this physical device has ever signed into — one entry per account, keyed by `authUserId`, never removed on sign-out so the user can switch back later. It is the backing store for the account-list UI and survives sign-out, sign-in as a different user, and session-scope swaps.
 
-## What this covers
+<Warning>
+The registry's write path (`upsert`) and the account-list / switching UI live **only** on the legacy V1 surface. `upsert` is called from `ui/v1/navigation/AppNavHost.kt` on every `AuthState.SignedIn`, and the list/switch screens are under `ui/v1/screens/accounts/`. The active V2 auth observer in `V2App` (`ui/v2/V2App.kt`) does **not** call `upsert`, and there is no V2 accounts-list screen — so under V2 today the registry is neither written nor displayed. The data layer below is complete and current; its UI is not yet ported.
+</Warning>
 
-- `KnownAccount` / `KnownAccountsRepository` remembering signed-in accounts on the device.
-- Session isolation guarantees on switch.
+## `KnownAccountsRepository`
+
+The repository is a Koin app-scoped `single` (`di/RepositoryModule.kt`) — device-spanning state can't live in any single user's per-user DataStore or Room DB, so it survives a session switch by design. It stores a JSON-serialized `List<KnownAccount>` under a single `stringPreferencesKey("accounts_json")` inside a `preferencesDataStore("known_accounts")`. `accounts: Flow<List<KnownAccount>>` emits sorted by `lastActiveAt` descending on every write. Bad JSON (forward-incompatible schema, manual edit) is treated as empty and self-heals on the next valid write.
+
+| Method | Behavior |
+| --- | --- |
+| `upsert(authUserId, email, displayName?, tier?)` | Insert or update by `authUserId`. `email` + `lastActiveAt` always overwritten; `displayName` / `tier` overwritten only when a non-null value is passed (a later "unknown tier" refresh can't wipe a good value); `addedAt` preserved. Idempotent |
+| `updateTier(authUserId, tier?)` | Sets the cached tier; no-op if the account isn't in the registry |
+| `updateCache(authUserId, …)` | Writes a full refresh snapshot (tier, storage bytes incl. per-group, the 6 sync toggles) and bumps `cacheUpdatedAt`; any null argument is left unchanged (partial refresh); no-op if the account isn't in the registry |
+
+## `KnownAccount`
+
+`KnownAccount` (`data/accounts/KnownAccount.kt`) is the `@Serializable` per-account record. Nullable cache fields deliberately distinguish "unknown" (not yet fetched) from a real value.
+
+| Field | Type | Meaning |
+| --- | --- | --- |
+| `authUserId` | `String` | Primary key; the account's stable id (the Clerk user id) |
+| `email` | `String` | Last-seen address for this account |
+| `displayName` | `String?` | Human name (from Clerk first/last); UI falls back to `email` when null |
+| `tier` | `String?` | Last-known effective entitlement tier (e.g. `pro_cloud_ai`) |
+| `storageUsedBytes` / `storageQuotaBytes` | `Long?` | Cloud usage + tier cap (`pro_cloud`+); null until first refresh |
+| `storageRecordingsBytes` / `…ContextsBytes` / `…CategoriesBytes` / `…SchedulesBytes` / `…ThreadsBytes` / `…SettingsBytes` / `…TemplatesBytes` | `Long?` | Per-group storage breakdown for the segmented bar |
+| `syncRecordings` / `syncContexts` / `syncCategories` / `syncSchedules` / `syncThreads` / `syncSettings` | `Boolean?` | The 6 Level-1 sync toggles; null = not yet fetched |
+| `cacheUpdatedAt` | `Long?` | Epoch ms of the last cache refresh; drives the "Updated X ago" label on inactive cards |
+| `lastActiveAt` | `Long` | Epoch ms of the most recent sign-in; sorts the list |
+| `addedAt` | `Long` | Epoch ms of the first-ever sign-in on this device |
 
 <Note>
-Scaffold generated from the codebase map — expand with full detail, examples, and specifics.
+The `KnownAccount` KDoc still describes `authUserId` as the "Supabase Auth `sub` claim" and `displayName` as coming from Supabase `user_metadata.name`. That phrasing is historical — auth is Clerk now, so `authUserId` is the Clerk user id and `displayName` comes from Clerk's first/last name via `AuthState.displayName`.
 </Note>
+
+## The refresh model
+
+Only the **currently-active** account's cached fields can be refreshed from the server, because the app only holds the JWT for the active session. Inactive accounts show a snapshot frozen at their last active moment, and `cacheUpdatedAt` makes the "Updated X ago" label honest about that staleness. Switching into another account to see its live numbers is a full, regular sign-in through the picker — there is no silent re-auth.
+
+## Account switching and session isolation
+
+Switching accounts (or signing out) drives `UserSessionManager.switchTo(newAuthUserId?)` (`data/session/UserSessionManager.kt`), the mechanism that guarantees zero cross-account carry-over. `AuthUserStore` must be updated **before** this call so the new scope's factories see the correct user id. In order, `switchTo`:
+
+1. **Finalizes any recording still running** under the outgoing user (forced sign-out path — e.g. an expired session mid-recording), saving it to that user's own database with `EXTRA_FORCE_STANDALONE_FINALIZE` so a merge worker can't follow the new session. This must be first, because `RecordingService` re-resolves its repositories from `currentScope` on every access.
+2. **Clears every app-level `UserScopedCache`** via the `UserScopedCacheRegistry` — the per-user caches that live outside the session scope and would otherwise survive.
+3. **Cancels the outgoing user's WorkManager jobs** so in-flight workers can't write back to a closing scope.
+4. **Cancels and joins the outgoing coroutine scope**, then closes per-user `Closeable`s (e.g. `UserSettingsDataSource`) before closing the Koin scope — ordering that avoids the "multiple DataStores active" file-lock error when the incoming scope reopens the same file.
+5. **Opens a fresh `UserSessionScope`** for the new id, updates `sessionIdFlow`, and emits the switch on `sessionSwitches` so recovery scans can re-run against the new DB.
+
+`AccountDeletionCoordinator` (`data/account/AccountDeletionCoordinator.kt`) runs the same teardown tail on account delete — `authRepository.signOut()`, `revenueCatManager.logOut()`, `AuthUserStore.clearCurrentUserId`, then `userSessionManager.switchTo(null)` — plus the server wipe and the per-user filesystem wipe.
+
+## Related
+
+- [Authentication (Clerk)](/rollingrecord/app/auth/clerk) — the auth observer that drives `switchTo`
+- [Identity Resolution](/rollingrecord/app/auth/identity-resolution) — resolving the canonical id before the swap
+- [Login & Sign-Up Flow](/rollingrecord/app/auth/login-flow) — signing into a different account
+- [Auth Token Injection & Refresh](/rollingrecord/app/auth/jwt-interceptors) — why only the active account can refresh

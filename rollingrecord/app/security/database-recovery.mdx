@@ -1,15 +1,59 @@
 ---
 title: "Database Recovery States"
-description: "How the app handles a database that can't be opened."
+description: "How the app routes a database that can't be opened: narrow key-mismatch wipe, fatal error, or recoverable DEK-unavailable."
 ---
 
-When the database can't be opened, the app surfaces recovery states rather than silently failing.
+When the encrypted database can't be opened, `DatabaseModule` classifies the failure and routes it to one of three observable outcomes that `V2App` renders at the root. Only a genuine key mismatch is ever safe to wipe; a missing DEK is refused before the DB is even opened; every other failure is fatal and leaves the file untouched. Audio files on disk are never touched by any path.
 
-## What this covers
+## The three recovery states
 
-- `DatabaseRecoveryState` and the `DatabaseModule` key-mismatch wipe/recovery path.
-- Recovery UI: `V2DatabaseRecoveryDialog`, `V2FatalDbErrorScreen`.
+`RecoveryState` (`states/DatabaseRecoveryState.kt`) is a sealed class with four cases, and `DatabaseRecoveryState` is an object exposing `state: StateFlow<RecoveryState>` plus the flag setters.
 
-<Note>
-Scaffold generated from the codebase map — expand with full detail, examples, and specifics.
-</Note>
+| `RecoveryState` | Trigger | V2 surface | Data on disk |
+| --- | --- | --- | --- |
+| `KeyMismatchWiped` | SQLCipher couldn't decrypt an opened DB (genuine corruption / reinstall leftover) | `V2DatabaseRecoveryDialog` (re-import audio) | DB wiped; audio intact |
+| `FatalError(errorCode, message)` | Schema / migration / unknown open failure | `V2FatalDbErrorScreen` (no reset) | Untouched |
+| `DekUnavailable(reason)` | Per-user DEK unresolvable **before** open | `V2DekUnavailableScreen` (retry) | Untouched — not opened, not wiped |
+| `None` | Normal | App tree | — |
+
+The setters are `flagRecoveryNeeded()`, `flagFatalError(code, message)`, `flagDekUnavailable(reason)`, and `clearRecovery()`.
+
+## Open-failure classification
+
+`classifyOpenFailure(e)` in `di/DatabaseModule.kt` walks the exception's cause chain (lowercased, joined) and returns a `DbOpenFailure`. Only `KEY_MISMATCH` is wipe-safe.
+
+| `DbOpenFailure` | Message signatures matched | Action | DB wiped? |
+| --- | --- | --- | --- |
+| `KEY_MISMATCH` | `file is not a database` / `file is encrypted or is not a database` | `handleKeyMismatch` → wipe + rebuild under current key | **yes** |
+| `SCHEMA_MISMATCH` | `room cannot verify` / `identity hash` / `expected:` + `found:` | `handleFatalDbError` → fatal screen | no |
+| `MIGRATION_MISSING` | `migration from … was required but not found` | `handleFatalDbError` → fatal screen | no |
+| `UNKNOWN` | anything else | `handleFatalDbError` → fatal screen | no |
+
+`verifyDatabaseConnection(db)` opens `openHelper.writableDatabase` to force the SQLCipher decrypt + schema check. `openVerifiedOrRecover(context, db, rebuildKey)` wraps it: on failure it routes `KEY_MISMATCH` to `handleKeyMismatch(rebuildKey)` and every other class to `handleFatalDbError`. It also contains the `[DEV] DevFlags.forceFatalDbErrorOnOpen` hook, which is consumed and then throws a synthetic schema-mismatch to exercise the fatal screen end-to-end (a no-op in release).
+
+## The key-mismatch wipe path
+
+`handleKeyMismatch` is the **only** path that wipes. Crucially, it resolves the rebuild key *before* any destructive wipe — so if the DEK became unavailable in the interim, `freshPassphrase()` throws `DekUnavailableException` with the file still untouched. It then reports to Crashlytics with `db.open.wipe = true`, calls `flagRecoveryNeeded()`, closes the stale handle, `wipeDbFiles()` (main + `-wal` + `-shm`), and rebuilds under the **current** session key — device-bound for anonymous, DEK-derived for signed-in. Rebuilding under the same current key is required: a fresh random key would loop `KEY_MISMATCH` forever, since the committed structure metadata expects a specific key on the next open.
+
+## The fatal path
+
+`handleFatalDbError` handles `SCHEMA_MISMATCH`, `MIGRATION_MISSING`, and `UNKNOWN`. It logs, reports to Crashlytics with `db.open.wipe = false` plus the fatal type and message, calls `flagFatalError(failure.name, message)`, closes the stale handle, and rethrows an `IllegalStateException`. The DB file is **not** touched — the data is intact on disk — and `V2App` renders the fatal screen.
+
+## DEK-unavailable: refused before open
+
+`DekUnavailableException` (private in `di/DatabaseModule.kt`) is thrown by `buildAppDatabaseForSession` when the per-user DEK can't be resolved. It is thrown **before** `buildRoomDatabase` / `verifyDatabaseConnection`, so a missing or wrong DEK is structurally incapable of reaching `classifyOpenFailure` → `handleKeyMismatch`. It pairs with `flagDekUnavailable(reason)`; the `App.kt` warmup swallows the throw, and `V2App` renders `V2DekUnavailableScreen` instead of mounting the nav host. This RR-321 gate means the wipe now requires **both** a `KEY_MISMATCH` classification **and** a successfully-resolved key — the old "any DB error wipes everything" behavior no longer applies.
+
+## The three root surfaces
+
+`V2App` (`ui/v2/V2App.kt`) collects `DatabaseRecoveryState.state` and branches:
+
+- **`FatalError`** replaces the surface with `V2FatalDbErrorScreen` (`ui/v2/screens/recovery/V2FatalDbErrorScreen.kt`). It has **no reset/wipe button** — only an error-code box, Contact support (`mailto:support@rollingrecord.ai`), Copy error, and an Export-recordings-to-zip bailout (`RecordingsZipExporter`), plus a reinstall reminder.
+- **`DekUnavailable`** shows `V2DekUnavailableScreen` (`ui/v2/screens/recovery/V2DekUnavailableScreen.kt`); Retry re-resolves the DEK and, on success, calls `clearRecovery()` and recreates the activity.
+- **`KeyMismatchWiped`** overlays `V2DatabaseRecoveryDialog` (`ui/v2/screens/recovery/V2DatabaseRecoveryDialog.kt`) over the nav host (the data is recoverable, unlike the fatal path). The dialog is a non-dismissable 4-state flow (Scanning → Results → Importing → Done) that re-imports orphaned audio, reusing the UI-agnostic V1 `DatabaseRecoveryViewModel` + `RecoveryUiState` — only the V2 surface is restyled.
+
+## Where to go next
+
+- [DEK & Database Key Lifecycle](/rollingrecord/app/security/dek-and-db-key) — how the DEK is resolved before open and where `DekUnavailable` originates
+- [Backup & Restore](/rollingrecord/app/security/backup-restore) — `recoverInterruptedRestore` runs before this classification
+- [Local database](/rollingrecord/app/architecture/local-database) — the Room/SQLCipher build this recovery guards
+- [User session scope](/rollingrecord/app/architecture/user-session-scope) — the scope rebuilt on the retry path

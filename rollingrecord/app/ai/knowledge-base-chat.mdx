@@ -1,16 +1,100 @@
 ---
 title: "Knowledge Base Chat"
-description: "Conversational chat over recordings and contexts."
+description: "The V2 KB-chat surface — KnowledgeBaseAdvisor's 23-tool client dispatcher, the thread and scope model, proposal cards, undo, and the send loop."
 ---
 
-KB chat is a conversational assistant over the user's recordings and contexts, with saved threads and scope filtering.
+Knowledge Base chat is a conversational assistant over the user's recordings and contexts. The V2 UI collects a question, and `V2KnowledgeBaseViewModel` calls `ContextCardRepository.ask`, which runs `KnowledgeBaseAdvisor.ask` (`data/repository/KnowledgeBaseAdvisor.kt`). The advisor pre-computes FTS orientation, resolves the thread's burned scope, builds the tool defs and the focused-context scope block, then hands an `AgentTurnRequest` to `AgentLoop` with a per-turn tool executor. See [Agent Loop & Tool Contract](/rollingrecord/app/ai/agent-loop) for the loop itself.
 
-## What this covers
+## `KnowledgeBaseAdvisor` and the ask flow
 
-- `KnowledgeBaseAdvisor` driving the conversational chat over recordings/contexts; `V2KnowledgeBaseScreen`, `V2ThreadsScreen`.
-- Saved threads (`SearchThreadRepository`, `SearchThread`/`SearchMessage` entities), context-scope filter (`V2ChatFilterSheet`), swipe-to-reply.
-- Chat UI components: `V2ChatBubbles`, `V2ChatInputBar`, `V2ChatSettingsSheet`, `V2MarkdownText`.
+`KnowledgeBaseAdvisor` is the client advisor. Its constructor takes `KbQuerySessionManager`, the `ContextCard` / `Context` / `ContextRecording` / `Recording` / `Transcript` DAOs, `BlueprintRepository`, `SearchApiClient`, `KnowledgeBaseSearchEngine`, `RecordingSemanticSearchEngine`, `ContextSectionReader`, `KbWriteCallbacks`, `UserSettingsDataSource`, and `AnalyticsTracker`.
 
-<Note>
-Scaffold generated from the codebase map — expand with full detail, examples, and specifics.
-</Note>
+`ask(...)` runs on `Dispatchers.IO` and, per turn:
+
+1. Short-circuits blank input and the `ServerConfig.kbChatEnabled` kill switch.
+2. Resolves the requested scope against contexts that still exist (`contextDao.existsById`); an emptied scope falls back to wide search.
+3. Runs FTS (`KnowledgeBaseSearchEngine.search`, augmented only when `aiEnabled`), then trims low-relevance sources with `filterSourcesByRelevance`. When AI is disabled it returns `AskResult.FtsResults` / `AskResult.NoData` for free.
+4. Builds the client-owned scope block (only when scoped to exactly one context), the tool usage instructions (`KbToolSpec.usageInstructions()`), the tool defs (`KbToolSpec.definitions()`), and the initial messages (`AgentMessageAssembly.buildInitialMessages`).
+5. Snapshots Medical Mode, constructs a per-turn `AndroidToolExecutor`, and runs `AgentLoop.run(AgentTurnRequest(...))`.
+6. Maps the `AgentTurnOutcome` to an `AskResult`, flushing trace + analytics.
+
+## The 23-tool dispatcher
+
+`AndroidToolExecutor` is a per-turn inner class implementing the loop's `ToolExecutor` seam. It holds all per-turn mutable state — `allSources`, the `transcriptSnippetCallsThisTurn` / `recordingSearchCallsThisTurn` caps, and the `proposedContext` / `proposedRecordingMembership` / `proposedBlueprint` stashes — so it dies with the turn. `execute()` runs `runToolSafely` (which logs entry/exit, catches throwables except `CancellationException`, reports `KbToolError` to Crashlytics, and returns a `TOOL_ERROR:` string so the loop survives) around a `when (toolUse.name)` over `KbToolNames`.
+
+Tool names are the constants in `KbToolNames` (`agentcore/.../data/repository/KbToolNames.kt`):
+
+| Tool | Kind | Purpose |
+| --- | --- | --- |
+| `getCapabilities` | read | returns `CAPABILITIES_DESCRIPTION` verbatim |
+| `findContextByName` | read | fuzzy context lookup (exact → starts-with → contains) |
+| `listAllContexts` | read | list non-archived contexts |
+| `searchContext` | read | FTS over extracted context-card content |
+| `getContextSections` | read | topic list for a context, with source-recording tags |
+| `getSectionDetail` | read | full insights of one topic with per-insight source attribution |
+| `createTask` | write | add an action item to a context |
+| `addNote` | write | append a note to a topic |
+| `createSection` | write | create a new topic |
+| `correctContext` | write | replace one insight's text |
+| `renameSection` | write | rename a topic title |
+| `getBlueprints` | read | enumerate (no query) or recommend (query) extraction blueprints |
+| `proposeBlueprint` | proposal | draft a custom blueprint card |
+| `searchRecordings` | read | topic search over recordings, scope `in_scope` / `out_of_scope` / `all` |
+| `getRecordingTranscriptSnippet` | read | semantic / FTS / head snippet of one transcript |
+| `scanRecording` | read | literal whole-transcript index / occurrence digest |
+| `listAllRecordings` | read | browse the whole library (paged) |
+| `listContextRecordings` | read | recordings in one context (paged) |
+| `proposeAddRecordingToContext` | proposal | add-recording card |
+| `proposeRemoveRecordingFromContext` | proposal | remove-recording card |
+| `proposeMoveRecordingBetweenContexts` | proposal | move-recording card (the only relocation tool) |
+| `getContextOverview` | read | library-shape snapshot for architecture coaching |
+| `proposeContext` | proposal | draft a new context card |
+
+## Writes are proposal-first
+
+Membership and structural changes never mutate the DB from inside a tool. `proposeContext`, `proposeBlueprint`, and `proposeAddRecordingToContext` / `proposeRemoveRecordingFromContext` / `proposeMoveRecordingBetweenContexts` only stash a proposal payload and return a `PROPOSAL_DRAFTED:` string; the UI renders a confirmation card the user must accept. Only the direct-write tools — `createTask`, `addNote`, `createSection`, `correctContext`, `renameSection` — mutate through `KbWriteCallbacks` and emit a `KbWrite` event that feeds the undo toast.
+
+`KbWriteCallbacks(addTask, addNoteToSection, createNewSection, syncFts, isContextExtractionInProgress)` holds the write ops that stay in `ContextCardRepository`. Proposal payloads are `ContextProposal(name, scopeDescription, suggestedBlueprintId?)`, `BlueprintProposal(name, description, systemPrompt)`, and `RecordingMembershipProposal` (sealed `Add` / `Remove` / `Move`).
+
+## Per-turn caps
+
+| Cap | Value source | Applies to |
+| --- | --- | --- |
+| transcript snippets per turn | `ClientConfig.aiChatMaxTranscriptSnippets` (default 3, Firebase) | `getRecordingTranscriptSnippet` |
+| recording-search calls per turn | `ServerConfig.aiChatMaxAcrossLibraryCalls` (default 3, `server_config`) | `searchRecordings` |
+| tool rounds per turn | `ServerConfig.kbChatMaxToolRounds` (default 3, `server_config`) + one final round | whole loop |
+| conversation history pairs | `ClientConfig.kbChatMaxHistoryPairs` (default 9, Firebase) | send() window |
+
+## Results and undo
+
+`ContextCardRepository.ask` returns an `AskResult`: `Success(answer, sources, proposal?, recordingMembershipProposal?, blueprintProposal?, retrievalSummary?)`, `FtsResults(sources)`, `NoData`, or `Error(message, diagnostic?)`. At most one proposal of any kind is set per turn — the prompt rules make the AI pick one tool. `KnowledgeBaseResult(contextId, contextName, snippet, sectionId?, sectionTitle?)` is the source-card payload. Undoable additive writes are the `KbWrite` sealed type: `TaskCreated`, `NoteAdded`, `SectionCreated`, `CorrectionApplied(previousSectionsJson)`.
+
+## The V2 UI
+
+`V2KnowledgeBaseViewModel` (`ui/v2/screens/knowledgebase/V2KnowledgeBaseViewModel.kt`) owns `send()`, which auto-creates and scope-burns the thread on the first message, persists the user + assistant turns, reads the last `ClientConfig.kbChatMaxHistoryPairs` pairs fresh from the DB, runs `ContextCardRepository.ask`, encodes any proposal PENDING into the message's durable `proposalJson` column, and auto-names the thread after the first answer. It also owns the scope filter, threads search, undo toast, proposal accept/edit/cancel handlers, and downgrade-aware `kbChatAccess` gating (`send()` refuses when access is not `FeatureAccess.FULL`). `V2ChatUiMessage(id, isUser, content, isError, sources, persistedProposal?, hasBeenAnimated, retrievalSummary?, replyToId?)` is the UI projection of a `SearchMessageEntity`; a proposal decoded from `proposalJson` re-renders in PENDING / ACCEPTED / REJECTED across reloads.
+
+Threads and messages persist through `SearchThreadRepository` (`createThread`, `burnScope`, `addMessage`, `getConversationWindow`, `updateMessageProposalJson`, tombstones, sync, auto-naming). Scope is burned into the thread on the first message and locked thereafter. Backing Room entities are `SearchThreadEntity` and `SearchMessageEntity` (the message carries `proposalJson`, `sourcesJson`, `retrievalSummary`, `replyToId`, `hasBeenAnimated`).
+
+| Composable | File | What it renders |
+| --- | --- | --- |
+| `V2KnowledgeBaseScreen` | `.../knowledgebase/V2KnowledgeBaseScreen.kt` | chat shell, `ChatHeader`, `ReplyQuoteAbove`, empty / syncing states |
+| `V2ThreadsScreen` | `.../knowledgebase/V2ThreadsScreen.kt` | saved-threads list with search and multi-select delete |
+| `V2ChatBubble` / `V2SourceChip` / `V2ThinkingDots` | `.../components/V2ChatBubbles.kt` | message bubbles, source chips, typing dots |
+| `V2ChatInputBar` / `V2ChatCapBanner` | `.../components/V2ChatInputBar.kt` | input bar and monthly-cap banner |
+| `V2ChatFilterSheet` | `.../components/V2ChatFilterSheet.kt` | context-scope "Search within" picker |
+| `V2ChatSettingsSheet` | `.../components/V2ChatSettingsSheet.kt` | on-device search toggle + scope |
+| `V2MarkdownText` | `.../components/V2MarkdownText.kt` | markdown renderer for answers |
+| `V2ProposalBlock` | `.../components/V2ProposalCards.kt` | proposal confirmation cards |
+| `V2UndoToast` / `V2UndoDetailsSheet` | `.../components/V2UndoToast.kt`, `V2UndoDetailsSheet.kt` | undo toast + details |
+
+## Capabilities
+
+`CAPABILITIES_DESCRIPTION` is a companion constant returned verbatim by the `getCapabilities` tool — the single source of truth for "what can you do?", covering find/browse/search, task and note creation, corrections, blueprint suggestion and building, and library reorganization, plus the explicit LIMITATIONS block (every library change runs through a confirmation card; it cannot delete recordings, delete/archive/rename contexts, delete topics/tasks, or mark tasks done).
+
+## Related
+
+- [Agent Loop & Tool Contract](/rollingrecord/app/ai/agent-loop)
+- [Semantic & Keyword Search](/rollingrecord/app/ai/semantic-search)
+- [Template Content Moderation](/rollingrecord/app/ai/content-moderation)
+- [Context Size Meter & Budget](/rollingrecord/app/ai/context-budget)
+- [AI & Context Intelligence Overview](/rollingrecord/app/ai/overview)

@@ -1,15 +1,99 @@
 ---
 title: "Notifications"
-description: "Recording, playback, and pre-start notifications."
+description: "Notification channels, the ongoing recording notification, recording alerts, and the media-style playback notification."
 ---
 
-Notifications cover the recording foreground service, media controls, and pre-recording alerts.
+Two managers own every notification the app posts. `RecordingNotificationManager` builds the ongoing foreground recording notification plus six distinct recording alerts across three channels; `PlaybackNotificationManager` owns the media-style playback notification. Several background workers register their own foreground-service channels on top of these.
 
-## What this covers
+## `RecordingNotificationManager`
 
-- `RecordingNotificationManager` (recording foreground) and `PlaybackNotificationManager` (media controls).
-- `PreStartNotificationWorker` pre-recording alerts.
+`RecordingNotificationManager` (`service/RecordingNotificationManager.kt`) is a plain class instantiated by `RecordingService` in `onCreate`. It is constructed with a `Context` and a `getNotificationData: () -> RecordingNotificationData` callback so it holds no state of its own — every build reads a fresh snapshot. It lives in the `service/` package, not `notification/`.
 
-<Note>
-Scaffold generated from the codebase map — expand with full detail, examples, and specifics.
-</Note>
+`createChannels()` registers three channels; `build()` returns the ongoing `Notification`; `update()` re-posts it via `notify(NOTIFICATION_ID, build())`. The brand color `0xFFD32F2F` is applied by drawing a solid 64×64 red bitmap and passing it as `setLargeIcon(colorArtwork)` alongside `setColor` + `setColorized(true)`, which gives Android a dominant color to extract so the notification background renders red instead of the device's dynamic color. On Android S\+ the ongoing notification sets `FOREGROUND_SERVICE_IMMEDIATE`.
+
+### `RecordingNotificationData`
+
+`RecordingNotificationData` is an immutable snapshot passed into the builder, captured on each `updateNotification()` call:
+
+| Field | Purpose |
+| --- | --- |
+| `serviceState` | The current `RecordingServiceState`. |
+| `recordingStartTime` | Epoch-ms start, for elapsed-time computation. |
+| `pausedAtMs` | When the current pause began (0 when running). |
+| `totalPausedMs` | Accumulated paused time, subtracted from elapsed. |
+| `maxStorageLimitBytes` | Rolling storage cap, used for the "% full" body text. |
+
+### What `build()` renders
+
+`build()` branches on `serviceState.recordingState`:
+
+- **`STANDBY` / `IDLE`** — a "Scheduled recordings active" notification. Tapping it opens `MainActivity` with `EXTRA_NAVIGATE_TO_SCHEDULE_LIST`; its delete-intent re-arms standby via `RecordingService.ACTION_STANDBY` so dismissing it does not tear down the pre-warmed service.
+- **`RECORDING` / `PAUSED`** — a "Recording..." / "Paused" notification showing effective elapsed time. In `ROLLING` mode the body appends the used bytes and a `% full` percentage against `maxStorageLimitBytes`.
+
+The action buttons are `PendingIntent`s pointed back at `RecordingService`:
+
+| Action button | Intent action | Shown in |
+| --- | --- | --- |
+| Stop | `ACTION_STOP` | Always |
+| Pause / Resume | `ACTION_PAUSE` / `ACTION_RESUME` | Always (label follows pause state) |
+| Cancel | `ACTION_CANCEL` | Manual mode only — Rolling always keeps its segments |
+
+## Recording channels
+
+`createChannels()` registers three channels at distinct importance levels so routine recording is silent while genuinely urgent conditions break through:
+
+| Channel ID | Importance | Purpose |
+| --- | --- | --- |
+| `recording_channel_v2` | `LOW` | Ongoing foreground recording / standby notification |
+| `recording_alerts` | `DEFAULT` | Storage-full, protected-space, battery-saver, mic-blocked, device-storage-too-low alerts |
+| `recording_urgent` | `HIGH` | Battery-low stop + warning heads-up alerts |
+
+## Recording alerts
+
+Beyond the ongoing notification, `RecordingNotificationManager` fires six alert notifications. Each is built with `NotificationCompat` and the `ic_stat_wave` small icon, and posts at a fixed notification ID:
+
+| ID | Constant | Method | Channel | Notification |
+| --- | --- | --- | --- | --- |
+| 1 | `NOTIFICATION_ID` | `build()` / `update()` | `recording_channel_v2` | Ongoing recording / standby |
+| 2 | `NOTIFICATION_ID_STORAGE_FULL` | `fireProtectedSpaceFullNotification()` | `recording_alerts` | Rolling record paused — all space protected |
+| 3 | `NOTIFICATION_ID_PROTECTED_WARNING` | `fireProtectedWarningNotification()` / `cancelProtectedWarning()` | `recording_alerts` | 70% of storage is protected |
+| 4 | `NOTIFICATION_ID_BATTERY_SAVER` | `fireBatterySaverNotification()` | `recording_alerts` | Battery Saver is on |
+| 5 | `NOTIFICATION_ID_MIC_BLOCKED` | `fireMicrophoneBlockedNotification()` | `recording_alerts` | Scheduled recording couldn't start (mic blocked) |
+| 6 | `NOTIFICATION_ID_BATTERY_LOW_STOP` | `fireBatteryLowStopNotification()` / `fireBatteryLowWarningNotification()` | `recording_urgent` | Battery low stop / warning |
+| 7 | `NOTIFICATION_ID_DEVICE_STORAGE_TOO_LOW` | `fireDeviceStorageTooLowNotification()` | `recording_alerts` | Device out of storage — recording stopped |
+
+The battery-saver and mic-blocked alerts tap through to `Settings.ACTION_REQUEST_IGNORE_BATTERY_OPTIMIZATIONS` rather than back into the app, because the fix lives in system settings. The two battery-low alerts use `recording_urgent` with `PRIORITY_HIGH` so they surface as heads-up notifications even mid-recording. `notifyTile()` delegates to `TileRefresher.refreshAll(context)` to keep the Quick Settings tiles in sync.
+
+## `PlaybackNotificationManager`
+
+`PlaybackNotificationManager` (`notification/PlaybackNotificationManager.kt`) owns the media-style playback notification. Its companion constants are `CHANNEL_ID = "playback_channel"`, `NOTIFICATION_ID = 2001`, and the same `BRAND_COLOR`. `createChannel()` registers the single `LOW` playback channel with badge, lights, and vibration all disabled.
+
+`post(title, positionText, isPlaying, sessionToken)` builds and notifies; `cancel()` dismisses. The notification uses `Notification.MediaStyle().setMediaSession(sessionToken).setShowActionsInCompactView(0)` driven by a `MediaSession.Token`, carries a single Play/Pause action (`android.R.drawable.ic_media_play` / `ic_media_pause`) that broadcasts `PlaybackActionReceiver.ACTION_PLAY_PAUSE`, is colorized red, and sets `setOngoing(isPlaying)` so it becomes dismissible when paused. See [Broadcast Receivers](/rollingrecord/app/platform/receivers) for how that action reaches the playback screen.
+
+## Scheduled-recording reminders
+
+The pre-start reminder for a scheduled recording is posted primarily by `ScheduleAlarmReceiver.handleNotify` (`receiver/ScheduleAlarmReceiver.kt`) on the `schedule_reminders_v2` channel (`IMPORTANCE_HIGH`), with Skip and Show actions. `PreStartNotificationWorker` (`worker/PreStartNotificationWorker.kt`) is a secondary WorkManager path that posts a simpler "`<label>` is starting soon" reminder on its own `schedule_reminders` channel (`IMPORTANCE_DEFAULT`) at `NOTIFICATION_ID_BASE = 1000` plus the hashed schedule id. The alarm-driven path is the live production reminder; see [Broadcast Receivers](/rollingrecord/app/platform/receivers) and [Background Work](/rollingrecord/app/platform/workmanager).
+
+## Worker foreground-service channels
+
+Several background workers run as foreground services and register their own `LOW`-importance channels lazily on first use:
+
+| Channel ID | Owner | Notification ID base | Purpose |
+| --- | --- | --- | --- |
+| `transcription_channel` | `TranscriptionWorker` (`worker/TranscriptionWorker.kt`) | `NOTIF_ID = 20001` | "Transcribing…" — expedited `dataSync` FGS |
+| `context_synthesis_channel` | `ContextSynthesisWorker` (`worker/ContextSynthesisWorker.kt`) | `NOTIF_ID_OFFSET = 40000` | Context-synthesis foreground service |
+| `merge_channel` | `MergeWorker` (`worker/MergeWorker.kt`) | `NOTIF_ID_OFFSET = 10000` | Continue-recording merge `dataSync` foreground service |
+
+## Full channel inventory
+
+| Channel ID | Importance | Owner |
+| --- | --- | --- |
+| `recording_channel_v2` | `LOW` | `RecordingNotificationManager` |
+| `recording_alerts` | `DEFAULT` | `RecordingNotificationManager` |
+| `recording_urgent` | `HIGH` | `RecordingNotificationManager` |
+| `playback_channel` | `LOW` | `PlaybackNotificationManager` |
+| `transcription_channel` | `LOW` | `TranscriptionWorker` |
+| `context_synthesis_channel` | `LOW` | `ContextSynthesisWorker` |
+| `merge_channel` | `LOW` | `MergeWorker` |
+| `schedule_reminders_v2` | `HIGH` | `ScheduleAlarmReceiver` (production path) |
+| `schedule_reminders` | `DEFAULT` | `PreStartNotificationWorker` (secondary path) |

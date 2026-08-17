@@ -1,15 +1,46 @@
 ---
 title: "On-Device Transcription"
-description: "The local Whisper transcription pipeline."
+description: "Status of on-device transcription in RollingRecord: not implemented — the LOCAL/WHISPER engine members are reserved placeholders and all transcription runs in the cloud."
 ---
 
-On-device transcription runs through a background worker using a downloadable Whisper model.
+On-device transcription is not implemented. There is no downloadable Whisper model, no model download/delete flow, no local inference class, and no code path that runs transcription on the device. All transcription runs through the cloud. This page documents that fact so the reserved enum members are not mistaken for a shipping feature.
 
-## What this covers
+## Reserved enum members
 
-- `TranscriptionWorker` pipeline; Whisper model download/delete and language (auto-detect / BCP-47).
-- `TranscriptChunker` segmentation for long audio.
+`TranscriptionEngine` (`data/local/db/entity/TranscriptEntity.kt`) declares three values:
 
-<Note>
-Scaffold generated from the codebase map — expand with full detail, examples, and specifics.
-</Note>
+```kotlin
+enum class TranscriptionEngine { LOCAL, WHISPER, CLOUD }
+```
+
+`LOCAL` and `WHISPER` are placeholders. A repo-wide search across `app/app/src/main` for `TranscriptionEngine.LOCAL` and `TranscriptionEngine.WHISPER` returns no matches — nothing constructs, dispatches on, or persists either value. Every production call site uses `TranscriptionEngine.CLOUD`:
+
+| Call site | File |
+| --- | --- |
+| `doWork` (marks `PROCESSING` with `CLOUD`) | `worker/TranscriptionWorker.kt` |
+| `triggerTranscription` (manual trigger) | `ui/v2/screens/playback/V2PlaybackViewModel.kt` |
+| `enqueueTranscriptionWork` (auto-on-save + rolling rotation) | `service/RecordingService.kt` |
+| `reTranscribe` (re-enqueue after a rolling-clip merge) | `worker/MergeWorker.kt` |
+| `enqueueTranscriptionIfPresent` (context source lacking a `DONE` transcript) | `worker/ContextExtractionWorker.kt` |
+
+(The V1 `PlaybackViewModel` / `ContextDetailViewModel` call sites also hardcode `CLOUD`, but are legacy and not part of the active surface.)
+
+Because `engine` is stored as `TranscriptionEngine.name`, every real `TranscriptEntity` row carries `engine = "CLOUD"`, and the UI engine chip is the fixed string `"Cloud AI"` (`R.string.playback_transcription_engine_cloud_ai`) with no picker.
+
+## The only transcription worker is a cloud worker
+
+`TranscriptionWorker` (`worker/TranscriptionWorker.kt`) is the single transcription worker in the app, and it is entirely cloud-based: it uploads audio to Supabase Storage and drives the AssemblyAI async flow through `AiEngineClient`. It never loads or runs a local model. Its `doWork()` calls `transcriptRepository.createOrResetProcessing(..., TranscriptionEngine.CLOUD, ...)`. The real pipeline is documented in [Cloud Transcription](/rollingrecord/app/transcription/cloud-transcription).
+
+## Language handling is server-side, not on-device
+
+There is no on-device language auto-detect. The language comes from the `transcriptionLanguage` setting (`data/local/UserSettingsDataSource.kt`, default `"auto"`) and is forwarded to the server, where `"auto"` is mapped to a null `language_code` so AssemblyAI auto-detects. See `TranscribeSubmitInput.languageCode` on the [Cloud Transcription](/rollingrecord/app/transcription/cloud-transcription) page.
+
+## `TranscriptChunker` is not a transcription component
+
+`TranscriptChunker` (`util/TranscriptChunker.kt`) is easy to mistake for audio segmentation, but it is neither. It splits an already-produced transcript's **text** into overlapping, sentence-aware, token-sized windows for server-side embedding / RAG chunk indexing (RR-487, moved out of the retired `RecordingEmbeddingWorker`). It operates on finished transcript text, not audio, and is never invoked by `TranscriptionWorker` or any other transcription code path.
+
+## Where to go next
+
+- [Transcription Overview](/rollingrecord/app/transcription/overview) — the subsystem map: data model, worker, triggers, gating.
+- [Cloud Transcription](/rollingrecord/app/transcription/cloud-transcription) — the actual transcription pipeline.
+- [Transcript UI](/rollingrecord/app/transcription/transcript-ui) — how a finished transcript is displayed.

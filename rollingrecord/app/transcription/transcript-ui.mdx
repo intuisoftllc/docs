@@ -1,15 +1,96 @@
 ---
 title: "Transcript UI"
-description: "Displaying word-synced transcripts and handling states."
+description: "The V2 playback transcription surface: the ic_ai entry icon that tints and pulses by status, the status-driven V2TranscriptionSheet, the word-synced V2SyncedTranscriptView panel, and the disclaimer / re-transcribe / export dialogs."
 ---
 
-Transcripts are displayed word-synced with the audio, with clear states and retry handling.
+The V2 transcription UI hangs off the playback screen. A single AI icon opens a status-driven bottom sheet; from its `DONE` state the user reveals an in-card, word-synced transcript panel. Everything binds to flows on `V2PlaybackViewModel` (`ui/v2/screens/playback/V2PlaybackViewModel.kt`).
 
-## What this covers
+## The entry icon
 
-- `V2TranscriptionSheet` and `V2SyncedTranscriptView` word-synced display.
-- Transcription states (Not started / Processing / Done / Error + Retry) and retry handling.
+`V2PlaybackScreen` (`ui/v2/screens/playback/V2PlaybackScreen.kt`) owns the transcribe entry point in its bottom action bar. In the active V2 UI the icon is `R.drawable.ic_ai` — not a "stars" glyph. The screen comment is explicit: `Transcribe entry point (AutoAwesome/"stars" in V1 → ic_ai here)`. It renders only when `transcribeAccess` allows (see [gating](#feature-access-gating) below), and its tint reflects `effectiveTranscriptStatus`.
 
-<Note>
-Scaffold generated from the codebase map — expand with full detail, examples, and specifics.
-</Note>
+| Status | Tint |
+| --- | --- |
+| `DONE` | `colorScheme.primary` |
+| `PROCESSING` | `colorScheme.secondary`, pulsing alpha 1.0 ↔ 0.25 (`rememberInfiniteTransition`, 650ms `tween`, `RepeatMode.Reverse`) |
+| `ERROR` | `colorScheme.error` |
+| `NOT_STARTED` / other | `colorScheme.onSurfaceVariant` |
+
+Tapping the icon shows the one-time accuracy disclaimer on first use, then opens `V2TranscriptionSheet`.
+
+## `V2TranscriptionSheet`
+
+`V2TranscriptionSheet` (`ui/v2/screens/playback/V2TranscriptionSheet.kt`) is a single `V2ModalBottomSheet` whose body switches on `status: TranscriptStatus`. A cap overlay pre-empts any transcribe/retry tap when over quota.
+
+| Status | Body composable | Primary affordance |
+| --- | --- | --- |
+| `NOT_STARTED` | `NotStartedContent` | "Transcribe" button (disabled + "Transcribing…" when another job is in flight) |
+| `PROCESSING` | `ProcessingContent` | 64dp spinner + full-width Cancel |
+| `ERROR` | `ErrorContent` | Retry button; offline vs generic copy via `isNetworkError` |
+| `DONE` | `DoneContent` | Show/Hide transcript + Export |
+| over quota | `CapReachedContent` overlay | "Get more hours" + Back/Close; pre-empts transcribe/retry taps |
+
+The engine/language line renders two chips built from caller-supplied strings — the engine is always `"Cloud AI"` (`R.string.playback_transcription_engine_cloud_ai`); the language is `"Auto-detect"` or the resolved BCP-47 display name.
+
+### No Re-transcribe button
+
+The `DONE` state has no "Re-transcribe" button — a deliberate deviation from V1. Re-transcription is a retry icon (`R.drawable.ic_repeat`) in the sheet header, right of the centered title, carrying `isRetranscribe` semantics via `onRetry`. It is disabled when another transcribe is in flight (`isOtherTranscribeInFlight`) or when the user is `readOnly` (RR-486 downgrade: view/export an existing transcript but no re-transcribe).
+
+### Two error presentations
+
+`ErrorContent` shows one of two messages, selected by `isNetworkError`: a generic engine-failure message, or an offline-specific message (`R.string.playback_transcription_error_offline`). The offline branch is driven by `V2PlaybackViewModel.isTranscriptNetworkError`, which is true when `transcript.errorMessage == TranscriptionWorker.NETWORK_ERROR_MESSAGE` (RR-491). Tapping Transcribe while offline never reaches the sheet's error state — `triggerTranscription` emits `transcribeOfflineEvents` (a one-shot toast) and enqueues nothing.
+
+### Companion dialogs
+
+Three dialogs live in the same file:
+
+- **`V2TranscriptionDisclaimerDialog`** — one-time, non-cancelable accuracy notice shown before the first transcribe; on "Got it" the caller marks it seen and opens the sheet.
+- **`V2RetranscribeWarningDialog`** — shown before re-transcribing a long recording (unless suppressed), with a "don't show again" checkbox that calls `onSuppressWarning`.
+- **`V2TranscriptionExportDialog`** — a V2 bottom sheet chooser: Share (system chooser) / Save to Downloads / Cancel.
+
+## `V2SyncedTranscriptView`
+
+When the user taps "Show transcript" in the `DONE` state, the screen flips `showTranscriptView` and animates the in-card `V2SyncedTranscriptView` (`ui/v2/screens/playback/V2SyncedTranscriptView.kt`) in over the waveform region via the `V2TranscriptCardOverlay` wrapper. The panel and the notes panel are mutually exclusive. It is a word-synced, tap-to-seek, diarized view.
+
+| `lines` value | Rendered as |
+| --- | --- |
+| `null` | centered `CircularProgressIndicator` (still parsing) |
+| `emptyList` | "no word timestamps" message (`R.string.playback_transcription_no_word_timestamps`) — text-only transcript |
+| non-empty | `LazyColumn` of speaker headers + tap-to-seek body lines, auto-scrolled to the active line |
+
+It computes `activeIndex` (the last line at/behind the play head) and `activeRunStart` (the start of that line's speaker run, so the whole turn stays highlighted). `isSeeking` freezes the highlight while the user scrubs — only the waveform tracks the drag live — then jumps to the settled position. Speaker-run headers (`[dot] Name [dot] M:SS`) render only when `showDiarization` is true; long-pressing one opens a rename dialog capped at 30 characters, which persists via `TranscriptRepository.updateSpeakerNames` → `speakerNamesJson` and is decoded back into `V2PlaybackViewModel.speakerNames`.
+
+## Shared V1 parser
+
+The panel reuses V1's pure helpers — it does not reimplement them. `TranscriptLine(startMs, endMs, text, speaker)` and `parseTranscriptLines(wordsJson)` live in `ui/v1/screens/playback/SyncedTranscriptView.kt`. The parser decodes `List<TranscriptWord>` and groups words into lines, breaking on a gap `> LINE_GAP_MS` (800ms), a line reaching `MAX_WORDS_PER_LINE` (8), or a speaker change; it returns `emptyList` on null/blank/parse-failure. `V2PlaybackViewModel.transcriptLines` runs it on `Dispatchers.Default` and exposes a `StateFlow<List<TranscriptLine>?>` (null = still parsing).
+
+## `V2PlaybackViewModel` state
+
+The screen binds to these flows and actions on `V2PlaybackViewModel`:
+
+| Member | Purpose |
+| --- | --- |
+| `transcript` | `StateFlow<TranscriptEntity?>` — the persisted row |
+| `effectiveTranscriptStatus` | in-flight `PROCESSING` beats persisted status; honors `DevFlags.transcriptionStatusOverride` |
+| `isTranscribing` | this recording's worker in `RUNNING`/`ENQUEUED` |
+| `transcribeQueueState` | global `TranscribeQueueState` (drives the "another job in flight" disable) |
+| `transcriptLines` / `speakerNames` / `diarizationEnabled` | data for the synced panel |
+| `isTranscriptNetworkError` | offline vs generic error copy |
+| `transcribeAccess` | `FeatureAccess` — FULL / READ_ONLY / LOCKED |
+| cap flows | `isTranscriptionCapReached`, `wouldExceedTranscriptionCap`, `remainingTranscriptionLabel`, `resetDateLabel` |
+| `triggerTranscription` / `cancelTranscription` | enqueue (with offline pre-check) / cancel |
+| `updateSpeakerName` | persist a renamed speaker |
+| `exportTranscript` / `saveTranscriptToDownloads` | share / save the transcript text |
+| `transcribeOfflineEvents` | `SharedFlow<Unit>` for the offline toast |
+
+`effectiveTranscriptStatus` is derived so live WorkManager state (`isTranscribing`) shows `PROCESSING` even before the row is written, falling back to the persisted `TranscriptStatus`.
+
+## Feature access gating
+
+`transcribeAccess` resolves `GatedFeature.TRANSCRIBE` (`ui/v2/gating/FeatureAccess.kt`, `required = UserTier.PRO_CLOUD`, `whenLocked = LockedStyle.HIDE`) against the tier and whether a finished transcript exists. The screen maps it to icon visibility: `FULL` shows the icon when the Settings master toggle is on, `READ_ONLY` always keeps it (so an existing transcript stays viewable/exportable), and `LOCKED` hides it entirely. `READ_ONLY` also disables the sheet's re-transcribe affordance.
+
+## Where to go next
+
+- [Transcription Overview](/rollingrecord/app/transcription/overview) — the subsystem map: data model, worker, triggers, gating.
+- [Cloud Transcription](/rollingrecord/app/transcription/cloud-transcription) — the pipeline that produces the text and word timing.
+- [On-Device Transcription](/rollingrecord/app/transcription/local-engine) — why there is no local engine.

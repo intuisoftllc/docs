@@ -1,16 +1,115 @@
 ---
 title: "Extraction Job Lifecycle"
-description: "How extraction jobs are tracked, coordinated, and surfaced."
+description: "The client-side state layer that polls, coordinates, and recovers server extraction jobs — status port, repository, phases, and the app-open reconciler."
 ---
 
-Extraction runs as a tracked job with local state, remote coordination, and progress UI.
+An extraction job lives on the server as an `extraction_jobs` row; the client's only window into it is the `extract-results {operation:"status"}` read. The classes on this page own the polling loop, the UI-facing phase timeline, and the app-open recovery that re-attaches a job WorkManager has forgotten. The worker that drives a run is documented in [Context Extraction Pipeline](/rollingrecord/app/ai/context-extraction).
 
-## What this covers
+## `ExtractionJobStatusSource`
 
-- `ExtractionJobRepository`, `ExtractionJobState`, `ExtractionJobPhase`, `ExtractionJobStatusSource`, `ExtractionJobReconciler`.
-- Remote job coordination: `ExtractionJobsApi` / `ExtractionJobsApiClient`, `ExtractionJobModels`.
-- UI signals: `ContextIntelligencePreExtraction`, `ExtractionDistillAnimation`, `ContextIntelligenceResults`.
+`ExtractionJobStatusSource` (`data/extraction/ExtractionJobStatusSource.kt`) is the narrow transport **port** the repository polls behind — not a client. It exposes only the three reads the repository needs:
 
-<Note>
-Scaffold generated from the codebase map — expand with full detail, examples, and specifics.
-</Note>
+| Method | Wire op | Purpose |
+| --- | --- | --- |
+| `status(jobId)` | `status` | The cheap progress read; never touches the encrypted results blob. |
+| `cancel(jobId)` | `cancel` | Flips status; `QUEUED` → `CANCELLED`, `RUNNING` → `CANCEL_REQUESTED`. Idempotent. |
+| `pending()` | `pending` | RR-504 reconcile read — every outstanding job for this user, no job id. |
+
+The concrete implementation is `ExtractionJobsApiClient`. Submit / fetch / ack are deliberately kept off this port — the worker calls those on the API client directly. `EXTRACT_RESULTS_FUNCTION = "extract-results"` names the Edge Function whose rate-limit cooldown the repository honours.
+
+### `ExtractionJobCallResult` and `ExtractionJobException`
+
+Every port method returns `ExtractionJobCallResult<T>` — one transport taxonomy the repository has a single retry policy for:
+
+| Result | Transport | Retry? |
+| --- | --- | --- |
+| `Ok<T>` | 200 | terminal (success) |
+| `NotFound` | 404 `extraction_job_not_found` | no — the row is gone |
+| `RateLimited(resetAtSec)` | 429 (real or synthetic) | sleep, not fail |
+| `Transient(reason)` | offline / timeout / 5xx | yes |
+| `Permanent(code)` | other 4xx / decode failure | no |
+
+The poll loop raises typed `ExtractionJobException`s whose `isTransient` gives callers a one-line retry decision: `ExtractionJobPollTimeoutException` (deadline, retryable), `ExtractionJobUnavailableException` (too many transient reads, retryable), and `ExtractionJobPollFailedException` (4xx, terminal).
+
+## `ExtractionJobState` and `ExtractionJobStatus`
+
+`ExtractionJobState` (`data/extraction/ExtractionJobState.kt`) mirrors one observation of a job row: `jobId`, `status`, `chunksDone`, `chunksTotal`, `errorCode`, and the job's own `contextId`. `belongsTo(contextId)` fails **closed** when the server didn't report a context id — applying one context's results to another destroys the wrong card, so a caller that can't confirm ownership must back off. `notFound()` synthesizes the 404 terminal observation.
+
+`ExtractionJobStatus` is the seven server states plus two client sentinels:
+
+| Status | Terminal | Holds single-flight slot |
+| --- | --- | --- |
+| `QUEUED` | no | yes |
+| `RUNNING` | no | yes |
+| `CANCEL_REQUESTED` | no | yes |
+| `DONE` | yes | no |
+| `FAILED` | yes | no |
+| `CANCELLED` | yes | no |
+| `ACKED` | yes | no |
+| `NOT_FOUND` (client-only, 404) | yes | no |
+| `UNKNOWN` (client-only, unrecognized string) | no | no |
+
+`errorCode` is set on `FAILED` and also alongside `DONE` when the runner finalized partially (`extraction_budget_exhausted`), so callers must read it on `DONE` too. `fromWire()` falls back to `UNKNOWN` rather than throwing — a future schema is more likely to add an intermediate state than a terminal one.
+
+## `ExtractionJobRepository`
+
+`ExtractionJobRepository` (`data/extraction/ExtractionJobRepository.kt`) is the user-scoped polling state layer. It owns no coroutine scope: `observe(jobId, contextId)` is a **cold** `Flow` that polls only while collected and stops the instant collection is cancelled, so the worker's WorkManager lifetime is the only lifecycle involved. `awaitTerminal` reduces that flow to the final state; `statusOnce`, `pendingOnce`, and `cancel` are one-shots.
+
+Alongside the poll it owns a hot phase projection the UI reads without polling a second time: `phases` (a `StateFlow<Map<String, ExtractionJobPhase>>`), `phaseFor(contextId)`, `currentPhase`, and `anyActive`; the run's owner pushes beats via `markPhase` / `markIdle` / `publish`.
+
+Polling uses a geometric ramp (constants on the companion):
+
+| Constant | Value | Role |
+| --- | --- | --- |
+| `INITIAL_POLL_DELAY_MS` | 2s | Short first look (the inline runner kick means a small job may already be `RUNNING`). |
+| `POLL_RAMP_BASE_MS` | 5s | Base ramp delay after the first look. |
+| `POLL_RAMP_FACTOR` | 1.6 | Multiplier each tick. |
+| `POLL_RAMP_CAP_MS` | 30s | Ceiling on the per-tick delay. |
+| `MAX_POLL_DURATION_MS` | 20 min | Wall-clock ceiling on one poll session; past it the worker retries and the job survives. |
+
+The docs on the class explain why this is polling and not Supabase Realtime: `:app` has no Supabase SDK, `extraction_jobs` is in no publication and has RLS enabled with no policies, and a WebSocket outside the Retrofit stack would inherit none of the interceptor chain (apikey, App Check, version floor, rate-limit cooldown). A 429 is a sleep keyed on the Edge Function name, never a job failure — burning the window would also block the final fetch and ack on the same function.
+
+## `ExtractionJobPhase` and `ExtractionProgress`
+
+`ExtractionJobPhase` (`data/extraction/ExtractionJobPhase.kt`) is the UI-facing timeline. A run only ever moves forward through it (by `ordinal`):
+
+| Phase | Origin | Bar |
+| --- | --- | --- |
+| `Idle` | no job — pane renders its normal state | none |
+| `Preparing` | local: enqueued / gathering sources / planning chunks | indeterminate |
+| `Uploading` | local: `extract-submit` POST in flight | determinate only if `uploadedFraction` is supplied, else indeterminate |
+| `Queued` | server: job row `QUEUED` behind the concurrency cap | none (text only) |
+| `Extracting` | server: runner working (`chunksDone` / `chunksTotal`) | determinate, capped at 99% |
+| `ProcessingResults` | local: fetching + decrypting the results blob | indeterminate |
+| `Applying` | local: writing merged results into Room (merge + tasks + FTS + embeddings) | indeterminate |
+
+`Extracting.percent` caps at 99 because the runner syncs `chunks_done` to `chunks_total` when it marks the job `DONE`, while the client still has to fetch, apply, and ack. `fromState()` derives a phase from a server observation — a `DONE` job with `chunksDone > 0` maps to `ProcessingResults` (the fetch is the very next thing), while a 0-chunk `DONE` (a context-full pre-flight refusal) goes straight to `Idle`.
+
+`ExtractionProgress` (same file) is the WorkManager transport: the phase rides `WorkInfo.progress`. `toData` / `fromData` / `fromDataOrNull` encode and decode it (`KEY_PHASE`, `KEY_CHUNKS_DONE`, `KEY_CHUNKS_TOTAL`, `KEY_UPLOADED_FRACTION`). `fromWorkInfo` maps `ENQUEUED` / `BLOCKED` to `Preparing` (never `Queued`, which would claim the transcripts are already on the server), and `fold()` collapses every `WorkInfo` carrying a context's tag into the one furthest along by ordinal — the ViewModel's single read.
+
+## `extract-results` operations
+
+`ExtractionJobsApi` (`data/remote/extraction/ExtractionJobsApi.kt`) is the Retrofit interface: `submit` (`POST functions/v1/extract-submit`) and `results` (`POST functions/v1/extract-results`, dispatched on the body's `operation` field). `@EdgeTag` is mandatory, and all five `extract-results` operations share one rate-limit cooldown keyed `extract-results`.
+
+| operation | Purpose | Client result type |
+| --- | --- | --- |
+| `status` | Cheap progress read (never touches ciphertext) | `ExtractionJobCallResult<ExtractionJobState>` |
+| `fetch` | Pull a `DONE` job's decrypted merged results | `ExtractionFetchResult` (`Done` / `NotReady` / `NotFound` / `Undecryptable` / …) |
+| `ack` | Delete a terminal job row (idempotent) | `ExtractionAckResult` (`Acked` / `StillActive` / …) |
+| `cancel` | Flip status; `QUEUED` → `CANCELLED`, `RUNNING` → `CANCEL_REQUESTED` | `ExtractionJobCallResult<ExtractionJobStatus>` |
+| `pending` | RR-504 reconcile: every outstanding job for this user, no job id | `ExtractionJobCallResult<List<ExtractionJobState>>` |
+
+`ExtractionJobsApiClient` (`data/remote/extraction/ExtractionJobsApiClient.kt`) is the one client for all of these: `submitExtraction` / `fetchExtractionResults` / `ackExtraction` return their own sealed results (the worker's run-a-job leg), and it implements `ExtractionJobStatusSource` for `status` / `cancel` / `pending` (the port the repository polls). It is built on `apiCall` + `ApiResult` and maps typed error envelopes (`ExtractionAlreadyRunningError`, `ExtractionPayloadTooLargeError`, `CapReachedError`, …) onto the sealed results.
+
+`ExtractionJobModels` (`data/remote/extraction/ExtractionJobModels.kt`) holds both the wire DTOs and the sealed result types: `ExtractionPayload` (`MAX_INLINE_PAYLOAD_BYTES = 8 MiB`, `serializedByteSize()`), `ExtractionPayloadRecording`, `ExtractionPriorState` / `ExtractionUserNote` / `ExtractionPriorTask`, `ExtractionResultsDto` (with `ExtractionSectionDto` / `ExtractionInsightDto` / `ExtractionTaskDto`), and the `ExtractionSubmitResult` / `ExtractionFetchResult` / `ExtractionAckResult` hierarchies. The `ExtractResultsRequest` factories (`OP_FETCH` / `OP_ACK` / `OP_STATUS` / `OP_CANCEL` / `OP_PENDING`) build each operation body.
+
+## `ExtractionJobReconciler`
+
+Retry and durability hinge on the client-generated job id in `inputData`. But when the work itself is gone — the 20-minute poll deadline or retry exhaustion — the id goes with it, while `extract-runner` keeps going, finishes, and **commits the per-recording charge**. Without recovery the user is billed and receives nothing until the 48h TTL sweeper deletes the results.
+
+`ExtractionJobReconciler` (`data/extraction/ExtractionJobReconciler.kt`) closes that hole. On every app open, `reconcile()` calls `repository.pendingOnce()` and enqueues `ContextExtractionWorker.enqueueAttach` for each outstanding job whose context has no active work. It re-uses the worker's attach path rather than a second apply path (a second place for the merge semantics to drift would be a bug generator). Two guards keep it restrained: a 30-second coalesce window collapses foreground flapping to one reconcile, and any context that already has enqueued or running extraction work is skipped. It never throws — reconcile is best-effort, and the next open tries again.
+
+## Related pages
+
+- [Context Extraction Pipeline](/rollingrecord/app/ai/context-extraction) — the worker that submits and applies a job.
+- [Extraction Templates (Blueprints)](/rollingrecord/app/ai/templates-blueprints) — what drives the extraction.

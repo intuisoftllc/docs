@@ -1,15 +1,52 @@
 ---
 title: "Embeddings Index & Reconciliation"
-description: "Storing embeddings locally and keeping the index current."
+description: "The unified on-device embeddings table, the WorkManager reconciler that keeps it current with server-produced vectors, and the encrypted bundle cache that avoids re-buying vectors."
 ---
 
-Embeddings are stored locally and continuously reconciled so search stays current with the user's content.
+RR-487 replaced three per-type on-device tables (`recording_chunk_embeddings`, `context_section_embeddings`, `context_embeddings`) with ONE unified `embeddings` table, and moved vector production SERVER-side. Vectors come from the `indexing` Edge Function (Cohere `embed-v4.0`, 1024-dim) via `SearchApiClient.embedDocuments` in batches of ≤96; the client owns only the WRITE side of the index. There is no on-device embedding model.
 
-## What this covers
+## The unified `embeddings` table
 
-- `EmbeddingDao`/`EmbeddingEntity` storage; `EmbeddingReconcileWorker` + `EmbeddingReconcileScheduler` keeping the index current.
-- `EmbeddingBundleCache` / `EmbeddingBundleFormat` bundle handling.
+`EmbeddingEntity` (`data/local/db/entity/EmbeddingEntity.kt`) is the Room entity for table `embeddings`, primary-keyed `(entityType, entityId, chunkKey)` with index `index_embeddings_entityType_entityId`.
 
-<Note>
-Scaffold generated from the codebase map — expand with full detail, examples, and specifics.
-</Note>
+| Column | Meaning |
+| --- | --- |
+| `entityType` | `RECORDING_CHUNK` / `CONTEXT_SECTION` / `CONTEXT` (from `EmbeddingType`) |
+| `entityId` | owner id — recordingId or contextId |
+| `chunkKey` | `chunkIndex` (recording), `sectionId` (section), `""` (whole context) |
+| `chunkText` | the passage / title, stored so search returns it without re-embedding |
+| `embeddingBlob` | little-endian IEEE-754 float32 vector (1024 dims) |
+| `modelVersion` | active embedding-model stamp |
+| `sourceVersion` | `ContentHash.sha256(sourceText)` — the re-embed predicate |
+
+`EmbeddingDao` (`data/local/db/dao/EmbeddingDao.kt`) covers every query the three retired DAOs did, parameterized by `entityType`: `upsert` / `upsertAll`, `getByOwner`, the scoring projections `getScoringPage` (keyset) / `getScoringRows` / `getScoringRowsForOwners` (each an `EmbeddingScoreRow` of rowid + entityId + blob, omitting `chunkText`), `deleteByOwner`, `deleteOwnerKeysNotIn` (orphan prune), and `getDistinctOwnerIds`.
+
+## `EmbeddingReconcileWorker`
+
+`EmbeddingReconcileWorker` (`worker/EmbeddingReconcileWorker.kt`) is a `CoroutineWorker` that brings the table into agreement with content. `doWork()` runs a scope of `recording` (one recording's chunks), `context` (one context's context + section vectors), or `all` (full library sweep, the startup safety net). `collectRecording` chunks the transcript with `TranscriptChunker`; `collectContext` builds one context-level vector (`chunkKey ""` = name + keywords + summary + first 10 section titles) plus one vector per section. It embeds missing chunks via `searchApiClient.embedDocuments` in ≤96 batches, storing each batch atomically. Offline or a retriable server error returns `Result.retry()`; a 4xx (tier lost, search disabled, bad request) gives up without rescheduling.
+
+### The convergence guarantee
+
+A chunk needs (re-)embedding iff no stored row for `(entityType, entityId, chunkKey)` has `sourceVersion == ContentHash.sha256(currentText)`. Because that hash is a pure function of the content, a successfully-stored vector satisfies the predicate PERMANENTLY — the chunk only re-enters the work set when its text actually changes. Each run therefore shrinks the missing set to zero and stops; the full sweep is effectively free once the library is indexed. A server-model swap is a rare out-of-band event handled by a one-time wipe of the table, not a per-run model check.
+
+### Orphan pruning
+
+When content shrinks — a transcript is trimmed to fewer chunks, or a context loses a section — stale rows are pruned. After collecting the CURRENT desired chunk keys per owner, `pruneOrphans` deletes every other row via `deleteOwnerKeysNotIn` (or `deleteByOwner` when nothing survives), so a stale vector never produces a phantom hit.
+
+## Scheduling and tier gate
+
+`EmbeddingReconcileScheduler` (`worker/EmbeddingReconcileScheduler.kt`) enqueues the worker. `reconcileRecording` / `reconcileContext` use `ExistingWorkPolicy.REPLACE` so the newest content wins; `reconcileAll` uses `KEEP` for the startup sweep. Every enqueue is tier-gated by `eligible()`: it requires a signed-in user at least `UserTier.PRO_CLOUD`, so an ineligible user never spends on indexing. Work carries a `NetworkType.CONNECTED` constraint, exponential backoff, and a per-user tag (`indexing` enforces the same entitlement server-side; this is the client-side short-circuit).
+
+## Encrypted bundle cache
+
+Because the server produces vectors and then forgets them, a wiped or reinstalled device would re-buy every vector and cannot search until a full re-embed finishes. `EmbeddingBundleCache` (`data/embeddings/EmbeddingBundleCache.kt`) is the client half of keeping a copy. Before embedding, `applyCached(plans, modelVersion, dimensions)` asks the server (via `getBundles`) which owners it holds a CURRENT bundle for — keyed on a `bundleHash` the client derives locally — then downloads, decrypts (AES-GCM, sealed with the session DEK), and stores whole owners, returning the satisfied owner ids so those chunks are dropped from the pending set. After embedding, `upload(plan, ...)` donates newly-completed owners back. Everything here is best-effort: any failure — miss, offline, corrupt blob, kill switch off — degrades to "no cache" and the normal embed path runs.
+
+An `OwnerPlan(ownerKind, ownerId, entityTypes, chunks: List<PlannedChunk>)` carries an owner's COMPLETE desired chunk set (a bundle's hash covers every chunk, so the cache needs the whole owner even when only one chunk is stale). `EmbeddingBundleFormat` (`data/embeddings/EmbeddingBundleFormat.kt`) holds the codec constants (`BYTES_PER_FLOAT` 4, `GCM_TAG_BYTES` 16, `MAX_BUNDLE_BYTES` 5 MiB, `OWNER_KIND_RECORDING` / `OWNER_KIND_CONTEXT`) and `BundleChunkRef`. The public bundle types are `BundleQuery(ownerKind, ownerId, bundleHash)`, `SealedBundle(...)`, and `CachedBundle(ownerKind, ownerId, url, ivBase64)` — the model, dimensions, and chunk count are inside the hash preimage, so a hit already agrees with local values and only the blob length is re-validated.
+
+`ServerConfig.embeddingModel` (default `embed-v4.0`) and `ServerConfig.embeddingDimensions` (default 1024) are server-authoritative; the client reads them to compute a bundle's hash before its first embed.
+
+## Related
+
+- [Semantic & Keyword Search](/rollingrecord/app/ai/semantic-search)
+- [AI & Context Intelligence Overview](/rollingrecord/app/ai/overview)
+- [Template Content Moderation](/rollingrecord/app/ai/content-moderation)

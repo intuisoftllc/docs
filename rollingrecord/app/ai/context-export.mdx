@@ -1,14 +1,39 @@
 ---
 title: "Context Export"
-description: "Exporting contexts to TXT or Markdown locally."
+description: "On-device export of selected context topics to plain text or Markdown, shared via the system sheet with no AI call and no metering."
 ---
 
-Contexts can be exported to plain text or Markdown entirely on-device, with no metering.
+A context's extracted topics can be exported entirely on-device to plain text or Markdown — no AI call, no metering. The user enters topic multi-select in the Intelligence results pane, taps Export, and picks a format; the ViewModel filters the current sections to the selected topics and hands them to a pure formatter that streams the body and fires the system share sheet. V2 exports the **selected topics only** — no task inclusion, the key difference from V1's combined section+task export.
 
-## What this covers
+## `ContextExportFormat`
 
-- Multi-select topic export to TXT/MD via `ContextExportFormatter` and `ContextExportFormatSheet`; local, no metering.
+`ContextExportFormat` (`util/ContextExportFormatter.kt`) is the enum of offered formats. Its `fileExtension` / `mimeType` are used when the export rides a `content://` stream:
 
-<Note>
-Scaffold generated from the codebase map — expand with full detail, examples, and specifics.
-</Note>
+| Format | Extension | MIME | Status |
+| --- | --- | --- | --- |
+| Plain text | `txt` | `text/plain` | live |
+| Markdown | `md` | `text/plain` (the `.md` carries the format) | live |
+| DOCX | — | — | disabled ("coming soon") |
+
+Markdown deliberately uses `text/plain` rather than `text/markdown`: the latter is not a registered Android MIME type, so share targets that filter on it would not appear in the chooser. Only `PLAIN_TEXT` and `MARKDOWN` are members of the enum and actually export.
+
+## `ContextExportFormatter`
+
+`ContextExportFormatter` (`util/ContextExportFormatter.kt`) is a pure, Android-free builder for the export body. `writeTo(out, format, contextName, blueprintName, dateLabel, sections)` streams either TXT or MD into an `Appendable`, keeping peak memory flat (a maxed-out context is ~1.4 MB of text). The `format` / `plainText` / `markdown` `String` helpers reuse the exact same logic through a `StringBuilder`, which is what keeps the two paths from drifting.
+
+The header is the context name plus `Exported: {date}` and an optional `Blueprint: {name}`; then each non-empty section's title followed by its insight texts (or legacy `items`) as bullets. Blank lines are emitted **before** each section rather than after, so the output streams byte-identically to a file without any lookback.
+
+## The format picker
+
+`ContextExportFormatSheet` (`ui/v2/screens/contexts/components/ContextExportFormatSheet.kt`) is the bottom sheet shown after the topic multi-select → Export. It is a pure chooser — the selection already happened upstream, so there are no per-section or per-task checkboxes. It offers TXT and MD rows (live) and a DOCX row (disabled), calling `onSelectFormat(ContextExportFormat)` on tap.
+
+## `exportTopics`
+
+`V2ContextDetailViewModel.exportTopics(androidContext, selectedIds, format)` (`ui/v2/screens/contexts/V2ContextDetailViewModel.kt`) is the read-only export path. It decodes the current card sections in screen order, filters to `selectedIds` by `resolvedId()`, resolves the context name and blueprint name, and stages the body with `ContextExportFormatter.writeTo`. There is no DB mutation and no metering.
+
+The export is **always** shared as a `content://` file, never as `Intent.EXTRA_TEXT`: an Intent's payload crosses a ~1 MB process-wide Binder buffer, and a 95%-full context (~1,700 insights) produced a 1.4 MB body that killed the app with `TransactionTooLargeException`. The body is streamed into `cacheDir/exports/` (cleared first, keeping the newest only), exposed through the app's `FileProvider`, and handed to `Intent.createChooser` with a subject only.
+
+## Related pages
+
+- [Context Extraction Pipeline](/rollingrecord/app/ai/context-extraction) — where the exported topics come from.
+- [Tasks & Action Items](/rollingrecord/app/ai/tasks-action-items) — tasks have their own share path and are not part of the topic export.

@@ -1,15 +1,99 @@
 ---
 title: "Plans & Subscription Management"
-description: "The upgrade flow and subscription management surfaces."
+description: "The Choose-a-Plan paywall, the Your-Plan management screen, the shared plan catalog, and the RevenueCat purchase/change/cancel flows."
 ---
 
-Users pick a plan through the upgrade flow and manage their subscription and bundles.
+Two V2 screens cover buying and managing a subscription: the "Choose a Plan" paywall for a first purchase, and the "Your Plan" screen for changing, resubscribing, or cancelling. Both read a shared static plan catalog, price it live from RevenueCat, and render the same full-screen result overlay after a transaction.
 
-## What this covers
+## `PlanCatalog`
 
-- Upgrade flow: `V2UpgradeScreen`, `ChoosePlanViewModel`, `PlanCatalog`, `PlanResultOverlays`.
-- `V2ManageSubscriptionScreen` / `ManageSubscriptionViewModel`; `V2BundlesScreen`.
+`PlanCatalog` (`ui/v2/screens/upgrade/PlanCatalog.kt`) is an internal enum shared by both flows. Names, descriptions, feature lists, and icons are fixed design content (string/array/drawable res IDs); prices come live from RevenueCat, matched to these product IDs. Each entry carries its `RcEntitlement`, monthly + annual store product IDs, res IDs, and a `staticBadge`.
 
-<Note>
-Scaffold generated from the codebase map — expand with full detail, examples, and specifics.
-</Note>
+| Catalog entry | Monthly product id | Annual product id | Static badge |
+| --- | --- | --- | --- |
+| `FREE` | (none) | (none) | (none) |
+| `PRO` | `pro_monthly` | `pro_annual` | `POPULAR` |
+| `PRO_CLOUD` | `pro_cloud_monthly` | `pro_cloud_annual` | `BEST_VALUE` |
+| `CLOUD_AI` | `pro_cloud_ai_monthly` | `pro_cloud_ai_annual` | `AI_POWERED` |
+
+The companion exposes `PAID` (the three purchasable tiers in display order), `forEntitlementKey(lookupKey)`, and `forProductId(productId)`. Two supporting enums live in the same file: `BillingPeriod { MONTHLY, ANNUAL }` and `PlanBadge { CURRENT, POPULAR, BEST_VALUE, AI_POWERED }` — where `CURRENT` always wins over a static badge.
+
+### Package helpers
+
+The same file provides the functions that bridge live RC packages to the catalog:
+
+- `packageKey(catKey, period)` builds the map key `"<catalogKey>:<PERIOD>"`.
+- `classifyPackage(pkg)` matches an RC `Package` to a bucket by normalized store product id (Google subs arrive as `productId:basePlanId`, so it normalizes) or by package identifier — either dashboard convention works.
+- `monthlyTimesTwelve(packages, catKey)` computes the struck-through "if you paid monthly for a year" full price shown next to an annual price.
+- `annualDiscountPercent(packages, catKey)` computes the percent saved versus monthly×12, returning null when the annual price is not actually cheaper (no point advertising a non-discount).
+
+## The paywall — `V2UpgradeScreen`
+
+`V2UpgradeScreen` (`ui/v2/screens/upgrade/V2UpgradeScreen.kt`) is the "Choose a Plan" surface, backed by `ChoosePlanViewModel` (`ui/v2/screens/upgrade/ChoosePlanViewModel.kt`). It renders one `PlanCard` per tier, a Monthly/Annual toggle with a "Save N%" floor badge, a pinned subscribe CTA, and a Restore-purchases action; a non-null `result` draws the `PlanResultOverlay` on top.
+
+`ChoosePlanViewModel` exposes `uiState: StateFlow<ChoosePlanUiState>` and the methods `load()`, `setBillingPeriod()`, `select()`, `purchase(activity)`, `restore()`, and `dismissResult()`:
+
+- `load()` fetches the current offering via `RevenueCatManager.getCurrentOffering()` and classifies each package into the `"<catalogKey>:<PERIOD>"` map. An `OfferingsResult.Empty` (no offering marked Current in the dashboard) surfaces as an error state rather than a spinner-forever.
+- The default selected card is `PlanCatalog.PRO_CLOUD` (the Best Value tier), matching the design's pre-selected card.
+- `purchase(activity)` sets `PlanResult.Processing`, calls `RevenueCatManager.purchase()`, and maps the outcome to `SuccessNew` / null (user cancelled) / `Error`.
+- `restore()` emits the one-shot `ChoosePlanEvent.RestoredNothing` (a lightweight toast) when a restore finds no active entitlements; a restore that finds entitlements reuses the `SuccessNew` overlay.
+
+`PlanCard` is the per-card render state (`key`, `iconRes`, `nameRes`, `descRes`, `featuresRes`, `badge`, `priceText`, `periodSuffixRes`, `strikeText`, `discountPercent`, `isCurrent`, `purchasable`). `ChoosePlanUiState` carries `loading`, `error`, `billingPeriod`, `cards`, `selectedKey`, `ctaPriceText`, `annualSavePercent`, and `purchaseInProgress`. `ChoosePlanEvent` is a sealed interface whose only member is `RestoredNothing`.
+
+## The management screen — `V2ManageSubscriptionScreen`
+
+`V2ManageSubscriptionScreen` (`ui/v2/screens/subscription/V2ManageSubscriptionScreen.kt`) is the "Your Plan" surface — a current-plan card, a change-plan sheet, and resubscribe/cancel/restore actions, with `PlanResultOverlay` for transaction results. It is backed by `ManageSubscriptionViewModel` (`ui/v2/screens/subscription/ManageSubscriptionViewModel.kt`), which derives its whole state from live RC `CustomerInfo`.
+
+`ManagePlanKind` classifies the current state, and the derivation checks Developer and lifetime cases before the ordinary recurring path:
+
+| `ManagePlanKind` | Meaning |
+| --- | --- |
+| `LOADING` | RC customer info not yet resolved. |
+| `FREE` | No active entitlement. |
+| `SUBSCRIBED` | Active recurring sub that will renew. |
+| `CANCELLED` | Active recurring sub with `willRenew == false` — full access until expiry. |
+| `LIFETIME` | Internal lifetime or public Founders Edition — one-time, never expires (change is upgrade-only). |
+| `DEVELOPER` | Internal-ops grant — not a purchase; no upgrade/downgrade/cancel path. |
+
+The supporting data types are `CurrentPlan` (summary card, with `isLifetime` / `isDeveloper` flags), `ChangePlanRow` (one compact row in the change-plan sheet), `ConfirmPlanInfo` (the confirm sheet), and the `ManageEvent.OpenUrl` event used to open the Play subscriptions page.
+
+### Change, resubscribe, cancel
+
+- **Change plan** — `confirmChange(activity, newKey, period)` runs a replacement purchase: it passes the currently-owned recurring product id as `oldProductId` so Google applies default proration rather than rejecting a second subscription in the group. A pure-lifetime holder with no recurring sub gets a fresh purchase layered on top instead. `changePlanRows(period)` builds the sheet rows (lifetime holders see upgrades only), and `annualSaveFloor()` drives the annual "Save N%" chip.
+- **Resubscribe** — `resubscribe(activity)` re-buys the same product to re-enable auto-renew on a cancelled-but-active plan.
+- **Cancel** — `cancel()` is a **deep-link only**: there is no in-app cancel and no SDK cancel API on any store. It emits `ManageEvent.OpenUrl` with RC's `managementURL` when present, otherwise `https://play.google.com/store/account/subscriptions`.
+
+The error overlay's "Try Again" replays the last attempted purchase via `retry(activity)`; `dismissResult()` clears the overlay and any pending action.
+
+## Transaction results — `PlanResultOverlay`
+
+`PlanResult` and `PlanResultOverlay` both live in `ui/v2/screens/upgrade/PlanResultOverlays.kt` and are shared by both flows. The sealed `PlanResult` has four states rendered full-screen over the originating screen:
+
+| `PlanResult` state | Rendered as |
+| --- | --- |
+| `Processing` | Spinner + "Updating your plan…". |
+| `SuccessNew(planNameRes)` | A newly activated subscription ("Welcome to X"). |
+| `SuccessUpdate(planNameRes)` | An existing plan changed ("Plan Updated"). |
+| `Error(reason)` | The charge failed; the plan is unchanged. Offers Try Again / Back. |
+
+A user backing out of the store sheet maps to null (no overlay), not to a distinct state.
+
+## `RevenueCatManager` purchase surface
+
+The purchase, offering, and restore calls all go through `RevenueCatManager` (`data/billing/RevenueCatManager.kt`):
+
+- `getCurrentOffering()` returns an `OfferingsResult` (`Success` / `Empty` / `Error`).
+- `purchase(activity, pkg, oldProductId?)` launches the store sheet and, on success, pushes the fresh `CustomerInfo` through so the tier unlock propagates on its own through `EntitlementRepository` — the caller only dismisses.
+- `restorePurchases()` is the explicit "Restore purchases" path.
+
+All of these work identically against the RC Test Store and the real Play Store; which store the SDK talks to is decided purely by the API key passed to `Purchases.configure`.
+
+## Add-on bundles — `V2BundlesScreen`
+
+`V2BundlesScreen` (`ui/v2/screens/bundles/V2BundlesScreen.kt`) is an explicit non-functional placeholder for the future add-on bundles screen (extra transcription / AI / storage credits) — its KDoc labels it a "STAGE 5 stub" / "coming soon placeholder." It renders a centered empty-state (a faint cart glyph, heading, and a short blurb about buying extra transcription hours / AI queries) above a full-width **disabled** "Coming Soon" button; the trailing overflow affordance is inert too. There is no purchase flow yet — per its KDoc, "The real add-on purchase flow lands in a later ticket." It is reached from the Usage screen's "Get More" CTA (`onNavigateToBundles`), which the Usage screen shows for `tier.atLeast(UserTier.PRO_CLOUD)`.
+
+## Related pages
+
+- [Entitlements & RevenueCat](/rollingrecord/app/monetization/entitlements-revenuecat) — the entitlement taxonomy and `RevenueCatManager` in full.
+- [User Tiers & Feature Map](/rollingrecord/app/monetization/tiers) — the tiers the catalog maps to.
+- [Usage Metering & Caps](/rollingrecord/app/monetization/usage-metering) — the Usage screen and the "Get More" entry point.

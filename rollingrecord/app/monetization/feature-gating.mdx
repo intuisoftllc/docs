@@ -1,15 +1,81 @@
 ---
 title: "Feature Gating & Upsell"
-description: "How below-tier features are gated and upsold."
+description: "RR-486 downgrade-aware feature gating: FeatureAccess levels, the GatedFeature enum, and the shared upsell/warning UI."
 ---
 
-Below-tier features are intercepted by gating helpers that surface upsell UI.
+Feature gating for the V2 UI is downgrade-aware (RR-486): when a user drops below the tier that owns a feature, content they already created stays read-only rather than vanishing. The gating primitives drive the UI side only — the server enforces every gate independently — and below-tier interception happens at real code paths, never by merely hiding a component.
 
-## What this covers
+## `FeatureAccess`
 
-- `FeatureAccess` / `FeatureUpsell` gating helpers; `V2UpsellSheet`, `V2WarningBanner` presentation.
-- Below-tier interception patterns (e.g. import → Upgrade).
+`FeatureAccess` (`ui/v2/gating/FeatureAccess.kt`) is the three-level access model resolved per feature from `(currentTier, hasContent)`:
 
-<Note>
-Scaffold generated from the codebase map — expand with full detail, examples, and specifics.
-</Note>
+| Level | Meaning |
+| --- | --- |
+| `FULL` | At or above the required tier — full create / edit / delete. |
+| `READ_ONLY` | Below the required tier but the user already has content for this feature — view / play / export only; mutation blocked, delete never offered. |
+| `LOCKED` | Below the required tier with no content — fall back to the feature's `whenLocked` style. |
+
+## `LockedStyle`
+
+`LockedStyle` (`ui/v2/gating/FeatureAccess.kt`) decides what a surface does when a feature resolves to `LOCKED`. It is consulted only in the `LOCKED` case:
+
+| Style | Behavior |
+| --- | --- |
+| `UPSELL` | Keep the entry point visible; tapping it opens the feature's upsell sheet. |
+| `HIDE` | Remove the entry point entirely — no upsell, no trace. |
+
+## `GatedFeature`
+
+`GatedFeature` (`ui/v2/gating/FeatureAccess.kt`) enumerates the eight V2 features that participate in gating. Each carries its `required` tier, its `whenLocked` style, and (for `UPSELL` features) `upsellTitle` / `upsellBody` string res IDs.
+
+| Feature | Required tier | `whenLocked` | Notes |
+| --- | --- | --- | --- |
+| `SESSIONS` | `PRO` | `UPSELL` | Rolling-record sessions; `READ_ONLY` when the user has sessions. |
+| `PROTECT_SEGMENT` | `PRO` | `HIDE` | Read-only action; simply not offered below `READ_ONLY`. |
+| `SCHEDULED_RECORDINGS` | `PRO` | `UPSELL` | Resolved with `hasContent = false` (always `LOCKED` below Pro); the fire path is independently disabled. |
+| `IMPORT` | `PRO` | `UPSELL` | Resolved with `hasContent = false`; imported files are just recordings. |
+| `TRANSCRIBE` | `PRO_CLOUD` | `HIDE` | Hides its create affordances when locked. |
+| `CONTEXTS` | `PRO_CLOUD_AI` | `HIDE` | Shares `hasAnyAiContent`. |
+| `KB_CHAT` | `PRO_CLOUD_AI` | `HIDE` | Shares `hasAnyAiContent`. |
+| `CUSTOM_BLUEPRINT` | `PRO_CLOUD_AI` | `HIDE` | Custom extraction blueprints; shares `hasAnyAiContent`. |
+
+The three AI surfaces (`CONTEXTS`, `KB_CHAT`, `CUSTOM_BLUEPRINT`) deliberately share one `hasAnyAiContent` signal so they resolve coherently — a downgraded user who has contexts but no chat threads still sees KB chat as `READ_ONLY`/empty rather than `LOCKED`. Callers compute that shared signal once (context or thread or blueprint present) and pass it to each AI feature.
+
+## `GatedFeature.access`
+
+`GatedFeature.access(tier, hasContent)` (`ui/v2/gating/FeatureAccess.kt`) is the single resolver every call site uses:
+
+```kotlin
+fun GatedFeature.access(tier: UserTier, hasContent: Boolean): FeatureAccess = when {
+    tier.atLeast(required) -> FeatureAccess.FULL
+    hasContent -> FeatureAccess.READ_ONLY
+    else -> FeatureAccess.LOCKED
+}
+```
+
+## The upsell controller
+
+`rememberUpsellSheet(onNavigateToUpgrade)` (`ui/v2/gating/FeatureUpsell.kt`) returns an `UpsellSheetController` that drives a shared `V2UpsellSheet` for any `UPSELL`-style feature. The controller holds `activeFeature` state, exposes `show(feature)` and `clear()`, and provides a `@Composable Render()` that draws the sheet using the feature's `upsellTitle` / `upsellBody`. `show(feature)` opens the sheet; tapping Upgrade clears it and routes to the V2Upgrade screen.
+
+`V2UpsellSheet` (`ui/v2/components/V2UpsellSheet.kt`) is the reusable "this is a Pro feature" modal bottom sheet — a centered title + body with Close / Upgrade buttons (`v2_upsell_action_close` / `v2_upsell_action_upgrade`). It is used by the gating controller and directly by the home rolling-mode and playback continue upsells.
+
+## `V2WarningBanner`
+
+`V2WarningBanner` (`ui/v2/components/V2WarningBanner.kt`) is the shared red-tinted alert card (`chatErrorBg` background + the `ic_alert` triangle). With `title == null` it renders a single `accentRed` message line; with a non-null title it renders a bold `strongText` title over a muted body. It sits above content to flag a problem while keeping the content visible (for example, the Usage screen's refresh-failed banner).
+
+## Interception, not hiding
+
+Below-tier gating is enforced at real code paths so the server-side check has a client-side counterpart at the actual action, not merely a hidden button:
+
+| Call site | Behavior |
+| --- | --- |
+| `V2AllRecordingsViewModel` / `V2AllRecordingsScreen` (`ui/v2/screens/allrecordings/`) | Resolves `GatedFeature.SESSIONS` (with `hasContent = sessions.isNotEmpty()`) and `GatedFeature.IMPORT` (with `hasContent = false`); tapping calls `upsell.show(...)` instead of showing the empty list or opening the SAF import picker. |
+| `V2ScheduleScreen` (`ui/v2/screens/schedule/`) | Renders `ScheduleLockedState` when `GatedFeature.SCHEDULED_RECORDINGS.access(tier, hasContent = false) != FeatureAccess.FULL`. |
+| `MainActivity.handleShareIntent` (`MainActivity.kt`) | Gates shared-audio import through `IMPORT` exactly as the in-app Import path does — a below-Pro user who picks the share target lands on Upgrade; signed out imports nothing. |
+| `V2SessionDetailViewModel`, `V2PlaybackViewModel`, `V2ContextsViewModel`, `V2KnowledgeBaseViewModel`, `V2ContextDetailViewModel` | Resolve `PROTECT_SEGMENT`, `TRANSCRIBE`, `CONTEXTS`, `KB_CHAT`, and `CUSTOM_BLUEPRINT` respectively at the point the real action is offered. |
+
+## Related pages
+
+- [User Tiers & Feature Map](/rollingrecord/app/monetization/tiers) — the `UserTier` ordering `atLeast()` compares against.
+- [Plans & Subscription Management](/rollingrecord/app/monetization/plans-and-subscription) — where the Upgrade CTA leads.
+- [Entitlements & RevenueCat](/rollingrecord/app/monetization/entitlements-revenuecat) — how the tier that gating resolves against is produced.

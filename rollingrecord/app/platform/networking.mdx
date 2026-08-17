@@ -1,15 +1,96 @@
 ---
 title: "Networking & Edge API Layer"
-description: "The API clients and error handling for the backend."
+description: "The two Retrofit/OkHttp clients, their shared interceptor chain, and the typed error taxonomy that mirrors the server error registry."
 ---
 
-The app talks to the backend through typed API clients with a shared error model that mirrors the server registry.
+The app reaches its Supabase Edge Functions through two Koin-named Retrofit stacks that share one base URL and one ordered OkHttp interceptor chain. Every endpoint is a Retrofit method tagged with `@EdgeTag`; every non-2xx flows through the `ApiResult`/`ApiError` taxonomy and the content-polymorphic `EdgeErrorBody` envelope; and AI calls route through the typed `AiEngineClient` façade.
 
-## What this covers
+## The two Retrofit stacks
 
-- `SupabaseApi`, `AiEngineApi` / `AiEngineClient`; `ApiResult` / `EdgeErrorBody` / `EdgeErrorReporter` / `EdgeTag`.
-- Error-registry mirror: `AiEngineErrorCode` / `AiEngineErrorMapper` (kept in sync with the server registry).
+Both stacks are built in `di/NetworkModule.kt` against `BuildConfig.SUPABASE_URL`, invoking functions at the `functions/v1/<name>` path. They differ only in timeouts and the set of Retrofit interfaces they serve.
 
-<Note>
-Scaffold generated from the codebase map — expand with full detail, examples, and specifics.
-</Note>
+| Koin name | Connect / Read / Write | Serves |
+| --- | --- | --- |
+| `supabase` | 30 / 60 / 60 s | `SupabaseApi`, `SyncApi`, `AudioSyncApi` |
+| `aiengine` | 30 / 120 / 120 s | `AiEngineApi`, `UsageApi`, `RecoveryCodeApi`, `SyncPreferencesApi`, `UserKeyApi`, `SetUserPinApi`, `AccountOtpApi`, `SearchApi`, `ExtractionJobsApi` |
+
+The `aiengine` client uses `encodeDefaults = true` on its Retrofit `Json` converter: every request body declares `val operation: String = "<op>"` with a default, and dropping a defaulted field would strip `operation` off the wire and earn a `missing_operation` rejection.
+
+## The `audio_signed_url` upload client
+
+A third Koin-named client, `audio_signed_url`, is **not** a Retrofit stack at all — in `di/NetworkModule.kt` it's a bare `OkHttpClient` with no `Retrofit.Builder`, no `SUPABASE_URL` base, and no interceptors. It exists only for raw `PUT` uploads of encrypted audio to Supabase Storage signed URLs, so it never hits `functions/v1`. It is deliberately un-authed — a Storage signed URL self-authenticates via its token query param, so it must not carry the user's JWT to a third-party host. Its only non-default setting is a 15-minute write timeout (`30 / 120 s / 15 min` connect/read/write) because audio uploads can be hundreds of MB on slow links.
+
+`SupabaseApi` (`data/remote/SupabaseApi.kt`) declares each function name once as a companion `const` (`FN_RESOLVE_IDENTITY`, `FN_SERVER_CONFIG`, `FN_DELETE_USER`, `FN_GENERATE_SUPPORT_TOKEN`) and one method each. `AiEngineApi` (`data/remote/aiengine/AiEngineApi.kt`) is a single `ai-engine` function reached by every method with a different typed body, all returning `Response<ResponseBody>` so the client can read headers and error envelopes. Its operations are `kbQuery` (with an optional `X-Query-Session-Token` header), `synthesis`, `transcribeUploadInit`/`transcribeSubmit`/`transcribeFetch`, `keywords`, `contextSummary`, `threadNaming`, `blueprintModeration`, `queryExpand`, and the user-blueprint CRUD trio. There is no `extract` method — extraction moved to `ExtractionJobsApi` (`extract-submit` / `extract-results`).
+
+## Interceptor chain
+
+Both authed clients carry the same interceptors in the same fixed order, outermost first. Rate-limiting sits outermost so a client cooldown short-circuits before any token fetch or network I/O.
+
+| Order | Component | File | Role |
+| --- | --- | --- | --- |
+| 1 | `RateLimitInterceptor` | `data/remote/ratelimit/RateLimitInterceptor.kt` | Short-circuit client cooldowns; record a 429's `reset_at_sec` |
+| 2 | `AppCheckTokenInterceptor` | `data/remote/AppCheckTokenInterceptor.kt` | `apikey` + `X-Firebase-AppCheck` |
+| 3 | `BearerJwtInterceptor` | `data/remote/aiengine/BearerJwtInterceptor.kt` | `Authorization: Bearer <Clerk JWT>` |
+| 4 | `AccountFreezeInterceptor` | `data/remote/aiengine/AccountFreezeInterceptor.kt` | Set/clear frozen from a 403 `account_frozen` / any 2xx |
+| 5 | `AppVersionHeaderInterceptor` | `data/version/AppVersionHeaderInterceptor.kt` | `X-App-Version: <versionCode>` |
+| 6 | `ClientTooOldInterceptor` | `data/version/ClientTooOldInterceptor.kt` | Flip `AppVersionGate` on a 410 `client_too_old` |
+| 7 | `HttpLoggingInterceptor` | `di/NetworkModule.kt` | `HEADERS` in debug, `NONE` in release |
+| authenticator | `TokenRefreshAuthenticator` | `data/remote/aiengine/TokenRefreshAuthenticator.kt` | On 401: refresh the Clerk token and retry once |
+
+- **`AppCheckTokenInterceptor`** attaches `apikey` (`BuildConfig.SUPABASE_ANON_KEY`, the public publishable key shipped in the APK — it grants no data access on its own because RLS is enabled on every table) and a fresh Firebase App Check token. It first blocks on `AppCheckWarmup` (15 s cap) so the SDK cache is hot, then fetches the token (15 s cap). On failure it proceeds header-less — the Edge Function will 401 — and logs with `save = true`.
+- **`BearerJwtInterceptor`** awaits `AuthRepository.awaitAccessToken()` (5 s) on the OkHttp thread via `runBlocking`. The JWT is a **Clerk** session token verified server-side against Clerk's JWKS, not a Supabase Auth token.
+- **`TokenRefreshAuthenticator`** fires only on a 401 whose body is `missing_bearer_token` / `invalid_jwt` / empty, fetches a fresh Clerk token, and retries the original request once. `response.priorResponse` guards against a loop.
+- **`AccountFreezeInterceptor`** peeks (never consumes) authed responses: a 403 `account_frozen` calls `AccountHealthRepository.setFrozen(reason)`, any 2xx calls `clearFrozen()`, everything else is a no-op. It only acts on requests carrying an `Authorization` header.
+- **`RateLimitInterceptor`** synthesizes a 429 (serialized from the real `RateLimitedError` envelope, so downstream can't tell it apart) when `RateLimitCoordinator` reports the target function still cooling down, and records real 429 `reset_at_sec` values for future short-circuits.
+
+## `apiCall` and the `ApiResult` taxonomy
+
+`data/remote/api/ApiResult.kt` is the single executor. `apiCall(tag) { call }` runs one Retrofit call and classifies the outcome into `ApiResult.Success` / `ApiResult.Failure`, where the failure carries one `ApiError`:
+
+| `ApiError` | Meaning |
+| --- | --- |
+| `Network` | Connectivity failed mid-flight (IOException family) |
+| `Timeout` | `SocketTimeoutException` — distinct from `Network` for UX |
+| `RateLimited(resetAtSec, bucket)` | 429 `rate_limited` (real or client-synthesized) |
+| `Server(code, rawCode, httpStatus, body)` | Non-2xx with a decodable registry envelope |
+| `Http(status)` | Non-2xx with no envelope (proxy edges, HTTP 546, empty bodies) |
+| `Decode(cause)` | 2xx whose success body failed to decode |
+
+Helpers include `isCode(code)`, `httpStatusOrNull`, `describe()` (a log-safe one-liner, never user content), and `isRetriable` (true for connectivity, rate limits, and 5xx). `EdgeJson` is the shared lenient codec, `parseErrorEnvelope()` is the one place raw error-body JSON is decoded, and `ApiResult<ResponseBody>.decode()` materializes hand-decoded bodies. A `MissingEdgeTagException` is rethrown rather than classified — it is a programming error, not an API failure.
+
+## The `EdgeErrorBody` envelope
+
+`data/remote/api/EdgeErrorBody.kt` is a content-polymorphic sealed interface: one data class per error family — `RateLimitedError`, `CapReachedError`, `BackupQuotaExceededError`, `AudioTooLargeError`, `SubscriptionRequiredError`, `ModelNotAllowedError`, `MaxRoundsExceededError`, `RunawayProtectionError`, `ModerationFailedError`, `FeatureDisabledError`, `ExtractionAlreadyRunningError`, `ExtractionPayloadTooLargeError`, `ValidationFailedError`, and the long-tail `GenericError`. `NormalizedCapFields` is the shared cap interface. `EdgeErrorBodySerializer` selects the concrete class from the JSON `error` code; codes without a dedicated shape decode as `GenericError`. Matching on the body's *type* replaces fishing through a nullable-field superset.
+
+## `EdgeErrorReporter`
+
+`data/remote/api/EdgeErrorReporter.kt` reports operator-actionable server failures to Crashlytics as non-fatals, called from inside `apiCall` so coverage is structural. The exception *type* is the Crashlytics filter axis: `EdgeResourceLimitException` (HTTP 546 — the isolate was killed before the handler ran, so nothing logged server-side), `EdgeServerException` (5xx), `EdgeRequestException` (4xx), `EdgeDecodeException` (un-decodable 2xx). It deliberately skips `RateLimited` / `Network` / `Timeout` and 401/403, and is rate-capped to 10 reports per 60 s.
+
+## `@EdgeTag`
+
+`data/remote/api/EdgeTag.kt` names which Edge Function a Retrofit method targets. `Request.edgeFunctionName()` reads it off the `Invocation` tag as the sole identity source; a method whose URL is `functions/v1/{fn}` but which lacks `@EdgeTag` throws `MissingEdgeTagException` on its first call. `RateLimitInterceptor` and `apiCall`'s reporter both consume this identity with zero per-call-site plumbing.
+
+## `AiEngineClient` and `AiEngineResult`
+
+`data/remote/aiengine/AiEngineClient.kt` is the typed façade over `AiEngineApi` — every AI call from the app routes through it, and each public suspend method returns an `AiEngineResult<T>` sealed variant. `safeCall { }` converts any thrown exception to `AiEngineResult.Network`. `decodeSuccess<T>()` reads the `x-developer-bypass` and `x-query-session-token` response headers, self-heals the local `server_config` feature flag on a 2xx for a gated operation (RR-118), and routes non-2xx through `parseErrorEnvelope` → `AiEngineErrorMapper`. On a `feature_disabled` response it mirrors the flag locally and fires a background `server_config` refresh.
+
+`AiEngineResult` lives in the shared `app/agentcore` module (`data/remote/aiengine/AiEngineResult.kt`), not the app package. Its variants are `Success(data, developerBypass, sessionToken)`, `Cap`, `RunawayProtection`, `MaxRoundsExceeded`, `SubscriptionRequired`, `FeatureDisabled`, `ModerationRejected`, `SessionExpired`, `NotFound`, `Forbidden`, `Validation`, `RateLimited`, `ServiceUnavailable`, `Upstream`, `Network`, and `DeveloperError`. Extensions `isSuccess`, `dataOrNull()`, and `isTransient` support callers; `TransientAiEngineException` / `PermanentAiEngineException` let workers translate a result into a WorkManager retry or a persisted user-facing message. `KbQuerySessionManager` wraps the `x-query-session-token` round-tripping so kb_query callers never thread the token by hand.
+
+## `AiEngineErrorMapper`
+
+`data/remote/aiengine/AiEngineErrorMapper.kt` maps a parsed `EdgeErrorBody` + HTTP status onto an `AiEngineResult` variant, keyed on the code's `Category`:
+
+- **`USER`** → `Cap` / `SubscriptionRequired` / `ModerationRejected` / `MaxRoundsExceeded` / `SessionExpired` / `NotFound` / `Forbidden` / `FeatureDisabled`.
+- **`INFRA`** → `ServiceUnavailable` / `RateLimited` / `RunawayProtection` (retriable).
+- **`DEVELOPER`** → `DeveloperError` (never shown, logged to Crashlytics).
+
+Unknown codes are logged as drift and fall back to `DeveloperError` with a `HANDLER_THREW` code — the signal that this mapper has drifted from `supabase/functions/_shared/errors.ts`.
+
+## Error registry mirror
+
+`AiEngineErrorCode` is the canonical Kotlin mirror of the server's `_shared/errors.ts`, covering **all** Edge Functions' codes (not just ai-engine). Each entry has a wire `code` string and a `Category` (`USER` / `DEVELOPER` / `INFRA`), and parity is asserted by `AiEngineErrorCodeDriftTest`. Like `AiEngineResult` and `AiEngineHttpHeaders` (the header-name constants), the enum lives in the shared `app/agentcore` module (`data/remote/aiengine/AiEngineErrorCode.kt`) — only `AiEngineErrorMapper` lives in the app package.
+
+## Related pages
+
+- [Diagnostic Logging](/rollingrecord/app/platform/logging) — where `save = true` transport failures land.
+- [Analytics & Crash Reporting](/rollingrecord/app/platform/analytics) — the Crashlytics side of `EdgeErrorReporter`.

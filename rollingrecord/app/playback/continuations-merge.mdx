@@ -1,15 +1,56 @@
 ---
 title: "Continuations & Merge"
-description: "Merging a continuation recording onto the original timeline."
+description: "How a continue-recording take is captured with no DB row and folded back onto the original recording by MergeWorker, with resume-safety and a standalone-file fallback."
 ---
 
-A continuation recording is merged back onto the original timeline by a background worker, with a standalone-file fallback.
+Continue-recording (Pro) extends an existing recording with a new take that `MergeWorker` folds back onto the original. The key architecture point: the continuation **never becomes a Room row** — `RecordingService` hands its metadata straight to the worker via `WorkData`, keeping it invisible to UI lists, sync, upload, and transcription until it is merged in.
 
-## What this covers
+## Starting a continuation
 
-- `MergeWorker` merging a continuation onto the original timeline; `V2PlaybackMergeUi`.
-- Standalone-file fallback behavior and its effect on mark positions.
+From the player, `V2PlaybackViewModel.startContinueRecording()` (`ui/v2/screens/playback/V2PlaybackViewModel.kt`) requests a start through `RecordingGatekeeper` with `RecordStartSource.CONTINUE_MANUAL` and `continueFromRecordingId = recordingId`. The gatekeeper HARD-blocks the start if a merge or clip-resave is already mutating the file. On `RecordStartResult.Started`, the VM fully releases the `MediaPlayer` and tears down its notification before navigating to the recorder. `canContinue` is true only for a manual recording whose format is mergeable (`MERGEABLE_FORMATS = wav / aac / opus`) and not mid-merge.
 
-<Note>
-Scaffold generated from the codebase map — expand with full detail, examples, and specifics.
-</Note>
+## Capture with no DB row
+
+`RecordingService` (`service/RecordingService.kt`) records the continuation as a normal segment, but on stop with a `continueId` set it stops and releases the recorder, then — if the finalized file exists and is non-empty — enqueues `MergeWorker` directly via `WorkData` (`originalId`, file path, duration, size, format, sample rate, protected, `createdAt`, the original's pre-merge `originalDurationMs`, and `markPositionsMs`). No `Recording` row is inserted for the continuation. Non-continuation stops insert the row and persist live marks directly instead.
+
+## MergeWorker
+
+`MergeWorker` (`worker/MergeWorker.kt`) is a `CoroutineWorker` (`KoinComponent`, user-scoped injects). It runs as unique work `tag(originalId) = merge_<id>` with `ExistingWorkPolicy.KEEP`. `doWork` wraps `runMerge` in `busyGuard.enter(BlockingOp.MERGE, originalId)` (released on every exit). The `WorkData` keys are companion constants (`KEY_ORIGINAL_ID`, `KEY_NEW_FILE_PATH`, `KEY_NEW_DURATION_MS`, …, `KEY_ORIGINAL_DURATION_MS`, `KEY_MARK_POSITIONS_MS`, `KEY_PROGRESS`).
+
+On a fresh merge it calls `AudioMerger.merge`, replaces the original audio in place (invalidate cache → delete → rename temp), writes a durable `.merge_sentinel`, then `finalizeMergedState` (idempotent): read the true duration via `MediaMetadataRetriever`, `markRecordingForReupload` + `updateRecordingDurationAndSize`, delete the stale transcript, and clean up caches, the continuation file, and the sentinel. Two more steps run **only** on the fresh-merge path (not on resume, to stay idempotent): `applyMarksToMerged` (rebases continuation marks) and `applyPostMergeSideEffects` (`touchRecording`, `touchCategory`, waveform re-extract, and `reTranscribe` when auto-transcribe is on).
+
+### Resume safety and outcomes
+
+A partial prior run is detected by a `.merge_sentinel` file or an original file larger than the DB size by more than `SIZE_TOLERANCE_BYTES = 1024` — either signals the rename happened but the DB didn't catch up, so the worker runs finalization only and skips the merge and mark-rebase.
+
+| Situation | Detection | Result |
+| --- | --- | --- |
+| Fresh merge succeeds | no sentinel, continuation exists | `AudioMerger.merge` → replace original in place, write sentinel, finalize, rebase marks, side effects |
+| Partial prior run | `.merge_sentinel` exists **or** original larger than DB size + 1 KB | finalize-only (idempotent); skip merge + mark-rebase |
+| Original deleted before merge | `getRecordingById == null` | save continuation as standalone `Recording` (marks stay continuation-relative) |
+| Merge fails ≤ 3× | `AudioMerger.merge` false or rename fails | `Result.retry()` (exponential backoff, 30 s) |
+| Merge fails 3× | `runAttemptCount ≥ 3` | `permanentFallback` → standalone `Recording` (audio never lost) |
+
+## Mark rebasing
+
+On a successful merge, `applyMarksToMerged` offsets each continuation-relative mark by the original's pre-merge duration and adds it as an empty note — a `0:30` mark on a `5:00` original lands at `5:30`. On the standalone-fallback and original-deleted paths there is no original to offset against, so `saveAsStandalone` keeps the marks at their continuation-relative positions. Mark-rebasing runs on the fresh-merge path only (not the resume/finalize path), to avoid duplicate notes.
+
+## AudioMerger backend selection
+
+`AudioMerger` (`util/AudioMerger.kt`) is an `object`. `merge(firstPath, secondPath, outputPath, format, onProgress)` routes by format and returns `Boolean`:
+
+| Format | Backend | Notes |
+| --- | --- | --- |
+| `wav` / `pcm` | `mergeWav` | RIFF concat via `AudioFileProbe.parseWavHeader` + a rewritten header; aborts on a `sampleRate` / `channels` / `bitsPerSample` mismatch (the continue-format-mismatch symptom). |
+| `aac` / `m4a` / `opus` / `ogg` | `mergeMuxed` | `MediaExtractor` → `MediaMuxer` passthrough; the second file's PTS is offset by `max(firstDuration, lastPts + 1000)`. |
+| unknown / empty | `isWav()` sniff of the RIFF magic | falls back to the byte-authoritative branch |
+
+## Overlays and observation
+
+The player only **observes** the worker — it never runs the merge. `V2PlaybackViewModel` collects `WorkManager.getWorkInfosByTagFlow(MergeWorker.tag(recordingId))` into `isMergeInProgress` / `isMergeFailed` / `mergeProgress` (with `DevFlags` overrides). When the merge-in-progress block leaves composition (the merge finished), `onMergeOverlayCleared()` re-seeds the duration, drops the stale `MediaPlayer`, and invalidates + reloads the waveform.
+
+The full-screen tap-swallowing overlays live in `V2PlaybackMergeUi.kt` (`ui/v2/screens/playback/V2PlaybackMergeUi.kt`): `PlaybackMergingOverlay` hosts `PlaybackMergingContent` (an animated bar field filling left→right by `progress` 0–100); `PlaybackMergeFailedOverlay` is the dismissible failure state (original safe, continuation lost); `PlaybackDownloadingOverlay` is the indeterminate cloud-only download spinner.
+
+The merge is enqueued from two sites: `RecordingService` (the normal continue-stop path) and `App.recoverOrphanedMergeJobs` (`App.kt`), which re-enqueues failed merge jobs from their persisted `WorkData` after process death.
+
+Related: [Playback Overview](/rollingrecord/app/playback/overview) · [Session Detail](/rollingrecord/app/playback/session-detail) · [Waveform Visualization](/rollingrecord/app/playback/waveform) · [Notes & Timestamp Marks](/rollingrecord/app/playback/notes-and-marks) · [Trim & Splice](/rollingrecord/app/playback/trim)

@@ -1,15 +1,83 @@
 ---
 title: "Session Detail (Segments)"
-description: "Viewing and editing the individual segments of a session."
+description: "The V2 single-recording player ViewModel — transport, options sheet, error handling, cloud on-demand download — plus the rolling-session detail screen that lists and manages a session's segments."
 ---
 
-Session Detail exposes the individual segments of a rolling/long session for play, trim, and delete.
+This page covers two distinct surfaces. The single-recording **player** (`V2PlaybackViewModel` / `V2PlaybackScreen`) is the detail view for one `Recording`. The rolling **session** detail (`V2SessionDetailViewModel` / `V2SessionDetailScreen`) lists and manages the segments of a rolling-record session. They are separate — a session's segment card opens the player; the player never opens the session list.
 
-## What this covers
+## The player ViewModel
 
-- `V2SessionDetailScreen` / `V2SessionDetailViewModel`: view, play, trim, and delete individual segments.
-- Protecting the live in-progress segment from the recording bottom sheet.
+`V2PlaybackViewModel` (`ui/v2/screens/playback/V2PlaybackViewModel.kt`) seeds duration from the DB row on open, validates the audio file, and watches the row `Flow` for a remote tombstone. Its transport surface delegates straight to `PlaybackMediaManager`:
 
-<Note>
-Scaffold generated from the codebase map — expand with full detail, examples, and specifics.
-</Note>
+| Action | Effect |
+| --- | --- |
+| `togglePlayPause()` / `play()` / `pause()` | Play ↔ pause; the file path is resolved fresh each call. |
+| `seekTo(ms)` / `seekToAndPlay(ms)` | Seek (the latter also resumes if paused — used by transcript timestamps). |
+| `skipForward()` / `skipBack()` | ±10 s. |
+| `setPlaybackSpeed(0.25–2.0)` | Quantized to 0.05× steps, clamped. |
+| `toggleRepeat()` / `toggleAudioBoost()` | Loop-at-end; the 8 dB `LoudnessEnhancer`. |
+
+`resolvedFilePath(path)` applies `DevFlags.audioFilePathOverride` at the lowest point before the player, so the `FileMissing` / `PlaybackFailed` paths can be exercised through the real player stack. `onCleared()` unregisters the `PlaybackStopHandle`, releases the notification + `MediaSession`, and frees the `MediaPlayer`.
+
+On open, the VM probes the file's real audio params via `AudioFileProbe.probe(...)` and logs them (format / sampleRate / channels / durationMs / byte size + recording UUID — never the filename) as a persisted support signal.
+
+## Organize, share, delete, continue
+
+| Method | Behavior |
+| --- | --- |
+| `rename(name)` | Updates the display name **and** renames the file on disk (`storageManager.renameRecordingFile`), then updates the stored `filePath`. |
+| `setCategory(id)` / `createCategory(name, onCreated)` | Assign, clear, or create-and-assign a category. |
+| `toggleFavorite()` | Flips `isFavorite`. |
+| `share(context)` | Shares the audio file via `ShareUtils.shareFiles`. |
+| `delete(onDeleted)` | Releases the player, then `recordingRepository.moveRecordingsToTrash` — **not** a hard delete. A hard delete let the recording reappear on relaunch (orphaned file re-imported / sync re-pull); the trash flag is the V1-proven path. |
+| `startContinueRecording()` | Requests a start through `RecordingGatekeeper` (`RecordStartSource.CONTINUE_MANUAL`, `continueFromRecordingId`). On `RecordStartResult.Started` it fully releases the `MediaPlayer` before the recorder takes the mic. See [Continuations & Merge](/rollingrecord/app/playback/continuations-merge). |
+
+A `PlaybackStopHandle { pause() }` is registered with the injected `PlaybackCoordinator` (`service/admission`) so a record-start can **pause** (not release) this playback before taking the mic — matching audio-focus-loss behavior, keeping the screen alive.
+
+## Cloud on-demand download
+
+Cloud status flows through `cloudStatus: StateFlow<CloudStatus>`, which is `Hidden` for any `ROLLING` segment (cloud is a session-level decision in V2) and otherwise `cloudStatusFor(rec, tier, isUndecryptable)`. `toggleCloudExcluded()` sets or clears `cloudExcludedAt`; `markCloudExcludeExplanationSeen()` suppresses the local-only warning.
+
+When a cloud-backed row's audio isn't on the device yet, `validateAudioFile(rec)` fetches and decrypts it before dead-ending on `FileMissing`, driving a full-screen `PlaybackDownloadingOverlay` and, on `ENOSPC`, a `V2StorageFullSheet`:
+
+| `DownloadResult` | Player response |
+| --- | --- |
+| `Ready` / `AlreadyLocal` | Proceed — the row `Flow` re-emits the flipped `filePath`. |
+| `StorageFull` | Show the storage-full sheet (`_showStorageFull`), no retry. |
+| `Permanent` / `SubscriptionRequired` | `PlaybackError.FileMissing`. |
+| `Retry` | `PlaybackError.CloudDownloadOffline` — retryable via `retryCloudDownload()`. |
+
+## `PlaybackError` states
+
+The sealed `PlaybackError` lives in `ui/v1/screens/playback/PlaybackViewModel.kt` and drives `V2PlaybackErrorOverlay` (red alert badge, or `ic_cloud_error` for the retryable case; title + body per state; primary Go-back / Try-again; secondary Remove-from-library for the file-level failures).
+
+| State | Trigger | Actions |
+| --- | --- | --- |
+| `RecordingGone` | Row not found on first load (or `DevFlags.forceRecordingGone`). | Go back |
+| `StorageUnavailable` | `StorageManager.isStorageAccessible()` is false (SD card removed, etc.). | Go back |
+| `FileMissing` | File absent on disk and not recoverable from cloud. | Go back + Remove from library |
+| `PlaybackFailed` | `MediaPlayer.prepare()` threw and the file is not an unfinalized MP4. | Go back + Remove from library |
+| `RecordingInterrupted` | File has an `ftyp` box but no `moov` atom (service killed mid-record). | Go back |
+| `RecordingTombstoned` | Row `Flow` went non-null → null while open (deleted on another device); the player is released and the local audio wiped. | Go back |
+| `CloudDownloadOffline` | Cloud download hit a transient/offline failure. | Try again (re-download) + Go back |
+
+## The rolling session detail screen
+
+`V2SessionDetailViewModel` (`ui/v2/screens/sessiondetail/V2SessionDetailViewModel.kt`) manages one rolling **session** — a continuous recording split into `ROLLING` segments (each a `Recording` with `mode == ROLLING` and a non-null `sessionId`). A segment is **protected** when `protectedAt != null`, which pins it so the rolling pruner never deletes it.
+
+`uiState: StateFlow<SessionDetailUiState>` folds the segments into display models plus the protected / unprotected byte totals for the storage bar and the resolved cap. `SessionSegmentItem.title` is `"Segment N"`, where **N is a computed 1-based positional number** over the `createdAt + id` sort (RR-475 — `segmentIndex` is no longer authoritative). `SessionSortField` is `SEGMENT_ORDER` / `FILE_SIZE` / `NAME`.
+
+| Session action | Notes |
+| --- | --- |
+| `protectSegment(id)` / `unprotectSegment(id)` | Protect stamps `protectedAt`; unprotect calls `demote(...)` (RR-472 — non-destructive, keeps the local buffer, no dialog). Protect is a Pro (`FeatureAccess.FULL`) create/edit action; the "Protected" pill on a card is display-only. |
+| `toggleProtectSelection()` | Multi-select flip: all-protected → demote all, else protect all. |
+| `rename` / `setCategory` / `setSegmentsFavorite` | Per-segment organize; `renameSession` / `setSessionCategory` / `setSessionFavorite` act on the whole session. |
+| `setSessionCloudExcluded(excluded)` | Session-level, all-or-nothing cloud — cascades to every segment. |
+| `setMaxStorage(bytes)` | Per-session rolling cap, clamped to the protected floor. |
+| `delete(ids, onAllDeleted)` | Moves segments to Trash; navigates back if the session empties. |
+| `togglePreview(id)` / `seekPreview(f)` | Snippet preview via `PreviewPlayerController` (CLIP mode). |
+| `continueSession()` | Pre-flights storage, then starts a `CONTINUE_SESSION` rolling recording through the gatekeeper. |
+
+Segment **trim** is not launched here — trimming opens `V2TrimScreen` from the player's options sheet. Tapping a segment card's body calls `onNavigateToPlayback(id)` to open the player.
+
+Related: [Playback Overview](/rollingrecord/app/playback/overview) · [Waveform Visualization](/rollingrecord/app/playback/waveform) · [Notes & Timestamp Marks](/rollingrecord/app/playback/notes-and-marks) · [Trim & Splice](/rollingrecord/app/playback/trim) · [Continuations & Merge](/rollingrecord/app/playback/continuations-merge)

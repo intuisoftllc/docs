@@ -1,15 +1,99 @@
 ---
-title: "Encrypted Backup & Restore"
-description: "Exporting and restoring an encrypted local backup."
+title: "Backup & Restore"
+description: "The encrypted .rrbackup export/restore engine and the debug-only ZIP backup tool."
 ---
 
-Users can export and restore an encrypted backup container of their local data.
+RollingRecord has two independent backup systems. The production one is the account-scoped, encrypted `.rrbackup` container (`BackupExporter` / `BackupRestorer`), keyed off the account DEK. The other is `DevBackupManager`, a debug-only raw-ZIP tool that dumps everything to Downloads for development. They share no code and must not be conflated.
 
-## What this covers
+## The `.rrbackup` container format
 
-- `BackupExporter` / `BackupRestorer`, `BackupModels`, `BackupSqlCipherFile`.
-- Container/manifest format: `RrBackupContainer`, `BackupManifest` (crypto module).
+`RrBackupContainer` (`app/crypto/RrBackupContainer.kt`) reads and writes the container: a 20-byte plaintext header followed by one AES-256-GCM-encrypted payload.
+
+| Segment | Size | Contents |
+| --- | --- | --- |
+| magic | 4 bytes | ASCII `"RRBK"` (`MAGIC`) |
+| formatVersion | 4 bytes | big-endian `Int` (`FORMAT_VERSION = 1`) |
+| IV | 12 bytes | AES-GCM 96-bit nonce — plaintext by design (GCM IVs are public) |
+| payload | rest | `AES-256-GCM(payload ZIP)` under the backup key; `ciphertext || 16-byte tag` |
+
+`write(payload, out, backupKey, iv = randomIv())` streams the payload through `encryptStream`; `readHeader(container)` validates the magic and version (throwing `RrBackupFormatException` on either) and leaves the stream at the first ciphertext byte; `read(container, payloadOut, backupKey)` decrypts to EOF and GCM-verifies. The header is intentionally plaintext so a file-picker can recognise the container without the key — everything sensitive, including the `authUserId`, lives inside the encrypted payload. `HEADER_BYTES = 20`, `IV_BYTES = 12`.
+
+The `backupKey` is `HKDF(DEK, "rr-db-backup-v1")` (`KeyDerivation.deriveBackupKey`), cryptographically independent of the DB key `HKDF(DEK, "rr-db-key-v1")`.
+
+`BackupManifest` (`app/crypto/BackupManifest.kt`) is the `@Serializable` metadata bundled as `manifest.json` **inside** the encrypted payload: `formatVersion`, `dbSchemaVersion`, `appVersionCode`, `authUserId`, `recordingCount`, `totalBytes`. The restore path reads it first and pre-checks `authUserId` (ownership) and `dbSchemaVersion` (`≤` the installed schema, else "update the app"); the GCM tag proves integrity. `appVersionCode` is diagnostics only, not a gate. `toJson` / `fromJson` are lenient on unknown keys so a newer app's manifest still parses. `CURRENT_FORMAT_VERSION = 1`.
+
+## `BackupExporter`
+
+`BackupExporter` (`data/backup/BackupExporter.kt`) is constructed with `Context`, `AppDatabase`, and `SessionDekHolder`, and its `export(out, onProgress)` runs on `Dispatchers.IO`, returning a `BackupExportResult`. The pipeline:
+
+1. Resolve the account DEK, derive the backup key and DB key.
+2. Take a **consistent DB snapshot on a copy**: `PRAGMA wal_checkpoint(FULL)` on the live connection, copy the encrypted DB file into `cacheDir`, open the copy, `DELETE FROM recordings WHERE trashedAt IS NOT NULL`, then `PRAGMA wal_checkpoint(TRUNCATE)` so the copied main file is self-contained. The **live DB is never modified**.
+3. Gather the non-trashed audio referenced by the surviving rows (only files under `files/recordings/<authUserId>/`).
+4. Build the `BackupManifest` and pack a payload ZIP (`manifest.json`, `db/rolling_record_db`, `audio/<basename>`).
+5. Stream-encrypt the payload into the container via `RrBackupContainer.write`.
+
+No plaintext database is ever written: the bundled DB is the SQLCipher ciphertext, and the whole payload is GCM-encrypted again under the backup key. Temp artifacts are shredded and owned keys zeroed in `finally`. `out` (a SAF document stream in the eventual UI) is not closed by the function.
+
+## `BackupRestorer`
+
+`BackupRestorer` (`data/backup/BackupRestorer.kt`) reverses the process with a strong safety invariant: **a failed import never harms the live library.** `restore(input, onProgress)` returns a `BackupRestoreResult`:
+
+1. Resolve the DEK → backup key + DB key.
+2. Decrypt + GCM-verify the container into a temp payload ZIP (tamper / wrong-key / truncation → `CORRUPT_BACKUP`).
+3. Read the manifest and pre-check `authUserId` (`OWNERSHIP_MISMATCH`), `dbSchemaVersion` vs the live `db.version` (`APP_UPDATE_REQUIRED`), and free space `≈ 2× bundle + 64 MB` (`NOT_ENOUGH_SPACE`).
+4. Extract into sibling `*.restore_new` staging on the target filesystem, then prove the staged DB opens/decrypts under the account key (`VERIFY_FAILED`).
+5. Only now close the live DB handle and `commitSwap` — a rename dance that moves the originals aside to `*.restore_bak`, moves staging into place, and on any failure **rolls back** from `*.restore_bak`.
+
+Every failure through step 4 leaves the live DB + audio 100% untouched (`Failure.libraryIntact = true`). A swap failure (`SWAP_FAILED`) rolls the on-disk originals back but reports `libraryIntact = false`, because the closed handle forces an app restart. A `Success` also requires the caller to restart so Koin rebuilds the session scope against the restored DB.
+
+The companion `recoverInterruptedRestore(context, segment)` reconciles a swap interrupted by power loss / process death **before Room opens** (it is called from `DatabaseModule`). Keyed on the DB (swapped first): a missing live DB with a present `*.restore_bak` **reverts** to the original; a present live DB with a leftover `*.restore_bak` **completes** the audio half; otherwise it discards stale staging. It is pure file-layout reconciliation — no key needed — and never throws.
+
+## `BackupSqlCipherFile`
+
+`BackupSqlCipherFile` (`data/backup/BackupSqlCipherFile.kt`) is a thin `internal object` that operates on a database **file** (a snapshot or staged copy), never the live Room connection. `rawKeyLiteral(hex)` builds the ASCII bytes of `x'<hex>'`; `openReadWrite(file, keyLiteral)` clones the key array (net.zetetic retains it by reference) so the caller can zero its own copy; `verifyOpens(file, keyLiteral)` forces decryption plus `PRAGMA cipher_integrity_check` and returns the schema version or `null` — it never throws, so a `null` is the restorer's signal to abort without touching the live library.
+
+## Error codes and phases
+
+`BackupError` (`data/backup/BackupModels.kt`) is a local error registry — every failure has a stable snake_case `code` (logged) and a localized `messageRes` (shown).
+
+| Code | Meaning |
+| --- | --- |
+| `not_signed_in` | No signed-in account (backups are DEK-derived) |
+| `dek_unavailable` | The account DEK could not be resolved |
+| `ownership_mismatch` | The backup belongs to a different account |
+| `app_update_required` | Backup DB schema is newer than this build supports |
+| `corrupt_backup` | Bad magic / unsupported format / GCM failure / truncation |
+| `not_enough_space` | Insufficient free storage to stage the restore |
+| `snapshot_failed` | Export could not produce a consistent DB snapshot |
+| `verify_failed` | Staged DB did not open/decrypt under the account key |
+| `swap_failed` | Atomic swap failed (on-disk original rolled back) |
+| `io_error` | Generic I/O failure |
+
+`BackupPhase` (`PREPARING`, `SNAPSHOT`, `BUNDLING`, `ENCRYPTING`, `DECRYPTING`, `VERIFYING`, `FINALIZING`) plus `BackupProgress(phase, fraction)` drive progress UI.
 
 <Note>
-Scaffold generated from the codebase map — expand with full detail, examples, and specifics.
+The `.rrbackup` engine is fully implemented but **not yet wired into the V2 UI**. `V2AccountSettingsScreen` holds only placeholder comments describing how to invoke `export()` / `restore()` from the user-session Koin scope; there is no `single` / `scoped` provider for `BackupExporter` / `BackupRestorer` today (each is constructed with `Context` + `AppDatabase` + `SessionDekHolder`).
 </Note>
+
+## `DevBackupManager` — the debug-only ZIP tool
+
+`DevBackupManager` (`devmode/DevBackupManager.kt`, `src/debug`) is a separate, unencrypted backup system for development. `backup()` writes a raw ZIP to Downloads via MediaStore containing `metadata.json` (`dbVersion`), `recordings_meta.json` (a JSON table dump as a metadata safety net), `databases/` (the DB checkpointed `FULL`), `security_prefs/rr_security_prefs.xml` (the file that wraps the SQLCipher key — needed so the restored DB stays decryptable), `datastore/`, and internal + external audio. `restore(uri)` validates metadata (including a schema-downgrade guard), overwrites files in place, then kills the process so Room reopens fresh. `restoreFromMetadataJson(uri)` is an emergency path that re-inserts sessions + recordings into the already-correctly-keyed DB, leaving audio untouched. Its companion pins `CURRENT_DB_SCHEMA_VERSION = 78` (matching `AppDatabase.version`), `BACKUP_VERSION = 1`, `MIN_SUPPORTED_BACKUP_VERSION = 1`, and `SECURITY_PREFS_NAME = "rr_security_prefs"`, and it exposes `BackupState` / `RestoreState` / `MetadataRestoreState` flows.
+
+The `src/release` variant of `DevBackupManager` is an inert stub — `class(context)` only (no `database`), `backup()` / `restore()` are no-ops, and the state flows are fixed at `Idle` — so R8 eliminates the tool from release builds.
+
+## Two backup systems compared
+
+| Aspect | `.rrbackup` (`BackupExporter` / `BackupRestorer`) | `DevBackupManager` |
+| --- | --- | --- |
+| Availability | Production, account-scoped | Debug builds only (release stub inert) |
+| Encryption | GCM under `HKDF(DEK, "rr-db-backup-v1")` + inner SQLCipher DB | None (raw ZIP; DB stays SQLCipher-encrypted, key file bundled) |
+| Destination | Caller `OutputStream` (SAF URI) | Downloads via MediaStore |
+| Schema version | Reads the live `db.version` at export/restore | Pinned `CURRENT_DB_SCHEMA_VERSION = 78` |
+| Restore safety | Atomic swap + rollback + next-launch recovery | Overwrite-in-place then kill process |
+
+## Where to go next
+
+- [DEK & Database Key Lifecycle](/rollingrecord/app/security/dek-and-db-key) — the DEK both backup keys derive from
+- [Envelope Encryption Primitives](/rollingrecord/app/security/envelope-crypto) — `RrBackupContainer`, `BackupManifest`, and the streaming GCM engine
+- [Database Recovery States](/rollingrecord/app/security/database-recovery) — where `recoverInterruptedRestore` hooks into DB open
+- [Local database](/rollingrecord/app/architecture/local-database) — the per-user DB + audio layout being snapshotted

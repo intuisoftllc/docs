@@ -1,16 +1,85 @@
 ---
 title: "Per-User Session Scope"
-description: "How the session scope is rebuilt on sign-in/out to isolate accounts."
+description: "How UserSessionManager rebuilds UserSessionScope on every sign-in/out, and the UserScopedCache + owner-stamping pattern that prevents cross-account leakage."
 ---
 
-Every account runs in its own session scope, rebuilt on each sign-in and sign-out so no state leaks between users.
+Every account runs in its own Koin scope (`UserSessionScope`), created at startup against the cached user id and replaced on every auth change by `UserSessionManager.switchTo`. App-level singles that must cache per-user data implement `UserScopedCache` and register in a registry that `switchTo` clears — and any cache gating a user-visible decision also owner-stamps its snapshot so a late in-flight response degrades to a cache miss, not a wrong answer.
 
-## What this covers
+## `UserSessionManager`
 
-- `UserSessionManager.switchTo()` tears down and rebuilds `UserSessionScope` on every sign-in/out; `UserSessionModule` wiring.
-- The `UserScopedCache` + `userScopedCacheRegistry` pattern and owner-stamping to prevent cross-account leakage (`UsageRepository` reference impl).
-- `SessionDekHolder`, `UserScopedInject`, and `UserWorkTag` for session-scoped work tagging.
+`UserSessionManager` (`data/session/UserSessionManager.kt`) is the app-wide single tracking the active per-user Koin scope. It exposes:
 
-<Note>
-Scaffold generated from the codebase map — expand with full detail, examples, and specifics.
-</Note>
+- `sessionIdFlow: StateFlow<String>` — the active `authUserId` or `AuthUserStore.ANONYMOUS_DIR`, seeded synchronously from `AuthUserStore` at construction.
+- `currentScope: Scope` — the live Koin scope, for non-Koin callers (Workers, Service) via `currentScope.get<...>()`.
+- `sessionScope: CoroutineScope` — a per-session `SupervisorJob() + Dispatchers.IO` scope that `App`'s recovery jobs launch from, so they cancel cleanly at a switch.
+- `sessionSwitches: SharedFlow<SessionSwitch>` — one event per completed swap.
+
+It does **not** observe `AuthState` itself. In the V2 surface the observer that calls `switchTo` is the `LaunchedEffect` in `ui/v2/V2App.kt` (`UserSessionManager`'s KDoc still names `AppNavHost` — that describes the legacy V1 path).
+
+## `UserSessionScope`
+
+`UserSessionScope` (`data/session/UserSessionScope.kt`) is an empty marker class used only as the Koin scope qualifier. Every per-user singleton (Room DB, per-user DataStore, repositories, `StorageManager`, entitlement cache) lives in one instance; closing it drops all `scoped {}` instances. App-wide singles do not participate.
+
+## `switchTo` — order of operations
+
+`switchTo(newAuthUserId: String?)` is a no-op when the id is unchanged. Otherwise it runs a strict order — the finalize step is first because `RecordingService` resolves its repositories through `userProperty()` on every access, so a save racing the swap would split writes across two users:
+
+| Step | Action | Why |
+| --- | --- | --- |
+| -1 | `finalizeActiveRecordingForOutgoingUser()` | Save an in-progress recording under the outgoing user before the ground moves. |
+| 0 | `UserScopedCacheRegistry.clearAll()` | Drop app-level per-user caches that survive the scope. |
+| 1 | `WorkManager.cancelWorkForUser(old)` | Stop mid-flight workers from writing to the closing DB. |
+| 2 | cancel + join old `sessionScope`, create fresh | Let in-flight DataStore collects finish so the file lock releases. |
+| 3 | close old `UserSettingsDataSource` | Release the DataStore file lock before the new scope opens the same file. |
+| 4 | `createScope(new)` + close(old) + set `sessionIdFlow` | Swap the live Koin scope. |
+| 5 | `tryEmit(SessionSwitch)` | Recovery scans re-run against the new user's DB. |
+
+The caller (`V2App`) **must** update `AuthUserStore` before calling `switchTo` so the new scope's DB/DataStore factories see the correct user id at construction time.
+
+### `finalizeActiveRecordingForOutgoingUser`
+
+The first step: if `RecordingService.state` is `RECORDING`/`PAUSED`, it fires `ACTION_STOP` with `EXTRA_FORCE_STANDALONE_FINALIZE` and awaits a terminal state (`IDLE` or `STANDBY`) within `FINALIZE_TIMEOUT_MS = 10_000`. There is no suspend stop API — the service's own state flow is the only true completion signal, flipping to terminal inside its `NonCancellable` block only after the row insert, live-mark notes, and session-row update all land. This is the forced-sign-out path (the account screen refuses a user-initiated sign-out while recording); the timeout is a backstop so a stale `RECORDING` value can't hang the auth observer forever.
+
+## `UserScopedCache` and owner-stamping
+
+`UserScopedCache` (`data/session/UserScopedCache.kt`) is the contract for app-level singles that hold per-user state. It has a `cacheName` (defaults to the class simple name) and a `suspend fun clearForUserSwitch()` that must be idempotent, thread-safe, and small.
+
+Implementing the interface is **necessary but not sufficient**. Clearing is a point-in-time action, and a network response already in flight when the switch happens lands *after* the clear. Any cache whose value gates a user-visible decision must ALSO stamp the owning user id at store time and drop responses whose owner no longer matches the active session. `UsageRepository` is the reference implementation — with owner-stamping, a missed clear degrades to a harmless cache miss instead of a wrong answer attributed to the wrong account.
+
+`UserScopedCacheRegistry` holds the explicit `List<UserScopedCache>`; `clearAll()` clears each (failures logged and swallowed individually) and `registeredNames()` feeds `UserScopedCacheRegistryTest`. The registered caches (from `di/UserSessionModule.kt`):
+
+| Cache | Notes |
+| --- | --- |
+| `UsageRepository` | Reference impl — owner-stamps each snapshot; gates the KB-chat AI cap + extraction budget. |
+| `SyncPreferencesRepository` | Decides which entity groups sync may push. |
+| `IdentityRepository` | RC customer id → canonical user id. |
+| `SupportTokenRepository` | Short-lived in-memory support-code cache. |
+| `DeviceSettingsDataSource` | Wipes only its per-user-segmented keys (e.g. pinned-session). |
+| `V2OnboardingSignals` | `nextSignInIsNewAccount` flag. |
+| `RecordingAdmissionBus` | In-flight admission events. |
+| `CloudDecryptFailureStore` | Undecryptable-blob marks keyed by one user's row ids. |
+
+## `SessionDekHolder`
+
+`SessionDekHolder` (`data/session/SessionDekHolder.kt`, RR-321) is the session-scoped holder of the plaintext 32-byte DEK. It caches the unwrapped DEK in RAM for the scope's lifetime; its `Mutex`-guarded `requireDek()` resolves through the full three-tier fallback (RAM → persisted Keystore-wrapped via `DekKeyStore` → network via `UserKeyApiClient`, persisting on success). It zero-fills on close (`Closeable`, auto-invoked when the scope tears down) and subscribes to `ConnectivityManager` to proactively refresh on network restore. The DEK is never written to disk, prefs, or logs. See [Room Database & SQLCipher](/rollingrecord/app/architecture/local-database) for how the DEK keys the database.
+
+`resolveDekForRecovery()` is a suspend extension used by the `V2DekUnavailableScreen` Retry: it resolves the DEK through `SessionDekHolder.requireDek` on IO and returns `true` iff it is now available (`DekResult.Available`) — a bare `recreate()` alone would loop if the persisted DEK is still missing.
+
+## Session-scoped resolution helpers
+
+The `data/session` package carries three distinct concerns:
+
+- **`userSession()` / `userInject()` / `userProperty()`** (`UserSessionManager.kt`) — `Koin.userSession()` and `KoinComponent.userSession()` return `currentScope`. `userInject<T>()` is a lazy resolve (Workers, single-session holders). `userProperty<T>()` is a non-caching `ReadOnlyProperty` that re-resolves on every read — used by `App` and foreground services that outlive session switches.
+- **`userScopedInject`** (`data/session/UserScopedInject.kt`) — a `@Composable inline fun` that resolves a per-user-scoped dep, `remember`-keyed on `sessionIdFlow` so it re-resolves after a swap. For composables outside a VM factory (`V2MainNavHost` reads `EntitlementRepository` / `ContextRepository` this way).
+- **`UserWorkTag` / `addUserTag` / `cancelWorkForUser`** (`data/session/UserWorkTag.kt`) — `UserWorkTag.forUser(id)` = `"user_{id}"`; `addUserTag(...)` tags a `WorkRequest.Builder` before `build()`; `WorkManager.cancelWorkForUser(id)` = `cancelAllWorkByTag`, used by `switchTo` step 1 so a mid-flight worker loses its DI reference before it writes back to the closed per-user DB.
+
+## Enforcement
+
+`UserScopedCacheRegistryTest` is build-failing: a `UserScopedCache` implementor missing from the registry fails, and a new app-level `single {}` that isn't a `UserScopedCache` and isn't in the test's `crossUserSafe` map (with a written reason) fails. This closes the exact bug the rule exists to prevent — one account's cached quotas or entitlements being read as the next account's after a sign-out / sign-in.
+
+## Where to go next
+
+- [Koin Dependency Injection](/rollingrecord/app/architecture/dependency-injection) — the modules that contribute the scope.
+- [Room Database & SQLCipher](/rollingrecord/app/architecture/local-database) — the per-user DB keyed by the DEK this scope holds.
+- [Application Shell & Entry Points](/rollingrecord/app/architecture/app-shell) — `App`'s recovery scans that re-run on each switch.
+- [UI & Navigation](/rollingrecord/app/architecture/ui-and-navigation) — the `V2App` observer that calls `switchTo`.

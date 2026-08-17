@@ -1,15 +1,68 @@
 ---
 title: "Authentication (Clerk)"
-description: "How the app authenticates through the Clerk SDK."
+description: "AuthRepository wraps the Clerk Android SDK — reactive auth state, per-request JWTs, sign-out, profile edits, device metadata, and the DEK provisioning gate."
 ---
 
-All authentication routes through a repository that wraps the Clerk SDK, which issues the JWTs the backend consumes.
+`AuthRepository` (`data/auth/AuthRepository.kt`) is the single app-level wrapper around the Clerk Android SDK. Every auth operation in the app routes through it; there are no direct Clerk SDK calls elsewhere. Clerk itself is initialized in `App.onCreate` (before Koin starts) and exposes its state through process-level singletons (`Clerk.isInitialized`, `Clerk.userFlow`), so it needs no Koin binding.
 
-## What this covers
+## `AuthState` — the reactive session
 
-- `AuthRepository` wraps the Clerk SDK (all auth routes through it); `Clerk.userFlow` session state and `Session.fetchToken()` JWTs.
-- `AuthUserStore` session persistence and `AuthCallbackActivity` for SSO callbacks.
+`authState: Flow<AuthState>` is `combine(Clerk.isInitialized, Clerk.userFlow)` mapped into a three-variant sealed interface:
 
-<Note>
-Scaffold generated from the codebase map — expand with full detail, examples, and specifics.
-</Note>
+| State | Emitted when | Key fields |
+| --- | --- | --- |
+| `Loading` | `Clerk.isInitialized` is false (cold start before the SDK rehydrates its token cache) | none |
+| `SignedOut` | initialized and `Clerk.userFlow == null` | none |
+| `SignedIn` | initialized and a Clerk user is present | `authUserId`, `email`, `displayName?`, `firstName?`, `lastName?`, `imageUrl`, `hasImage`, `accessToken` |
+
+The flow is coalesced with `distinctUntilChanged`, but the equality comparison spans **every rendered field** (`authUserId`, `email`, `firstName`, `lastName`, `imageUrl`, `hasImage`) — a rename or avatar change re-emits, while token refreshes that leave those fields identical are suppressed. Two subtleties matter for consumers:
+
+- `SignedIn.imageUrl` is **always** non-empty because Clerk serves a generated default avatar; treat it as a real photo only when `hasImage` is true.
+- `SignedIn.accessToken` is **intentionally empty** in the reactive flow. Callers that need the real JWT must call `awaitAccessToken()`.
+
+`currentAuthState()` is the non-suspending snapshot equivalent (reads Clerk's StateFlows directly). `currentAccessToken()` always returns null and exists only for API compatibility — Clerk tokens require suspension.
+
+## Per-request JWTs
+
+`awaitAccessToken(timeoutMs = 5_000L)` returns the current Clerk session token, suspending until available or the timeout elapses. It wraps `Clerk.session?.fetchToken()` and reads `.jwt` inside `withTimeoutOrNull`. Calling `fetchToken` is also what triggers Clerk's internal refresh when the session is near expiry (the session-token TTL is short, ~60s), so going through it on every request is correct rather than wasteful. This is the token source both the OkHttp `BearerJwtInterceptor` and the `TokenRefreshAuthenticator` call (via `runBlocking`) — see [Auth Token Injection & Refresh](/rollingrecord/app/auth/jwt-interceptors). There is no explicit refresh call anywhere in `AuthRepository`.
+
+## Sign-out
+
+`signOut()` runs `Clerk.auth.signOut()` inside `withContext(NonCancellable)`. The instant Clerk clears the local session, `authState` flips to `SignedOut`, the calling screen unmounts, and its ViewModel scope dies — cancelling this coroutine mid-revocation (observed at 22ms in the field, before the HTTP call finished) would leave the server session alive. Clerk's `signOut` never throws and always clears the local session even when server-side revocation fails, reporting failure through the returned `ClerkResult`; the only meaningful handling is logging that the server session was left un-revoked. This is why the UI gates sign-out on connectivity: an offline attempt would always "succeed" locally while silently leaving the server session live.
+
+## The DEK provisioning gate
+
+Interactive sign-ins (`verifySignInOtpV2`, `verifySignUpOtpV2`, `signInWithGoogle`) end with `provisionDekOrThrow()`. The DEK-derived key is required to open the local encrypted database, so a sign-in must not "succeed" into the app without one. `fetchAndPersistDek(authUserId)` fetches the account DEK from the `get-user-key` Edge Function and persists it Keystore-wrapped via `DekKeyStore`. On any failure it signs the just-established session back out (leaving no signed-in-without-DEK half-state) and throws `DekProvisioningException`, whose `reason` is a stable diagnostic code (`transient`, `rate_limited`, `persist_failed`, `bad_dek_size`, …) — never DEK bytes. The V2 login ViewModel maps this to a retryable message. Subsequent cold launches do **not** re-run this gate; they read the persisted DEK offline.
+
+`InvalidOtpException` and `DekProvisioningException` are both declared in `AuthRepository.kt`. `InvalidOtpException` is thrown only when Clerk reports one of `INVALID_CODE_ERROR_CODES` (`form_code_incorrect`, `verification_failed`, `verification_expired`), letting the OTP screen show a precise error instead of the generic failure.
+
+## Profile edits and device metadata
+
+`AuthRepository` also owns the Clerk user-profile operations. Profile images are stored and served entirely from Clerk's CDN — never persisted locally or in Supabase — and a successful edit re-emits `Clerk.userFlow`, so `authState` refreshes automatically.
+
+| Method | Purpose |
+| --- | --- |
+| `updateName(firstName, lastName)` | Writes first/last independently — preferred over `updateDisplayName`'s join-then-split, so multi-word names survive |
+| `updateDisplayName(name)` | Splits a single string at the first space into first/last |
+| `updateProfileImage(file)` / `removeProfileImage()` | Upload / clear the Clerk profile picture |
+| `reloadUser()` | Pulls a fresh user (cross-device edits); throttled to once per `USER_RELOAD_INTERVAL_MS` (15s) |
+| `maybeRefreshDeviceMetadata()` | Called on every foreground; refreshes this device's metadata entry at most hourly (`METADATA_REFRESH_INTERVAL_MS`) |
+
+`updateDeviceMetadata()` writes a per-device entry (model, OS, app version, locale, `last_seen_at` + `last_seen_ms`) into the user's Clerk `unsafeMetadata`, keyed by a stable salted SHA-256 of `ANDROID_ID` (so a reinstall updates the same entry instead of duplicating). `pruneDeviceEntries` bounds the map to `MAX_DEVICE_ENTRIES = 15` and drops entries older than `DEVICE_RETENTION_MS` (~1 year) so it never approaches Clerk's ~8KB metadata cap. Metadata failures are swallowed — a hiccup never blocks sign-in.
+
+## `AuthUserStore` and `AuthCallbackActivity`
+
+`AuthUserStore` (`data/auth/AuthUserStore.kt`) is an `object` doing synchronous read/write of the current `auth_user_id` in plain `SharedPreferences` (`auth_user_store`), with `ANONYMOUS_DIR = "anonymous"`. It is the **only** place the "which user's DB should we open" question is answered — `DatabaseModule` reads it at Koin init, before any coroutine scope exists, which is why it uses `SharedPreferences` and not DataStore. It does **not** store the Clerk session; Clerk manages session persistence and token refresh internally.
+
+`AuthCallbackActivity` (`AuthCallbackActivity.kt`) is a transparent trampoline for Clerk deep-link callbacks: it passes `intent.data` to `Clerk.auth.handle(uri)`, then starts `MainActivity` with `NEW_TASK | CLEAR_TOP` and finishes. Email OTP sign-in involves no URI at all; this activity only matters for the browser-based Google OAuth fallback. Its manifest entry registers scheme `com.intuisoftllc.rollingrecord`, host `auth-callback`, with `singleTask`, `noHistory`, and `excludeFromRecents` — the scheme must match `authModule` (`di/AuthModule.kt`) and the Clerk dashboard redirect URLs.
+
+## The `V2App` auth observer
+
+A single `LaunchedEffect` in `V2App` (`ui/v2/V2App.kt`) collects `authState` and is the primary session-swap trigger — though not the only caller of `UserSessionManager.switchTo`: `AccountDeletionCoordinator.wipeLocalAndSignOut` calls `switchTo(null)` during account deletion, and for new accounts the `switchTo` runs from `V2App`'s recovery-code `onAcknowledged` callback once the code is saved. On `SignedIn` it sets `AuthUserStore.setCurrentUserId` **before** calling `UserSessionManager.switchTo` (so the new scope's DB/DataStore factories see the correct user id), deferring the switch behind the recovery-code overlay for new accounts or interrupted acknowledgements. On `SignedOut` it clears `AuthUserStore` and calls `switchTo(null)`. `Loading` is a no-op.
+
+## Related
+
+- [Login & Sign-Up Flow](/rollingrecord/app/auth/login-flow) — the screens that call the sign-in methods
+- [Identity Resolution](/rollingrecord/app/auth/identity-resolution) — the `canonical_users` upsert
+- [Auth Token Injection & Refresh](/rollingrecord/app/auth/jwt-interceptors) — where `awaitAccessToken` is consumed
+- [Known Accounts / Account Switching](/rollingrecord/app/auth/known-accounts) — device account registry and switching

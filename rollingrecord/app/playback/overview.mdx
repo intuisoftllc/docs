@@ -1,16 +1,69 @@
 ---
 title: "Playback Overview"
-description: "Playing, managing, and editing recordings, with background controls."
+description: "The V2 playback subsystem — the single-recording player, its seekable waveform, timestamped notes, trim editing, and rolling-session continuation merge — built as a thin V2 shell over the shared media stack."
 ---
 
-Playback covers play/seek plus recording management, editing, and media controls in the notification shade.
+Opening a recording enters `V2PlaybackScreen` (`ui/v2/screens/playback/V2PlaybackScreen.kt`), the active single-recording player, backed by `V2PlaybackViewModel`. The ViewModel is deliberately a thin bridge over the shared playback engine rather than a reimplementation: it reuses the same `PlaybackMediaManager` and `PlaybackNotificationSync` that ship with V1, so every byte of the real audio-focus, position-polling, speed, and notification logic runs unchanged.
 
-## What this covers
+## The V2 player and its shared engine
 
-- `V2PlaybackScreen` / `V2PlaybackViewModel` and `PreviewPlayerController`.
-- Play/pause/seek, rename, delete, share (Free); notes and trim (Pro).
-- Background playback controls: `PlaybackNotificationManager`, `PlaybackActionReceiver`, `PlaybackCommandBus`.
+`V2PlaybackViewModel` is Koin-scoped with `parametersOf(recordingId)`. It owns two plain helper classes and re-exposes their `StateFlow`s so there is no duplicated player state:
+
+| Class | File | Responsibility |
+| --- | --- | --- |
+| `PlaybackMediaManager` | `ui/v1/screens/playback/PlaybackMediaManager.kt` | `MediaPlayer` lifecycle, `AudioFocusRequest` (GAIN; pauses on loss), a 50 ms position-polling job, `LoudnessEnhancer` (800 mB / 8 dB boost), `PlaybackParams` speed (0.25×–2.0×), looping, and `prepare()`-failure error detection. |
+| `PlaybackNotificationSync` | `ui/v1/screens/playback/PlaybackNotificationSync.kt` | A platform `MediaSession` plus `PlaybackNotificationManager`. Reads live state through lambdas. `updateNotification()` re-posts on state changes; `syncMediaSession()` runs on every 50 ms tick to move the scrubber without re-posting (which would flicker the colorized background). |
+
+The media manager receives its callbacks as constructor lambdas — `onStateChanged = { notificationSync.updateNotification() }`, `onPositionTick = { notificationSync.syncMediaSession() }`, `onCancelNotification = { notificationSync.cancelNotification() }` — so the two collaborate without either owning the other's state.
 
 <Note>
-Scaffold generated from the codebase map — expand with full detail, examples, and specifics.
+The files `PlaybackMediaManager`, `PlaybackNotificationSync`, `PlaybackError`, `PlaybackWaveform`, and the transcript parser physically live in the `ui.v1.screens.playback` / `ui.v1.components` packages, but they are the **shared engine**, not legacy UI. Only `PlaybackScreen.kt`, `PlaybackViewModel.kt`, and the `ExternalPlayback*` files in that package are the retired V1 surface. The active player is `ui/v2/screens/playback`.
 </Note>
+
+## Screen structure
+
+`V2PlaybackScreen(recordingId, onExit, onContinueRecording, onNavigateToBundles, onNavigateToTrim, onNavigateToUpgrade)` lays out, top to bottom:
+
+- `PlaybackCard` — a steel-blue header card that crossfades the big position timer with the seekable waveform (`AnimatedContent`) and layers the transcript / notes overlays into the same fixed-height box.
+- `PlaybackSeekBar` — a tap-and-continuous-drag scrubber with always-visible clustered note dots.
+- `TransportControls` — −10 s / play-pause / +10 s.
+- `PlaybackBottomBar` — `ic_ai` (transcribe) / cloud status / `ic_wave` (waveform toggle) / speed / repeat.
+- The 3-dot `PlaybackOptionsSheet` and all sub-sheets and overlays.
+
+`formatClock(ms)` renders `M:SS` (or `H:MM:SS` past an hour) for the timer and seek labels.
+
+## Transport commands and the notification
+
+`PlaybackNotificationManager` (`notification/PlaybackNotificationManager.kt`) builds the colorized `MediaStyle` notification (channel `playback_channel`, id `2001`, brand red `0xFFD32F2F`) with a single play/pause `Action` whose `PendingIntent` broadcasts `PlaybackActionReceiver.ACTION_PLAY_PAUSE`.
+
+The transport controls in the notification and lock screen reach the ViewModel through the `MediaSession.Callback` (`onPlay` / `onPause` / `onSeekTo`), which `PlaybackNotificationSync` forwards to `play()` / `pause()` / `seekTo()`. The broadcast `PlaybackActionReceiver` → `PlaybackCommandBus` (`receiver/PlaybackCommandBus.kt`) path is collected **only** by the legacy V1 `PlaybackViewModel`; `V2PlaybackViewModel` has no bus collector.
+
+## Capabilities and tier gating
+
+| Capability | Tier | Entry point / control |
+| --- | --- | --- |
+| Play / pause / seek / skip ±10 s | Free | `TransportControls` + `PlaybackSeekBar` |
+| Rename / Set category / Favorite | Free (universal organize actions) | `PlaybackOptionsSheet` |
+| Audio boost (8 dB) / speed / repeat / waveform toggle | Free | options sheet + `PlaybackBottomBar` |
+| Share audio | Free | options sheet (`ShareUtils`) |
+| Timestamped notes + live marks | Pro | mark / view icons over the waveform |
+| Trim | Pro | options sheet → `V2TrimScreen` |
+| Continue recording (continuation merge) | Pro | options sheet → recorder |
+| Transcription | Pro+Cloud / Cloud+AI | `ic_ai` bottom-bar icon |
+| Cloud backup local-only toggle | Pro+Cloud | `CloudStatusIcon` in the bottom bar |
+
+Rename, Set category, and Favorite stay visible even to a demoted Pro user (RR-486) — they only relabel or organize the user's own data. Notes are Pro-clamped inside `SettingsRepository.notesEnabled`; Trim is gated by `showTrim = isPro`; Continue routes non-Pro taps to a `V2UpsellSheet`.
+
+## Errors
+
+Any player error surfaces as the full-screen `V2PlaybackErrorOverlay` (`ui/v2/screens/playback/V2PlaybackErrorOverlay.kt`) driven by the sealed `PlaybackError` — `RecordingGone`, `StorageUnavailable`, `FileMissing`, `PlaybackFailed`, `RecordingInterrupted`, `RecordingTombstoned`, and the retryable `CloudDownloadOffline`. See [Session Detail](/rollingrecord/app/playback/session-detail) for the trigger table.
+
+`PreviewPlayerController` (`ui/v2/common/PreviewPlayerController.kt`) is a separate snippet-preview player (CLIP / FULL modes) used by session-detail segment cards and library list rows — it is **not** the single-recording player, which drives `PlaybackMediaManager` directly.
+
+## Where to go next
+
+- [Session Detail (Segments)](/rollingrecord/app/playback/session-detail) — the player ViewModel's actions, cloud on-demand download, and the rolling-session segment manager.
+- [Waveform Visualization](/rollingrecord/app/playback/waveform) — amplitude decoding, sidecar caching, the extraction worker, and rendering.
+- [Notes & Timestamp Marks](/rollingrecord/app/playback/notes-and-marks) — the notes data model and live marks dropped while recording.
+- [Trim & Splice](/rollingrecord/app/playback/trim) — the `keepSegments` model and the `AudioSplicer` pipeline.
+- [Continuations & Merge](/rollingrecord/app/playback/continuations-merge) — how a continue-recording take folds back onto the original via `MergeWorker`.

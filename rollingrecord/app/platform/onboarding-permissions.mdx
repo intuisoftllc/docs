@@ -1,15 +1,55 @@
 ---
 title: "Onboarding & Permissions"
-description: "The first-run onboarding and permission-setup flow."
+description: "The post-sign-up recovery-code onboarding overlay and the one-time V2 permission-setup screen, both mounted by V2App above the active nav host."
 ---
 
-First launch runs an onboarding overlay and a one-time permission-setup screen.
+`V2App` can mount exactly one onboarding overlay above the nav host — today the post-sign-**up** recovery-code save flow, which defers the Clerk session swap until the user acknowledges their recovery code. Separately, once signed in with no overlay pending, the device flag `permissions_setup_done` gates the one-time permission-setup screen. Neither is a feature tour.
 
-## What this covers
+## The onboarding overlay
 
-- `V2OnboardingOverlay` / `V2OnboardingSignals` first-run flow.
-- `V2PermissionsScreen` / `ViewModel`, `PermissionRationaleSheet`, `V2PermissionModel`.
+`ui/v2/screens/onboarding/V2OnboardingOverlay.kt` is a sealed interface of full-screen overlays `V2App` can mount above the active nav host. Its only current variant is `RecoveryCode(code, email, isError)`, shown for brand-new accounts immediately after first sign-in; `code` is `null` while the recovery-code-generate call is in flight, and `isError` flips the renderer to a Retry state. `ui/v2/screens/onboarding/V2RecoveryCodeSaveScreen.kt` is the composable `V2App` renders for that variant — it displays and saves the recovery code, offers Retry on a generate failure, and on Continue acknowledges the code server-side before the deferred session swap proceeds.
 
-<Note>
-Scaffold generated from the codebase map — expand with full detail, examples, and specifics.
-</Note>
+The overlay's defining property is that the session swap is **deferred**: the overlay sits above the still-mounted login nav host, and `sessionManager.switchTo` fires only on the Continue tap, so the user cannot bypass the overlay by backgrounding and restoring the app.
+
+## `V2OnboardingSignals`
+
+`ui/v2/screens/onboarding/V2OnboardingSignals.kt` is a tiny cross-tree singleton (a `UserScopedCache`) with a `@Volatile var nextSignInIsNewAccount`. `V2LoginViewModel` sets it before OTP verify; `V2App` reads and resets it on the next Clerk `SignedIn`. Because the flag is genuinely cross-tree — the login ViewModel is disposed on session swap before `V2App` could read its state — a navigation argument or shared scope wouldn't work. `clearForUserSwitch` resets it so an aborted sign-in can't mis-flag the next account as new.
+
+## `V2App` wiring
+
+`ui/v2/V2App.kt` observes Clerk auth state. On a new-account `SignedIn` (or an interrupted-acknowledgment flow recovered from `pendingRecoveryAckUserId`), it sets `pendingOverlay = V2OnboardingOverlay.RecoveryCode` in loading mode, persists the pending-ack flag *before* the network call, and calls `recoveryCodeClient.generateRecoveryCode()`; the session swap is deferred to the Continue path. A returning user with an already-acknowledged code swaps immediately. Separately, once `sessionId` is not anonymous, `pendingOverlay == null`, and `!permissionsSetupDone` (from `DeviceSettingsDataSource.permissionsSetupDone`), `V2App` renders `V2PermissionsScreen` over Home.
+
+## `V2PermissionsScreen`
+
+`ui/v2/screens/permissions/V2PermissionsScreen.kt` is the one-time "Grant Permissions" screen (Figma 1676-25825). A single composable renders all three visual states (neutral / all-granted / failed) driven purely by per-row `PermissionStatus`. The screen owns the runtime and Settings launchers and the ON_RESUME status refresh; the ViewModel owns the decisions. A grant is only ever launched from a row tap or a rationale-sheet confirm — never from a `LaunchedEffect`, recompose, or lifecycle observer — which is the no-double-dialog guarantee. On completion it calls `markComplete()`.
+
+## `V2PermissionsViewModel`
+
+`ui/v2/screens/permissions/V2PermissionsViewModel.kt` is state and decisions only — no Compose, no launcher. It holds the ordered, version-filtered `PermissionRowState` list. `refreshStatuses` is STATUS-ONLY (re-reads the system, clears the in-flight guard) and is the ON_RESUME / result path — it can never auto-launch. `request` / `confirmRationale` are the only launch entry points, each guarded per-key via `requestedKeys` so a mid-flight recompose can't re-fire the OS dialog; `onRuntimeResult` / `onLaunchFailed` record outcomes; `markComplete` flips `DeviceSettingsDataSource.permissions_setup_done` and emits `completed`. It exposes `allRequiredGranted` and `hasFailures` as `StateFlow`s derived purely from the row list.
+
+## The permission model
+
+`ui/v2/screens/permissions/V2PermissionModel.kt` defines the `PermissionKey` enum (each row carrying its `androidPermission`, `mechanism`, `required`, `minSdk`, `showPreRationale`, and string/icon resources), `GrantMechanism` (`RUNTIME`, `SETTINGS_BATTERY`, `SETTINGS_EXACT_ALARM`), `PermissionStatus` (`NOT_REQUESTED` / `GRANTED` / `DENIED` / `PERMANENTLY_DENIED` / `NOT_APPLICABLE` / `FAILED`, with `isSatisfied` / `isFailure`), and the `PermissionRowState` / `PendingRequest` render types. The screen covers all five permissions in declaration order:
+
+| Key | Android permission | Mechanism | Required | Min SDK | Pre-rationale |
+| --- | --- | --- | --- | --- | --- |
+| `MICROPHONE` | `RECORD_AUDIO` | `RUNTIME` | yes | 0 | yes |
+| `NOTIFICATIONS` | `POST_NOTIFICATIONS` | `RUNTIME` | yes (API 33+) | 33 (TIRAMISU) | yes |
+| `EXACT_ALARM` | appop | `SETTINGS_EXACT_ALARM` | yes (API 31+) | 31 (S) | no |
+| `BATTERY_OPTIMIZATION` | appop | `SETTINGS_BATTERY` | no (recommended) | 0 | yes |
+| `PHONE_STATE` | `READ_PHONE_STATE` | `RUNTIME` | no | 0 | no |
+
+A row hidden by its `minSdk` gate resolves to `NOT_APPLICABLE` and is treated as satisfied. Optional permissions (battery, phone state) can be denied without blocking the Continue button, though an optional failure still contributes to the failed visual state.
+
+## `RationaleSheet`
+
+`ui/v2/screens/permissions/PermissionRationaleSheet.kt` defines the `RationaleSheet` composable — the custom pre-prompt bottom sheet shown before the real grant surface for the three `showPreRationale` keys (`MICROPHONE`, `NOTIFICATIONS`, `BATTERY_OPTIMIZATION`). Its confirm triggers the OS dialog (for runtime keys) or the Settings intent (for battery); dismissing it clears the ViewModel's in-flight guard and is not treated as a denial. Layout adapts to the mechanism — a stacked red "Allow" over "Not now" for runtime keys, a two-button row for the battery Settings grant.
+
+## The gate flag
+
+`data/local/DeviceSettingsDataSource.kt` holds `PERMISSIONS_SETUP_DONE` (default `false`), device-scoped because microphone permission and onboarding are per-install. `markComplete` writes it `true` so the one-time screen never re-shows.
+
+## Related pages
+
+- [Settings Surface](/rollingrecord/app/platform/settings) — the device settings store that backs the permission gate.
+- [Storage & File Utilities](/rollingrecord/app/platform/storage-files) — the recordings directory the mic permission unlocks.

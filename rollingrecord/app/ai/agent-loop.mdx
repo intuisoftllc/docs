@@ -1,16 +1,79 @@
 ---
 title: "Agent Loop & Tool Contract"
-description: "The shared agent loop, tool spec, and round budget."
+description: "agentcore's pure-JVM AgentLoop — the round loop, KbQueryInput assembly, server-authoritative round budget, error mapping, tool_result wiring, and the ports the app implements."
 ---
 
-KB chat runs on a shared agent loop with a client-owned tool contract and a server round budget — the same loop the eval runner drives.
+`AgentLoop` (`agentcore/.../agentcore/AgentLoop.kt`) is the KB-chat agentic loop, extracted verbatim from `KnowledgeBaseAdvisor.ask` so the eval runner (`app/agentrunner`) can drive the LITERAL production loop. The app injects the real `AndroidToolExecutor` and binds `AiEngineClient::kbQuery`; the eval runner injects a mock `ToolExecutor` and a harness-token HTTP `AiEnginePort`. Both run byte-identical turn openings via `AgentMessageAssembly`.
 
-## What this covers
+## What the loop owns — and doesn't
 
-- agentcore `AgentLoop`, `ToolExecutor`, `KbToolSpec` / `KbToolNames`, `KbQuerySessionManager` round-budget.
-- The `AiEnginePort` abstraction implemented by the app (Retrofit/Room) and by mocks in agentrunner.
-- Turn tracing/analytics (`TurnTrace`, `AgentAnalytics`) and message assembly.
+`AgentLoop` owns per-round `KbQueryInput` construction, the session `start` / `continueQuery` calls, the full `AiEngineResult` → error-string mapping, token accounting, `tool_use` filtering and `tool_result` message assembly, the exhausted-rounds fallback round, and crash containment. It does NOT own pre-flight (FTS, scope resolution, the scope block, capability gates), tool-handler logic (behind the `ToolExecutor` seam), proposal/source accumulation (executor state), or turn-lifecycle trace and end-of-turn analytics (the caller's).
 
-<Note>
-Scaffold generated from the codebase map — expand with full detail, examples, and specifics.
-</Note>
+Its constructor is `AgentLoop(sessionManager: KbQuerySessionManager, toolExecutor: ToolExecutor, trace: TurnTrace = noop, analytics: AgentAnalytics = noop)`, and `suspend fun run(request: AgentTurnRequest): AgentTurnOutcome`.
+
+## `AgentTurnRequest` and `AgentTurnOutcome`
+
+`AgentTurnRequest` carries everything the caller pre-computes: `question`, `initialMessages`, `tools`, `toolInstructions`, `scopeBlock?`, `medicalMode`, `historyTruncated?`, `userTimezone`, `evalSystemSuffix?`, `onStreamToken?`, and the per-turn `recap` (`RetrievalSummaryBuilder`). The loop copies `initialMessages` into its own mutable list and appends rounds to the copy — it never reaches back into app state.
+
+`AgentTurnOutcome` is a sealed type with `Success(answer, retrievalSummary?, totalInputTokens, totalOutputTokens, toolRounds, hadWriteOp)` and `Error(message, totalInputTokens, totalOutputTokens, toolRounds, hadWriteOp, diagnostic?)`. Token totals, round count, and the write flag ride BOTH variants so the caller can flush end-of-turn analytics (which fire on success and error alike). `diagnostic` is an internal detail (server error code + details) never shown to the user.
+
+## The round loop
+
+`run` repeats up to `ServerConfig.kbChatMaxToolRounds` (default 3):
+
+1. Build an inputs-only `KbQueryInput` with `isFinal = false` — the server owns prompt, tools, model, round number, and round budget. The client only signals "this is a tool round".
+2. Call `sessionManager.start(kbInput)` on round 1, `sessionManager.continueQuery(kbInput)` thereafter — replaying the server-issued `x-query-session-token`.
+3. On `AiEngineResult.Success`, accumulate `usage` tokens, increment `toolRounds`, and read content blocks. `stop_reason == "end_turn"` (or no `tool_use` blocks) ends the turn: the text block is sanitized and returned. Text that appears alongside `tool_use` is treated as internal monologue and never surfaced.
+4. Otherwise, append the assistant round, execute each `tool_use` through `toolExecutor.execute`, OR each result's `isWriteOp` into `hadWriteOp`, wrap results into `tool_result` user messages, and loop.
+
+On budget exhaustion, the loop pushes a terminal user message plus a client fallback prompt (`FALLBACK_PROMPT_WRITE` when a write happened, else `FALLBACK_PROMPT_READ`) and does one final `isFinal = true` round with no tools — so the model cannot emit XML tool stubs. The server reserves one round beyond `kbChatMaxToolRounds` for this final step, so the loop consumes one extra session slot.
+
+`sanitizeResponseText` strips leaked function-call XML (`<function_calls>`, `<invoke>`, `<parameter>`) and internal id patterns (`contextId=` / `recordingId=` / `sectionId=` / `blueprintId=` / `insightIndex=` / `ID:` / `[internal-only:]`) from the final text.
+
+## Round budget is server-authoritative
+
+The budget default is `ServerConfig.kbChatMaxToolRounds = 3` (from `server_config`), plus the one reserved `isFinal = true` final-answer round. The server — not the client — is authoritative on the budget via the session token and `max_rounds_exceeded`; client-supplied round counts were removed in RR-194.
+
+## Error mapping
+
+`AiEngineResult` variants map to user-facing strings (or a generic error, logged) inside `run`:
+
+| `AiEngineResult` | Surfaced to user? | Outcome |
+| --- | --- | --- |
+| `Cap` | yes | "reached your monthly AI usage limit" |
+| `SubscriptionRequired` | yes | "requires a subscription upgrade" |
+| `FeatureDisabled` | yes | "AI chat is temporarily unavailable" |
+| `MaxRoundsExceeded` | yes | "Maximum search rounds exceeded" |
+| `SessionExpired` | yes | "Your session expired" |
+| `ModerationRejected` | yes | "Your message couldn't be processed — please rephrase." |
+| `NotFound` | yes | "The requested item could not be found." |
+| `Forbidden` | yes | "You don't have access to that resource." |
+| `RateLimited` / `ServiceUnavailable` | yes | "temporarily unavailable / too quickly" |
+| `Upstream` | yes (logged) | "AI service is temporarily unavailable. Please try again in a moment." — retriable, no diagnostic set |
+| `RunawayProtection` | no (logged) | generic "Request failed" |
+| `DeveloperError` / `Validation` | no (logged, diagnostic set) | generic "Something went wrong" |
+| `Network` | rethrown | wrapped by the outer `runCatching` → `Error` outcome |
+
+`CancellationException` always propagates out of `run`; every other throwable becomes an `Error` outcome and emits the `loop_crash` analytics event.
+
+## Ports the app implements
+
+| Symbol | File | Contract |
+| --- | --- | --- |
+| `ToolExecutor` | `agentcore/.../agentcore/ToolExecutor.kt` | `fun interface { suspend execute(call: ToolCall): ToolResult }`. `ToolCall(name?, id?, input: JsonObject?)`; `ToolResult(text, isWriteOp = false)` — `isWriteOp` ORs into `hadWriteOp`. |
+| `AiEnginePort` | `agentcore/.../agentcore/AiEnginePort.kt` | `fun interface { suspend kbQuery(input: KbQueryInput, sessionToken: String?): AiEngineResult<AiPassthroughResponse> }`. App binds `AiEngineClient::kbQuery`. |
+| `KbQuerySessionManager` | `agentcore/.../session/KbQuerySessionManager.kt` | Holds the `x-query-session-token` across rounds. `start()` mints it; `continueQuery()` replays it; `isStarted`; `reset()`. |
+| `AgentMessageAssembly` | `agentcore/.../agentcore/AgentMessageAssembly.kt` | `buildInitialMessages(question, conversationHistory, replyContext, orientationSummary)` — shared so app + runner open turns identically. |
+| `TurnTrace` | `agentcore/.../agentcore/TurnTrace.kt` | Per-round hooks `assistantRound(...)` + `toolResult(...)`; default no-ops. App forwards to `DevChatTraceCapture`. |
+| `AgentAnalytics` | `agentcore/.../agentcore/AgentAnalytics.kt` | Minimal `chatError(kind)` hook — only the `loop_crash` event, emitted inside the loop. |
+| `RetrievalSummaryBuilder` | `agentcore/.../data/repository/RetrievalSummaryBuilder.kt` | Builds the compact per-turn `[Tool call recap]` (`MAX_LINES` 12) that re-feeds prior retrieval facts on the next turn. |
+
+## Wire models
+
+`KbQueryInput(messages, isFinal, hadWriteOp, question, tools?, toolInstructions?, scopeBlock?, fallbackSystemPrompt?, userTimezone?, medicalMode, maxHistoryPairs?, historyTruncated?, evalSystemSuffix?)` is the request; `KbQueryMessage(role, content: JsonElement)` and `KbQueryTool(name, description, input_schema)` are its parts (`agentcore/.../model/AiOperationModels.kt`). The provider-normalized response is `AiPassthroughResponse` — content blocks (`AiContentBlock(type, text?, name?, input?, id?)`), `stop_reason`, and `AiUsage(inputTokens, outputTokens, …)`.
+
+## Related
+
+- [Knowledge Base Chat](/rollingrecord/app/ai/knowledge-base-chat)
+- [AI & Context Intelligence Overview](/rollingrecord/app/ai/overview)
+- [Semantic & Keyword Search](/rollingrecord/app/ai/semantic-search)

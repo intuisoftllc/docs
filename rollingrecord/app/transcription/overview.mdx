@@ -1,15 +1,105 @@
 ---
 title: "Transcription Overview"
-description: "On-device vs cloud transcription and the transcript data model."
+description: "How RollingRecord turns a recording's audio into text: one cloud engine, a WorkManager worker, the 1:1 TranscriptEntity data model, per-user minute metering, and the sync/cloud-exclusion cascade."
 ---
 
-Recordings can be transcribed on-device or in the cloud, with an auto-transcribe option and a shared transcript data model.
+Transcription turns a recording's audio into text plus per-word timing. There is exactly one implemented engine — `CLOUD` — which uploads audio and routes it through the backend `ai-engine` Edge Function to AssemblyAI. Everything is orchestrated by a single foreground WorkManager worker, persisted one-row-per-recording, and gated to the Pro+Cloud tier.
 
-## What this covers
+## The one engine
 
-- Engine choice: Standard built-in vs downloadable Whisper (Pro); the Auto-transcribe-on-save setting.
-- Data model: `TranscriptRepository`, `TranscriptEntity`/`Dao`, `TranscriptWord`; `TranscribeQueueObserver` queueing.
+`TranscriptionEngine` (`data/local/db/entity/TranscriptEntity.kt`) is an enum of `LOCAL`, `WHISPER`, and `CLOUD`, but only `CLOUD` is ever used. `LOCAL` and `WHISPER` are reserved placeholders with zero references in main source — every production call site hardcodes `TranscriptionEngine.CLOUD`:
 
-<Note>
-Scaffold generated from the codebase map — expand with full detail, examples, and specifics.
-</Note>
+- `TranscriptionWorker.doWork` (`worker/TranscriptionWorker.kt`)
+- `V2PlaybackViewModel.triggerTranscription` (`ui/v2/screens/playback/V2PlaybackViewModel.kt`)
+- `RecordingService.enqueueTranscriptionWork` (`service/RecordingService.kt`)
+- `MergeWorker.reTranscribe` (`worker/MergeWorker.kt`) — re-enqueues after a rolling-clip merge
+- `ContextExtractionWorker.enqueueTranscriptionIfPresent` (`worker/ContextExtractionWorker.kt`) — transcribes a context source that has no `DONE` transcript yet
+
+(The V1 `PlaybackViewModel` / `ContextDetailViewModel` call sites also hardcode `CLOUD` but are legacy and not part of the active surface.)
+
+The engine chip shown in the UI is the fixed string `"Cloud AI"` (`R.string.playback_transcription_engine_cloud_ai`) — there is no engine picker. See [On-Device Transcription](/rollingrecord/app/transcription/local-engine) for why the two on-device members exist but do nothing, and [Cloud Transcription](/rollingrecord/app/transcription/cloud-transcription) for the real pipeline.
+
+## `TranscriptEntity`
+
+`TranscriptEntity` (`data/local/db/entity/TranscriptEntity.kt`) is a Room row on table `transcripts`, keyed 1:1 to a recording — the primary key is `recordingId`, there is no separate surrogate id.
+
+| Field | Type | Notes |
+| --- | --- | --- |
+| `recordingId` | `String` (PK) | 1:1 with the recording; no separate id column |
+| `text` | `String?` | full transcript text; null until `DONE` |
+| `status` | `String` | `TranscriptStatus.name` (`NOT_STARTED`/`PROCESSING`/`DONE`/`ERROR`) |
+| `engine` | `String` | `TranscriptionEngine.name` — always `"CLOUD"` in practice |
+| `language` | `String` | `"auto"` or a BCP-47 tag e.g. `"en-US"` |
+| `errorMessage` | `String?` | failure message; sentinel `"transcription_network_error"` for offline |
+| `createdAt` / `updatedAt` | `Long` | epoch millis |
+| `wordsJson` | `String?` | serialized `List<TranscriptWord>` (word timing + speaker) |
+| `speakerNamesJson` | `String?` | `Map<String,String>` speaker index → display name |
+| `remoteSyncedAt` | `Long?` | sync metadata (Migration 41→42); NULL = never pushed |
+| `cloudExcludedAt` | `Long?` | keep-local-only flag (Migration 60→61) |
+
+The entity has evolved well past its original v9 shape: `remoteSyncedAt` was added in Migration 41→42 and `cloudExcludedAt` in Migration 60→61.
+
+### `TranscriptStatus`
+
+`TranscriptStatus` is the four-state machine that drives the whole UI. It is stored as `TranscriptStatus.name` in `TranscriptEntity.status`.
+
+| State | Meaning |
+| --- | --- |
+| `NOT_STARTED` | no transcript yet, or reset (e.g. after a support cancel) |
+| `PROCESSING` | worker has dequeued and is running the cloud flow |
+| `DONE` | text (and usually `wordsJson`) populated |
+| `ERROR` | failed; `errorMessage` carries the reason |
+
+### `TranscriptWord`
+
+`TranscriptWord` (`data/remote/TranscriptWord.kt`) is the `@Serializable` word model persisted inside `wordsJson`: `word`, `start` (seconds), `end` (seconds), `confidence`, `punctuatedWord` (`@SerialName("punctuated_word")`), and `speaker` (integer index). Its field names deliberately match the legacy `DeepgramWord` schema so recordings transcribed before the AssemblyAI migration still deserialize cleanly.
+
+## `TranscriptRepository`
+
+`TranscriptRepository` (`data/repository/TranscriptRepository.kt`) wraps `TranscriptDao` plus a `SyncEnqueuer`. It is the single write surface for transcript state, and it decides which mutations get pushed to the cloud.
+
+| Method | Effect | Enqueues sync? |
+| --- | --- | --- |
+| `createOrResetProcessing(id, engine, language)` | writes `PROCESSING`, clears text/words | no — no content yet |
+| `markDone(id, text, wordsJson)` | writes `DONE` + text/words | yes — `WireEntity.TRANSCRIPT` upsert |
+| `markError(id, msg)` | writes `ERROR` + message | no — local-only flip |
+| `markNotStarted(id)` | resets status | no — local-only flip |
+| `updateSpeakerNames(id, json)` | writes `speakerNamesJson` | yes — upsert |
+| `delete(id)` | deletes the row | yes — tombstone |
+| `setTranscriptCloudExcluded(id, excludedAt)` | sets/clears `cloudExcludedAt` | yes — upsert (no-op if no transcript) |
+
+Only `DONE` transcripts sync: `TranscriptDao.getUnsyncedRecordingIds` filters on `status = 'DONE' AND remoteSyncedAt IS NULL`, so `PROCESSING`/`ERROR` rows never leave the device. `setTranscriptCloudExcluded` is the transcript half of the local-only cascade — because a transcript is the recording's spoken content as text, marking a recording "keep local only" must take its words local too, otherwise the words keep reaching the cloud while the audio stays home.
+
+## `TranscriptDao`
+
+`TranscriptDao` (`data/local/db/dao/TranscriptDao.kt`) is keyed on `recordingId` throughout. Beyond the CRUD/status mutators it exposes FTS keyword search over the `transcript_fts` virtual table (`searchFts` / `getFtsSnippetForRecording`, created by Migration 54→55, queried via `@RawQuery`) and per-context character-count projections used to estimate extraction token load. Its read-only projection types are `TranscriptFtsHit` (recordingId + `snippet()` window) and `RecordingTranscriptChars` (recordingId + text length).
+
+## `TranscriptionWorker`
+
+`TranscriptionWorker` (`worker/TranscriptionWorker.kt`) is a foreground `CoroutineWorker` (`FOREGROUND_SERVICE_TYPE_DATA_SYNC`) that performs the entire cloud transcription. It marks `PROCESSING` on dequeue, runs the four-step async AssemblyAI flow, then calls `markDone` or `markError`. All jobs share one unique WorkManager queue (`QUEUE_NAME = "transcription_queue"`) so they run one at a time. On success — before `markDone` — it calls `UsageRepository.invalidate()` so the next cap read refetches the server-consumed minute quota. Only successful transcriptions bill; failures and support-cancellations are free. The full pipeline is documented in [Cloud Transcription](/rollingrecord/app/transcription/cloud-transcription).
+
+## Triggers
+
+Transcription is enqueued from two places, both hardcoding `TranscriptionEngine.CLOUD` and the shared queue with `ExistingWorkPolicy.APPEND_OR_REPLACE`:
+
+| Trigger | Site | Notes |
+| --- | --- | --- |
+| Manual | `V2PlaybackViewModel.triggerTranscription` | offline pre-check emits `transcribeOfflineEvents` and enqueues nothing when offline; adds a `NetworkType.CONNECTED` constraint |
+| Auto on-save | `RecordingService.enqueueTranscriptionWork` | fires only when the `autoTranscribe` setting is `true` |
+| Rolling rotation | `RecordingService` (protected clip rotated) | re-enqueues the rotated recording when `autoTranscribe` is on |
+
+`autoTranscribe` (`data/local/UserSettingsDataSource.kt`) is a DataStore `Flow<Boolean>` that defaults to `false` — auto-transcribe-on-save is opt-in, not on by default. Companion settings include `transcriptionLanguage` (default `"auto"`), `diarizationEnabled` (default `false`), and `medicalModeEnabled` (default `false`).
+
+## `TranscribeQueueObserver`
+
+`TranscribeQueueObserver` (`data/transcribe/TranscribeQueueObserver.kt`) is an app-scoped, user-filtered, read-only observer of WorkManager state — it does not itself enqueue anything. It combines the work-info flow for `TranscriptionWorker.ALL_TAG` with the current user's session tag and exposes a `StateFlow<TranscribeQueueState>` with `isAnyInFlight`, `runningCount`, `queuedCount`, and `activeRecordingId`. This is the single source of truth for the app-wide one-at-a-time transcribe policy and the "Transcribing…" relabel: work tagged for a previous user is invisible, so nothing leaks across a sign-out.
+
+## Feature gating
+
+Cloud transcription is `GatedFeature.TRANSCRIBE` (`ui/v2/gating/FeatureAccess.kt`): `required = UserTier.PRO_CLOUD`, `whenLocked = LockedStyle.HIDE`. A user below Pro+Cloud with no existing transcript sees the entry icon hidden entirely; a user who downgraded but still has a finished transcript resolves to `READ_ONLY` (view/export, no re-transcribe). See [Transcript UI](/rollingrecord/app/transcription/transcript-ui) for how the three access levels drive the playback surface.
+
+## Where to go next
+
+- [On-Device Transcription](/rollingrecord/app/transcription/local-engine) — the status of the reserved `LOCAL`/`WHISPER` enum members (not implemented).
+- [Cloud Transcription](/rollingrecord/app/transcription/cloud-transcription) — the four-step async AssemblyAI flow, upload dedupe, adaptive polling, retries, Medical Mode, and minute allotments.
+- [Transcript UI](/rollingrecord/app/transcription/transcript-ui) — the `ic_ai` entry icon, the status-driven sheet, and the word-synced in-card panel.

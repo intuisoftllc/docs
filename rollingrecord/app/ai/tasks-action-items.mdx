@@ -1,15 +1,77 @@
 ---
 title: "Tasks & Action Items"
-description: "Action items extracted from recordings and managed as tasks."
+description: "Action items extracted from recordings or user-added, managed as a per-context task list with completion, editing, deadlines, and sync."
 ---
 
-Extraction produces action items that surface as tasks the user can create, complete, and sync.
+Extraction emits action items that become `ActionItemEntity` rows keyed by context. They surface in the V2 Tasks screen per context — split into pending and completed, with multi-select, add/edit via a bottom sheet, and deadline / overdue rendering. Every write flows through `ContextCardRepository`'s task facade so sync enqueues automatically, and the context lifecycle gates what the screen permits.
 
-## What this covers
+## `ActionItemEntity`
 
-- `ActionItemRepository` / `ActionItemEntity`; `V2TasksScreen` / `V2TasksViewModel` / `V2TaskFormSheet`; `TaskDeadlines`.
-- Completing/creating tasks and their sync transform (`ActionItemTransform`).
+`ActionItemEntity` (`data/local/db/entity/ActionItemEntity.kt`) is the Room `@Entity("action_items")` (PK `id` UUID, `@Index` on `contextId`):
 
-<Note>
-Scaffold generated from the codebase map — expand with full detail, examples, and specifics.
-</Note>
+| Field | Meaning |
+| --- | --- |
+| `contextId` | Owning context. |
+| `text` | The short task name. |
+| `description` | Optional longer detail, capped at 500 chars (AI server-side, user client-side). |
+| `owner` | Optional assignee. |
+| `dueDate` | Local start-of-day epoch, parsed from `deadlineText`. |
+| `isDone`, `sortOrder` | Completion + ordering. |
+| `createdAt`, `updatedAt` | Timestamps. |
+| `deadlineText` | The AI's deadline string; a legacy `~` prefix means soft/estimated. |
+| `sourceRecordingId` | RR-423 attribution — the recording that produced the task; `NULL` for pre-attribution rows and treated as shared/unknown. |
+| `remoteSyncedAt`, `cloudExcludedAt` | Sync / cloud-exclusion metadata. |
+
+`ActionItemDao` (`data/local/db/dao/ActionItemDao.kt`) provides `getByContextId(Once)`, `getById`, `insert` / `upsert` (REPLACE) / `update` / `delete` / `deleteById`, `markDone` / `markDoneByIds`, `deleteByContextId`, `deleteCompletedByContextId`, `deleteByContextAndRecording` (RR-423 selective prune — a `NULL` `sourceRecordingId` is not matched), `setCloudExcluded(ForContext)`, and `getUnsyncedIds`.
+
+## `ActionItemRepository`
+
+`ActionItemRepository` (`data/repository/ActionItemRepository.kt`) is CRUD over the DAO that enqueues sync on every mutation (`syncEnqueuer.upsert` / `tombstone` with `WireEntity.ACTION_ITEM`). It exposes `getTasks` / `getTasksOnce`, `addTask`, `insertTasks` (the extraction batch), `updateTask`, `deleteTask`, `markTaskDone`, `deleteCompletedTasks`, and `completeTasksByIds`.
+
+The Tasks screen and the extraction applier never call this repository directly — every mutation routes through `ContextCardRepository`'s task facade (`addTask` / `updateTask` / `markTaskDone` / `deleteTask` / `completeTasksByIds` / `insertTasks`), which delegates here and is what triggers sync. The facade's `addTask` is additionally lifecycle-guarded: it refuses a new task unless the context is `ACTIVE`.
+
+## How extraction results become tasks
+
+`ExtractionResultsMapper.map()` (`worker/extraction/ExtractionResultsMapper.kt`) translates the results blob's tasks:
+
+| Case | Behavior |
+| --- | --- |
+| Task with an echoed `client_id` and `isDone` | Completes the **existing** local row (added to `completedClientTaskIds`). The text is not overwritten — the user may have edited it locally since submit. |
+| Task without a `client_id` | Mints a new `ActionItemEntity` whose id is derived from `(jobId, serverTaskId)`, so a repeated apply overwrites rather than duplicates. The deadline is parsed via `TaskDeadlines.parseToEpoch`. |
+
+`ExtractionResultsApplier` writes both in the same Room transaction: `insertTasks` for new rows, then `completeTasksByIds` — but only after validating the completed ids against the tasks that actually belong to the context, so a transcript can never talk the model into completing an arbitrary task id.
+
+## `TaskDeadlines`
+
+`TaskDeadlines` (`util/TaskDeadlines.kt`) is the deadline model. V2 keeps **hard `YYYY-MM-DD` dates only**; a legacy `~` soft-marker prefix is tolerated and stripped so old rows still parse.
+
+- `parseToEpoch` — strips a leading `~`, parses ISO `yyyy-MM-dd`, and anchors to the **local start-of-day** epoch.
+- `isOverdue` — true only for a not-done task whose `dueDate` is before today (local); a task due today is not overdue until tomorrow.
+- `format` — a `"MMM d, yyyy"` label.
+
+The mapper calls `parseToEpoch`; the UI calls `isOverdue` and `format`.
+
+## The V2 Tasks screen
+
+`V2TasksScreen` (`ui/v2/screens/tasks/V2TasksScreen.kt`) renders the per-context list: Pending and Completed sections with a See-All (preview count 3), a `TaskRow` (checkbox, owner, due-date with an overdue accent, long-press menu of Select / Complete / Edit / Delete), a selection-mode bar (Complete / Share / Delete), an Add-task button (ACTIVE only) or a `LockedAddHint` (COMPLETED), and a 3-dot options menu (Share all / Delete completed / Delete all). Sharing goes out via `Intent.ACTION_SEND`.
+
+`V2TasksViewModel` (`ui/v2/screens/tasks/V2TasksViewModel.kt`) backs it. `tasks` is a `StateFlow` from `ContextCardRepository.getTasks`. It derives `canAddTask` (`canEditInputs` — ACTIVE) and `canModifyTasks` (`canModifyExistingTasks` — not ARCHIVED) from the context lifecycle, drives the multi-select state, and hard-guards every mutation on lifecycle (`addTask` / `updateTask` / `toggleDone` / `deleteTask` / `deleteCompleted` / `deleteAll` / `completeSelected` / `deleteSelected`). `buildShareText` builds the plain-text export; `TASK_DESCRIPTION_MAX = 500`. All writes go through the `ContextCardRepository` task facade, not the DAO.
+
+`V2TaskFormSheet` (`ui/v2/screens/tasks/V2TaskFormSheet.kt`) is the new/edit bottom sheet: name + description (≤ `TASK_DESCRIPTION_MAX`) + due date (via `V2DatePickerSheet`, `allowPast = false`) + owner. A non-null `existing` puts it in edit mode; `onSave(name, description, owner, dueDate)` commits.
+
+### Permissions by context lifecycle
+
+| Lifecycle | Add new task | Modify / complete / delete existing |
+| --- | --- | --- |
+| `ACTIVE` | yes (`canEditInputs`) | yes |
+| `COMPLETED` | no (`LockedAddHint` shown) | yes |
+| `ARCHIVED` | no | no (fully read-only) |
+
+## Sync transform
+
+`ActionItemTransform` (`data/sync/transform/ActionItemTransform.kt`) is the RR-221 wire↔Room bridge. `applyPulledActionItem` decrypts the encrypted pairs and upserts (with a tombstone-delete path and an excluded-and-absent guard); `buildActionItemWireRow` encrypts them for push. The encrypted-at-rest fields are `text`, `description`, `owner`, and `deadline_text` (each a `_ct` / `_iv` pair); `context_id`, `due_date`, `is_done`, `sort_order`, `created_at`, and `cloud_excluded_at` ride in plaintext.
+
+## Related pages
+
+- [Context Extraction Pipeline](/rollingrecord/app/ai/context-extraction) — how tasks are produced.
+- [Context Export](/rollingrecord/app/ai/context-export) — exporting a context's topics (tasks are not included in that flow).

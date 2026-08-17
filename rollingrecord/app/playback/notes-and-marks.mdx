@@ -1,15 +1,53 @@
 ---
 title: "Notes & Timestamp Marks"
-description: "Timestamped notes and the live marks that seed them."
+description: "Timestamped notes attached to a recording during playback, and the live marks dropped while recording that become empty notes to fill in later."
 ---
 
-Notes attach text to timestamps, and live marks dropped during recording become empty notes to fill in later.
+A note is timestamped text on a recording. During playback (Pro) the user drops marks over the waveform and edits their text; while recording, live marks are buffered and become empty notes on the saved recording. The notes stack is the shared V1 stack reused unchanged; only the V2 UI is new.
 
-## What this covers
+## Data model
 
-- `NoteRepository` / `Note` model; `V2NotesCard` and `V2NoteEditSheet`.
-- Live marks during recording that become empty notes; the min-spacing rule; Notes (Pro) gating.
+`Note` (`data/models/Note.kt`) is `id, recordingId, positionMs, createdAt, text: String? = null`. It is persisted by `NoteEntity` (`data/local/db/entity/NoteEntity.kt`), a Room `@Entity(tableName = "recording_notes")` with a `ForeignKey` to `RecordingEntity(id)` on `recordingId` and `ON DELETE CASCADE`, indexed `@Index("recordingId")`. Fields: `id` (UUID PK), `recordingId`, `positionMs`, `createdAt`, `text?`, and `remoteSyncedAt?` (RR-333 sync metadata, migration 41→42; `NULL` = never pushed).
 
-<Note>
-Scaffold generated from the codebase map — expand with full detail, examples, and specifics.
-</Note>
+`NoteDao` (`data/local/db/dao/NoteDao.kt`) exposes `getNotesForRecording(recordingId)` ordered `positionMs ASC`, `insertNote` / `updateNoteText` / `deleteNote`, plus sync helpers `upsert` (REPLACE), `getUnsyncedIds` (LIMIT 5000), `getById`, and `deleteById`.
+
+`NoteRepository` (`data/repository/NoteRepository.kt`) is the write surface: `addNote(recordingId, positionMs)` and `addNote(recordingId, positionMs, text?)` do a single insert plus `syncEnqueuer.upsert(WireEntity.RECORDING_NOTE, ...)`; `updateNoteText` upserts; `deleteNote` enqueues a sync tombstone.
+
+## Notes in the player
+
+Notes are Pro-gated: `V2PlaybackViewModel.notesEnabled` reads `SettingsRepository.notesEnabled`, which is Pro-clamped at that layer — a demoted user reads `false` and the mark/view toolbar hides, without touching the stored toggle. The toolbar icons render only when the waveform is up **and** notes are enabled **and** no other overlay (notes card or transcript) is showing.
+
+| VM action | Behavior |
+| --- | --- |
+| `addNoteAtCurrentPosition()` | Marks the current position — creates an **empty** note. Returns `false` if within `MIN_NOTE_SPACING_MS = 1000` of an existing note. |
+| `addNoteWithText(positionMs, text?)` | Creates a note at a captured position with text in one write (position captured at popup-open so playback drift can't move it). Same 1000 ms guard. |
+| `updateNoteText(noteId, text?)` | Sets the text; a blank string clears it back to `null` (placeholder). |
+| `deleteNote(noteId)` | Deletes the note and enqueues a sync tombstone. |
+
+The waveform's `ic_bookmark` (view) opens the in-card notes panel; `ic_bookmark_add` (mark) calls `addNoteAtCurrentPosition()` and greys out (`canAddNote`) when within 1000 ms of an existing note.
+
+## Notes UI
+
+`V2NotesCard.kt` (`ui/v2/screens/playback/V2NotesCard.kt`) defines `V2NotesCardOverlay` (the in-card panel with expand + close icons, an empty state, and edge fades), `V2NotesBottomSheet` (a 75 %-height expand sheet), and the shared `NoteRow` and `DismissibleNoteItem`. `NoteRow` shows the timestamp (tapping it seeks) and either the body text or a "+ Add note" placeholder plus a trash icon. `DismissibleNoteItem` runs a slide-out (300 ms) followed by a shrink (220 ms, delayed 260 ms); the caller flips visibility off a `dismissingNoteIds` set and runs the 550 ms-then-delete timing.
+
+`V2NoteEditSheet` (`ui/v2/screens/playback/V2NoteEditSheet.kt`) is the create/edit bottom sheet: `NOTE_MAX_CHARS = 500`, a read-only captured-timestamp label, auto-focus after the sheet fully expands, and IME padding. `isEdit` selects the title; `onSave` passes the trimmed text (the VM converts blank → `null`).
+
+On the seek bar, `PlaybackSeekBar` draws always-visible note dots, clustering notes within ~11 dp into one dot at the cluster mean; `PlaybackWaveform` draws per-note vertical-line-plus-dot markers from `notePositionsMs`.
+
+## Live marks while recording
+
+`RecordingService` (`service/RecordingService.kt`) buffers live marks. `markCurrentPosition()` (dispatched by `ACTION_MARK`) records the elapsed ms into `_pendingMarks` with a `MIN_MARK_SPACING_MS = 1000` guard, reset on start. The min-spacing rule is enforced **twice with the same 1000 ms value** — `MIN_MARK_SPACING_MS` in the service for live marks, and `MIN_NOTE_SPACING_MS` in the ViewModel / screen for playback marks.
+
+On stop, a non-continuation recording turns each buffered mark into an empty note (`noteRepository.addNote(newRecordingId, mark)`) on the new recording. For a continuation, the marks are handed to `MergeWorker` (as `markPositionsMs` with the original's pre-merge `originalDurationMs`) to rebase onto the merged timeline instead.
+
+## Note lifecycle: mark vs. edit
+
+| Action | Entry point | Result |
+| --- | --- | --- |
+| Drop live mark (recording) | mark control → `markCurrentPosition()` | Buffered in `_pendingMarks`; becomes an empty note (`text = null`) on save. |
+| Mark during playback | `ic_bookmark_add` → `addNoteAtCurrentPosition()` | Empty note at the current position, 1000 ms spacing guard. |
+| Add / edit text | tap a note → `V2NoteEditSheet` | `note.text` set (≤ 500 chars; blank clears back to placeholder). |
+| Delete | trash on `NoteRow` | 550 ms slide-out, then `NoteRepository.deleteNote` → sync tombstone. |
+| Continuation marks | continue-recording stop | `MergeWorker` rebases each by the original's pre-merge duration onto the merged recording. |
+
+Related: [Playback Overview](/rollingrecord/app/playback/overview) · [Session Detail](/rollingrecord/app/playback/session-detail) · [Waveform Visualization](/rollingrecord/app/playback/waveform) · [Trim & Splice](/rollingrecord/app/playback/trim) · [Continuations & Merge](/rollingrecord/app/playback/continuations-merge)

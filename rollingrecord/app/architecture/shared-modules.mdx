@@ -1,16 +1,64 @@
 ---
 title: "Shared JVM Modules (crypto, agentcore, agentrunner)"
-description: "The pure-JVM modules shared across the app, smoketest, and evals."
+description: "The three pure-Kotlin/JVM modules shared across the app, smoketest, and the eval runner so identical logic runs everywhere."
 ---
 
-Several pure-JVM modules are shared between the app and other parts of the monorepo so the exact same logic runs everywhere.
+Three pure-Kotlin/JVM Gradle modules keep security- and AI-critical logic identical across the app and the other monorepo parts. `app/crypto` holds every client-side encryption primitive; `app/agentcore` holds the pure pieces of the KB-chat agent loop; `app/agentrunner` is a JDK-http CLI that drives the literal production loop for evals. None of the three may import `android.*`, Room, Koin, Firebase, or Retrofit — Android concerns enter only through port interfaces.
 
-## What this covers
+## The three modules
 
-- `app/crypto`: pure-JVM primitives (`EnvelopeCrypto`, `TextCrypto`, `KeyDerivation`, `AppLockVerifier`, `RrBackupContainer`) shared with smoketest by source inclusion.
-- `app/agentcore`: the KB-chat agent loop (`AgentLoop`, `ToolExecutor`, `KbToolSpec`, `ClientConfig`/`ServerConfig`) shared by the app and the eval runner.
-- `app/agentrunner`: pure-JVM CLI driving the real agent loop for evals.
+| Module | Purpose | Cross-part reuse |
+| --- | --- | --- |
+| `app/crypto` | Client-side encryption primitives (streaming AES-GCM, text crypto, HKDF, PIN verifier, `.rrbackup`) | `smoketest` source-includes `../app/crypto/src/main/kotlin` for byte-parity |
+| `app/agentcore` | Pure pieces of the KB-chat agent loop (`AgentLoop`, ports, `KbToolSpec`, wire models, `ClientConfig`/`ServerConfig`) | shared by `app` (real ports) and `agentrunner` (eval ports) |
+| `app/agentrunner` | JDK-http CLI driving the literal `AgentLoop` | consumed by `evals/run.py --sut=kotlin` over a frozen stdin/stdout contract |
 
-<Note>
-Scaffold generated from the codebase map — expand with full detail, examples, and specifics.
-</Note>
+## `app/crypto`
+
+`app/crypto` (`app/crypto/build.gradle.kts`) is pure Kotlin/JVM (`jvmToolchain(17)`), depending only on BouncyCastle `bcprov` and `kotlinx-serialization-json` — no Android, Koin, Room, or networking. Keeping every encryption primitive in one module means one place to audit, compile-time isolation, and identical code in the app and smoketest. `smoketest` source-includes `../app/crypto/src/main/kotlin` in its test source set for byte-parity; the app consumes it via the normal Android→JVM path.
+
+The primitives (`app/crypto/src/main/kotlin/com/intuisoftllc/rollingrecord/crypto/`):
+
+- **`EnvelopeCrypto`** — streaming AES-256-GCM (`encryptStream`/`decryptStream`) for large payloads (audio, backups) plus one-shot byte variants. Uses BouncyCastle's `GCMBlockCipher` directly (`O(chunk)` memory) instead of Conscrypt, which buffers the whole plaintext. Pairs with `sync-audio` `upload_init`/`download` (base64 DEK + IV); the 16-byte GCM auth tag is written/verified at end-of-stream.
+- **`TextCrypto`** / **`EncryptedField`** — AES-256-GCM for small text/JSON columns (`encryptString`/`decryptString`, `encryptJson`/`decryptJson`), used by the sync engine to encrypt user-content columns before push (`<field>_ct`/`<field>_iv`). `EncryptedField` is the `(ciphertext, iv)` pair; a fresh random 12-byte IV per call.
+- **`KeyDerivation`** — HKDF-SHA256 (RFC 5869) deriving domain sub-keys from the per-user DEK so a leak in one usage domain can't compromise the others. `deriveDbKey` (info `"rr-db-key-v1"`) + `toSqlCipherRawKey` feed the DEK-derived SQLCipher raw key used by `DatabaseKeyTransition`; `deriveBackupKey` (info `"rr-db-backup-v1"`) keys the `.rrbackup` payload. Pure functions over byte arrays, deterministic across devices.
+- **`AppLockVerifier`** — the RR-492 PIN verifier. A 6-digit PIN gets two layers: PBKDF2-HMAC-SHA256 stretch (random per-verifier salt, 120,000 iterations) producing a one-way `salt || hash` blob, then AES-256-GCM sealed with the user's DEK. So a leaked verifier never reveals the low-entropy PIN, and a leaked ciphertext is useless without the DEK. Verification is fully offline.
+- **`RrBackupContainer`** / **`BackupManifest`** — reader/writer for the `.rrbackup` container: a 20-byte plaintext header (magic `RRBK`, format version, 12-byte IV) plus one AES-256-GCM payload. `BackupManifest` is the JSON manifest bundled *inside* the encrypted payload (`authUserId`, etc.) so an ownership pre-check runs before touching the library.
+
+## `app/agentcore`
+
+`app/agentcore` (`app/agentcore/build.gradle.kts`) is pure Kotlin/JVM (`jvmToolchain(17)`), depending only on `kotlinx-serialization-json` and `kotlinx-coroutines-core`. It holds the client-side agent loop's pure pieces — wire models, the result taxonomy, the tool contract, config objects, the session-token threader, and the ports the app implements. It is deliberately Kotlin/JVM (not an Android library) so the eval-side CLI can drive the literal production agent loop; Android enters only through the port interfaces. Shared by `:app` (implements the ports with Room/Retrofit/Koin) and `:agentrunner` (implements them with mocks / JDK http).
+
+### `AgentLoop`
+
+`AgentLoop` (`app/agentcore/.../agentcore/AgentLoop.kt`) is the KB-chat agentic tool loop, extracted **verbatim** from `KnowledgeBaseAdvisor.ask()` so the eval runner drives the literal production loop. `run(AgentTurnRequest)` repeats up to `ServerConfig.kbChatMaxToolRounds`: it builds a `KbQueryInput`, calls `sessionManager.start`/`continueQuery`, maps every `AiEngineResult` to a user-facing error string, accumulates tokens, filters `tool_use` blocks, executes each via `ToolExecutor`, and assembles `tool_result` messages. On round exhaustion it pushes one fallback final round (`is_final = true`, `FALLBACK_PROMPT_READ`/`FALLBACK_PROMPT_WRITE`). It returns `AgentTurnOutcome.Success` or `.Error`, and `sanitizeResponseText` strips leaked function-call XML and internal ids from the answer.
+
+The loop owns the full `AiEngineResult`→error-string mapping and the exhausted-rounds fallback, but **not** pre-flight (FTS orientation, scope resolution, scope-block construction) or the tool handlers — those stay in the caller.
+
+- **`AgentTurnRequest`** — all pre-computed turn inputs: `question`, `initialMessages`, `tools`, `toolInstructions`, `scopeBlock`, `medicalMode`, `historyTruncated`, `userTimezone`, `evalSystemSuffix`, `onStreamToken`, and the `recap` builder.
+- **`AgentTurnOutcome`** — a sealed class; both `Success(answer, retrievalSummary, tokens, toolRounds, hadWriteOp)` and `Error(message, tokens, toolRounds, hadWriteOp, diagnostic)` expose token totals, round count, and the write flag so the caller can flush end-of-turn analytics on success and error alike.
+
+### The port seams
+
+The loop is built around two `fun interface` seams so the same loop runs in the app and the eval runner:
+
+- **`AiEnginePort`** (`AiEnginePort.kt`) — the transport seam: `suspend fun kbQuery(input, sessionToken): AiEngineResult<AiPassthroughResponse>`. The app binds it to `AiEngineClient::kbQuery` (Retrofit + App Check/JWT); the runner binds a JDK-http impl with harness tokens.
+- **`ToolExecutor`** (`ToolExecutor.kt`) — the tool-dispatch seam: `suspend fun execute(ToolCall): ToolResult`. `ToolCall(name?, id?, input?)` is one `tool_use` block; `ToolResult(text, isWriteOp)` is the exact `tool_result` content plus a write flag the loop ORs into its per-turn `hadWriteOp`. The app implements it inside `KnowledgeBaseAdvisor`; the eval runner implements it against fixtures.
+
+### Tool spec, session, and hooks
+
+- **`KbToolSpec`** / **`KbToolNames`** (`data/repository/KbToolSpec.kt`) — the pure, client-owned tool SPEC: `usageInstructions()` (injected at the `{TOOL_USAGE_INSTRUCTIONS}` placeholder) and `definitions()` (the 23 `kb_query` tools). Depends only on `KbToolNames` and `ClientConfig`; snapshot-pinned. The tool DISPATCH stays in the app's advisor.
+- **`KbQuerySessionManager`** (`data/remote/aiengine/session/KbQuerySessionManager.kt`) — threads the per-turn session token across rounds (`start` then `continueQuery` via the `AiEnginePort`), enforcing the server round budget end-to-end.
+- **`AgentLog`** (`AgentLog.kt`) / **`TurnTrace`** (`TurnTrace.kt`) / **`AgentAnalytics`** (`AgentAnalytics.kt`) — all three under `app/agentcore/.../agentcore/` — `AgentLog` is the pure logging hook object bound to `AppLogger` in `App.onCreate` (no-op elsewhere); `TurnTrace` and `AgentAnalytics` are optional seams the loop calls for dev trace capture and end-of-turn analytics.
+
+`ClientConfig` and `ServerConfig` also live here — see [Client vs Server Configuration](/rollingrecord/app/architecture/config-split).
+
+## `app/agentrunner`
+
+`app/agentrunner` (`app/agentrunner/src/main/kotlin/com/intuisoftllc/rollingrecord/agentrunner/Main.kt`) is an application CLI (`mainClass = MainKt`) depending on `:agentcore` and JDK `java.net.http` (no OkHttp, no Android). It reads one JSON case envelope from stdin, drives the literal `AgentLoop.run` once per user turn against the dev ai-engine, and writes one JSON session trace to stdout — a frozen stdin/stdout contract co-owned with `evals/`. Exit code 0 whenever a JSON trace could be emitted (in-band failures ride `_session.error`); exit code 1 only when stdin isn't parseable JSON. It is production-faithful: one `AgentLoop.run` per user message, each with a fresh `KbQuerySessionManager` (fresh round budget), carrying context between turns as `(question, answer)` pairs windowed to `ClientConfig.kbChatMaxHistoryPairs`. `HttpAiEnginePort` / `RecordingAiEnginePort` / `RunnerMockRegistry` implement the ports.
+
+## Where to go next
+
+- [Client vs Server Configuration](/rollingrecord/app/architecture/config-split) — `ClientConfig` / `ServerConfig`, which live in `agentcore`.
+- [Room Database & SQLCipher](/rollingrecord/app/architecture/local-database) — how `KeyDerivation` feeds the SQLCipher key.
+- [Per-User Session Scope](/rollingrecord/app/architecture/user-session-scope) — `SessionDekHolder`, the DEK the crypto primitives operate against.

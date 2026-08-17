@@ -1,15 +1,96 @@
 ---
 title: "Audio Cloud Backup"
-description: "Encrypted audio upload/download and Google Drive backup."
+description: "Encrypted audio upload to Supabase Storage via reserve → stream-encrypt PUT → commit, the RR-472 rolling-segment demote, and the AudioSyncWorker that drives them."
 ---
 
-Audio blobs are encrypted and backed up to the cloud, with an optional Google Drive path.
+Audio backup is a pipeline entirely separate from metadata sync. `AudioCloudRepository` (`data/sync/audio/AudioCloudRepository.kt`) is the per-user orchestrator; the one and only backend is **Supabase Storage** reached through the `sync-reserve` and `sync-audio` Edge Functions plus a `sync-push` commit. There is no Google Drive path anywhere in the code.
 
-## What this covers
+## `uploadRecording` — the upload sequence
 
-- `AudioCloudRepository`, `AudioSyncClient` / `AudioSyncApi` / `AudioSyncWorker` / `AudioSyncScheduler` for encrypted audio upload/download.
-- Google Drive backup + auto-upload frequency; `CloudUploadErrorBus` surfacing.
+`AudioCloudRepository.uploadRecording(recording)` returns a typed `UploadResult` and runs:
 
-<Note>
-Scaffold generated from the codebase map — expand with full detail, examples, and specifics.
-</Note>
+1. **Eligibility** (`isEligible`) — skip an unprotected `ROLLING` segment (designed to be pruned; uploading burns quota that gets refunded) and any `cloudOnly` placeholder (nothing local to upload).
+2. **Mark pending** — set `cloudBackupStatus = "pending"` (`STATUS_PENDING`) so concurrent runs don't double-process.
+3. **Reserve** — `AudioSyncClient.reserve(id, sizeBytes)`. The server mints a fresh per-recording DEK, wrapped-DEK metadata, and a signed Storage PUT URL. Stateless — nothing to clean up if the rest fails.
+4. **Stream-encrypt PUT** (`putEncrypted`) — `crypto.encryptStream` chunks the local file directly into the OkHttp PUT body. The plaintext never sits fully in memory; the 16-byte GCM auth tag (`GCM_TAG_BYTES = 16`) is appended at end-of-stream, so `Content-Length` is `file.length() + 16`.
+5. **Commit** — build the standard recording wire row via `transform.buildPushRow(WireEntity.RECORDING, id)`, overlay the crypto columns (`mergeCryptoFields`), and POST through `SyncApi.push` — the same `sync-push` Edge Function as metadata. The server does a blob HEAD verification before persisting.
+6. **On accept** — set `cloudBackupStatus = "committed"` (`STATUS_COMMITTED`), capture the server `updated_at` (for a later LWW demote), and verify the stored blob size.
+
+The DEK buffer is zero-filled in a `finally` regardless of outcome.
+
+### LWW retry
+
+The commit posts an INSERT first (no `known_updated_at`). If a plain metadata sync raced ahead and inserted the row without crypto fields, the server returns `server_wins` with its `updated_at`, and the repository retries as a proper LWW UPDATE — a path that sets only the columns it sends, so the crypto fields land while everything else is preserved. Capped at `MAX_PUSH_ATTEMPTS = 3`.
+
+### Crypto columns written at commit
+
+`mergeCryptoFields` overlays these onto the base recording row:
+
+| Column | Source |
+| --- | --- |
+| `storage_path` | `reserved.storagePath` |
+| `dek_ct` | `reserved.dekCt` (wrapped DEK) |
+| `dek_iv` | `reserved.dekIv` |
+| `audio_iv` | `base64(reserved.audioIv)` |
+| `kek_version` | `reserved.kekVersion` |
+| `cloud_backup_committed_at` | `Instant.now()` ISO |
+| `file_size_bytes` | on-disk `file.length()` (re-asserted so the server's HEAD verifier compares against the actual upload) |
+
+## `UploadResult` dispositions
+
+`UploadResult` is a sealed type the worker routes on:
+
+| Result | Worker action |
+| --- | --- |
+| `Committed` | count, continue |
+| `SkipPermanent(reason)` | count skipped, continue (`ineligible_mode`, `file_missing`, `empty_file`, `too_large`, `size_exceeded`) |
+| `Retry(reason)` | row stays unsynced; next run retries. Stop the batch if `sync-reserve` is now rate-limited |
+| `SubscriptionRequired` | break the whole batch |
+| `QuotaExceeded` | break the batch; emit `StorageCapExceededEvent` |
+
+A file that exceeds the server ceiling (`AudioReserveResult.TooLarge`) or the bucket `file_size_limit` (HTTP 413 on the PUT) is written the terminal `STATUS_SIZE_EXCEEDED` — not `STATUS_FAILED` — so `getUnbackedUpRecordings` drops it from the candidate list instead of retrying forever. Only user action (trimming the file) clears it.
+
+## `putEncrypted` and blob verification
+
+`putEncrypted` streams `crypto.encryptStream(plaintext, sink, dek, audioIv)` into a signed-URL PUT and classifies the response as `PutResult.Success`, `SizeExceeded` (HTTP 413 or a body sniff for `"413"` / "Payload too large"), or `Retryable`. `HTTP_PAYLOAD_TOO_LARGE = 413`.
+
+`verifyUploadedBlobSize` runs right after commit: a 1-byte `Range` GET reads the `Content-Range` total and compares it against `file.length() + 16`. A mismatch (a truncated, undecryptable cloud copy) is logged and files a Crashlytics non-fatal, but **never fails the upload** — a verify hiccup must not block a real successful backup.
+
+## `AudioSyncClient` and `AudioSyncApi`
+
+`AudioSyncClient` (`data/sync/audio/AudioSyncClient.kt`) is the typed wrapper over the Retrofit `AudioSyncApi`. It base64-decodes the DEK/IV, validates `DEK_BYTES = 32` / `IV_BYTES = 12`, and maps the shared `ApiError` taxonomy to domain sealed types:
+
+- `reserve` → `AudioReserveResult` (`Success`, `SubscriptionRequired`, `QuotaExceeded`, `TooLarge`, `RateLimited`, `Transient`)
+- `download` → `AudioDownloadResult` (`Success`, `SubscriptionRequired`, `NotFound`, `BlobMissing`, `RateLimited`, `Transient`)
+- `deleteCloudBlob` → `Boolean`
+
+`AudioSyncApi` (`data/sync/audio/AudioSyncApi.kt`) exposes `reserve` (`sync-reserve`), `download` and `delete` (both `sync-audio`, distinguished by an `operation` field forced on the wire via `@EncodeDefault(ALWAYS)`). Constants `FN_SYNC_RESERVE = "sync-reserve"`, `FN_SYNC_AUDIO = "sync-audio"`. The reserve response DTO carries `dek`, `audio_iv`, `storage_path`, `signed_url`, `dek_ct`, `dek_iv`, `kek_version`.
+
+## RR-472 rolling demote
+
+`demote(ids)` un-protects protected rolling segments **offline-first**. For each id, `demoteOne` applies the local un-protect (`clear protectedAt + categoryId`) immediately and unconditionally — a local declassification back to ephemeral buffer must work offline. The acting device keeps its audio as a buffer.
+
+If the segment was committed to the cloud it becomes *demote-pending*, and `cleanupDemotedCloudCopy` converges the cloud copy best-effort:
+
+- **`buildDemoteRow`** starts from the standard recording row, forces `protected_at = null`, and explicitly nulls every crypto/storage column so the server's LWW UPDATE clears the backup.
+- **`pushDemote`** always sends a non-null `known_updated_at` so the push takes the LWW UPDATE path. A concurrent newer protect/edit returns `server_wins` with the current row, which the caller adopts verbatim — re-protecting the segment and discarding the demote. This `server_wins` guard is what prevents the data-loss the old unconditional-push demote caused.
+- **On accept**, local cloud bookkeeping clears and the orphaned blob is deleted via `deleteCloudBlob`; the audio file is always kept.
+
+A legacy commit that never captured `remoteUpdatedAt` recovers it via an INSERT-mode probe (which returns `server_wins` + the live `updated_at` without modifying the row) rather than bypassing the LWW gate.
+
+## `AudioSyncWorker` and `AudioSyncScheduler`
+
+`AudioSyncWorker` (`data/sync/audio/AudioSyncWorker.kt`) drains `getUnbackedUpRecordings` (uploads) one at a time plus a `getDemotePendingRecordings` convergence pass. Before doing work it re-checks Wi-Fi-only at execution time, prechecks the Recordings sync group, prechecks the cloud entitlement, and defers if `sync-reserve` is rate-limited via `RateLimitCoordinator`. It returns `Result.retry` if any row returned `Retry`. `TAG_AUDIO_SYNC = "rr_audio_sync"`.
+
+`AudioSyncScheduler` (`data/sync/audio/AudioSyncScheduler.kt`) owns the worker at app scope. `ensurePeriodic()` enqueues a 60-minute periodic (`PERIODIC_INTERVAL_MINUTES = 60`, 15-minute flex; network + battery-not-low + storage-not-low constraints); `triggerNow()` enqueues a non-expedited network-only one-shot after a recording finalizes. Both gate on `tier.atLeast(UserTier.PRO_CLOUD)` and add a per-user tag. The 60-minute cadence is deliberately longer than metadata's 30 — audio is bandwidth-heavy and less freshness-sensitive; new recordings still get an immediate `triggerNow`.
+
+## `CloudUploadErrorBus`
+
+`CloudUploadErrorBus` (`data/sync/audio/CloudUploadErrorBus.kt`) is an app-wide `SharedFlow` (buffer 4, `DROP_OLDEST`) carrying `CloudUploadEvent`. Its sole member is `StorageCapExceededEvent` (`recordingId`, `recordingName`, `usedBytes`, `capBytes`, `requestedBytes`, `overageBytes`), emitted when `sync-reserve` returns quota-exceeded so the AppNavHost-level collector can render a global "Storage limit reached" dialog. It is **not** for `subscription_required` or `rate_limited`, which have their own surfacing paths.
+
+## Where to go next
+
+- [Cloud Prefetch & Download](/rollingrecord/app/sync/cloud-prefetch-download) — the download side of the same repository.
+- [Sync & Cloud Overview](/rollingrecord/app/sync/overview) — audio as one of the two parallel families.
+- [Wire Format & Transforms](/rollingrecord/app/sync/wire-transforms) — `buildRecordingWireRow` and the crypto-column conventions.
+- [Trash Sync & Free Up Space](/rollingrecord/app/sync/trash-and-free-up) — cloud-exclude, distinct from the rolling demote.

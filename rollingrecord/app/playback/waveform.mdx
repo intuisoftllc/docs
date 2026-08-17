@@ -1,15 +1,61 @@
 ---
 title: "Waveform Visualization"
-description: "How waveforms are extracted, cached, and rendered."
+description: "How amplitude data is decoded, cached in a sidecar file, extracted off the UI thread by a worker, and rendered as the seekable V2 playback waveform."
 ---
 
-Waveforms are extracted and cached in the background, then rendered live during recording and playback.
+The V2 playback waveform is a pre-extracted static amplitude array scrolled by wall-clock playback position — not live amplitude capture (only the recording screen renders live samples). The data path is decode → sidecar cache → background worker → render.
 
-## What this covers
+## Extraction
 
-- `WaveformEngine`, `WaveformExtractor`, `WaveformCache`, and the background `WaveformExtractionWorker`.
-- `V2MiniWaveform` and `RecordingWaveBackground` rendering; the "Always show waveform" setting.
+`WaveformExtractor` (`util/WaveformExtractor.kt`) is an `object`. `extract(filePath)` (and a `extract(context, uri)` overload) decodes the first audio track with `MediaExtractor` + `MediaCodec` into one peak per **80 ms** window — matching the live-recording sample interval — accumulating raw `[0, 32767]` peaks, then downsamples with `downsampleAndNormalize` (max-of-bucket; trailing undecoded bars pad with `0f`).
 
-<Note>
-Scaffold generated from the codebase map — expand with full detail, examples, and specifics.
-</Note>
+Key properties:
+
+- **Cache-first.** A cache hit returns immediately with no decode work.
+- **Primitive accumulator.** An internal `IntList` stores peaks without boxing, capped at `MAX_SIZE = 1_200_000` ints (~26 h of audio); a 128 KB `ShortArray` scratch chunks large codec output buffers (notably WAV/PCM, which can dump the whole file in one buffer).
+- **Wall-clock deadline.** `100 ms` per second of audio, clamped to `[10 s, 60 s]`, bounds a hanging or pathologically slow decode. Coroutine cancellation can't interrupt blocking JVM calls, so real time is checked each loop.
+- **Flat fallback.** A decoder throw returns `FloatArray(60) { 0.3f }`, which is **not** cached (caching it would pin a fake flat waveform).
+
+## Sidecar cache
+
+`WaveformCache` (`util/WaveformCache.kt`) is an `object` that stores a `<audio>.waveform2` sidecar: an `Int32` little-endian version header (`CACHE_VERSION = 7`) followed by little-endian floats. `load` / `save` / `invalidate`. A cache entry is evicted on version mismatch or when the audio file's `lastModified` is newer than the cache file. Bumping the version rejects and regenerates every existing cache.
+
+## The extraction worker
+
+`WaveformExtractionWorker` (`worker/WaveformExtractionWorker.kt`) is a `CoroutineWorker` that runs extraction off the UI thread and survives navigation and process death. It is enqueued as **unique work** named `waveform_extract_<recordingId>` with `ExistingWorkPolicy.KEEP`, so a second enqueue for the same row is a no-op, and the UI reattaches to an in-flight run by that name.
+
+- `enqueue(...)` is expedited (with the standard quota fallback).
+- It fast-paths a present cache, retries only transient file-missing (`MAX_ATTEMPTS = 3`), and does **not** retry decoder failure — `extract()` already returns the flat fallback and the worker returns success.
+- Trigger sites: record-stop insert, cloud-download `Ready`, and playback-open cache miss.
+
+`V2PlaybackViewModel.ensureWaveformReady(filePath)` loads `WaveformCache` and, on a miss, enqueues the worker and observes the unique work: `SUCCEEDED` → reload cache, `FAILED` / `CANCELLED` → `FloatArray(60) { 0.3f }`. `onMergeOverlayCleared()` invalidates and reloads the cache after a continuation merge rewrites the file.
+
+## Amplitude mapping
+
+`WaveformEngine.kt` (`util/WaveformEngine.kt`) is a file of top-level functions plus the `WaveformConfig` data class — not a class or object. It maps a raw peak or a pre-normalized float to a bar height:
+
+- `waveformAmplitudeToHeight(rawAmp: Int)` — dBFS pipeline for raw `[0, 32767]` peaks: convert to dBFS, gate at the `-36 dB` noise floor, normalize over the 36 dB window, apply gamma `0.55`, clamp to `[0.03, 1]`.
+- `waveformNormalizedToHeight(f: Float)` — the same shape for pre-normalized `[0, 1]` input, using a linear silence gate (`0.06`) instead of dBFS because the input is relative to the recording's own peak.
+- `rollingMaxNormalize(waveform, windowSize)` — local-loudness normalization so bar heights adapt to the section rather than a single loud peak.
+
+## Rendering
+
+V2 playback renders through the shared `PlaybackWaveform` composable (`ui/v1/components/PlaybackWaveform.kt`). Position is driven by the **wall clock**, not ViewModel polls: on play it anchors `(startPos, startTime)` and computes `smoothPos = startPos + (frameTime − startTime) × speed` each frame at 60 fps, consulting the ViewModel position only to detect seeks (`SEEK_THRESHOLD_MS = 1500`). It compensates for the device's `OUTPUT_LATENCY`, smooths adjacent heights with a 3-point weighted average, keeps the cursor at 72 % width, and draws per-note vertical-line-plus-dot markers from `notePositionsMs`. V2 passes `config = WaveformConfig.V2Playback`, `playedColor = recordingWave`.
+
+The card hosts the waveform in a fixed `CARD_CONTENT_HEIGHT = 150.dp` slot, toggled by the bottom-bar `ic_wave` icon (local `showWaveform` state, default off). A full-width horizontal drag scrubs a fixed `WAVEFORM_SCRUB_FULLWIDTH_MS = 360_000` span (or the whole recording, whichever is shorter). There is no "always show waveform" setting wired into V2 playback — that setting belongs to the recording screen.
+
+### `WaveformConfig` presets
+
+| Preset | `maxBarHeightFraction` | `barCount` | `gapPx` | Used by |
+| --- | --- | --- | --- | --- |
+| `LiveRecording` | 0.60 | 45 | 8 | legacy live recording waveform |
+| `V2Recording` | 0.80 | 64 | 3 | V2 recording panel background |
+| `Playback` | 0.78 | 50 | 4 | V1 playback (legacy) |
+| `V2Playback` | 0.80 | 80 | 3 | V2 playback panel (active seekable waveform) |
+| `Static` | 0.75 | 45 | 8 | thumbnail / static waveform |
+
+## Library mini-waveform
+
+`V2MiniWaveform` (`ui/v2/components/V2MiniWaveform.kt`) draws the compact library-preview mark: `MINI_WAVEFORM_BARS = 14` bars, **mean**-downsampled and re-normalized (the mean tracks the loudness envelope; a max would flatten every bar to the top over a whole recording). `rememberMiniWaveformBars(filePath)` loads via `WaveformExtractor` (cache-first) off the main thread; a fixed `FALLBACK_HEIGHTS` pattern is drawn while loading or for cloud-only rows with no local file.
+
+Related: [Playback Overview](/rollingrecord/app/playback/overview) · [Session Detail](/rollingrecord/app/playback/session-detail) · [Notes & Timestamp Marks](/rollingrecord/app/playback/notes-and-marks) · [Trim & Splice](/rollingrecord/app/playback/trim) · [Continuations & Merge](/rollingrecord/app/playback/continuations-merge)

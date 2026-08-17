@@ -1,15 +1,62 @@
 ---
 title: "Koin Dependency Injection"
-description: "App-level Koin modules and the cross-user safety enforcement."
+description: "The Koin module set, the app-level single vs UserSessionScope-scoped split, and the cross-user-safety enforcement."
 ---
 
-Dependency injection is handled by Koin, split into app-level singletons and per-user scoped instances.
+DI is Koin, started in `App.onCreate` with twelve modules. Bindings split by lifetime: app-level `single {}` survive session switches, while per-user `scoped {}` bindings under `scope(named<UserSessionScope>())` are torn down and rebuilt on every sign-in / sign-out. ViewModels resolve per-user deps through a `userScope()` helper rather than by injecting scoped types at the app root.
 
-## What this covers
+## The two binding lifetimes
 
-- App-level modules: `AuthModule`, `DatabaseModule`, `DaoModule`, `DataSourceModule`, `NetworkModule`, `RepositoryModule`, `ServiceModule`, `ViewModelModule`, `WorkerModule`, `AnalyticsModule`, `V2Module`.
-- The app-level `single` vs user-scoped distinction, and the cross-user-safety enforcement (`UserScopedCacheRegistryTest`).
+- **App-level `single {}`** — survives a session switch. Correct only for stateless plumbing, device-global facts, network clients, or config identical for every user (`AuthRepository`, `DeviceSettingsDataSource`, the config managers, `RecordingGatekeeper`, `AppLockController`, OkHttp/Retrofit clients).
+- **Per-user `scoped {}`** under `scope(named<UserSessionScope>())` — rebuilt by `UserSessionManager.switchTo` on every session change. This is the default and correct home for anything user-specific (`AppDatabase`, all DAOs, per-user data sources, most repositories, `StorageManager`, the sync engine). Leaks are structurally impossible here.
 
-<Note>
-Scaffold generated from the codebase map — expand with full detail, examples, and specifics.
-</Note>
+Koin merges the `scope<UserSessionScope> { ... }` blocks contributed across `databaseModule`, `daoModule`, `dataSourceModule`, `repositoryModule`, `serviceModule`, and `userSessionModule` into a single scope. See [Per-User Session Scope](/rollingrecord/app/architecture/user-session-scope).
+
+## Binding lifetime by module
+
+| Module | App-level `single {}` | Per-user `scoped {}` (`UserSessionScope`) |
+| --- | --- | --- |
+| `authModule` | `AuthRepository`, `AccountDeletionCoordinator` | — |
+| `userSessionModule` | `UserSessionManager`, `UserScopedCacheRegistry` | `SessionDekHolder`, `EmbeddingBundleCache`, `CloudDownloadManager`, `SyncOutboxRepository`, `SyncEnqueuer`, `SettingsSyncObserver`, `WireTransform`, `SyncRejectionDebugLogger`, `SyncEpisodeProgress`, `SyncEngine`, `AccountHealthProvider`, `ReconcileEngine`, `AudioCloudRepository`, `SyncEnqueueRecovery` |
+| `databaseModule` | — | `AppDatabase` |
+| `daoModule` | — | 19 DAOs (`get<AppDatabase>().xDao()`) |
+| `dataSourceModule` | `DeviceSettingsDataSource`, `RevenueCatManager`, `ServerConfigDataSource`, `ServerConfigManager`, `CloudUploadErrorBus`, `ConnectivityMonitor`, `CloudDecryptFailureStore` | `RecordingLocalDataSource`, `CategoryLocalDataSource`, `UserSettingsDataSource`, `InMemoryTranscribeUploadCache` |
+| `repositoryModule` | `IdentityRepository`, `BlueprintModerationService`, `SupportTokenRepository`, `AccountHealthRepository`, `KnownAccountsRepository`, transcribe-queue observer | the per-user repositories (`RecordingRepository`, `CategoryRepository`, `ContextRepository`, `ContextCardRepository`, `NoteRepository`, `TranscriptRepository`, `ScheduledRecordingRepository`, `BlueprintRepository`, `SearchThreadRepository`, `SettingsRepository`, `EntitlementRepository`, `ProfileCache`, `RecordingSemanticSearchEngine`, `ContextSearchRanker`, `ExtractionJobRepository`, …) |
+| `serviceModule` | `RecordingController`, `BusyGuard`, `PlaybackCoordinator`, `RecordingAdmissionBus`, `RecordingGatekeeper`, `AppLockController` | `StorageManager`, `RecordingImporter` |
+| `networkModule` | OkHttp clients, Retrofit APIs, `AppCheckWarmup`, `RateLimitCoordinator`, `UsageRepository` | — |
+| `viewModelModule` | `Dispatchers.IO` | — (VMs route via `userScope()`) |
+| `v2Module` | `V2OnboardingSignals` | — (VMs route via `userScope()`) |
+| `workerModule` | `WorkManager` + schedulers | — |
+| `analyticsModule` | `AnalyticsTracker`, analytics client | — |
+
+## Module notes
+
+- **`authModule`** — app-level `AuthRepository` (wraps the Clerk SDK; its `userKeyApiClientProvider` is a lazy `{ get() }` to break a DI cycle) and `AccountDeletionCoordinator`.
+- **`userSessionModule`** — binds `UserSessionManager` and the `UserScopedCacheRegistry`, plus a large `scope<UserSessionScope>` block that wires the entire sync engine (`SyncEngine`, `WireTransform`, `ReconcileEngine`, `AudioCloudRepository`) and `SessionDekHolder`. See [the session page](/rollingrecord/app/architecture/user-session-scope).
+- **`databaseModule`** — `scoped<AppDatabase> { buildAppDatabaseForSession(androidContext(), this) }` — the encrypted per-user Room DB. Also owns `allMigrations` and the open-failure classifier. See [Room Database & SQLCipher](/rollingrecord/app/architecture/local-database).
+- **`daoModule`** — 19 `scoped { get<AppDatabase>().xDao() }` bindings (recording, recordingSession, category, note, scheduledRecording, transcript, context, contextRecording, contextSession, contextCard, actionItem, blueprint, searchThread, searchMessage, analytics, keywordIndex, embedding, syncOutbox, pendingPullApply).
+- **`networkModule`** — the three named OkHttp clients (`supabase`, `audio_signed_url`, `aiengine`), the Retrofit APIs (`SupabaseApi`, `SyncApi`, `AudioSyncApi`, `AiEngineApi`, `UsageApi`, `RecoveryCodeApi`, `SyncPreferencesApi`, `UserKeyApi`, `SetUserPinApi`, `AccountOtpApi`, `SearchApi`, `ExtractionJobsApi`), `AppCheckWarmup`, `RateLimitCoordinator`, and `UsageRepository` — an app-level single that is a `UserScopedCache` and owner-stamps each snapshot. No scoped bindings.
+- **`v2Module`** — V2 ViewModels plus `single { V2OnboardingSignals() }`. Each VM factory does `val s = userScope()` then mixes `s.get()` (per-user) with `get()` (app singles). Kept separate from `viewModelModule` so V1 can be deleted as a unit.
+
+## The `userScope()` helper
+
+`viewModelModule` defines the single scope-routing helper, reused by `v2Module`:
+
+```kotlin
+internal fun Scope.userScope(): Scope = get<UserSessionManager>().currentScope
+```
+
+ViewModels resolve per-user deps through it (`= UserSessionManager.currentScope`) rather than injecting scoped types at the app root. A root `get()` can't see scoped definitions, but a scope `get()` falls through to app singles — so a VM factory can freely mix both. Composables outside a VM factory use the `@Composable` `userScopedInject<T>()` instead (remember-keyed on `sessionIdFlow`), which is how `V2MainNavHost` reads `EntitlementRepository` and `ContextRepository`.
+
+## Cross-user-safety enforcement
+
+`UserScopedCacheRegistry` (registered in `userSessionModule`) holds an **explicit** list of every app-level single that caches per-user state — `switchTo()` clears all of them before opening the new scope. Registration is a hand-written list, not a reflective `getAll<UserScopedCache>()` sweep, because reflection silently picks up whatever is on the graph and says nothing when something is missing.
+
+`UserScopedCacheRegistryTest` fails the build when a `UserScopedCache` implementor is missing from the registry, or when a new app-level `single {}` is neither a `UserScopedCache` nor listed in the test's `crossUserSafe` map with a written reason. See [Per-User Session Scope](/rollingrecord/app/architecture/user-session-scope) for the registered caches and the owner-stamping pattern.
+
+## Where to go next
+
+- [Per-User Session Scope](/rollingrecord/app/architecture/user-session-scope) — how `switchTo` rebuilds the scope and clears the caches.
+- [Room Database & SQLCipher](/rollingrecord/app/architecture/local-database) — the `AppDatabase` and DAO bindings.
+- [Application Shell & Entry Points](/rollingrecord/app/architecture/app-shell) — where `startKoin` runs.
+- [Client vs Server Configuration](/rollingrecord/app/architecture/config-split) — the config managers bound here.

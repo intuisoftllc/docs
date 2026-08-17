@@ -1,15 +1,64 @@
 ---
 title: "Settings Surface"
-description: "The app settings screen and its sections."
+description: "The V2 app-settings screen: tier-gated collapsible sections built on the reused V1 SettingsViewModel plus the V2 selector, row, and slider building blocks."
 ---
 
-The settings surface groups all app preferences into a set of themed sections.
+`V2AppSettingsScreen` is a V2 re-skin over the V1 `SettingsViewModel` — it adds no new preferences. It renders a bare Appearance selector, four collapsible cards (Recording, Playback, Rolling Record, Transcription), a Quick Settings Tiles card, then Factory Reset, the dev-menu bridge, and the version label. Controls are built from `V2SegmentedSelector`, `V2PillRow`, and `V2AudioQualitySlider`; sensitive toggles gate behind a confirm sheet.
 
-## What this covers
+## `V2AppSettingsScreen`
 
-- `V2AppSettingsScreen` and settings components (`V2SettingsRows`, `V2SettingsSelectors`, `V2AudioQualitySlider`, confirm sheets).
-- Sections: Recording, Playback, Rolling Record, Transcription, Appearance.
+`ui/v2/screens/settings/V2AppSettingsScreen.kt` is the root composable (Figma 1984:77192 / 77451). It takes `onNavigateBack`, `onNavigateToDevMode`, and a Koin `SettingsViewModel`, then renders each section into a vertically-scrolling column. Collapse state for the four collapsible cards is persisted and synced as a set of section ids (stable string constants `SECTION_RECORDING` / `SECTION_PLAYBACK` / `SECTION_ROLLING` / `SECTION_TRANSCRIPTION`, never the localized titles). The screen also holds the log-scale storage-slider math (100 MB → 50 GB) and the rolling segment-count estimate. All the private section composables (`CollapsibleSection`, `StaticCardSection`, `SectionCard`, `LabeledControl`, `ToggleRow`, `TileRadioRow`, and the rest) live in this one file.
 
-<Note>
-Scaffold generated from the codebase map — expand with full detail, examples, and specifics.
-</Note>
+## Sections and tier gating
+
+The Rolling Record, Transcription, and Quick Settings Tiles sections are tier-gated and simply do not render below their tier — the Recording and Playback cards render for everyone but hide their Pro-only controls inside `tier.atLeast(...)` guards.
+
+| Section | Composable | Tier gate | Notable controls |
+| --- | --- | --- | --- |
+| Appearance | `AppearanceSection` | Free (all) | Theme segmented selector (System / Day / Night) |
+| Recording | `RecordingSection` | Free (Block calls); PRO for the rest | Recording mode, Audio format, Sample rate, Audio quality, Block calls |
+| Playback | `PlaybackSection` | Free (waveform); PRO (notes) | Always-show waveform, Notes |
+| Rolling Record | `RollingRecordSection` | `tier.atLeast(PRO)` | Max-storage slider (100 MB–50 GB), Segment duration |
+| Transcription | `TranscriptionSection` | `tier.atLeast(PRO_CLOUD)` | Enable, Language, Auto-transcribe, Speaker labels, Medical mode |
+| Quick Settings Tiles | `QuickTilesSection` | `tier.atLeast(PRO)` | Manual / Rolling-new / Rolling-pinned tile mode + pin picker |
+| Factory reset / Dev / Version | `FactoryResetButton`, `DebugMenuEntry`, `VersionLabel` | all | Full reset, hidden dev entry (7-tap), version label |
+
+The theme selector writes the same `"system"` / `"off"` / `"on"` values the V1 theme reader expects (labeled System / Day / Night). The Rolling Record max-storage slider is log-scale between `MIN_STORAGE_BYTES` (100 MB) and `MAX_STORAGE_BYTES` (50 GB) and shows a live estimated segment count derived from the current format, sample rate, and segment duration.
+
+## `SettingsViewModel` (reused from V1)
+
+`ui/v1/screens/settings/SettingsViewModel.kt` is reused unchanged — there is no V2-specific settings ViewModel. It exposes `currentTier`, `darkMode`, `recordingProfile`, `audioFormat`, `sampleRate`, `audioQuality`, `blockCallsWhileRecording`, `maxStorageLimitBytes`, `segmentDurationMs`, the `transcription*` toggles, `tileMode` / `tilePinnedSession*`, `collapsedSettingsSections`, `factoryReset`, and the rest of the settings state and actions.
+
+## Building blocks
+
+`ui/v2/screens/settings/components/V2SettingsSelectors.kt` holds the selectors this screen actually uses:
+
+- `V2SegmentOption(id, label, iconRes)` — the option model.
+- `V2SegmentedSelector` — the equal-width icon-card single-select (Appearance theme, Recording mode, Audio format). The selected card fills `Blue500` with white content.
+- `V2PillRow` — the equal-width label-only pill row (Sample rate) with an `enabled` flag that dims the row when Opus fixes the sample rate.
+
+`V2AudioQualitySlider` (`ui/v2/screens/settings/components/V2AudioQualitySlider.kt`) is the recording bitrate slider; `AUDIO_QUALITY_BITRATES` lists the steps 64 / 96 / 128 / 192 / 256 / 320 kbps (persisted as a bps string; 320 kbps is the Hi-Fi max, and selecting it also flips the recording profile to High Fidelity). `V2SettingsRows.kt` holds the shared titled-section / rounded-card / icon-chevron nav-row / label-description toggle-row blocks reused mainly by the Account and Help & Support screens so those read identically.
+
+## Confirmation and pin sheets
+
+`V2SettingsConfirmSheet` (`ui/v2/screens/settings/components/V2SettingsConfirmSheet.kt`) is the confirmation bottom sheet shown before enabling auto-transcribe (first time) and medical mode — the medical-mode sheet shows the usage-cost multiplier read from `ServerConfig.medicalModeUsageMultiplier`. `V2PinSessionSheet` (`.../V2PinSessionSheet.kt`) is the session picker for the rolling-pinned quick-tile mode: apply or clear the pinned rolling session the QS tile launches.
+
+## `DeviceSettingsDataSource`
+
+`data/local/DeviceSettingsDataSource.kt` is the device-scoped `DataStore` backing the settings this screen touches indirectly — values that describe *this install on this device* and must not follow a user across devices. Per-user preferences live in `UserSettingsDataSource` instead.
+
+| Key | Default | Notes |
+| --- | --- | --- |
+| `DARK_MODE` | `"system"` | `on` / `off` / `system` |
+| `STORAGE_LOCATION` | `"internal"` | SAF tree choice — a per-device grant |
+| `TILE_MODE` / `TILE_PINNED_SESSION_*` | `"MANUAL"` / `""` | QS-tile state; reset on account switch |
+| `PERMISSIONS_SETUP_DONE` | `false` | one-time permission screen gate |
+| `SYNC_WIFI_ONLY` | `false` | per-device "don't burn my cell data" |
+| `UI_VERSION` | `"v2"` | which UI generation renders |
+
+The store implements `UserScopedCache`: `clearForUserSwitch()` resets the tile pinned-session pair and `TILE_MODE` to `MANUAL` on an account change, because a pinned session id belongs to the previous user's database. Everything else (dark mode, storage location, permission setup) is genuinely device-scoped and survives the switch.
+
+## Related pages
+
+- [Storage & File Utilities](/rollingrecord/app/platform/storage-files) — the storage-location grant and audio-file management.
+- [Onboarding & Permissions](/rollingrecord/app/platform/onboarding-permissions) — the one-time permission screen gated by `permissions_setup_done`.

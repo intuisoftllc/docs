@@ -1,16 +1,111 @@
 ---
 title: "UI & Navigation"
-description: "The Jetpack Compose UI surface and app navigation."
+description: "The V2 Jetpack Compose surface: the V2App composition root, the login and main NavHosts, the bottom-nav tabs, theming, and tier gating."
 ---
 
-The app's UI is built entirely in Jetpack Compose, rooted at `V2App.kt`.
+The active UI is 100% Jetpack Compose under `ui/v2`, rooted at `V2App`. `V2App` wraps everything in the V2 theme, observes auth state to drive session switching, and branches on the session id between the anonymous login flow and the signed-in main graph — stacking recovery, onboarding, permissions, App-Lock, and version-gate overlays above whichever nav host is mounted.
 
-## What this covers
+## `V2App` — the composition root
 
-- The Compose UI surface (`ui/v2`, rooted at `V2App.kt`) and how the app composes its screens.
-- Navigation: `V2MainNavHost` / `V2MainRoutes` for the signed-in app, and `V2LoginNavHost` / `V2LoginRoutes` for the pre-sign-in flow.
-- How the root hosts app-wide surfaces (the App Lock overlay, onboarding, and recovery dialogs).
+`V2App` (`ui/v2/V2App.kt`) is the top-level `@Composable`. Its parameters are the one-shot nav latches threaded from `MainActivity` (`navigateToScheduleList` / `navigateToRecording` / `navigateToAllRecordings` / `navigateToUpgrade`, `externalAudioUri`, and their `onConsumed` callbacks). It reads `DeviceSettingsDataSource.darkMode` (an app-wide device setting, not the user-scoped `SettingsRepository`) and drives `RollingRecordV2Theme`.
+
+Inside, a `LaunchedEffect` collects `AuthRepository.authState` and drives session switching:
+
+- **`SignedIn`** — sets `AuthUserStore.setCurrentUserId(...)` **before** `switchTo` (so the new scope's DataStore/DB factories see the correct user id), then either swaps immediately for a returning user, or defers the swap behind a recovery-code onboarding overlay for a new account / interrupted acknowledgement.
+- **`SignedOut`** — clears `AuthUserStore` and calls `sessionManager.switchTo(null)`.
+- **`Loading`** — no-op.
 
 <Note>
-Scaffold generated from the codebase map — expand with full detail, examples, and specifics.
+The auth-state observer that calls `UserSessionManager.switchTo` lives here in `V2App.kt` for the V2 surface — **not** in `AppNavHost`. `UserSessionManager`'s own KDoc still references `AppNavHost`; that describes the legacy V1 path.
 </Note>
+
+Below the overlays, the body branches on the session id: `sessionId == AuthUserStore.ANONYMOUS_DIR` mounts `V2LoginNavHost`, otherwise `V2MainNavHost` (wrapped in `Modifier.blur(20.dp)` while the App-Lock overlay is up or the lock decision is still resolving).
+
+### Overlays stacked above the nav host
+
+`V2App` renders these in a `Box` above whichever nav host is mounted:
+
+| Overlay | Driven by | Purpose |
+| --- | --- | --- |
+| `V2FatalDbErrorScreen` | `DatabaseRecoveryState` `FatalError` | Replaces the whole tree on a non-key DB-open failure. |
+| `V2DekUnavailableScreen` | `DatabaseRecoveryState` `DekUnavailable` | Retry surface; resolves the DEK then `recreate()`. |
+| `V2FirstPullProgressOverlayHost` | RR-228 initial `/sync/pull` | Covers empty Home for a cloud-eligible user during first pull. |
+| `V2DatabaseRecoveryDialog` | `DatabaseRecoveryState` `KeyMismatchWiped` | Re-imports on-disk audio after a key-mismatch wipe. |
+| `V2OnboardingOverlay` (single slot) | `pendingOverlay` | One onboarding moment at a time — recovery-code save today. |
+| `V2PermissionsScreen` | device `permissionsSetupDone` flag | First-launch, one-time permission setup. |
+| `V2LockOverlay` (+ forgot-PIN, logout sheet) | `AppLockController.phase == LOCKED` | App-Lock PIN / biometric unlock. |
+| `V2RecordingInterruptedSheet` | `RecordingInterruptedState` | Post-kill recovery sheet; waits out the lock. |
+| `V2BlockingUpdateScreen` | `AppVersionGate.State.NeedsUpdate` | Hard version-floor block, drawn last. |
+
+### The onboarding overlay slot
+
+`V2OnboardingOverlay` (`ui/v2/screens/onboarding/`) is a sealed type for the single `pendingOverlay` slot. Its one variant today is `RecoveryCode(code, email, isError)`, which renders `V2RecoveryCodeSaveScreen` and defers the session swap until the user acknowledges the code via `RecoveryCodeApiClient.generateRecoveryCode` / `acknowledgeRecoveryCode`. Adding a new onboarding moment is a new sealed-class variant plus a render branch.
+
+## `V2LoginNavHost` — the anonymous flow
+
+`V2LoginNavHost` (`ui/v2/navigation/V2LoginNavHost.kt`) is the pre-sign-in NavHost, mounted while the session is anonymous. A single `V2LoginViewModel` is shared across all four routes so the email / name / OTP screens read and mutate the same `LoginUiState`; navigation is driven off `viewModel.navEvents` (`V2LoginNavigation.ToEmailEntry` / `ToNameEntry` / `ToOtpEntry` / `PopToRoot` / `FlowComplete`). The routes (`V2LoginRoutes.kt`) are `@Serializable` no-arg objects: `V2LoginRoot` (start), `V2EmailEntry`, `V2NameEntry`, `V2OtpEntry`.
+
+## `V2MainNavHost` — the signed-in graph
+
+`V2MainNavHost` (`ui/v2/navigation/V2MainNavHost.kt`) is the signed-in area — a `Scaffold` with a custom bottom bar, `startDestination = V2Home`. It consumes the one-shot latches plus `RecordingAdmissionBus.events` (`RouteToRecordingScreen` / `Blocked` / `BatteryTooLow` / `StorageTooLow`) and a cold-start safety net that suspends on `RecordingService.state` until the first `RECORDING`/`PAUSED` emission before routing to the recording screen. It registers every deep-route composable, `addDebugRoutes(navController)` (real routes in debug, no-op in release), and `V2CloudUploadErrorDialogHost`.
+
+Tier is read reactively via `userScopedInject<EntitlementRepository>().currentTier`, and RR-486 content signals (`hasContexts` / `hasThreads` / `hasBlueprints` / `hasSessions`) are each mapped to a plain `isNotEmpty()` boolean so a tab only re-evaluates on empty↔non-empty transitions.
+
+### Bottom-nav tabs
+
+`MainNavItem` is a private enum of the four tabs. Each carries a `route` and `routeType` (`KClass` for `hasRoute<>`), outlined + filled `@DrawableRes` icons, a `labelRes`, an optional `minimumTier`, and a `visibleWithAiContent` flag. `isVisibleForTier(tier, hasAnyAiContent, hasSessions)` decides visibility:
+
+| Tab | Route | Min tier | Icons | Downgrade-visible |
+| --- | --- | --- | --- | --- |
+| Home | `V2Home` | none | `ic_home` / `ic_home_filled` | n/a |
+| Library | `V2Library` | none | `ic_library` / `ic_library_filled` | n/a |
+| Contexts | `V2Contexts` | `PRO_CLOUD_AI` | `ic_brain` / `ic_brain_filled` | yes (`hasAnyAiContent`) |
+| Accounts | `V2Accounts` | none | `ic_profile` / `ic_profile_filled` | n/a |
+
+Contexts is the one gated tab: it stays visible read-only for a user who dropped below Cloud+AI but still has AI content, via `visibleWithAiContent = true`.
+
+### The custom bottom bar
+
+`V2BottomNavBar` is hand-built, **not** `androidx.compose.material3.NavigationBar`. It draws a 1dp top border, a `weight(1f)` `Row` of `V2BottomNavItem`s, and a single `V2BottomNavIndicator` — a `56dp × 2dp` red bar (`MaterialTheme.colorScheme.primary`) snapped to the top edge that slides between tabs (`tween`, `IndicatorAnimationMs = 250`, `FastOutSlowInEasing`) rather than teleporting like the M3 pill. Tab switches use the standard recipe: `popUpTo(graph.start) { saveState }` + `launchSingleTop` + `restoreState`, so each tab preserves its deep navigation state.
+
+Deep screens land in the same NavHost; the bar hides for any destination that isn't one of the four tab routes, and recording / playback / trim routes draw full-bleed (they manage their own insets so the blue card sits under the status bar).
+
+### Signed-in routes
+
+`V2MainRoutes.kt` holds the `@Serializable` typed routes. Tabs: `V2Home`, `V2Library`, `V2Contexts`, `V2Accounts`. Deep routes include `V2ContextList(status)`, `V2ContextDetail(contextId, sectionId?)`, `V2Tasks(contextId)`, `V2BlueprintEditor(blueprintId?)`, `V2AccountSettings`, `V2AppSettings`, `V2HelpSupport`, `V2Security`, `V2SetPin(change)`, `V2Privacy`, `V2Usage(expandStorage)`, `V2Recording`, `V2Schedule`, `V2AddSchedule(scheduleId?)`, `V2Favorites`, `V2AllRecordings`, `V2Categories`, `V2CategoryDetail(categoryId)`, `V2Trash(targetItemId?)`, `V2SessionDetail(sessionId, isLive)`, `V2Playback(recordingId)`, `V2Trim(recordingId)`, `V2ExternalPlayback(uri)`, `V2KnowledgeBaseChat(contextId?, threadId?)`, `V2Threads`, `V2Bundles`, `V2ManageSubscription`, `V2Upgrade`.
+
+## Theming
+
+`RollingRecordV2Theme` (`ui/v2/theme/Theme.kt`) is the theme entry point. `darkModeSetting` — `"on"` forces dark, `"off"` forces light, anything else follows `isSystemInDarkTheme()` — picks `v2LightColorScheme()` or `v2DarkColorScheme()`. Both are Material 3 `ColorScheme`s built from the designer's palette: red primary (`#D43C39`), blue secondary (`#7BAFD4`), indigo tertiary (`#4F46E5`), plus `V2Typography`. The theme also provides `LocalV2Colors` with `v2LightColors()` / `v2DarkColors()`.
+
+`V2Theme` (`ui/v2/theme/V2Colors.kt`) exposes `colors: V2Colors` via `LocalV2Colors.current` (a `staticCompositionLocalOf`). The `V2Colors` data class holds extended palette tokens (e.g. `nav`, `cardOutline`) beyond the M3 scheme — the bottom bar reads `V2Theme.colors.nav` and `V2Theme.colors.cardOutline` directly.
+
+## Tier gating
+
+`FeatureAccess.kt` (`ui/v2/gating/`) is the RR-486 downgrade-aware gating primitive. A user who drops below the tier that owns a feature keeps existing content **read-only** but loses mutation. Three levels resolve per-feature from `(currentTier, hasContent)`:
+
+- `FeatureAccess.FULL` — at/above the required tier; full create/edit/delete.
+- `FeatureAccess.READ_ONLY` — below the required tier but has existing content; view/play/export only.
+- `FeatureAccess.LOCKED` — below the required tier with no content; apply `GatedFeature.whenLocked`.
+
+`GatedFeature.access(tier, hasContent)` resolves the level, and when `LOCKED` the `LockedStyle` (`UPSELL` keeps an entry point that opens an upsell sheet; `HIDE` removes it) decides the fallback. The gated features and their required tiers:
+
+| Feature | Required tier | When locked |
+| --- | --- | --- |
+| `SESSIONS` | `PRO` | `UPSELL` |
+| `PROTECT_SEGMENT` | `PRO` | `HIDE` |
+| `SCHEDULED_RECORDINGS` | `PRO` | `UPSELL` |
+| `IMPORT` | `PRO` | `UPSELL` |
+| `TRANSCRIBE` | `PRO_CLOUD` | `HIDE` |
+| `CONTEXTS` | `PRO_CLOUD_AI` | `HIDE` |
+| `KB_CHAT` | `PRO_CLOUD_AI` | `HIDE` |
+| `CUSTOM_BLUEPRINT` | `PRO_CLOUD_AI` | `HIDE` |
+
+The three AI surfaces (`CONTEXTS`, `KB_CHAT`, `CUSTOM_BLUEPRINT`) deliberately share one `hasAnyAiContent` signal so they resolve consistently. `FeatureUpsell.kt` is the companion upsell-sheet plumbing invoked when a `GatedFeature` resolves `LOCKED` with `LockedStyle.UPSELL`.
+
+## Where to go next
+
+- [Application Shell & Entry Points](/rollingrecord/app/architecture/app-shell) — how `MainActivity` mounts `V2App`.
+- [Per-User Session Scope](/rollingrecord/app/architecture/user-session-scope) — the `switchTo` that the auth observer here drives.
+- [Koin Dependency Injection](/rollingrecord/app/architecture/dependency-injection) — how `userScopedInject` resolves per-user deps in composables.
+- [Room Database & SQLCipher](/rollingrecord/app/architecture/local-database) — the recovery states these overlays render.

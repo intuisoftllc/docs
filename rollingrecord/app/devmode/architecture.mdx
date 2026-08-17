@@ -1,15 +1,86 @@
 ---
 title: "Dev Mode Architecture"
-description: "The source-set duplication pattern and dev entry points."
+description: "How developer tooling is compiled only into debug builds via source-set duplication, reached through the hidden 7-tap entry point, and injected into the real production stack through the DevFlags contract."
 ---
 
-Developer tooling is compiled only into debug builds via source-set duplication, reached through a hidden entry point.
+Developer tooling in RollingRecord is not gated by `BuildConfig.DEBUG` checks scattered through the app. It is gated **structurally**: every dev bridge class has a real implementation in `src/debug/` and a byte-compatible inert stub in `src/release/` with the same package, filename, and signatures. Main source references only the bridge symbols; the linker picks the debug or release body per variant, and R8 dead-code-eliminates the (now constant-false) dev branches from the release APK.
 
-## What this covers
+## Source-set duplication
 
-- Source-set duplication (`src/debug` vs `src/release`) instead of `BuildConfig.DEBUG`; `DebugNavGraph`, `DebugMenuEntry`, the `DevFlags` contract.
-- Entry points: 7-tap version label → Developer Options → `DevModeScreen`.
+A structural guarantee ("this class does not compile into the release APK") is stronger than a conditional one ("this `if (BuildConfig.DEBUG)` was placed correctly and never removed"). Three bridge symbols are all that `src/main/` ever touches from the `devmode` package — `DevFlags`, `addDebugRoutes`, and the `DebugMenuEntry` / `DebugVersionLabel` pair. Each exists twice.
 
-<Note>
-Scaffold generated from the codebase map — expand with full detail, examples, and specifics.
-</Note>
+| Bridge symbol | Debug behavior (`src/debug/.../devmode/`) | Release stub (`src/release/.../devmode/`) |
+| --- | --- | --- |
+| `DevFlags` | `var` fields backed by `mutableStateOf` + a `dev_flags` `SharedPreferences`; `init()` seeds them | every field a compile-time `val` inert constant, so R8 rewrites each `if (DevFlags.x)` as `if (false)` and drops the branch |
+| `addDebugRoutes` (`DebugNavGraph.kt`) | `NavGraphBuilder` extension that registers nine dev composable routes | empty no-op — no routes registered |
+| `DebugMenuEntry` (`DebugMenuEntry.kt`) | red "Developer Options" row, shown only after the 7-tap unlock | empty composable — renders nothing |
+| `DebugVersionLabel` (`DebugMenuEntry.kt`) | version label carrying the 7-tap easter egg + countdown toasts | plain, non-tappable version label |
+| `DevChatTraceCapture` (`DevChatTraceCapture.kt`) | real capture object writing JSON traces to `cacheDir` | all methods inert (return `null` / empty / `0`) |
+| `DevBackupManager`, `SyncDebugScreen`, `LogDiagnosticsScreen`, `LogFullViewScreen` | full implementations | no-op composables / inert objects |
+
+Because release stubs are inert constants, a release build cannot reach a dev screen even in principle: the routes are never registered and the entry row never renders.
+
+## `DevFlags` — the single override contract
+
+`DevFlags` (`devmode/DevFlags.kt`) is the one place every runtime dev override lives; main source imports **only** this object from `devmode`. In the debug variant each field is a `var` backed by `mutableStateOf`, so flipping a toggle in `DevModeScreen` recomposes any composable that reads the flag. Flags that must survive a force-stop (`transcriptionMinutesCapOverride`, `aiQueriesCapOverride`, `extractionsCapOverride`, `tierOverride`, `forceFatalDbErrorOnOpen`, `captureKbChatTraces`, `contextBudgetPercent`, `forcedAccountHealth`, `forcedFrozenReason`) persist through a `SharedPreferences` store named `dev_flags`.
+
+`DevFlags.init(context)` is called once in `App.onCreate` (`App.kt`, line 242) on the main thread **before any Compose composition**. It seeds the persisted values and forces the `mutableStateOf` fields to be created outside a Compose snapshot — creating them lazily inside a composition would throw "Reading a state that was created after the snapshot was taken."
+
+Two fields are one-shot: `consumeForceFatalDbError()` is called at the `DatabaseModule` injection site immediately before the synthetic throw so the launch after the crash recovers cleanly, and `consumeForceFirstPullOverlay()` is called by the forced first-pull overlay's tap-to-dismiss so a tester can escape the full-screen overlay. Both are no-ops in the release stub.
+
+## The hidden 7-tap entry point
+
+There is exactly one navigation path into the dev hub, and it is invisible by default. `DebugVersionLabel` renders the "Version X (Y)" line at the footer of the settings screen and carries a tap counter:
+
+- Taps 3–6 show a countdown toast ("N more taps to unlock").
+- Tap 7 persists `KEY_DEV_MODE_UNLOCKED` to the `dev_mode_prefs` DataStore, flips the in-memory `DevModeState.unlocked` flag, and shows a confirmation toast.
+- The counter resets if the user pauses for 2 seconds between taps.
+
+Once unlocked, `DebugMenuEntry` renders a red "Developer Options" `Surface` row (BugReport icon, `errorContainer` color) just above factory reset. Both composables are double-gated behind `BuildConfig.DEBUG` as a belt-and-suspenders check on top of the source-set separation. `DebugMenuEntry`'s `onClick` navigates to the `DevMode` route, which `addDebugRoutes` maps to `DevModeScreen` (titled "Developer Options"). `DevModeScreen` groups every tool into labeled `SettingsSection` cards — see [Developer Tools & Diagnostics](/rollingrecord/app/devmode/tools).
+
+## Dev nav routes
+
+The route marker objects live in **main source** (`ui/v1/navigation/Routes.kt`) so type-safe navigation compiles in both build variants, but they are only *registered* by the debug `addDebugRoutes`. Both nav hosts call it inside their graph — `V2MainNavHost.kt` (line 834, the active V2 surface) and `AppNavHost.kt` (line 746, legacy V1) — and in release the call resolves to the empty stub, so nothing is registered.
+
+| Route marker | Debug destination |
+| --- | --- |
+| `DevMode` (object) | `DevModeScreen` — the dev hub |
+| `EvalMode` (object) | `EvalDashboardScreen` — the in-app eval runner |
+| `OnboardingPreview(isNewUser = true)` (data class) | `DevOnboardingPreviewScreen` |
+| `PermissionsPreview` (object) | `V2PermissionsScreen` (live) |
+| `TranscriptionDebug` (object) | `TranscriptionDiagnosticsScreen` |
+| `SyncDebug` (object) | `SyncDebugScreen` |
+| `LogDebug` (object) | `LogDiagnosticsScreen` |
+| `LogFullView(tag, key)` (data class) | `LogFullViewScreen` |
+| `ChatTracesDebug` (object) | `DevChatTracesScreen` |
+
+`LogFullView` carries only a `tag` and a UUID `key`, never the log body: a long stack trace serialized into the nav savedState `Bundle` would exceed the Binder transaction limit and crash on navigation. The body is stashed process-scope in `LogFullTextHolder` and read back by key.
+
+## Injection-site discipline
+
+Each `DevFlags` field has a **primary** injection site in main source — the lowest practical layer where the real data is resolved — so that every layer below the override runs for real. Most flags are read at a single site, but some are read at more than one (e.g. `extractionsCapOverride` is read in both `ContextExtractionWorker` and `V2ContextDetailViewModel`), and the legacy V1 surface carries its own duplicate reads that are not documented here. Each read is preceded by a `// [DEV]` comment, making all injection sites greppable for a release audit.
+
+| `DevFlags` field | Injection site (`src/main/`) | What executes for real below it |
+| --- | --- | --- |
+| `audioFilePathOverride` | `V2PlaybackViewModel.resolvedFilePath` (920) | real MediaPlayer `prepare`, error callbacks, UI error state |
+| `forceRecordingGone` | `V2PlaybackViewModel` (754) | the real null-check → RecordingGone error path |
+| `forceMergeInProgress` / `forceMergeFailed` / `forceMergeProgress` | `V2PlaybackViewModel` (227 / 232 / 238) | the real merge progress + error-overlay `LaunchedEffect`s |
+| `transcriptionStatusOverride` | `V2PlaybackViewModel` (382) | real transcript-status-derived UI |
+| `forceStorageNotAccessible` | `StorageManager.isStorageAccessible` (43) | Home banner, record-start guard, Playback StorageUnavailable overlay |
+| `forceDeviceStorageTooLow` | `V2HomeViewModel.checkStorageHealth` (81) | real Home "Device Storage Too Low" banner + record gate |
+| `forceBatteryLow` | `V2HomeScreen` (152) | real low-battery banner + record-button gate |
+| `forceFatalDbErrorOnOpen` | `DatabaseModule` (527, consumes at 528) | real classifier → `handleFatalDbError` → `FatalDbErrorScreen` → Crashlytics keys |
+| `tierOverride` | `EntitlementRepository` (156, `snapshotFlow`) | the real tier-gated UI resolution |
+| `forcedAccountHealth` / `forcedFrozenReason` | `AccountHealthProvider.health` flow (88, `snapshotFlow`) | real status dot, `V2AccountHealthSheet`, per-state CTA |
+| `forceGraceBanner` / sync banners / `forceFirstPullOverlay` | `V2AccountSettingsScreen` + `V2FirstPullProgressScreen` | the real banner / overlay rendering paths |
+| `captureKbChatTraces` | `KnowledgeBaseAdvisor.ask` (five `DevChatTraceCapture` calls: 1135 / 1290 / 1300 / 1342 / 1360) | the real KB turn; capture is a passive side-channel |
+| `extractionsCapOverride` | `ContextExtractionWorker` (1192) + `V2ContextDetailViewModel` (475) | real extraction-budget / deferred UI |
+| `contextBudgetPercent` | `V2ContextDetailViewModel` (1290) | real context-size meter bar / color / warning (only the numerator is faked) |
+| `disableWaveformCache` | `WaveformExtractor` (84 / 114) | real full re-decode path |
+
+`captureKbChatTraces` is the clearest example of a flag with multiple injection sites: it drives **five** closely-coupled `DevChatTraceCapture` calls inside the single `KnowledgeBaseAdvisor.ask` method — `startTurn` (1135), `recordAssistantRound` (1290), `recordToolResult` (1300), `discardTurn` (1342), and `finishTurn` (1360–1362) — that together record the shape of one turn.
+
+## Where to go next
+
+- [Developer Tools & Diagnostics](/rollingrecord/app/devmode/tools) — the diagnostic screens, override flags, and utilities exposed in `DevModeScreen`.
+- [In-App Eval Harness](/rollingrecord/app/devmode/in-app-evals) — the on-device Kotlin port of the Python eval suites, reached via the `EvalMode` route.

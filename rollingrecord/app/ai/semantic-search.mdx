@@ -1,15 +1,56 @@
 ---
 title: "Semantic & Keyword Search"
-description: "Server-side embeddings with an offline keyword/FTS fallback."
+description: "Server-embedded, on-device-scored semantic search over recordings and contexts, with a rank-aware margin filter and a universal FTS/keyword fallback."
 ---
 
-Search combines server-side semantic embeddings with an offline keyword/FTS fallback and on-device ranking.
+Every semantic query is embedded SERVER-side (Cohere `embed-v4.0`, 1024-dim) via `SearchApiClient.embedQuery` on the `search` Edge Function; the cosine SCORING runs on-device against vectors stored in the unified `embeddings` table. On ANY embed failure — offline, server error, rate-limit — the engines return empty and each caller falls back to FTS or keyword search, so search is never blocked by the embed call.
 
-## What this covers
+## Recording transcript search
 
-- `RecordingSemanticSearchEngine`, `KnowledgeBaseSearchEngine`, `ContextSearchRanker`, `SemanticMarginFilter`.
-- Server-side embeddings (RR-487) with keyword/FTS offline fallback (`KeywordIndexDao`/`Entity`); `SearchApi` / `SearchModels`.
+`RecordingSemanticSearchEngine` (`data/repository/RecordingSemanticSearchEngine.kt`) scores recording-transcript chunks. `search(query, source)` returns `List<SearchResult(recordingId, score)>`: it server-embeds the query, then folds a max-per-recording cosine over `EmbeddingType.RECORDING_CHUNK` in keyset pages (`PAGE_SIZE` 512) to bound memory, and applies `applySemanticMarginFilter`. `findTopChunks(recordingId, queryEmbedding, limit)` returns the most similar chunks in TRANSCRIPT ORDER (not score order) for the snippet tool, so the model reads passages chronologically.
 
-<Note>
-Scaffold generated from the codebase map — expand with full detail, examples, and specifics.
-</Note>
+There is no recording-level FTS table for semantic recording search: `search` returns EMPTY on embed failure, and the KB-chat `searchRecordings` handler then falls back to `transcriptDao.searchFts` (transcript FTS) keyword search, annotating each hit `match=transcript` / `match=fts` / `match=name-only`.
+
+## Context-card search
+
+`KnowledgeBaseSearchEngine` (`data/repository/KnowledgeBaseSearchEngine.kt`) is the hybrid context-card engine. `search(rawQuery, aiAugmented, contextScope)` returns `List<KnowledgeBaseResult>` by running a fixed pipeline and merging with Reciprocal Rank Fusion (global, deduped by contextId) or `(contextId, sectionId)` dedup (single-context scope):
+
+| Step | Mechanism | Notes |
+| --- | --- | --- |
+| 0 | exact keyphrase | `keyword_index.searchExact`, seeded first so exact phrases rank highest in RRF |
+| 1 | FTS BM25 | `runFtsWithBm25` over `context_fts` (porter tokenizer) |
+| 2 | column-filtered FTS | `contextName` / `keywords` / `sectionTitle` only |
+| 3 | HyDE | Haiku hypothetical doc; only if `<2` results, query is interrogative, and `aiAugmented` |
+| 4 | query expansion | Haiku 3 variants; only if `<2` results and `aiAugmented` |
+| 5 | LIKE fallback | always runs (2 longest keywords) |
+| 6 | fuzzy LIKE | prefix drop; only if `<2` results |
+| 6b | per-section semantic | `context_section` vectors + margin filter (query vector available) |
+| 7 | context-level semantic | context vectors, threshold `0.3` (query vector available) |
+
+The BM25 path uses FTS4 `matchinfo(context_fts, 'pcnalx')` with a porter tokenizer and column weights `contextName` 5x / `keywords` 15x / `sectionTitle` 20x / `sectionContent` 1x — a separate mechanism from the exact `keyword_index`, which matches multi-word phrases that FTS tokenization would destroy. `buildFtsQuery` lowercases, drops stop-words and FTS boolean operators, and expands a small synonym table before joining terms with `OR`. `filterSourcesByRelevance(question, sources, threshold = 0.25)` trims low-relevance sources before Claude injection (keeping a source if either its context vector or its best section vector clears the threshold), and `detectScopeSemantically` auto-scopes only when the best context match is confident (≥0.65) and a clear winner (gap ≥0.15).
+
+## Manual (typed) context ranking
+
+`ContextSearchRanker` (`data/repository/ContextSearchRanker.kt`) powers the manual search bar (`SearchSource.USER`), separate from `KnowledgeBaseSearchEngine` so a typed query never burns AI tokens (no HyDE / expansion). `rank(query, contextIds, floor = sectionSemanticThreshold)` grades each context as `max(context vector, best section vector)` over the `embeddings` table, then applies the margin filter. It returns empty on any embed failure so the caller falls back to text search.
+
+## The rank-aware margin filter
+
+`applySemanticMarginFilter(items, floor, margin, cap, score)` (`data/repository/SemanticMarginFilter.kt`) is the shared policy, applied in order: the top hit must clear the absolute `floor` (else return empty); keep only items within `margin` of the top score (an adaptive per-query cutoff); then `take(cap)`. This exploits that embedding scores compress into a narrow band where ranking is near-perfect even when absolute scores drift per query.
+
+| Value | Default | Firebase key |
+| --- | --- | --- |
+| `topicSearchThreshold` (recording floor) | 0.48 | `topic_search_threshold` |
+| `sectionSemanticThreshold` (section floor) | 0.50 | `section_semantic_threshold` |
+| `semanticSearchMargin` | 0.02 | `semantic_search_margin` |
+| `semanticSearchResultCap` | 8 | `semantic_search_result_cap` |
+| `semanticSnippetChunkCount` | 3 | `semantic_snippet_chunk_count` |
+
+## Embedding transport
+
+`SearchApi` (`data/remote/search/SearchApi.kt`) is the Retrofit interface for the `search` and `indexing` Edge Functions (sharing the `aiengine` OkHttp client). `SearchApiClient` exposes `embedQuery(query, source): ApiResult<QueryEmbedding>` and `embedDocuments(texts): ApiResult<DocumentEmbeddings>` (batch ≤96), plus `getBundles` / `putBundle` for the bundle cache. `SearchSource` is `USER("user")` / `AI("ai")` — it drives server telemetry (`usage.searches` vs `usage.ai_searches`); cost is tracked either way. `QueryEmbedding(vector: FloatArray, modelVersion)` and `DocumentEmbeddings(vectors: List<FloatArray>, modelVersion)` are the public result shapes. The little-endian float32 BLOB codec and `cosineSimilarity` (returns 0 on a zero norm) live as top-level helpers in `data/local/db/dao/EmbeddingDao.kt`.
+
+## Related
+
+- [Embeddings Index & Reconciliation](/rollingrecord/app/ai/embeddings-index)
+- [Knowledge Base Chat](/rollingrecord/app/ai/knowledge-base-chat)
+- [AI & Context Intelligence Overview](/rollingrecord/app/ai/overview)

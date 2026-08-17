@@ -1,15 +1,60 @@
 ---
 title: "Security & Encryption Overview"
-description: "The client-side encryption posture and access controls."
+description: "The client-side encryption posture (SQLCipher DB, envelope-encrypted audio, per-user DEK) and the access controls layered on top — App Lock, PIN/biometrics, and account recovery."
 ---
 
-RollingRecord encrypts data on-device and gates access behind App Lock, with a DEK-based key model and recovery paths.
+RollingRecord encrypts content on-device around a single per-user key, then gates access to the decrypted app behind App Lock. This page maps the whole subsystem: where the key comes from, what it derives, and how the two independent "recovery" concepts differ.
 
-## What this covers
+## The per-user DEK
 
-- Client-side encryption posture: SQLCipher DB + envelope-encrypted content and audio.
-- App Lock, PIN/biometrics, the DEK model, and recovery paths at a glance.
+Every on-device encryption operation resolves back to one 32-byte **Data Encryption Key (DEK)** per account. The DEK is fetched from the `get-user-key` Edge Function — the single endpoint where a plaintext DEK crosses the wire — which unwraps it server-side from a versioned KEK. `UserKeyApiClient.fetch()` (`data/remote/userkey/UserKeyApiClient.kt`) returns a `UserKeyFetchResult.Success` carrying the base64 DEK, its `kekVersion`, and (piggy-backed) the synced App Lock PIN verifier.
 
-<Note>
-Scaffold generated from the codebase map — expand with full detail, examples, and specifics.
-</Note>
+Once resolved, the DEK is held in RAM for the session by `SessionDekHolder` (`data/session/SessionDekHolder.kt`) and persisted Keystore-wrapped on disk by `DekKeyStore` (`data/local/security/DekKeyStore.kt`), so the local database can be opened offline after the first fetch. The plaintext DEK is never written to disk, DataStore, or any log, and its RAM buffer is zero-filled when the user-session scope closes.
+
+## DEK resolution tiers
+
+`SessionDekHolder.requireDek()` resolves the DEK through three tiers under a `Mutex`, so concurrent cold-start callers collapse into one fetch. It returns a `DekResult`: `Available(dek, kekVersion)`, `SubscriptionRequired(entitlement)`, or `Unavailable(reason)`.
+
+| Tier | Source | Offline? | Notes |
+| --- | --- | --- | --- |
+| 1 | In-RAM cache | Yes | Populated by a prior call this session; wiped and zero-filled on scope close |
+| 2 | `DekKeyStore` (Keystore-wrapped) | Yes | Makes the DEK — and the DEK-derived DB key — available offline after the first fetch; no network round-trip |
+| 3 | `UserKeyApiClient.fetch` (`get-user-key`) | No | Server unwraps the DEK from the KEK; on success it is persisted to tier 2. The success body also carries the synced PIN verifier |
+
+A `SubscriptionRequired` result gates cloud features for the session but leaves every non-cloud feature fully usable; an `Unavailable` result is retriable (`rate_limited`, `network_error`, `decode_failed`, `invalid_dek_size`).
+
+## Derived keys
+
+Using the raw DEK for multiple purposes would be a key-reuse footgun, so `KeyDerivation` (`app/crypto/KeyDerivation.kt`) runs RFC 5869 HKDF-SHA256 to split it into cryptographically independent 32-byte keys bound to distinct `info` labels. The DEK itself, paired with per-file IVs from `sync-audio`, envelope-encrypts audio files and synced text columns via the `app/crypto/EnvelopeCrypto.kt` primitives (AES-256-GCM, 12-byte IV, 128-bit tag).
+
+| Key | HKDF `info` label | Purpose |
+| --- | --- | --- |
+| DB key | `rr-db-key-v1` (`DB_KEY_INFO`) | SQLCipher raw key, hex-encoded via `toSqlCipherRawKey` into the `x'<hex>'` passphrase |
+| Backup key | `rr-db-backup-v1` (`BACKUP_KEY_INFO`) | AES-256-GCM key for the `.rrbackup` container payload |
+| (DEK itself) | — | Directly envelope-encrypts audio files and synced text columns with per-file IVs |
+
+Because the DB key is HKDF-derived from the account DEK (not a random device-bound passphrase), the local SQLCipher database is portable across a user's devices. `DekKeyStore.db_structure_version` distinguishes legacy installs (`1` — random passphrase) from the DEK-derived structure (`2`).
+
+## Access control: App Lock
+
+Encryption protects data at rest; **App Lock** protects the decrypted app while it is running. `AppLockController` (`data/applock/AppLockController.kt`) is an app-scoped state machine exposing a single `phase: StateFlow<LockPhase>` (`UNLOCKED` / `RESOLVING` / `LOCKED`). Locking is strictly lifecycle-driven — it never slams the lock over the screen mid-use — and the secret is a 4–6 digit PIN stored only as a DEK-sealed one-way verifier, with optional biometric unlock. See [App Lock](/rollingrecord/app/security/app-lock) and [PIN & Biometrics](/rollingrecord/app/security/pin-and-biometrics).
+
+## Two distinct "recovery" concepts
+
+The word "recovery" covers two unrelated mechanisms in this codebase. They must not be conflated:
+
+| Concept | What it is | Where it lives |
+| --- | --- | --- |
+| **Database recovery** | When SQLCipher can't decrypt the local DB, Room wipes it and the on-disk audio is re-imported | `RecoveryState.KeyMismatchWiped` (`states/DatabaseRecoveryState.kt`), surfaced by `V2DatabaseRecoveryDialog` (`ui/v2/screens/recovery/`) |
+| **Recovery codes** | A 16-digit secondary **account-auth** credential (RR-315), argon2id-hashed on `canonical_users` | `RecoveryCodeApiClient` (`data/remote/recoverycode/`), shown at onboarding by `V2RecoveryCodeSaveScreen` |
+
+The recovery code is **not** part of the encryption key model: it never wraps, protects, or rewraps the DEK, and there is no client "DEK rewrap on recovery" path. The DEK is unwrapped server-side from a KEK (`get-user-key`) and Keystore-wrapped locally (`DekKeyStore`) — that is the entire key-availability story. See [Recovery Codes](/rollingrecord/app/security/recovery-codes).
+
+## Where to go next
+
+- [App Lock](/rollingrecord/app/security/app-lock) — the lifecycle-driven lock overlay and its `LockPhase` state machine
+- [PIN & Biometrics](/rollingrecord/app/security/pin-and-biometrics) — the DEK-sealed PIN verifier, biometric unlock, lockout backoff, and cross-device sync
+- [Forgot PIN / PIN Reset](/rollingrecord/app/security/forgot-pin) — the email-OTP-gated reset flow hosted above the lock
+- [Recovery Codes](/rollingrecord/app/security/recovery-codes) — the two-phase generate/acknowledge account-recovery credential
+- [Envelope Encryption Primitives](/rollingrecord/app/security/envelope-crypto) — the `app/crypto` AES-256-GCM engines and HKDF key schedule
+- [DEK & Database Key Lifecycle](/rollingrecord/app/security/dek-and-db-key) — how the DEK becomes the SQLCipher key

@@ -1,15 +1,55 @@
 ---
 title: "User Tiers & Feature Map"
-description: "The four tiers and how features are gated by them."
+description: "The four stacked UserTier levels, the authoritative feature-map comment, and atLeast() ordering."
 ---
 
-Features are gated by four stacked tiers, each a strict superset of the one below.
+Every paid capability in RollingRecord is assigned to one of four stacked tiers. The tier itself is a four-value enum where each level is a strict superset of the one below it, and gating is decided by ordinal comparison — never by checking a specific tier equality.
 
-## What this covers
+## `UserTier`
 
-- `UserTier` enum (FREE, PRO, PRO_CLOUD, PRO_CLOUD_AI) and `atLeast()` gating; the authoritative feature-map comment.
-- `ProAccess` resolution and tier-driven UI (`V2TierBadge`).
+`UserTier` (`data/models/UserTier.kt`) is a four-value enum. The values are declared in ascending order so the ordinal encodes tier height, which is what makes `atLeast()` work:
 
-<Note>
-Scaffold generated from the codebase map — expand with full detail, examples, and specifics.
-</Note>
+```kotlin
+fun atLeast(required: UserTier): Boolean = ordinal >= required.ordinal
+```
+
+Any tier-gated check reads "am I at least tier X?" via `atLeast(required)`, so a `PRO_CLOUD_AI` user automatically satisfies a `PRO` requirement. `displayName()` maps each value to its user-facing label.
+
+| Enum value | ordinal | `displayName()` | Owning RC entitlement (lookupKey) |
+| --- | --- | --- | --- |
+| `FREE` | 0 | Free | (none — no paid entitlement) |
+| `PRO` | 1 | Pro | `pro` |
+| `PRO_CLOUD` | 2 | Pro + Cloud | `pro_cloud` |
+| `PRO_CLOUD_AI` | 3 | Cloud + AI | `pro_cloud_ai` |
+
+Note that the top enum constant is `PRO_CLOUD_AI` but its `displayName()` is **"Cloud + AI"**, not "Pro + Cloud + AI".
+
+## The tier feature map
+
+The ~180-line plain block comment directly above the enum in `data/models/UserTier.kt` is the single source of truth for what feature belongs to which tier. Per the project's HARD RULE, this comment must be updated before any feature is added or removed. Because each tier is a strict superset of the one above it, a tier owns every feature in its own block plus everything in the blocks above it.
+
+| Tier | Representative features (see the KDoc for the exhaustive list) |
+| --- | --- |
+| `FREE` | Manual record (start/stop/pause/resume), interruption resilience, recordings list, playback (play/seek/rename/delete/share), categories, favorites, Trash (30-day), dark mode, Clerk profile picture, display name |
+| `PRO` | Import recordings + receive shared audio, Rolling Record mode, scheduled recordings, live marks, waveform, trim, notes, session detail (segment view/delete/trim/protect), audio-format settings, Quick Settings tiles, on-device transcription (Standard / Whisper) |
+| `PRO_CLOUD` | Google Drive backup, cross-device recording + trash access, semantic search (RR-487, server-side embeddings), cloud transcription (AssemblyAI, up to 8 hrs/mo), Medical Mode, Usage screen, free-up-cloud-space sheet |
+| `PRO_CLOUD_AI` | Cloud transcription raised to 20 hrs/mo, context cards (AI extraction, 30 hrs/mo), AI correction, AI/knowledge-base search, KB chat (Claude), custom extraction templates, context-architecture coaching |
+
+## How a tier is produced
+
+There is **no stored tier field** — the effective tier is derived from the user's RevenueCat entitlements at read time.
+
+- `RcEntitlement.resolveTier(customerInfo)` (`data/billing/RcEntitlement.kt`) picks the max-ordinal tier across the user's active RC entitlements; a null `CustomerInfo` (signed out or RC not yet fetched) resolves to `UserTier.FREE`, and unknown entitlement keys are ignored so a stale client build still resolves from what it knows.
+- `EntitlementRepository.currentTier` (`data/repository/EntitlementRepository.kt`) is the canonical live read — a `SharedFlow<UserTier>` that combines auth state, RC customer info, the cached last-known tier, and a debug override into one deduplicated stream that every tier-gated UI observes.
+
+See [Entitlements & RevenueCat](/rollingrecord/app/monetization/entitlements-revenuecat) for the full resolution pipeline.
+
+## `V2TierBadge`
+
+`V2TierBadge` (`ui/v2/components/V2TierBadge.kt`) renders the tier pill shown on the Account-settings header card and the Usage screen header card. It draws the tier's glyph (`ic_pro` / `ic_pro_cloud` / `ic_cloud_ai`; `FREE` has no icon) ahead of `tier.displayName()`, on the `tierBadgeBg` background. Sharing one composable keeps the pill identical across both surfaces.
+
+## Related pages
+
+- [Entitlements & RevenueCat](/rollingrecord/app/monetization/entitlements-revenuecat) — how RC entitlements map to tiers, plus the developer bypass.
+- [Feature Gating & Upsell](/rollingrecord/app/monetization/feature-gating) — the downgrade-aware access model built on `atLeast()`.
+- [Usage Metering & Caps](/rollingrecord/app/monetization/usage-metering) — per-tier monthly caps and the Usage screen.

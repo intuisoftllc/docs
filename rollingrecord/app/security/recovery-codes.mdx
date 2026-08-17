@@ -1,15 +1,55 @@
 ---
 title: "Recovery Codes"
-description: "One-time recovery codes and their role in DEK recovery."
+description: "The one-time 16-digit account-recovery credential generated at onboarding, argon2id-hashed server-side through a two-phase generate/acknowledge handshake — not part of the DEK key model."
 ---
 
-A recovery code issued at onboarding backs the account's key-recovery path.
+A recovery code is a secondary **account-auth** credential (RR-315): 16 digits shown as four groups of four, generated once per account at first sign-in and stored server-side as an argon2id hash. It is deliberately **not** part of the encryption key model — it never wraps, protects, or rewraps the DEK.
 
-## What this covers
+<Warning>
+There is no client "DEK rewrap on recovery" path. The DEK is unwrapped server-side from a KEK (`get-user-key`) and Keystore-wrapped locally (`DekKeyStore`); the recovery code is a pure account/identity-recovery credential hashed with argon2id on `canonical_users`. See [Security & Encryption Overview](/rollingrecord/app/security/overview) for the actual key model.
+</Warning>
 
-- `RecoveryCodeApi` / `RecoveryCodeApiClient` and models (`RecoveryCodeRequest`/`Response`, `AcknowledgeResponse`).
-- `V2RecoveryCodeSaveScreen` during onboarding and its role in DEK recovery.
+## The onboarding screen
+
+`V2RecoveryCodeSaveScreen` (`ui/v2/screens/onboarding/V2RecoveryCodeSaveScreen.kt`) is shown once per account, as a non-dismissible overlay immediately after the first sign-in for a fresh account — there is no back button and the system back is intercepted (`BackHandler`). Two states are driven by `code`: `null` shows a loading spinner with Continue disabled; non-null shows the full UI; `isError` shows a retry state. The 16-digit code renders as a monospace two-row block. The user can copy it to the clipboard or save it as a markdown file to Downloads (`saveMarkdownToDownloads` via `MediaStore.Downloads`, API 29+; API `< 29` returns false and the user falls back to Copy). An always-expanded warning card and an acknowledge checkbox gate the Continue button, which calls `onAcknowledged(displayCode)`.
+
+## Two-phase generate → acknowledge
+
+The flow is deliberately two-phase to survive a dropped network response, so the plaintext is never permanently hashed before the client is proven to have received it.
+
+| Operation | Server effect | Client result codes |
+| --- | --- | --- |
+| `generate` | Idempotent: stores the display code in `canonical_users.recovery_code_pending` and returns it (the same code on retry) | `200` `Success(recoveryCode)` / `409` `AlreadyExists` / `Failure` |
+| `acknowledge` | Compares the client code to `recovery_code_pending`; on match, argon2id-hashes it into `recovery_code_hash` and clears the pending column | `200` `Success` / `422` `Mismatch` / `409` `NotPending` / `Failure` |
+
+`generateRecoveryCode()` is idempotent — a retry after a network drop returns the same pending code — and `acknowledgeRecoveryCode(code)` proves delivery before the server permanently hashes. The client never hashes anything itself.
+
+## `RecoveryCodeApiClient`
+
+`RecoveryCodeApiClient` (`data/remote/recoverycode/RecoveryCodeApiClient.kt`) wraps `RecoveryCodeApi` on the shared `apiCall` pipeline. `generateRecoveryCode()` returns `Result.Success(recoveryCode)` / `AlreadyExists` (409) / `Failure(error)`; `acknowledgeRecoveryCode(code)` returns `AcknowledgeResult.Success` / `Mismatch` (422) / `NotPending` (409) / `Failure(error)`.
+
+`RecoveryCodeApi` (`data/remote/recoverycode/RecoveryCodeApi.kt`) is a Retrofit interface with a single Edge Function name, `FN_RECOVERY_CODE = "recovery-code"`. Both operations hit the same endpoint with an `operation` field in the body — `generate` returns `RecoveryCodeResponse`, `acknowledge` returns `AcknowledgeResponse` — riding the shared apikey / AppCheck / Bearer interceptor chain.
+
+The request and response DTOs (`data/remote/recoverycode/model/`):
+
+- `RecoveryCodeRequest` — `operation: String` plus `code: String?` (only for acknowledge); factories `generate()` and `acknowledge(code)`.
+- `RecoveryCodeResponse` — `@SerialName("recovery_code") recoveryCode: String`, returned only on a fresh 200 generation.
+- `AcknowledgeResponse` — `{ acknowledged: Boolean }`.
 
 <Note>
-Scaffold generated from the codebase map — expand with full detail, examples, and specifics.
+`RecoveryCodeResponse.kt`'s own doc-comment referencing a `recovery-code-generate` Edge Function is stale. The current function is the single operation-routed `recovery-code` endpoint (`RecoveryCodeApi.FN_RECOVERY_CODE`); the old one-shot `recovery-code-generate` was replaced in the revised RR-315.
 </Note>
+
+## Onboarding host in `V2App`
+
+`V2App` (`ui/v2/V2App.kt`) renders `V2RecoveryCodeSaveScreen` for the `V2OnboardingOverlay.RecoveryCode` variant. `onRetry` re-calls `generateRecoveryCode` (resetting to the loading state first). `onAcknowledged` calls `acknowledgeRecoveryCode`, treats `Success` **or** `NotPending` (already acknowledged server-side) as safe to proceed, then clears the DataStore flag via `deviceSettings.clearPendingRecoveryAckUserId()` and switches the user session with `sessionManager.switchTo(authUserId)`. Any other result is a genuine failure and leaves the overlay up so the user can tap Continue again.
+
+## Server hashing primitive
+
+For accuracy, the argon2id hashing happens **server-side** in `recovery_code.ts` (`supabase/functions/_shared/auth/recovery_code.ts`) during the acknowledge operation — the client never hashes. `generateRecoveryCode` samples uniform digits (rejecting bytes `>= 250` to avoid modulo bias), and `hashRecoveryCode` / `verifyRecoveryCode` use `hash-wasm` argon2id at 64 MiB memory, 3 iterations, single-threaded (`RECOVERY_CODE_LENGTH = 16`). The hash is stored on `canonical_users.recovery_code_hash`; `recovery_code_pending` holds the display plaintext only until acknowledged. None of this wraps the DEK.
+
+## Where to go next
+
+- [Security & Encryption Overview](/rollingrecord/app/security/overview) — the actual DEK key model this credential is distinct from
+- [PIN & Biometrics](/rollingrecord/app/security/pin-and-biometrics) — the App-Lock secret, a separate on-device credential
+- [Forgot PIN / PIN Reset](/rollingrecord/app/security/forgot-pin) — the email-OTP flow (also not the recovery code)

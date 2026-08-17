@@ -1,15 +1,59 @@
 ---
 title: "AI & Context Intelligence Overview"
-description: "The Cloud+AI feature set and the client/server content split."
+description: "Map of the app's Cloud+AI intelligence subsystem — KB chat, the shared agent loop, semantic search, the on-device embedding index, blueprints, tasks, synthesis, and moderation — with the client/server content split."
 ---
 
-The Cloud+AI tier adds context intelligence on top of recordings — extraction, chat, templates, and coaching — with AI-facing content carefully split between client and server.
+The Cloud+AI tier layers context intelligence on top of recordings and contexts: a conversational knowledge-base chat, on-device semantic search, server-produced embeddings stored and scored locally, extraction into context cards, synthesis, and client-side template moderation. Every piece of AI-facing content is deliberately placed on one side of the client/server line per the `HARD RULE — AI Content Placement`.
 
-## What this covers
+## The client / server split
 
-- The Cloud+AI feature set: context cards, KB chat, custom templates, coaching.
-- The server/client split of AI-facing content (`KnowledgeBaseAdvisor` tools client-side; prompts/blueprints server-side).
+The client owns the tool contract and the loop; the server owns behavioral prompts, model choice, and the round budget. Nothing is duplicated.
 
-<Note>
-Scaffold generated from the codebase map — expand with full detail, examples, and specifics.
-</Note>
+| Concern | Owner | Where |
+| --- | --- | --- |
+| kb_query tool definitions + usage instructions | Client | `KbToolSpec.definitions()` / `usageInstructions()` (`agentcore/.../data/repository/KbToolSpec.kt`) |
+| Focused-context scope block | Client | built from local state in `data/repository/KnowledgeBaseAdvisor.kt` |
+| Capabilities text + exhausted-round fallback prompts | Client | `KnowledgeBaseAdvisor.CAPABILITIES_DESCRIPTION`, `AgentLoop.FALLBACK_PROMPT_WRITE`/`FALLBACK_PROMPT_READ` |
+| System prompts, behavioral rules, model selection, round budget | Server | `ai-engine` Edge Function |
+| Extraction blueprint prompts (built-in IP) | Server | `ai-engine` blueprints |
+| Query / document embedding | Server | `search` + `indexing` Edge Functions (Cohere `embed-v4.0`) |
+
+The tool SPEC lives in `agentcore` (`KbToolSpec`, client-owned) while the tool DISPATCH lives in `KnowledgeBaseAdvisor.AndroidToolExecutor` (client). The agentic round loop itself lives in `agentcore` (`AgentLoop`), shared verbatim by the production app and the eval runner.
+
+## AI operations and their transport
+
+| Operation | Status | Client entry |
+| --- | --- | --- |
+| kb_query | live (inputs-only) | `KnowledgeBaseAdvisor.ask` → `AgentLoop` → `KbQuerySessionManager` |
+| extract / extract_preflight | retired from `ai-engine` | replaced by an async job (`extract-submit` / `extract-results`, run in `extract-runner`) |
+| synthesis | live (inputs-only) | `SynthesisInput` / `SynthesisResponse` via `ai-engine` |
+| query_expand / query_expand_hyde | live | `KnowledgeBaseSearchEngine.expandQuery` / `hydeSearch` |
+| search / indexing | live | `SearchApiClient.embedQuery` / `embedDocuments` |
+
+Synchronous extraction was retired from `ai-engine`; extraction is now an asynchronous server job. Synthesis (`SynthesisInput(sectionsJson, tasksJson, useDeepReasoning)` → `SynthesisResponse.digest`) remains a live `ai-engine` operation.
+
+## Embeddings are server-produced, on-device-scored
+
+The on-device embedding model was retired in RR-487. Vectors are produced SERVER-side (Cohere `embed-v4.0`, 1024-dim) by the `search` and `indexing` Edge Functions, then STORED and cosine-SCORED on-device against the unified `embeddings` table. Every semantic engine returns empty on any embed failure and its caller falls back to FTS/keyword search — search is never blocked by the embed call. See [Embeddings index & reconciliation](/rollingrecord/app/ai/embeddings-index).
+
+## Key symbols
+
+| Symbol | File | Role |
+| --- | --- | --- |
+| `KnowledgeBaseAdvisor` | `data/repository/KnowledgeBaseAdvisor.kt` | Client KB-chat driver: builds the scope block, tool defs, and per-turn `AndroidToolExecutor`; delegates the round loop to `AgentLoop`. |
+| `AgentLoop` | `agentcore/.../agentcore/AgentLoop.kt` | Shared pure-JVM agentic round loop; drives production KB chat and the eval runner. |
+| `KbToolSpec` | `agentcore/.../data/repository/KbToolSpec.kt` | Client-owned tool definitions (23 tools) + usage-instructions prose. |
+| `KnowledgeBaseSearchEngine` | `data/repository/KnowledgeBaseSearchEngine.kt` | Hybrid FTS + keyword + semantic search over context cards. |
+| `RecordingSemanticSearchEngine` | `data/repository/RecordingSemanticSearchEngine.kt` | Semantic search over recording-transcript chunks. |
+| `EmbeddingReconcileWorker` | `worker/EmbeddingReconcileWorker.kt` | Owns the WRITE side of the on-device `embeddings` index. |
+| `BlueprintModerationService` | `data/moderation/BlueprintModerationService.kt` | Client keyword pre-check before the server's authoritative Haiku moderation. |
+| `ContextBudget` | `agentcore/.../data/repository/ContextBudget.kt` | On-device meter of a context's extraction input-token budget. |
+
+## Where to go next
+
+- [Knowledge Base Chat](/rollingrecord/app/ai/knowledge-base-chat) — the KB-chat surface, its 23-tool dispatcher, proposals, and undo.
+- [Agent Loop & Tool Contract](/rollingrecord/app/ai/agent-loop) — the shared `AgentLoop`, round budget, and ports.
+- [Semantic & Keyword Search](/rollingrecord/app/ai/semantic-search) — the hybrid pipeline and margin filter.
+- [Embeddings Index & Reconciliation](/rollingrecord/app/ai/embeddings-index) — the unified table, reconciler, and bundle cache.
+- [Context Size Meter & Budget](/rollingrecord/app/ai/context-budget) — the on-device extraction-budget meter.
+- [Template Content Moderation](/rollingrecord/app/ai/content-moderation) — the client keyword pre-check for custom blueprints.

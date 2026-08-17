@@ -1,15 +1,90 @@
 ---
 title: "App Lock"
-description: "The lock overlay that gates the whole app."
+description: "The lifecycle-driven lock overlay (AppLockController + V2LockOverlay) that gates the whole app on background/foreground transitions and cold start, never mid-use."
 ---
 
-App Lock gates the entire app behind an overlay driven by a lifecycle-aware controller.
+App Lock (RR-492) draws a full-screen unlock overlay over the entire app whenever the account is locked. Locking is driven purely by lifecycle transitions — never mid-use — and the recording engine keeps running underneath it. The lock is a UI layer, not an encryption gate.
 
-## What this covers
+## `AppLockController` and `LockPhase`
 
-- `AppLockController`, `AppLockRepository`, `AppLockArmedCache`; `V2LockOverlay` / `V2LockOverlayViewModel` and `AppLockUi` hosting.
-- The arm/disarm lifecycle and how the overlay gates the whole app.
+`AppLockController` (`data/applock/AppLockController.kt`) is a process singleton — app-scoped so its state survives the per-user Koin scope teardown on sign-out and account switch. It exposes one flow, `phase: StateFlow<LockPhase>`, that the UI host consumes. Because App Lock settings are per-**user**, the session layer feeds the current account's snapshot in rather than the controller reaching into the user scope.
 
-<Note>
-Scaffold generated from the codebase map — expand with full detail, examples, and specifics.
-</Note>
+| Phase | When | UI shown |
+| --- | --- | --- |
+| `UNLOCKED` | Signed out, disabled, or unlocked this session | Normal app, fully interactive |
+| `RESOLVING` | Active session, cold-start settings snapshot still loading | Blocking frosted scrim (no keypad) — fail-closed, content blurred |
+| `LOCKED` | Signed-in + enabled + hasPin, triggered by lifecycle or cold start | `V2LockOverlay` (keypad / biometric / lockout countdown) |
+
+`RESOLVING` is the fail-closed window: a fast tap can't reach the local, no-auth content before the lock decision lands. The initial phase is seeded synchronously from `AppLockArmedCache` so a cold start never flashes interactive content.
+
+The controller is fed by the session and settings layers through: `onUserSignedIn(authUserId)`, `onFreshLogin()`, `onUserSignedOut()`, `updateSettings(enabled, autoLockMs)`, and `onUnlocked()`. Lifecycle hooks are `start()` / `stop()`, `onActivityStopped()` / `onActivityStarted()`, plus a `ProcessLifecycleOwner` observer and a `SCREEN_ON` / `SCREEN_OFF` `BroadcastReceiver`.
+
+## Lifecycle-driven locking
+
+The lock timer conceptually starts on login: a fresh sign-in never immediately locks. On entering background or screen-off the controller records `SystemClock.elapsedRealtime()`; on returning to foreground (or screen-on) it locks iff `enabled && signedIn` **and** the elapsed time is `>=` the auto-lock delay. A delay of `0` (Immediate) locks directly on background.
+
+Two things make this robust:
+
+- **Cold-start re-lock.** A force-quit + relaunch or a restored session re-locks unconditionally when the account is armed (the `coldStart` flag), so quitting the app can't bypass the lock. `onFreshLogin()` exempts a genuine interactive login.
+- **Never mid-use.** The `coldStart` flag is consumed by the first settings snapshot of a session, so a later mid-session change — first-time PIN setup, or the server sync flipping `enabled` on — can never trigger the cold-start re-lock. Enabling App Lock while actively using the app arms the *next* background/foreground cycle; it doesn't slam the lock over the settings page the user is standing on.
+
+The lock decision gates on `enabled` only. App Lock is "enabled" only when a PIN is set, so `enabled` implies a PIN; the PIN verifier (which syncs from the server and can lag) is used solely to verify an entered PIN, never to decide whether to show the lock.
+
+### `MainActivity` drives the controller directly
+
+`MainActivity.onStop` / `onStart` call `appLockController.onActivityStopped()` / `onActivityStarted()` directly, in addition to the `ProcessLifecycleOwner` path. This is load-bearing: `ProcessLifecycleOwner` debounces `ON_STOP` by ~700ms, which made "Immediate" auto-lock silently miss a brief background + return. The activity callbacks fire immediately (the single activity is portrait-locked, so there are no rotation-recreate false triggers), and the two paths are idempotent — the background timestamp is consumed once and locking is guarded by the current phase.
+
+## `AppLockArmedCache`
+
+`AppLockArmedCache` (`data/applock/AppLockArmedCache.kt`) is a per-account, synchronously-readable `SharedPreferences` cache (`app_lock_armed_prefs`) of whether an account has App Lock **armed** (enabled + PIN). It is the only App Lock state available before the async per-user DataStore snapshot loads, so the controller seeds its initial `LockPhase` from it. `seedLocked()` returns the fail-closed initial phase; `setActiveUser` / `clearActiveUser` maintain a `last_active_user` pointer (the user isn't known at process construction), and `setArmed(userId, armed)` caches each account's armed state independently.
+
+## Auto-lock delay presets
+
+The delay is chosen in `V2AutoLockSheet` (`ui/v2/screens/security/components/V2AutoLockSheet.kt`) and rendered on the Security row via `autoLockLabel`.
+
+| Label | Millis |
+| --- | --- |
+| Immediate | `0` (locks directly on background) |
+| 30 seconds | `30000` |
+| 1 minute | `60000` (`DEFAULT_APP_LOCK_AUTO_LOCK_MS`) |
+| 5 minutes | `300000` |
+| 10 minutes | `600000` |
+| 30 minutes | `1800000` |
+| 1 hour | `3600000` |
+
+## Auto-lock suppression
+
+`setAutoLockSuppressed(Boolean)` temporarily disables auto-lock for windows where locking would be self-defeating. It is in-memory only, so a process death drops it and the cold-start re-lock still applies.
+
+| Site | Why |
+| --- | --- |
+| `V2OtpCodeStep` (`ui/v2/components/V2OtpCodeStep.kt`) | Fetching the emailed OTP requires leaving the app; locking on return would dismiss the very sheet the user must finish — an unresolvable loop |
+| `V2RecordingScreen` | Active recording — never lock mid-use |
+
+A Compose `DisposableEffect` flips suppression on while the step is shown and off when it leaves, so the unlock window lasts only that long.
+
+## `V2LockOverlay`
+
+`V2LockOverlay` (`ui/v2/screens/security/lock/V2LockOverlay.kt`) is the full-screen unlock UI drawn over the blurred app while `phase == LOCKED`. It is a frosted scrim (`V2Theme.colors.lockScrim`) that consumes all touches and the system back button. Layout: a masked account badge top-left, a red logout affordance top-right, a centered `V2PinKeypad` (or `LockoutContent` countdown while timed out), and "Need help?" / "Forgot PIN?" links pinned to the bottom.
+
+The biometric sheet runs at the `FragmentActivity`; the overlay requests it via `onRequestBiometric` and feeds the result back to the VM. A declarative reconciler decides "should the sheet be showing?" against "is it showing?" — the sheet re-offers itself once per foreground stint (`episodeAnswered` resets on every `ON_RESUME`), `SystemCancelled` results retry up to a cap of 3, and a 250ms settle delay avoids the keyguard-dismiss animation stealing the prompt. The overlay takes `onLogout`, `onNeedHelp`, `onForgotPin`, `onRequestBiometric`, `biometricSuppressed`, and `onCancelBiometric`.
+
+### `V2LockOverlayViewModel`
+
+`V2LockOverlayViewModel` (`ui/v2/screens/security/lock/V2LockOverlayViewModel.kt`) drives the keypad. It owns the transient PIN buffer (never surfaced — only its length reaches the UI), the `TITLE` ⇄ `DOTS` ⇄ `ERROR` status swap (`LockTop`), biometric results, and a live lockout countdown derived from `AppLockRepository.lockoutUntil`. Its entry points are `onDigit` / `onDelete` / `onOk` / `onBiometricResult`. On a correct PIN it calls `AppLockController.onUnlocked()` and lets the host dismiss via the phase flow — it never signals dismissal directly. Crucially, it resolves its user-scoped dependencies at **use** time through `UserSessionManager.currentScope` (never captured at construction), so the Activity-cached VM survives sign-out/sign-in of the same account. `UNLOCK_VERIFY_TIMEOUT_MS` (8000) bounds a cold-start unlock whose DEK leg falls through to a network fetch, so the OK tap can never look silently dead. `abbreviateAccountLabel()` masks the email badge.
+
+### `V2PinKeypad`
+
+`V2PinKeypad` (`ui/v2/screens/security/lock/V2PinKeypad.kt`) is the custom numeric keypad — it **never** raises the OS keyboard (a locked device shows only this pad). A 3×4 grid renders 1–9 then DELETE · 0 · OK; OK is inert until `okEnabled` (length 4–6), and the fingerprint button appears only when `showBiometric`. It is purely presentational, routing `onDigit` / `onDelete` / `onOk` / `onBiometric` out to the VM. `V2PinDots` renders the filled-of-6 dot row.
+
+## Hosting and lock-aware surfaces
+
+`V2App` (`ui/v2/V2App.kt`) hosts the overlay: it injects `AppLockController`, collects `phase`, blurs `V2MainNavHost` by 20dp when `appLocked || resolvingLock`, renders the `RESOLVING` shield scrim, and draws `V2LockOverlay` when `appLocked && sessionActive`. It wires `onRequestBiometric` to `AppLockBiometricGate.current`, sets `biometricSuppressed = showForgotPin || showLockLogoutConfirm`, and hosts `V2ForgotPinFlow` above the lock.
+
+Any surface that renders in its own window can react to the same signal via `AppLockUi` (`ui/v2/components/AppLockUi.kt`): `rememberAppLocked(): Boolean` observes `AppLockController.phase == LOCKED` inside composition and backs `V2ModalBottomSheet` / `V2AlertDialog`, while `DismissOnAppLock` dismisses a raw `Dialog` the instant App Lock engages so it can't float over the lock.
+
+## Where to go next
+
+- [PIN & Biometrics](/rollingrecord/app/security/pin-and-biometrics) — the DEK-sealed verifier, biometric gate, and lockout backoff
+- [Forgot PIN / PIN Reset](/rollingrecord/app/security/forgot-pin) — the reset flow reached from the overlay
+- [Security & Encryption Overview](/rollingrecord/app/security/overview) — where App Lock sits in the wider subsystem

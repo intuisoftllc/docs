@@ -1,16 +1,103 @@
 ---
 title: "PIN & Biometrics"
-description: "PIN verification, lockout backoff, and biometric unlock."
+description: "The App-Lock PIN (a DEK-sealed PBKDF2 verifier, never the PIN itself), offline verification, biometric unlock, lockout backoff, and cross-device PIN sync on user_crypto."
 ---
 
-App Lock unlocks with a PIN or biometrics, with lockout backoff and a synced PIN verifier.
+The App Lock secret is a 4–6 digit PIN that is **never stored** — only a one-way, DEK-sealed verifier is. Verification is fully offline, and the verifier plus the auto-lock delay sync across a user's devices with last-write-wins.
 
-## What this covers
+## The verifier: `AppLockVerifier`
 
-- `AppLockCrypto` and `AppLockVerifier` (crypto module) PIN verification; `PinLockoutPolicy` backoff.
-- `AppLockBiometricGate` / `BiometricHelper`; `V2PinEntryScreen` / `V2PinKeypad` UI.
-- Remote PIN registration: `SetUserPinApi` / `SetUserPinApiClient`.
+`AppLockVerifier` (`app/crypto/AppLockVerifier.kt`) builds the verifier in the pure-JVM `app/crypto` module, alongside every other client-side crypto primitive. A 6-digit PIN is low entropy, so it gets two layers:
 
-<Note>
-Scaffold generated from the codebase map — expand with full detail, examples, and specifics.
-</Note>
+1. **PBKDF2-HMAC-SHA256** stretch — `ITERATIONS = 120_000`, a 16-byte random salt (`SALT_LEN`), 32-byte output (`HASH_LEN`) — producing a `salt || hash` blob so a leaked verifier never reveals the PIN directly.
+2. That blob is **AES-256-GCM sealed with the user's DEK** via `encryptBytes` (a 12-byte IV, the same envelope used for synced columns), so a leak of just the ciphertext is useless without the DEK.
+
+`buildVerifier(pin, dek)` returns an `EncryptedField`; `verify(pin, ciphertext, iv, dek)` decrypts the blob, re-runs PBKDF2 over the entered PIN, and compares constant-time via `MessageDigest.isEqual` — no early-exit timing leak. Verification is fully offline because the session DEK is always resolvable before any locked UI can render.
+
+`AppLockCrypto` (`data/applock/AppLockCrypto.kt`) is only a thin base64 boundary around it — `buildVerifier(pin, dek)` returns an `EncryptedVerifier(ctB64, ivB64)` and `verify(pin, ctB64, ivB64, dek)` decodes back — mirroring how `SyncTransformHelpers` wraps `EnvelopeCrypto`. No crypto logic lives in the app layer.
+
+## `AppLockRepository`
+
+`AppLockRepository` (`data/applock/AppLockRepository.kt`) is the user-session-scoped owner of the PIN lifecycle and verifier state — it rebuilds on every sign-in / account switch alongside `UserSettingsDataSource` and `SessionDekHolder`. It exposes reactive flows `isEnabled`, `hasPin`, `biometricEnabled`, `autoLockMs`, `failedAttempts`, and `lockoutUntil`, and drives:
+
+- `setPin(pin)` — builds a fresh DEK-sealed verifier, caches it locally **first** (the local cache is the source of truth for whether the lock works on this device), sets `enabled`, then best-effort pushes to the server. Fails without enabling when the DEK is unavailable.
+- `verifyPin(pin)` — a pure offline check with no side effects.
+- `attemptUnlock(pin)` — the overlay's entry point: honors an active lockout, verifies, and applies `PinLockoutPolicy` on failure. Returns `UnlockResult.Success` / `Wrong(lockedUntil)` / `LockedOut(until)`.
+- `changePin(current, new)` — verifies the current PIN, then replaces it.
+- `disableAndClear(otpTicket)` / `clearPinForReset(otpTicket)` — OTP-gated removal (see below).
+- `refreshFromServer()` — the cross-device reconcile (see below).
+
+## Offline-first, server-synced
+
+The verifier and the auto-lock delay sync across the user's devices via the `user_crypto` table. `pushToServer` calls `SetUserPinApiClient` when online; when offline it marks the change pending, and `setPin` still succeeds locally immediately. `refreshFromServer()` reconciles local and server state using the **server-assigned** last-write-wins marker `pin_updated_at`, with a 60s throttle (`REFRESH_THROTTLE_MS`) after each successful fetch; a pending local change bypasses the throttle so it is never starved. A failed fetch never stamps the throttle window, so it keeps retrying.
+
+| Column | Type | Meaning |
+| --- | --- | --- |
+| `pin_verifier_ct` | `BYTEA` | AES-256-GCM DEK-sealed PBKDF2 verifier ciphertext; `NULL` = no PIN (paired-NULL `CHECK` with the iv) |
+| `pin_verifier_iv` | `BYTEA` | 12-byte IV for `pin_verifier_ct` |
+| `pin_settings` | `JSONB` | Non-encrypted synced settings, e.g. `{"auto_lock_ms": 0}` |
+| `pin_updated_at` | `TIMESTAMPTZ` | Server-assigned last-write-wins marker; `NULL` on legacy rows (client treats as `0`) |
+
+The verifier rides along on the `get-user-key` response (`UserKeyFetchResult.Success` carries `pinVerifierCt` / `pinVerifierIv` / `pinAutoLockMs` / `pinUpdatedAt`), so the PIN reconcile reuses the same fetch as the DEK.
+
+## `SetUserPinApiClient`
+
+`SetUserPinApiClient` (`data/remote/userpin/SetUserPinApiClient.kt`) is the typed client for the `set-user-pin` Edge Function. `setPin(ctB64, ivB64, autoLockMs)` writes the verifier pair and returns the server's LWW stamp (`Result<Long?>`); `clearPin(otpTicket)` sends explicit JSON `null`s plus the `otp_ticket` to tombstone the verifier. The body is built with the kotlinx JSON DSL — not a serializer-bound DTO — because the server distinguishes "clear" (explicit null) from "absent" and the shared `Json` instances drop nulls. A write failure is a **soft** failure: the PIN still works locally.
+
+Clearing the PIN is a security-control removal, so it is gated on a single-use OTP ticket and the server verifier is cleared **first**, before any local mutation. A rejected or expired ticket leaves the PIN fully intact locally — the device can never end up unlocked while the server (and the user's other devices) still hold the PIN.
+
+## Biometrics
+
+Two components cooperate, sharing one error mapping so the user-vs-system cancel distinction can never drift.
+
+- `BiometricHelper` (`data/applock/BiometricHelper.kt`) — a one-shot suspend prompt used by the Security screen's enable-confirm. `isAvailable(context)` checks for an enrolled `BIOMETRIC_STRONG` or `BIOMETRIC_WEAK`. A single non-matching read does not resolve; the system sheet stays up for a retry.
+- `AppLockBiometricGate` (`data/applock/AppLockBiometricGate.kt`) — the lock overlay's biometric path. It is **one** long-lived `BiometricPrompt` created in `MainActivity.onCreate` via `install(activity)` and reused for every unlock (companion `current`). This is load-bearing: androidx `BiometricPrompt` is designed around a single early-created instance, and `authenticate()` called while the FragmentManager state is saved is a silent no-op. The gate queues launches made before `RESUMED` and fires them at `ON_RESUME`; `authenticate(onResult)` is idempotent while in-flight (a repeat request only re-points the callback, never relaunches), and `cancel()` abandons a showing or queued prompt with no result.
+
+`mapBiometricError` classifies the terminal outcome:
+
+| Variant | Meaning | Caller action |
+| --- | --- | --- |
+| `Success` | Authenticated | Unlock |
+| `Cancelled` | User dismissed the sheet (Cancel / back / negative button) | Fall back to PIN silently; do **not** re-prompt |
+| `SystemCancelled` | Framework killed the prompt (pre-`RESUMED` launch, keyguard race, sensor stolen) | Retryable — the overlay re-arms its auto-prompt, capped at 3 per foreground stint |
+| `Error(message)` | Genuine failure (lockout, hardware) | Show the system message |
+
+## Lockout backoff: `PinLockoutPolicy`
+
+`PinLockoutPolicy` (`data/applock/PinLockoutPolicy.kt`) is the non-configurable escalation. As lockouts stack, the allowed attempts **tighten** and the wait **grows** (`BACKOFF_SCHEDULE_MS = [30s, 1m, 2m, 5m]`, last value repeats). The tier is the number of lockouts already served; a correct PIN, biometric unlock, or reset clears both the running attempt count and the tier. `AppLockRepository` persists the count, tier, and deadline so a force-quit can't clear them.
+
+| Trigger | Lockout tier → wait | Attempts before next lockout |
+| --- | --- | --- |
+| 10 consecutive wrong PINs | 1st → 30s | then 3 allowed |
+| 3 more wrong | 2nd → 1m | then 3 allowed |
+| 3 more wrong | 3rd → 2m | then 3 allowed |
+| 3 more wrong | 4th → 5m (cap) | then 1 allowed |
+| 1 more wrong | 5th+ → 5m (capped) | 1 allowed each |
+
+## Setting and changing the PIN
+
+`V2PinEntryScreen` (`ui/v2/screens/security/V2PinEntryScreen.kt`) is the reusable full-screen entry for SET / CONFIRM / CHANGE (and the reset flow). Unlike the lock overlay's custom pad, it uses the **system** numeric keyboard via a hidden, auto-focused `BasicTextField` (`NumberPassword`, 4–6 digits). Up to six dots reflect entry, a Continue button appears at 4 digits, and a spinner shows while saving; `clearSignal` resets the buffer, and `topInset` handles the scaffold-less reset host.
+
+`V2SecurityScreen` / `V2SecurityViewModel` (`ui/v2/screens/security/`) host it. The Security screen (all tiers) has an App-Lock master toggle (ON → the Set-PIN flow, OFF → the OTP-gated `V2DisableAppLockSheet`), side-by-side Fingerprint + PIN method cards, and the auto-lock row. The ViewModel projects `SecurityUiState` from the repository flows and runs the SET/CHANGE state machine (`PinFlowMode` SET/CHANGE, `PinStep` CURRENT/NEW/CONFIRM, `PinError`, `SecurityEvent`); `disableWithTicket(otpTicket)` consumes the OTP ticket for turn-off.
+
+## DataStore keys
+
+`UserSettingsDataSource` (`data/local/UserSettingsDataSource.kt`) holds the per-user App Lock state:
+
+| Key | Type | Purpose |
+| --- | --- | --- |
+| `app_lock_enabled` | Boolean | Master toggle (also the sole lock signal) |
+| `app_lock_biometric_enabled` | Boolean | Device-specific biometric preference |
+| `app_lock_auto_lock_ms` | Long | Auto-lock delay (`DEFAULT_APP_LOCK_AUTO_LOCK_MS = 60000`) |
+| `app_lock_pin_ct` / `app_lock_pin_iv` | String | Base64 verifier (exposed as `appLockPinVerifier: Pair(ct, iv)?`) |
+| `app_lock_failed_attempts` | Int | Running wrong-PIN count |
+| `app_lock_pin_pending_sync` | Boolean | A local change not yet pushed to the server |
+| `app_lock_pin_updated_at` | Long | Last-seen server LWW marker |
+| `app_lock_lockout_tier` | Int | Lockouts already served |
+| `app_lock_lockout_until` | Long | Wall-clock lockout deadline |
+
+## Where to go next
+
+- [App Lock](/rollingrecord/app/security/app-lock) — the lock overlay and lifecycle state machine that consume the verifier
+- [Forgot PIN / PIN Reset](/rollingrecord/app/security/forgot-pin) — the OTP-gated reset that clears and replaces the PIN
+- [Security & Encryption Overview](/rollingrecord/app/security/overview) — the DEK the verifier is sealed with

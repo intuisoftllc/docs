@@ -1,15 +1,78 @@
 ---
 title: "Background Work (WorkManager)"
-description: "The WorkManager worker inventory and session scoping."
+description: "The WorkManager worker inventory, the schedulers that drive sync and indexing, and per-user work-tag session scoping."
 ---
 
-Long-running work runs through WorkManager, with every worker session-scoped to the signed-in user.
+Almost every worker is a plain `CoroutineWorker` + `KoinComponent` instantiated by WorkManager's default factory — there is no custom `WorkerFactory`. Those workers resolve their dependencies from Koin via `userInject()` / `inject()`, so a session switch changes which user's dependencies they see. The exception is `WaveformExtractionWorker`, which is a bare `CoroutineWorker` (no `KoinComponent`) and resolves nothing from Koin — it uses the static `WaveformExtractor` / `WaveformCache`. Only the schedulers are wired in DI; the workers are not.
 
-## What this covers
+## `WorkerModule`
 
-- Full worker inventory: `TranscriptionWorker`, `ContextExtractionWorker`, `ContextSynthesisWorker`, `MergeWorker`, `WaveformExtractionWorker`, `EmbeddingReconcileWorker`, the Sync / AudioSync / CloudPrefetch workers, and the scheduled-recording workers.
-- `WorkerModule` wiring and `UserWorkTag` session scoping.
+`workerModule` (`di/WorkerModule.kt`) registers the `WorkManager` process singleton plus four app-scoped schedulers — and nothing else:
 
-<Note>
-Scaffold generated from the codebase map — expand with full detail, examples, and specifics.
-</Note>
+- `SyncScheduler`
+- `AudioSyncScheduler`
+- `CloudPrefetchScheduler`
+- `EmbeddingReconcileScheduler`
+
+These are app-scoped `single {}` rather than user-scoped because WorkManager is itself a process singleton; each scheduler reads the live user from `UserSessionManager` on every call, so a sign-in/out cycle needs no rebinding. The worker classes themselves are never registered here.
+
+## Per-user work tags
+
+`UserWorkTag` (`data/session/UserWorkTag.kt`) is the mechanism that keeps one user's background work from touching another's. Every enqueue calls `.addUserTag(...)` immediately before `.build()`, stamping a tag of the form `user_{authUserId}` (`user_anonymous` when signed out). The extension functions come in two overloads — `.addUserTag(context)` (resolves via `AuthUserStore`) and `.addUserTag(manager: UserSessionManager)`.
+
+On sign-out, `UserSessionManager.switchTo()` calls `WorkManager.cancelWorkForUser(userId)` — a thin wrapper over `cancelAllWorkByTag` — **before** the Koin scope closes, so any worker mid-execution loses its DI reference before it can write back to the now-closed per-user database, and only the outgoing user's work is cancelled.
+
+## Worker inventory
+
+| Worker | File | Enqueued by | Tier gate | Foreground channel |
+| --- | --- | --- | --- | --- |
+| `SyncWorker` | `data/sync/SyncWorker.kt` | `SyncScheduler` (periodic 30m + one-shot) | Pro+Cloud | none |
+| `AudioSyncWorker` | `data/sync/audio/AudioSyncWorker.kt` | `AudioSyncScheduler` (periodic 60m + one-shot) | Pro+Cloud | none |
+| `CloudPrefetchWorker` | `data/sync/audio/CloudPrefetchWorker.kt` | `CloudPrefetchScheduler` (periodic 6h + one-shot + chain) | Pro+Cloud | none |
+| `EmbeddingReconcileWorker` | `worker/EmbeddingReconcileWorker.kt` | `EmbeddingReconcileScheduler` (targeted + all-sweep) | Pro+Cloud | none |
+| `TranscriptionWorker` | `worker/TranscriptionWorker.kt` | transcribe flow / `MergeWorker` / `ContextExtractionWorker` | server-enforced | `transcription_channel` |
+| `ContextExtractionWorker` | `worker/ContextExtractionWorker.kt` | extraction flow (`enqueue` / `enqueueAttach`) | server-enforced | none |
+| `ContextSynthesisWorker` | `worker/ContextSynthesisWorker.kt` | on context `COMPLETED` | server-enforced | `context_synthesis_channel` |
+| `MergeWorker` | `worker/MergeWorker.kt` | continue-recording flow (`RecordingService.stopRecording`) / orphan-merge recovery (`App.kt`) | — | `merge_channel` |
+| `WaveformExtractionWorker` | `worker/WaveformExtractionWorker.kt` | after a recording is saved | — | none |
+| `PreStartNotificationWorker` | `worker/PreStartNotificationWorker.kt` | scheduled-recording pre-start (secondary) | Pro | `schedule_reminders` |
+| `ScheduledRecordingStartWorker` | `worker/ScheduledRecordingStartWorker.kt` | scheduled fire (secondary to alarms) | Pro (backstop) | none |
+| `ScheduledRecordingStopWorker` | `worker/ScheduledRecordingStopWorker.kt` | `ScheduledRecordingStartWorker` | — | none |
+
+## Cloud sync schedulers
+
+The three cloud workers are gated on `tier.atLeast(PRO_CLOUD)` in each scheduler's `shouldSync()` (re-evaluated on every call, so a tier upgrade takes effect on the next scheduling decision), and honor the `syncWifiOnly` device preference by choosing `NetworkType.UNMETERED` vs `NetworkType.CONNECTED`. Periodic requests use `ExistingPeriodicWorkPolicy.UPDATE`.
+
+| Scheduler | Periodic interval / flex | Extra constraints | Notes |
+| --- | --- | --- | --- |
+| `SyncScheduler` (`data/sync/SyncScheduler.kt`) | 30 min / 10 min | battery-not-low (periodic); one-shot expedited, network-only | Metadata sync; one-shot uses `REPLACE` |
+| `AudioSyncScheduler` (`data/sync/audio/AudioSyncScheduler.kt`) | 60 min / 15 min | battery-not-low + storage-not-low | Audio uploads; non-expedited one-shot |
+| `CloudPrefetchScheduler` (`data/sync/audio/CloudPrefetchScheduler.kt`) | 6 h / 2 h | battery-not-low + storage-not-low | Cloud-only blob prefetch; `chainContinuation` drains a backlog |
+
+`SyncWorker` is deliberately thin: it runs `SyncEngine.sync()`, rethrows `CancellationException`, and maps any other failure to `Result.retry` so WorkManager's exponential backoff (from 30s) replays it. Its unique names are `rr_sync_periodic` / `rr_sync_oneshot` under tag `rr_sync`; the audio worker mirrors this with `rr_audio_sync_periodic` / `rr_audio_sync_oneshot` / `rr_audio_sync`. `CloudPrefetchWorker` walks up to `MAX_CANDIDATES_PER_RUN = 200` cloud-only rows and pauses when device free space drops below `SAFETY_FLOOR_BYTES` (1 GB); when it fills a full batch it calls `chainContinuation()` (`APPEND_OR_REPLACE`) so a large backlog drains continuously instead of waiting for the 6-hour periodic.
+
+One-shot expedited requests (`SyncScheduler.triggerNow`) must omit `setRequiresBatteryNotLow` because WorkManager rejects expedited jobs that carry anything beyond network and storage constraints.
+
+## `EmbeddingReconcileScheduler`
+
+`EmbeddingReconcileScheduler` (`worker/EmbeddingReconcileScheduler.kt`) drives `EmbeddingReconcileWorker`, which reconciles the on-device `embeddings` table against current transcript/context content via the server-side `indexing` Edge Function. Semantic search is a Pro+Cloud feature and each embed costs money, so `eligible()` gates every enqueue on signed-in AND `tier.atLeast(PRO_CLOUD)`.
+
+| Method | Scope | Policy |
+| --- | --- | --- |
+| `reconcileRecording(recordingId)` | `SCOPE_RECORDING` | `REPLACE` |
+| `reconcileContext(contextId)` | `SCOPE_CONTEXT` | `REPLACE` |
+| `reconcileAll()` | `SCOPE_ALL` | `KEEP` (startup safety-net sweep) |
+
+All three enqueue through `enqueueUniqueWork` under tag `embedding_reconcile` with a `NetworkType.CONNECTED` constraint and exponential backoff from 30s. `EmbeddingReconcileWorker` reads `KEY_SCOPE` / `KEY_ID`, batches at `MAX_BATCH = 96`, and treats `STATUS_DONE` content as eligible. `TranscriptionWorker` calls `reconcileRecording` after a transcript lands.
+
+## Content workers
+
+- **`TranscriptionWorker`** drives server-side transcription through `AiEngineClient`. It reads `KEY_RECORDING_ID` / `KEY_IS_RETRANSCRIBE`, runs as an expedited `dataSync` foreground service via `getForegroundInfo()`, and carries a polling ramp bounded by `MAX_POLL_DURATION_MS` and a hard `MAX_TOTAL_WORK_MS` wall-clock ceiling. Companion: `CHANNEL_ID = "transcription_channel"`, `NOTIF_ID = 20001`, `ALL_TAG = "transcription_all"`, `QUEUE_NAME = "transcription_queue"`, and `tag(recordingId)`.
+- **`ContextExtractionWorker`** drives one server-side context extraction (gather → plan → submit → poll → apply → ack). Its client-generated `KEY_JOB_ID` (`"extraction_job_id"`) survives process death, so a killed run re-attaches — a resent id can only resolve to `Queued` (the row was never created) or `AlreadyRunning` carrying that same id. It queues onto a single global chain (`QUEUE_NAME = "context_extraction_queue"`, `ALL_TAG`) via `enqueue()` / `enqueueAttach()` with `APPEND_OR_REPLACE`, and carries error-message constants (`CAP_ERROR_MESSAGE`, `CONTEXT_FULL_ERROR_MESSAGE`, `CONTEXT_TOO_LARGE_ERROR_MESSAGE`, plus network / unrecoverable sentinels). Extraction runs server-side; the worker only submits, polls, applies, and acks.
+- **`ContextSynthesisWorker`** runs once when a context completes, distilling its sections and tasks into a bounded digest via `AiEngineClient` (the server owns prompt, model, and `max_tokens`; the client always requests deep reasoning). Companion: `KEY_CONTEXT_ID`, `CHANNEL_ID = "context_synthesis_channel"`, `NOTIF_ID_OFFSET = 40000`, `tag(id)`.
+- **`MergeWorker`** is a `dataSync` foreground worker (via the merged `SystemForegroundService` manifest entry) that merges a continuation recording segment onto the original via `AudioMerger.merge(firstPath=original, secondPath=continuation)` and swaps the result onto the original recording row, then re-enqueues `TranscriptionWorker` for the merged file **only when the user's auto-transcribe setting is on** — `applyPostMergeSideEffects()` gates `reTranscribe()` on `settingsRepository.autoTranscribe.first()`. It enqueues with `ExistingWorkPolicy.KEEP` under `tag(originalId)` and carries many `KEY_NEW_*` inputs plus `KEY_PROGRESS`; `WORKER_TAG = "merge_worker"`, `CHANNEL_ID = "merge_channel"`, `NOTIF_ID_OFFSET = 10000`.
+- **`WaveformExtractionWorker`** generates a recording's waveform after it is saved. Companion: `KEY_FILE_PATH = "filePath"`, `WORK_NAME_PREFIX = "waveform_extract_"`, `MAX_ATTEMPTS = 3`, with `enqueue(context, recordingId, filePath)`.
+
+## Scheduled-recording workers
+
+`ScheduledRecordingStartWorker` and `ScheduledRecordingStopWorker` are a secondary WorkManager fire path for schedules — the primary mechanism is `AlarmManager` exact alarms via `ScheduleAlarmReceiver` and `ScheduleEnqueuer` (see [Broadcast Receivers](/rollingrecord/app/platform/receivers)). The start worker enforces the same Pro-tier backstop (`tier.atLeast(UserTier.PRO)`), stops active playback, starts `RecordingService` with `ACTION_START` in `MANUAL` mode, sets the recording name, and enqueues a `ScheduledRecordingStopWorker` after `durationMs`. Both share `KEY_SCHEDULE_ID = "schedule_id"` and the `startTag` / `stopTag` / `notifyTag` helpers; the stop worker sends `ACTION_STOP` and disables `ONCE` or re-enqueues recurring schedules. `PreStartNotificationWorker` posts the secondary pre-start reminder (see [Notifications](/rollingrecord/app/platform/notifications)).

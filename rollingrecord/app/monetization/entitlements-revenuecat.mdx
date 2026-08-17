@@ -1,15 +1,80 @@
 ---
 title: "Entitlements & RevenueCat"
-description: "Mapping RevenueCat entitlements to tiers, and purchase flow."
+description: "The RcEntitlement taxonomy, effective-tier resolution, the developer bypass, and the RevenueCatManager SDK wrapper."
 ---
 
-RevenueCat entitlements are resolved into tiers and drive the purchase flow.
+RevenueCat is the entitlement authority. A single enum defines every entitlement the client understands, a thin manager wraps the process-wide SDK singleton, and a session-scoped repository turns entitlements into an effective tier while guarding against the SDK reporting a different user's purchases.
 
-## What this covers
+## `RcEntitlement`
 
-- `RevenueCatManager`, `EntitlementRepository`, `RcEntitlement` mapping RC entitlements to tiers.
-- Purchase flow results: `PurchaseFlowResult`, `PurchaseGuardResult`; developer-entitlement bypass semantics.
+`RcEntitlement` (`data/billing/RcEntitlement.kt`) is the single source of truth for the RC entitlement taxonomy on Android and a mirror of `supabase/functions/_shared/billing/entitlements.ts` — when one changes, the other must too. Every reference to an RC entitlement `lookupKey` goes through this enum; no entitlement key is string-literalled anywhere else. Each member carries `lookupKey`, `displayName`, `tier`, `kind`, `hasSku`, `description`, and `bypassesCaps` (default false).
 
-<Note>
-Scaffold generated from the codebase map — expand with full detail, examples, and specifics.
-</Note>
+| Member | `lookupKey` | `tier` | `kind` | `hasSku` | `bypassesCaps` |
+| --- | --- | --- | --- | --- | --- |
+| `PRO` | `pro` | `PRO` | `RECURRING_SUB` | true | false |
+| `PRO_CLOUD` | `pro_cloud` | `PRO_CLOUD` | `RECURRING_SUB` | true | false |
+| `PRO_CLOUD_AI` | `pro_cloud_ai` | `PRO_CLOUD_AI` | `RECURRING_SUB` | true | false |
+| `LIFETIME_PRO` | `lifetime_pro` | `PRO` | `INTERNAL_LIFETIME` | false | false |
+| `LIFETIME_PRO_CLOUD` | `lifetime_pro_cloud` | `PRO_CLOUD` | `INTERNAL_LIFETIME` | false | false |
+| `LIFETIME_PRO_CLOUD_AI` | `lifetime_pro_cloud_ai` | `PRO_CLOUD_AI` | `INTERNAL_LIFETIME` | false | false |
+| `FOUNDERS_EDITION` | `founders_edition` | `PRO` | `PUBLIC_LIFETIME` | true | false |
+| `DEVELOPER` | `developer` | `PRO_CLOUD_AI` | `INTERNAL_OPS` | false | true |
+
+`RcEntitlement.Kind` distinguishes the four acquisition paths: `RECURRING_SUB` (sold monthly/yearly subs), `INTERNAL_LIFETIME` (comp/employee grants, never sold), `PUBLIC_LIFETIME` (the publicly-sold Founders Edition lifetime), and `INTERNAL_OPS` (the developer grant).
+
+### Companion helpers
+
+- `fromLookupKey(key)` resolves an entitlement by its `lookupKey`, or null if the key is unknown to this client build.
+- `LIFETIME_LOOKUP_KEYS` is the set of all internal + public lifetime keys (includes `founders_edition`).
+- `resolveTier(customerInfo)` returns the max-ordinal tier across the user's active entitlements — mirroring the server-side cascade — with unknown keys ignored and a null `CustomerInfo` mapping to `UserTier.FREE`.
+
+## Developer bypass
+
+`bypassesCaps` is true on `DEVELOPER` only. Per its KDoc, holding the `developer` entitlement grants `pro_cloud_ai`-tier access **and** skips the usage-cap gate and the rate-limit gate in ai-engine (the code labels these Gate 4 and Gate 5). Every tier entitlement — including the lifetimes and `FOUNDERS_EDITION` — is always subject to its tier's normal quota; only the ops grant bypasses. The developer entitlement is granted through the RC dashboard.
+
+## `RcCustomerInfo`
+
+`RcCustomerInfo` (`data/billing/RevenueCatManager.kt`) is a `data class(appUserId: String?, info: CustomerInfo?)`. The RevenueCat SDK is a process-wide singleton whose identity can lag the app's signed-in user (mid-`logIn`, a stuck identity switch, or an offline cold start that restored a prior user's cached receipt). Pinning each emission to the `appUserID` it was fetched for lets consumers refuse entitlements that don't belong to the currently signed-in auth user — without it, one user's paid entitlements could surface as, and get cached for, a different user.
+
+## `RevenueCatManager`
+
+`RevenueCatManager` (`data/billing/RevenueCatManager.kt`) is a thin wrapper over the SDK singleton. It exposes `customerInfo: StateFlow<RcCustomerInfo>`, the `customerId`, and `isConfigured`, plus:
+
+| Method | Purpose |
+| --- | --- |
+| `linkToAuthUser(authUserId, email?, displayName?)` | Logs RC in to the Supabase auth user id, sets the `$email` / `$displayName` reserved attributes, and calls `syncPurchases()` so subscriptions follow the user across devices and reinstalls. |
+| `updateDisplayName(displayName)` | In-place `$displayName` update for an already-signed-in user. |
+| `logOut()` | Resets the SDK to anonymous on sign-out (clears the snapshot synchronously so no stale paid entitlement lingers). |
+| `checkPurchaseGuard()` | Cross-store double-billing guard. |
+| `getCurrentOffering()` | Fetches the current offering for a paywall / management screen. |
+| `purchase(activity, pkg, oldProductId?)` | Launches the store purchase / plan-change flow. |
+| `restorePurchases()` | Explicit "Restore purchases" path. |
+| `startObserving()` | Wires the `updatedCustomerInfoListener` and does the initial customer-info fetch. |
+
+## `EntitlementRepository`
+
+`EntitlementRepository` (`data/repository/EntitlementRepository.kt`) is user-session-scoped and derives the effective tier. `currentTier: SharedFlow<UserTier>` combines four inputs — `AuthRepository.authState`, `RevenueCatManager.customerInfo`, `UserSettingsDataSource.lastKnownTier`, and `DevFlags.tierOverride` — deduplicates identical evaluations, logs each real change, and shares the pipeline across all subscribers (`SharingStarted.Eagerly`, `replay = 1`) so the combine + log runs exactly once regardless of observer count.
+
+The **owner guard** is the core correctness rule: RC customer info is trusted only when its owning `appUserId` matches the signed-in auth user. Resolution order:
+
+- **Signed out** → `UserTier.FREE` (the cache is thrown away).
+- **Loading** → the cached tier (`cached ?: FREE`) — treating a mid-probe state as FREE causes an auth-flap storm.
+- **Signed in, RC owner matches** → `RcEntitlement.resolveTier(rc.info)`.
+- **Signed in, RC identified as a different user** → forced to `FREE` (never expose or cache a tier that can't be attributed to this user).
+- **Signed in, RC not yet hydrated for this user** → the per-user cached tier, so a returning paid user isn't degraded on a cold or offline start.
+
+There is no mutator — the tier is derived, never set. As a side effect the repository persists the resolved tier to `lastKnownTier` only when the RC owner matches the signed-in user. The server stays the authoritative gate: a genuinely-lapsed entitlement is caught at the API layer with `subscription_required`, so the worst case of a stale cache is a brief "looks paid but server rejects paid calls" window.
+
+## Billing result types
+
+Three sealed result types model the outcomes of the RC calls:
+
+- `OfferingsResult` (`data/billing/PurchaseFlowResult.kt`) — `Success(offering)` / `Empty` (no offering marked Current — a configuration state, not an error) / `Error(message)`.
+- `PurchaseFlowResult` (`data/billing/PurchaseFlowResult.kt`) — `Success(customerInfo)` / `Cancelled` (user backed out) / `Error(message)`.
+- `PurchaseGuardResult` (`data/billing/PurchaseGuardResult.kt`) — `Offer` / `AlreadySubscribedSameStore(store)` / `BlockedByOtherStore(store)`. The last blocks a purchase when the user is already subscribed via a different store (e.g. App Store while on Android), preventing double-billing.
+
+## Related pages
+
+- [User Tiers & Feature Map](/rollingrecord/app/monetization/tiers) — the `UserTier` levels entitlements resolve to.
+- [Plans & Subscription Management](/rollingrecord/app/monetization/plans-and-subscription) — the paywall and management flows that call `RevenueCatManager`.
+- [Feature Gating & Upsell](/rollingrecord/app/monetization/feature-gating) — how the resolved tier drives UI access.

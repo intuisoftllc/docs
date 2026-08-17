@@ -1,14 +1,80 @@
 ---
 title: "Broadcast Receivers"
-description: "The broadcast receivers that drive scheduling and playback."
+description: "The three manifest-declared receivers: boot re-arming, scheduled-recording exact alarms, and playback media actions."
 ---
 
-Broadcast receivers handle boot re-arming, scheduled-recording alarms, and playback actions.
+Three broadcast receivers are declared in `AndroidManifest.xml`. `BootReceiver` re-arms recording and schedules after a reboot, `ScheduleAlarmReceiver` is the primary scheduled-recording engine driven by `AlarmManager` exact alarms, and `PlaybackActionReceiver` turns notification media actions into commands the playback screen collects.
 
-## What this covers
+## Manifest declarations
 
-- `BootReceiver` (re-arm schedules), `ScheduleAlarmReceiver`, and `PlaybackActionReceiver` + `PlaybackCommandBus`.
+| Receiver | Exported | Intent-filter actions | Role |
+| --- | --- | --- | --- |
+| `BootReceiver` | `true` | `android.intent.action.BOOT_COMPLETED` | Auto-resume rolling session + re-arm all schedules after reboot |
+| `ScheduleAlarmReceiver` | `false` | `SCHEDULE_START` / `SCHEDULE_STOP` / `SCHEDULE_NOTIFY` / `SCHEDULE_SKIP` | Scheduled-recording exact-alarm engine |
+| `PlaybackActionReceiver` | `false` | `PLAYBACK_PLAY_PAUSE` / `PLAYBACK_CYCLE_SPEED` | Notification media actions → `PlaybackCommandBus` |
 
-<Note>
-Scaffold generated from the codebase map — expand with full detail, examples, and specifics.
-</Note>
+## `BootReceiver`
+
+`BootReceiver` (`receiver/BootReceiver.kt`) is a `BroadcastReceiver` + `KoinComponent`. On `ACTION_BOOT_COMPLETED` it returns immediately unless `RECORD_AUDIO` is granted — without the permission there is no microphone foreground service to start and nothing to resume. When permission is present it does two things:
+
+1. Starts `RecordingService` with `ACTION_BOOT_CHECK` via `startForegroundService` to check for and auto-resume a rolling-record session that was active before the reboot.
+2. Inside `goAsync()` on `Dispatchers.IO`, calls `ScheduleEnqueuer.reEnqueueAll(context, scheduleRepository)` to re-arm every future schedule, and — if any schedule `isActive()` — starts `RecordingService` with `ACTION_STANDBY` so the service is pre-warmed for the next alarm.
+
+The `ScheduledRecordingRepository` is resolved with `userInject()` so the receiver reads the signed-in user's schedules.
+
+## `ScheduleAlarmReceiver`
+
+`ScheduleAlarmReceiver` (`receiver/ScheduleAlarmReceiver.kt`) is the primary scheduled-recording engine. It receives `AlarmManager` exact alarms (set by `ScheduleEnqueuer`, not WorkManager) and dispatches on four custom actions:
+
+| Companion action | Wire string | Handler |
+| --- | --- | --- |
+| `ACTION_START` | `com.intuisoftllc.rollingrecord.SCHEDULE_START` | `handleStart` |
+| `ACTION_STOP` | `com.intuisoftllc.rollingrecord.SCHEDULE_STOP` | `handleStop` |
+| `ACTION_NOTIFY` | `com.intuisoftllc.rollingrecord.SCHEDULE_NOTIFY` | `handleNotify` |
+| `ACTION_SKIP` | `com.intuisoftllc.rollingrecord.SCHEDULE_SKIP` | `handleSkip` |
+
+Other companion constants: `EXTRA_SCHEDULE_ID = "schedule_id"`, `CHANNEL_ID = "schedule_reminders_v2"`, `NOTIFICATION_ID_BASE = 1000`, and the request-code offsets `RC_SKIP = 3` / `RC_SHOW = 4`. It injects `ScheduledRecordingRepository` and `EntitlementRepository` via `userInject()`, and `PlaybackCoordinator` via `inject()`.
+
+### `handleStart` — the tier gate and the FGS-exemption window
+
+Scheduled recordings are a Pro feature, and `handleStart` enforces that as a fire-time backstop in two phases:
+
+- **Warm-cache check (synchronous).** It reads `entitlementRepository.currentTier.replayCache`. If a cached tier is present and below `PRO`, it cancels this schedule's alarms via `ScheduleEnqueuer.cancel` and returns without ever taking the microphone. The DB row is left untouched so a later re-upgrade re-arms it.
+- **Cold-cache backstop (async).** When the replay cache is empty, the start is allowed to proceed and the tier is resolved authoritatively inside `goAsync`; if it resolves below `PRO`, the recording is stopped with `ACTION_STOP` and future alarms cancelled.
+
+Before dispatching, `handleStart` also skips the occurrence if the service is already `RECORDING` / `PAUSED`, or if battery is in `0..10`, and calls `playbackCoordinator.stopActivePlayback()`. It then starts `RecordingService` with `ACTION_START` **synchronously inside `onReceive`** — plain `startService()` when the state is `STANDBY` (the service is already a microphone FGS), otherwise `startForegroundService()`. Doing this on-stack keeps the call inside the exact-alarm `MICROPHONE` FGS-start exemption window, which `goAsync()` extends for the receiver but not for the OS-level exemption on strict OEM builds. Remaining DB work — setting the name, disabling `ONCE` schedules, enqueuing the stop alarm via `ScheduleEnqueuer.enqueueStop` — happens in the coroutine.
+
+### `handleStop`, `handleNotify`, `handleSkip`
+
+| Handler | Behavior |
+| --- | --- |
+| `handleStop` | Stops the recording only when `serviceState.activeScheduleId` matches this schedule AND it is `RECORDING` / `PAUSED`, then disables a `ONCE` schedule or re-enqueues the next recurring occurrence. |
+| `handleNotify` | Pre-warms `STANDBY` if the service is `IDLE`, then posts the "`<label>` is starting soon" reminder on `schedule_reminders_v2` with Skip and Show actions. |
+| `handleSkip` | Cancels the pending start alarm, sets a skip-until for recurring schedules, and replaces the reminder with a 4-second auto-timeout confirmation. |
+
+## `ScheduleEnqueuer`
+
+`ScheduleEnqueuer` (`worker/ScheduleEnqueuer.kt`) is an `object` that drives the exact alarms `ScheduleAlarmReceiver` receives — using `AlarmManager.setExactAndAllowWhileIdle` with `RTC_WAKEUP`, **not** WorkManager. Exact alarms are required both for a guaranteed fire time (WorkManager's `setInitialDelay` is deferrable by Doze) and because starting a microphone foreground service from the background on Android 14 needs an exact-alarm callback as the calling context.
+
+Its methods build `PendingIntent.getBroadcast` intents targeting `ScheduleAlarmReceiver`:
+
+| Method | Purpose |
+| --- | --- |
+| `enqueue(context, schedule, fireAtMs)` | Cancel-then-set the notify + start alarms for a schedule |
+| `enqueueStop(context, scheduleId, durationMs)` | Set the stop alarm anchored to the real start time |
+| `cancel(context, scheduleId)` | Cancel all three alarms for one schedule |
+| `cancelAll(context, repository)` | Cancel every schedule's alarms (used on drop below Pro) |
+| `reEnqueueAll(context, repository)` | Re-arm all active future schedules (boot / app start) |
+
+`PRE_START_NOTIFY_MS` is 5 minutes; per-schedule request codes are derived from `RC_NOTIFY = 0` / `RC_START = 1` / `RC_STOP = 2` hashed against the schedule id.
+
+## `PlaybackActionReceiver` and the command bus
+
+`PlaybackActionReceiver` (`receiver/PlaybackActionReceiver.kt`) maps two action strings onto the process-wide command bus:
+
+| Action string | Command |
+| --- | --- |
+| `ACTION_PLAY_PAUSE` (`com.intuisoftllc.rollingrecord.PLAYBACK_PLAY_PAUSE`) | `PlaybackCommand.TogglePlayPause` |
+| `ACTION_CYCLE_SPEED` (`com.intuisoftllc.rollingrecord.PLAYBACK_CYCLE_SPEED`) | `PlaybackCommand.CycleSpeed` |
+
+`PlaybackCommandBus` (`receiver/PlaybackCommandBus.kt`) is an `object` exposing a `MutableSharedFlow<PlaybackCommand>` with `extraBufferCapacity = 8` as `commands: SharedFlow<PlaybackCommand>`; `send()` uses `tryEmit`. `PlaybackCommand` is a sealed class of two objects, `TogglePlayPause` and `CycleSpeed`. This bridges the media-notification broadcast to whichever playback ViewModel/screen is currently collecting the flow. The playback notification itself is documented in [Notifications](/rollingrecord/app/platform/notifications).

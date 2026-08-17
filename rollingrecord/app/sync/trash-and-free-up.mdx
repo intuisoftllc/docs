@@ -1,15 +1,78 @@
 ---
 title: "Trash Sync & Free Up Space"
-description: "The 30-day trash safety net and cloud free-up flow."
+description: "Soft-delete trash (trashedAt, server-configurable retention swept by TrashSweeper) and the Free-Up-Space sheet that cloud-excludes or deletes the heaviest cloud-backed items."
 ---
 
-Deleted items land in a 30-day trash that syncs across devices, and a free-up flow reclaims cloud space.
+Trash is a soft delete: a recording's `trashedAt` timestamp hides it from every list while the row survives, and the flag round-trips through sync so a trash/restore on one device propagates everywhere. Free Up Space is a separate flow that reclaims *cloud* storage by cloud-excluding (keep local, drop from cloud) or deleting the heaviest cloud-backed items.
 
-## What this covers
+## Trash lifecycle
 
-- Trash 30-day safety net (`TrashSweeper`, `V2TrashScreen`) and cross-device trash/restore/permanent-delete propagation.
-- `V2FreeUpSpaceSheet` / `V2FreeUpSpaceViewModel`: multi-select the largest cloud items to cloud-exclude or delete (`V2CloudExcludeDialog`).
+`RecordingRepository` (`data/repository/RecordingRepository.kt`) owns the trash operations:
 
-<Note>
-Scaffold generated from the codebase map — expand with full detail, examples, and specifics.
-</Note>
+| Method | What it does |
+| --- | --- |
+| `moveRecordingsToTrash(ids)` | set `trashedAt`, enqueue a recording upsert (syncs the flag), cancel in-flight transcription work, clear a tile-pin left pointing at an emptied session |
+| `restoreRecordingsFromTrash(ids)` | clear `trashedAt`, enqueue an upsert |
+| `permanentlyDeleteRecordings(ids)` | reuse the `deleteRecording` tombstone path (transcript + junction tombstones) + delete the audio file and `.waveform2` sidecar |
+| `emptyTrash()` | permanently delete every trashed id |
+| `deleteOrphanLocally(id)` | local-only delete (no tombstone) used by the pull orphan sweep |
+
+**Why the flag must round-trip:** `trashed_at` is pushed and pulled on the ordinary recording wire row. Without that round-trip, the next pull would read the server's null and `applyPulledRecording` would overwrite the local `trashedAt` — the user would see every trashed item silently restored on the next sync (or on cold launch, which fires a pull immediately). Server is authoritative for trash state, so the push/pull round-trip is the correctness point. See [Wire Format & Transforms](/rollingrecord/app/sync/wire-transforms).
+
+## `TrashSweeper` — the purge
+
+`TrashSweeper` (`data/trash/TrashSweeper.kt`) is the device-side purge. `sweepIfDue(force)` reads `getOverdueTrash(cutoff = now − ServerConfig.trashRetentionDays)` and routes overdue rows through `permanentlyDeleteRecordings`. Retention is `ServerConfig.trashRetentionDays` (default 30, server-configurable) — not a hardcoded 30; the sweeper and the expiry math both read that value.
+
+- For **free / pro** users it is the **sole** purge mechanism — they have no cloud sync, so the server's nightly cron never runs against their data.
+- For **cloud** users it is a **fallback** — the server cron is primary (it tombstones, the device pulls the tombstone), and the sweeper only covers a device that was offline through one or more cron windows.
+
+`THROTTLE_MS = 1h` throttles cold-start invocations; opening the Trash screen passes `force = true` because the user expects it to reflect reality the instant they get there.
+
+## `V2TrashScreen` / `V2TrashViewModel`
+
+`V2TrashViewModel` (`ui/v2/screens/trash/V2TrashViewModel.kt`) holds the real logic; `V2TrashScreen` renders it as bucketed `LibraryItemCard` sections. Trash holds standalone MANUAL recordings and rolling SESSIONS (segments collapsed into one row per `sessionId`) — never categories. Rows are grouped by `trashedAt` into four buckets, newest-trashed first:
+
+| Bucket | Range by `trashedAt` |
+| --- | --- |
+| `TODAY` | on or after local start-of-today |
+| `YESTERDAY` | the prior calendar day |
+| `PREVIOUS_7_DAYS` | 2–7 days ago |
+| `PREVIOUS_30_DAYS` | older (never past the retention cap) |
+
+A row within 7 days of purge carries a non-null `expiresInDays` so the card renders its red expiry warning (`EXPIRY_WARNING_DAYS = 7`, math against `ServerConfig.trashRetentionDays`). Because a session's display id is its `sessionId` but restore/delete operate on segment recording ids, each emission rebuilds `sessionSegmentIds`, and `expandToRecordingIds` fans a session id out to its segments before hitting the repository.
+
+### Inline preview
+
+The screen has a full inline preview player (`PreviewPlayerController` in `FULL` mode — scrubbable across the whole recording, unlike the 10s library clip). Only local audio previews; a cloud-only or missing row emits `previewUnavailable` with a `PreviewBlocked` reason instead of downloading:
+
+- `PreviewBlocked.Restorable` — a real cloud copy exists (`cloudExcludedAt == null && cloudBackupCommittedAt != null`); restoring re-queues the download.
+- `PreviewBlocked.Gone` — no copy anywhere; restoring cannot bring the audio back.
+
+`previewBlockReason` mirrors the prefetch eligibility query exactly so the snackbar's "restore to recover" promise stays truthful.
+
+## Free Up Space
+
+`V2FreeUpSpaceViewModel` (`ui/v2/screens/accountsettings/freeup/V2FreeUpSpaceViewModel.kt`) builds one unified, size-ranked list of the heaviest cloud-backed items across three types (`FreeUpItemType.RECORDING`, `SESSION`, `CONTEXT`), capped at `FREE_UP_MAX_ITEMS = 1000`. It supports text search (`libraryNameMatches`), `FreeUpSort` (`LARGEST` / `SMALLEST` / `DATE`), and optional semantic search (gated Pro+Cloud and up). `V2FreeUpSpaceSheet` renders it as a multi-select bottom sheet with a Keep-on-device / Delete action bar and a selected summary (count + bytes).
+
+The two actions treat the three types asymmetrically:
+
+| `FreeUpItemType` | "Keep on device" | "Delete" |
+| --- | --- | --- |
+| `RECORDING` | `setRecordingCloudExcluded(id, true)` | `moveRecordingsToTrash([id])` |
+| `SESSION` | cloud-exclude each segment | trash all segment ids |
+| `CONTEXT` | `setContextCloudExcluded(id, true)` | `contextRepository.delete(id)` — **hard delete**, not trash |
+
+Note the asymmetry: recordings and sessions go to Trash (recoverable), but contexts are hard-deleted.
+
+### Cloud-exclude vs the rolling demote
+
+`RecordingRepository.setRecordingCloudExcluded` sets `cloudExcludedAt`, enqueues a recording upsert, and **cascades the same flag to the transcript** — "keep this recording local only" has to mean the audio *and* its words stay local, or the transcript keeps leaking to the cloud. The server sweeper deletes the cloud blob after a ~14-day grace; re-including triggers an audio re-upload. This is distinct from the [rolling demote](/rollingrecord/app/sync/audio-sync) (`AudioCloudRepository.demote`), which un-protects a rolling segment back to ephemeral buffer.
+
+`V2CloudExcludeDialog` (`ui/v2/components/V2CloudExcludeDialog.kt`) explains "keep on device / remove from cloud" before the first cloud-exclude, gated by `DeviceSettingsDataSource.cloudExcludeExplanationSeen`.
+
+## Where to go next
+
+- [Wire Format & Transforms](/rollingrecord/app/sync/wire-transforms) — how `trashed_at` and `cloud_excluded_at` round-trip.
+- [Audio Cloud Backup](/rollingrecord/app/sync/audio-sync) — the rolling demote, distinct from cloud-exclude.
+- [Cloud Prefetch & Download](/rollingrecord/app/sync/cloud-prefetch-download) — why a restored cloud-only row re-downloads.
+- [Sync & Cloud Overview](/rollingrecord/app/sync/overview) — where trash sits in the sync subsystem.

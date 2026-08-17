@@ -1,15 +1,104 @@
 ---
 title: "Usage Metering & Caps"
-description: "Monthly usage counters, caps, and the usage screen."
+description: "The owner-stamped UsageRepository, the get-user-usage snapshot, monthly calendar-month caps, and the V2 Usage screen."
 ---
 
-Metered features are tracked against monthly caps on calendar-month periods.
+Metered usage is fetched from the server, cached in an owner-stamped app-level repository, and rendered on the V2 Usage screen. Caps are calendar-month periods that reset on the 1st at 00:00 UTC — never rolling — and admin-granted credits extend the base caps.
 
-## What this covers
+## `UsageApi` and `UsageApiClient`
 
-- `UsageRepository` (owner-stamped, the `UserScopedCache` reference impl), `UsageApi`/`Client`, `UserUsageSnapshot`.
-- Calendar-month periods (YYYY-MM, UTC) per `CLAUDE.md`; `V2UsageScreen` meters and `UsageResetFormat`.
+`UsageApi` (`data/remote/usage/UsageApi.kt`) is the Retrofit interface for the RR-200 `get-user-usage` Edge Function. It is GET-only with no body:
 
-<Note>
-Scaffold generated from the codebase map — expand with full detail, examples, and specifics.
-</Note>
+```kotlin
+const val FN_GET_USER_USAGE = "get-user-usage"
+
+@GET("functions/v1/" + FN_GET_USER_USAGE)
+@EdgeTag(FN_GET_USER_USAGE)
+suspend fun getUserUsage(): Response<UserUsageSnapshot>
+```
+
+Auth headers (apikey + App Check + Bearer JWT) ride the shared `aiengine` OkHttp client. `UsageApiClient` (`data/remote/usage/UsageApiClient.kt`) is the typed wrapper over `UsageApi` on the shared `apiCall` pipeline; its sealed `Result` is `Success(snapshot)` / `Failure(ApiError)`.
+
+## `UserUsageSnapshot`
+
+`UserUsageSnapshot` (`data/remote/usage/model/UserUsageSnapshot.kt`) mirrors the server payload one-to-one:
+
+- `period` — the current billing period, `YYYY-MM` UTC.
+- `periodResetAt` — ISO-8601 UTC timestamp for first-of-next-month 00:00:00; the cache keys expiry on it.
+- `tier` — the highest paid tier the caller holds (`pro` / `pro_cloud` / `pro_cloud_ai`), or null.
+- `counters` — a flat, open-ended `Map<String, CounterPair>` (each `CounterPair` is `used` / `cap`; a `cap` of `0` means the tier doesn't grant that counter).
+- `storage` — an optional `StorageUsage` breakdown (all bytes).
+- `creditBalances` — an optional RR-119 `CreditBalances` block of admin gratuity credits.
+
+`counter(key)` defaults to `{used=0, cap=0}` for a missing key. `CounterKey` holds the counter-name constants:
+
+| `CounterKey` constant | Wire key | Unit | Creditable |
+| --- | --- | --- | --- |
+| `AI_QUERIES` | `ai_queries` | count (kb_chat turns) | yes (`ai_queries`) |
+| `TRANSCRIPTION_MS` | `transcription_ms` | milliseconds | yes (`transcription_ms`) |
+| `EXTRACTION_MS` | `extraction_ms` | audio milliseconds (hidden guardrail) | yes (`extraction_ms`) |
+| `SYNTHESES` | `syntheses` | count | no |
+| `DEEP_REASONING_SYNTHESES` | `deep_reasoning_syntheses` | count | no |
+
+### Credits and the effective cap
+
+`CreditBalances` carries `transcriptionMs`, `aiQueries`, and `extractionMs`, all in the same native unit as the matching counter so clients sum directly. `creditBalanceForCounter(key)` returns the balance for a counter (0 for `syntheses` / `deep_reasoning_syntheses`, which have no credit pool).
+
+`effectiveCapForCounter(key)` is the honest total budget:
+
+```kotlin
+fun effectiveCapForCounter(counterKey: String): Long {
+    val pair = counter(counterKey)
+    return maxOf(pair.used, pair.cap) + creditBalanceForCounter(counterKey)
+}
+```
+
+It is `maxOf(used, base cap) + credit balance`, **not** `base cap + credits`. `used` already reflects credits the server consumed as overage, so adding the already-reduced balance straight onto the base cap would subtract that overage a second time — the 2026-07 double-subtract billing bug. Taking `maxOf(used, cap)` cancels that and mirrors the server's `capRemaining()`.
+
+`StorageUsage` (RR-229) partitions `usedBytes` into per-group byte figures — recordings, contexts, categories, schedules, threads, settings, blueprints (`templates_bytes` on the wire), and trashed bytes (RR-403) — plus `quotaBytes` and `remainingBytes`.
+
+## `UsageRepository`
+
+`UsageRepository` (`data/repository/UsageRepository.kt`) caches the snapshot in memory. It is an **app-level single** — it outlives the `UserSessionScope` and a session switch does not rebuild it — and it is the reference `UserScopedCache` implementation. Two mechanisms keep one account's counters from ever being read as another's:
+
+1. `clearForUserSwitch()` nulls the snapshot, the freshness stamp, and the owner on every session change.
+2. Every snapshot is stamped with the user it was fetched for (`ownerUserId`), and the repository drops it both on **store** and on **read** when the owner no longer matches the active session.
+
+Owner-stamping on both sides is what makes an in-flight response landing after a session switch a harmless miss instead of a wrong-account answer: a fetch already running when the user switches lands after the clear and would otherwise overwrite the empty cache with the previous account's numbers. This matters because the snapshot gates the KB-chat AI cap and the extraction budget — a carried-over value would lock a paying user out of quota they hold.
+
+`getUsage(forceRefresh = false)` coalesces concurrent callers through a `Mutex` (one network fetch in flight at a time) and returns a `UsageResult`:
+
+| `UsageResult` | Meaning |
+| --- | --- |
+| `Fresh(snapshot)` | A network fetch just landed for the active user. |
+| `Cached(snapshot)` | Reused the in-memory snapshot (within the period and younger than the TTL). |
+| `Failed(retriable, message)` | Fetch failed, or the session changed mid-fetch. |
+
+Freshness is a 60-second client TTL (`TTL_MS = 60_000`); cache expiry is also keyed on `periodResetAt` so the cache invalidates at month rollover with no scheduled job. `invalidate()` drops only the freshness stamp (keeping the last-good value visible through `latest: StateFlow<UserUsageSnapshot?>`), and is called from the success handler of any op that moved a counter server-side.
+
+## `UsageResetFormat`
+
+`UsageResetFormat` (`util/UsageResetFormat.kt`) is the canonical UTC reset-label formatter — no ViewModel hand-rolls reset labels. Caps reset on the 1st at 00:00 **UTC**, so formatting the boundary in the device timezone would be off by one for users west of UTC; every label is therefore computed and rendered in UTC with a "(UTC)" marker. Its pure time math (`Instant` in, value out, injectable `now`) is unit-testable without Android:
+
+- `resetInstant(periodResetAt, now)` — prefers the server value, else computes first-of-next-month 00:00 UTC.
+- `relativeParts(resetAt, now)` — returns a `RelativeParts(unit, count)` over `RelativeUnit { DAYS, HOURS, MINUTES }`.
+- `dateLabel(resetAt)` — e.g. "Jul 1".
+- `combinedLabel(...)` — e.g. "Resets in 3 days · Jul 1 (UTC)".
+- `dateUtcLabel(...)` — "Jul 1 (UTC)" for prose sentences.
+
+## `V2UsageScreen`
+
+`V2UsageViewModel` (`ui/v2/screens/usage/V2UsageViewModel.kt`) paints the last-known snapshot immediately from `UserSettingsDataSource.cachedUsageSnapshot`, then refreshes via `UsageRepository.getUsage` — so the screen never collapses to a spinner on a return visit. A failed refresh keeps the cached numbers and raises `refreshFailed`. `V2UsageUiState` carries `tier`, `snapshot`, `resetAt`, `refreshing`, and `refreshFailed`; `refresh()` forces a pull past the TTL.
+
+`V2UsageScreen` (`ui/v2/screens/usage/V2UsageScreen.kt`) gates which cards render by tier:
+
+- Storage + Transcription cards for `tier.atLeast(UserTier.PRO_CLOUD)`.
+- The AI Queries card for `tier.atLeast(UserTier.PRO_CLOUD_AI)`.
+
+Meters use `effectiveCapForCounter` for their maxes so a meter's max never slides backward as credits are consumed. Pull-to-refresh forces a fetch, a `V2WarningBanner` shows over the cached numbers on a failed refresh, and the "Get More" CTA (shown for `tier.atLeast(UserTier.PRO_CLOUD)`) navigates to the add-on bundles screen.
+
+## Related pages
+
+- [User Tiers & Feature Map](/rollingrecord/app/monetization/tiers) — the tiers that gate which meters render.
+- [Client Rate-Limit Handling](/rollingrecord/app/monetization/rate-limiting) — the sibling transport-level 429 handling.
+- [Plans & Subscription Management](/rollingrecord/app/monetization/plans-and-subscription) — the "Get More" bundles destination.

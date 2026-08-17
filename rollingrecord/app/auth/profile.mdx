@@ -1,15 +1,83 @@
 ---
 title: "Account Profile"
-description: "Display name, profile photo, and profile caching."
+description: "First/last name editing, the Clerk-hosted profile photo pipeline, the deterministic avatar fallback ladder, and the cold-start profile cache."
 ---
 
-The account screen manages the user's display name and profile photo, cached for fast rendering.
+The V2 Account screen renders and edits the signed-in user's identity — name and photo. The name is two independent Clerk fields (first + last), the photo lives only in Clerk's CDN, and a write-through cache keeps both painting real data during cold start before Clerk re-initializes.
 
-## What this covers
+## `V2AccountScreen` and `V2AccountViewModel`
 
-- `V2AccountScreen` / `V2AccountViewModel`; display name (`DisplayNameSanitizer`) and `V2EditNameDialog`.
-- Profile photo (`ProfilePhotoController`, `ProfilePhotoFiles`, `V2ProfileAvatar`) stored in Clerk; `ProfileCache` / `CachedUserProfile`.
+`V2AccountScreen` (`ui/v2/screens/account/V2AccountScreen.kt`) is the Accounts-tab root (Figma node 1809:62941). It composes the avatar (with a camera-overlay badge and busy spinner), a name/email/sync card, a "Manage" nav section, and a header with a red logout icon. On every `ON_RESUME` it calls `viewModel.refreshProfile()`, which pulls a fresh Clerk user so a profile edit made elsewhere shows up.
 
-<Note>
-Scaffold generated from the codebase map — expand with full detail, examples, and specifics.
-</Note>
+`V2AccountViewModel` (`ui/v2/screens/account/V2AccountViewModel.kt`) combines five flows — `AuthRepository.authState`, `SyncEngine.state`, the effective tier, `AccountHealthProvider.health`, and the cached profile — into a single `AccountUiState`. During `AuthState.Loading` (cold start), it falls back field-by-field to the cached `CachedUserProfile` so the screen never shows a blank card. It owns the photo pipeline as a delegate named `photo`.
+
+`AccountUiState` fields:
+
+| Field | Meaning |
+| --- | --- |
+| `authUserId` | Stable Clerk `auth_user_id`; seeds the deterministic avatar gradient. Null while signed out / loading. |
+| `displayName`, `email` | Rendered name and email (name falls back to first name, then email). |
+| `firstName`, `lastName` | The two Clerk name parts, exposed independently for the edit dialog. |
+| `imageUrl` | Clerk image URL — always non-empty (a generated default when no real photo). |
+| `hasImage` | True only for a real uploaded photo; gates whether `imageUrl` is treated as a photo. |
+| `isSyncing`, `lastSyncAt` | Drive the sync chip's spinner and relative time. |
+| `showSyncTime` | The sync element renders only for `PRO_CLOUD`+ (cloud tiers have a surface to sync). |
+| `accountHealth` | Worst-case client-derived health; drives a glance-only status dot next to the name. |
+
+`AccountMessage` is a one-shot snackbar enum for outcomes the screen must explain: `SYNC_FAILED`, `SYNC_WIFI_ONLY_BLOCKED`, `SIGN_OUT_OFFLINE`, `SIGN_OUT_FAILED`. Tapping the card fires `syncNow()` (which both `reloadUser()`s the Clerk profile and runs `SyncEngine.sync()`); tapping the bold name or edit icon opens the change-name dialog.
+
+## Editing the name
+
+Name editing is deliberately split into **two** fields. `V2EditNameDialog` (`ui/v2/screens/account/components/V2EditNameDialog.kt`, Figma 1809:63954) overrides Figma's single combined "Name" field with clearly-labeled First name + Last name inputs, so a multi-word name maps cleanly onto Clerk's distinct `firstName` / `lastName` instead of being guessed apart at a space. Each field is capped at `NAME_PART_MAX_CHARS` (50), and Save is enabled once at least one field is non-blank after trimming.
+
+The save is **awaited**, not fire-and-forget. `V2AccountViewModel.updateName(first, last)` is `suspend` and returns `Result<Unit>`; the dialog shows a spinner while it runs, then closes on success or keeps the sheet open with an inline error on failure. On success it calls `reloadUser()` so the new name reflects immediately.
+
+Sanitization happens one layer down, inside `AuthRepository.updateName` (`data/auth/AuthRepository.kt`) — **not** in the dialog. Each part is passed through `DisplayNameSanitizer.sanitize` (`util/DisplayNameSanitizer.kt`); a part that is blank after sanitization is written as `null` so Clerk clears it, and at least one of the two must survive. `updateName` is preferred over the older `updateDisplayName`, which joins the two parts and re-splits at the first space (re-bucketing "Mary Jane" / "Van Der Berg").
+
+`DisplayNameSanitizer` NFC-normalizes, replaces embedded `\r\n\t` with spaces, strips control / format / private-use / surrogate / unassigned / line-separator / paragraph-separator categories plus an explicit set of bidi and zero-width codepoints, then trims and collapses whitespace runs. It does **not** block profanity, non-Latin scripts, or emoji, and does **not** enforce length — the 50-char cap is the dialog's job.
+
+## The profile photo pipeline
+
+The photo pipeline is driven by `ProfilePhotoController` (`ui/v2/screens/account/photo/ProfilePhotoController.kt`) — not a ViewModel, but a delegate the account VM owns, constructed with `viewModelScope`, the `AuthRepository`, and the app `Context`. It exposes `isBusy: StateFlow<Boolean>` (drives the avatar spinner and guards against double-taps) and `errors: SharedFlow<ProfilePhotoError>`. Each of `uploadFromGallery(uri)`, `uploadFromCamera()`, and `removePhoto()` no-ops while busy and always cleans up temp files.
+
+`ProfilePhotoError` is a coarse, content-free failure enum mapped to snackbar strings — `READ_FAILED`, `COMPRESS_FAILED`, `UPLOAD_FAILED`, `REMOVE_FAILED` — and never carries the picked image or its path.
+
+All file plumbing lives in `ProfilePhotoFiles` (`ui/v2/screens/account/photo/ProfilePhotoFiles.kt`), an object whose every byte lands only under `cacheDir/profile_photos` — never the DB, DataStore, or a user-content directory:
+
+| Stage | Detail |
+| --- | --- |
+| Source | Gallery `content://` URI (Android Photo Picker) OR a camera capture written to a FileProvider `Uri`. |
+| Staging | `cacheDir/profile_photos` only. |
+| Downscale | `Compressor`: `MAX_EDGE_PX` 1024, `JPEG_QUALITY` 85, `MAX_BYTES` ≈ 1,048,576 (~1 MB); normalizes EXIF rotation. |
+| Upload | `AuthRepository.updateProfileImage(file)` → Clerk `user.setProfileImage`. |
+| Remove | `AuthRepository.removeProfileImage()` → Clerk `user.deleteProfileImage`. |
+| Cleanup | `ProfilePhotoFiles.cleanUp(...)` deletes every temp file, success or fail. |
+
+The picker plumbing is separate from the sheet UI. `V2ProfilePhotoSheet` (`ui/v2/screens/account/components/V2ProfilePhotoSheet.kt`) is pure UI: rows for "Choose from gallery", "Take photo" (omitted when `showCamera` is false), and "Remove photo" (shown only when `hasImage`, rendered brand red). Its companion `rememberProfilePhotoLaunchers` wires the two `ActivityResult` launchers — gallery via `PickVisualMedia` (no storage permission), camera via `TakePicture` to a FileProvider `Uri`. Because the manifest declares `CAMERA`, launching `IMAGE_CAPTURE` without the grant would `SecurityException`, so `launchCamera` checks and requests `CAMERA` at point-of-use on every tap; a denial logs and toasts rather than crashing.
+
+The photo is stored **only** in Clerk's CDN — `AuthRepository.updateProfileImage` never persists it locally or in Supabase. `CachedUserProfile` mirrors just `imageUrl` + `hasImage`; the actual bytes come from Coil's durable per-user disk cache keyed by `imageUrl`, so there is no saved file to manage.
+
+## `V2ProfileAvatar` fallback ladder
+
+`V2ProfileAvatar` (`ui/v2/components/V2ProfileAvatar.kt`) is the single avatar surface for the whole V2 account UX, and it is never empty — it renders a 4-step fallback ladder over a deterministic 2-stop gradient:
+
+| Priority | Condition | Renders |
+| --- | --- | --- |
+| 1 | `hasImage == true` | Coil `AsyncImage` of a CDN-sized `imageUrl` (256px, `fit=crop`). |
+| 2 | else, `firstName` non-blank | Uppercase first letter of the first name (white on gradient). |
+| 3 | else, `lastName` non-blank | Uppercase first letter of the last name. |
+| 4 | else | Person icon (`ic_profile`) centered. |
+
+Case 1 is gated on `hasImage`, not on a blank `imageUrl`, because Clerk always serves a generated default URL. The background is `avatarBrushFor` (`ui/v2/theme/Color.kt`), a two-stop `Brush` seeded from `auth_user_id` (stop A) and email (stop B): the same user renders the same gradient everywhere and nothing is persisted. With no identity at all, it degrades to a neutral grey circle with dark initials.
+
+## Cold-start profile cache
+
+`ProfileCache` (`data/repository/ProfileCache.kt`) is a user-session-scoped `Closeable` write-through cache. It observes `AuthRepository.authState` and persists every `SignedIn` snapshot into the per-user `UserSettingsDataSource` via `setCachedProfile`. Only scalar fields are mirrored (avatar bytes stay in Coil's disk cache). It is eagerly resolved at session start so the observer runs regardless of which screen is open — the cache must be populated by *this* session for the *next* cold start to benefit.
+
+`CachedUserProfile` (`data/models/CachedUserProfile.kt`) is the mirror it writes: `authUserId?`, `firstName?`, `lastName?`, `email`, `hasImage`, `imageUrl`, with an `EMPTY` sentinel. Both the home greeting and the account VMs read it as the fallback during `AuthState.Loading`, so real name / email / avatar appear before Clerk finishes re-initializing.
+
+## Related pages
+
+- [Account Settings](/rollingrecord/app/auth/account-settings)
+- [Account Health & Freeze](/rollingrecord/app/auth/account-health)
+- [Account Deletion](/rollingrecord/app/auth/account-deletion)

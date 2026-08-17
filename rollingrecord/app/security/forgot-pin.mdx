@@ -1,15 +1,52 @@
 ---
 title: "Forgot PIN / PIN Reset"
-description: "The email-OTP-backed forgot-PIN flow."
+description: "The email-OTP-gated forgot-PIN reset flow hosted above the lock overlay — it clears the old PIN the instant the code verifies, then lets the user set a new one."
 ---
 
-Users who forget their PIN reset it through an email-OTP-verified flow.
+When a locked-out user taps "Forgot PIN?" on the lock overlay, they enter a five-step reset flow that proves email ownership, clears the old PIN immediately, and sets a replacement. The flow is hosted above the main NavHost by `V2App`, so it drives itself by ViewModel state rather than nav routes.
 
-## What this covers
+## Hosting above the lock
 
-- `V2ForgotPinFlow`: email, verify, and success screens + `V2ForgotPinViewModel`.
-- OTP backing via `AccountOtpApi` / `AccountOtpApiClient` (`OtpPurpose`).
+The lock overlay sits above everything, so `V2App` (`ui/v2/V2App.kt`) hosts `V2ForgotPinFlow` above `V2MainNavHost` and exits it via two callbacks: `onDismiss` returns to the still-locked overlay, and `onExitToApp` calls `AppLockController.onUnlocked()`. `V2ForgotPinFlow` (`ui/v2/screens/security/reset/V2ForgotPinFlow.kt`) forces the flow back to the EMAIL step on every (re)entry via `remember { viewModel.reset() }` — the VM is Activity-scoped, so without this a reset completed earlier in the session would retain `SUCCESS` and jump straight to the success screen. It dispatches on `state.step` and hosts a snackbar for `ForgotPinEvent` (Offline / GenericError / CodeResent).
 
-<Note>
-Scaffold generated from the codebase map — expand with full detail, examples, and specifics.
-</Note>
+## The five-step state machine
+
+`V2ForgotPinViewModel` (`ui/v2/screens/security/reset/V2ForgotPinViewModel.kt`) runs the `ResetStep` machine. Its four constructor-injected dependencies are `AppLockRepository`, `AuthRepository`, `AccountOtpApiClient`, and `ConnectivityMonitor`. (`EmailValidator` is not injected — it's a static util called as `EmailValidator.isValid(...)`.)
+
+| Step | Screen | Action / exit |
+| --- | --- | --- |
+| `EMAIL` | `V2ForgotPinEmailScreen` | Local email match, then `account-otp` send; "Back to PIN" → `onDismiss` (still locked) |
+| `VERIFY` | `V2ForgotPinVerifyScreen` | Verify the 6-digit code → `clearPinForReset(ticket)` (old PIN cleared immediately, app unlocked from here) |
+| `SET_NEW` | `V2PinEntryScreen` (reused) | Enter the new PIN; Back → `onExitToApp` (unlocked, no new PIN) |
+| `CONFIRM_NEW` | `V2PinEntryScreen` (reused) | Re-enter; match → `setPin` (offline-capable) |
+| `SUCCESS` | `V2ForgotPinSuccessScreen` | "PIN Updated" → "Open App" (`onExitToApp`) |
+
+`SET_NEW` and `CONFIRM_NEW` reuse `V2PinEntryScreen` (`ui/v2/screens/security/V2PinEntryScreen.kt`) with its system keyboard and dot indicator — they are distinct steps, not bespoke screens.
+
+## The email step matches locally
+
+`onSendCode` validates the entered address against the **signed-in account's** email — `EmailValidator.isValid(...)` plus an exact case-insensitive equality check — with **no** Clerk existence probe. The server-side `account-otp` Edge Function is what actually emails the code, because Clerk cannot OTP an already-signed-in user. A mismatch or malformed address sets `emailError`, which flips the envelope icon, field border, and hint box from blue to red.
+
+`V2ForgotPinEmailScreen` (`ui/v2/screens/security/reset/V2ForgotPinEmailScreen.kt`) is keyboard-safe by construction: `statusBarsPadding()` + `imePadding()` + a `verticalScroll` so the IME can't starve the weighted column and collapse the field to ~0dp height. It defines the local `PrimaryButton` / `SecondaryButton` used across the reset flow.
+
+## The security-critical ordering at VERIFY
+
+On a correct OTP the server mints a single-use ticket, and the flow **immediately** consumes it via `AppLockRepository.clearPinForReset(ticket)` before advancing. `clearPinForReset` is `disableAndClear(otpTicket).onSuccess { resetLockout() }`: the server verifier is cleared first, then local verifier / enabled / biometric / attempts are dropped. A rejected or expired ticket leaves the old PIN intact and keeps the user on the VERIFY step rather than landing them unlocked with a stale server PIN.
+
+The consequence is that from VERIFY onward the app is already unlocked and there is **no** stale PIN — a user who backs out of `SET_NEW` lands on the unlocked app. Setting a new PIN is therefore optional after the clear succeeds. `SET_NEW` / `CONFIRM_NEW` commit the replacement via `setPin`, which works offline because the DEK is always resolvable while the app is locked.
+
+## `AccountOtpApiClient` and `OtpPurpose`
+
+`AccountOtpApiClient` (`data/remote/accountotp/AccountOtpApiClient.kt`) is the client for the `account-otp` Edge Function — a two-phase (validate → consume) email-ownership OTP. `send(purpose)` emails a fresh 6-digit code; `verify(code, purpose)` returns `VerifyResult.Success(ticket)` / `IncorrectCode` (mapped from `AiEngineErrorCode.OTP_CODE_INCORRECT`) / `Failure`. The single-use ticket (10-minute TTL) is what actually authorizes the sensitive op — proving a leaked session token alone cannot perform it — and the consuming endpoint requires a matching purpose.
+
+`OtpPurpose` (`data/remote/accountotp/OtpPurpose.kt`) mirrors the server `_shared/otp/purposes.ts` allowlist. `APP_LOCK_PIN_RESET` (`"app_lock_pin_reset"`) is used for **both** the forgot-PIN reset here and the Settings "turn off App Lock" path; `ACCOUNT_DELETION` (`"account_deletion"`) covers permanent account deletion.
+
+## Shared OTP step-up
+
+The Settings turn-off path reaches the same clear through a different UI: `V2DisableAppLockSheet` embeds `V2OtpCodeStep` (`ui/v2/components/V2OtpCodeStep.kt`), a reusable email-OTP step. It auto-sends on first show, takes the plain 6-digit code, verifies, and calls `onVerified(ticket)` — the same `OtpPurpose.APP_LOCK_PIN_RESET` ticket handed to `disableAndClear`. Because fetching the emailed code requires leaving the app, `V2OtpCodeStep` suppresses App Lock auto-lock via a `DisposableEffect` (`setAutoLockSuppressed`) so the sheet can't be locked away on return.
+
+## Where to go next
+
+- [App Lock](/rollingrecord/app/security/app-lock) — the overlay that launches this flow and the auto-lock suppression it relies on
+- [PIN & Biometrics](/rollingrecord/app/security/pin-and-biometrics) — `clearPinForReset` / `disableAndClear` and the server-first clear ordering
+- [Recovery Codes](/rollingrecord/app/security/recovery-codes) — the unrelated account-recovery credential (not a PIN reset)
