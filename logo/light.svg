@@ -1,6 +1,7 @@
 <svg xmlns="http://www.w3.org/2000/svg" width="300" height="72" viewBox="0 0 300 72">
   <g transform="translate(36 36) scale(0.3333) translate(-100 -100)">
-    <g fill="none" stroke="#7BAFD4" stroke-width="12" stroke-linecap="round">
+    <rect x="0" y="0" width="200" height="200" rx="44" fill="#D43C39"></rect>
+    <g fill="none" stroke="#FFFFFF" stroke-width="12" stroke-linecap="round">
       <line x1="100" y1="48" x2="100" y2="18" transform="rotate(0 100 100)"></line>
       <line x1="100" y1="48" x2="100" y2="32" transform="rotate(27 100 100)"></line>
       <line x1="100" y1="48" x2="100" y2="24" transform="rotate(54 100 100)"></line>
@@ -13,7 +14,7 @@
       <line x1="100" y1="48" x2="100" y2="16" transform="rotate(243 100 100)"></line>
       <line x1="100" y1="48" x2="100" y2="30" transform="rotate(270 100 100)"></line>
     </g>
-    <circle cx="100" cy="34" r="15" fill="#D43C39" transform="rotate(-27 100 100)"></circle>
+    <circle cx="100" cy="34" r="15" fill="#7BAFD4" transform="rotate(-27 100 100)"></circle>
   </g>
   <text x="76" y="45" font-family="Poppins, sans-serif" font-weight="600" font-size="27" letter-spacing="-0.5" fill="#121212">RollingRecord</text>
 </svg>
