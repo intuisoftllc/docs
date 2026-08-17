@@ -3,13 +3,121 @@ title: "Importing & Exporting Recordings"
 description: "Bringing audio in via the share sheet and bulk archive import/export."
 ---
 
-Recordings can be imported from the system share sheet or via bulk archives, and exported the same way.
+Audio can move in and out of RollingRecord five ways: opening a single audio file from another app for preview (deep link), importing shared files via the share sheet, sharing recordings out through the system share sheet, saving recordings to the device's Downloads folder, and bulk-importing or bulk-exporting all recordings as a zip archive.
 
-## What this covers
+## Opening a single audio file (deep link preview)
 
-- `RecordingImporter` and share-sheet receive (`MainActivity.handleShareIntent`), Pro-gated.
-- Bulk archive via `RecordingsZipImporter` / `RecordingsZipExporter`.
+RollingRecord registers for `Intent.ACTION_VIEW` on audio MIME types. When another app opens an audio file with RollingRecord, `MainActivity.onCreate` (or `onNewIntent` if already running) captures the `Uri` and routes it into the V2 External Playback preview via a hoisted latch (`v2ExternalAudioUriPending`) that `V2App` / `V2MainNavHost` consume. The preview lets the user listen to the file and then choose to import it into the library.
 
-<Note>
-Scaffold generated from the codebase map — expand with full detail, examples, and specifics.
-</Note>
+## Sharing INTO the app (`ACTION_SEND` / `ACTION_SEND_MULTIPLE`)
+
+The manifest declares a share-target alias, so RollingRecord appears in other apps' share sheets for `audio/*`. `MainActivity.handleShareIntent(intent)` is the only enforcement point for shares.
+
+### Reading the payload
+
+`sharedAudioUris(intent)` returns the URIs the sender attached:
+
+- `ACTION_SEND` → the single `Intent.EXTRA_STREAM`.
+- `ACTION_SEND_MULTIPLE` → the `EXTRA_STREAM` list.
+- **`ClipData` fallback** — plenty of senders (including ShareCompat and anything built on the AndroidX sharing helpers) leave `EXTRA_STREAM` null and attach the payload as `ClipData`. Reading only `EXTRA_STREAM` used to resolve those shares to "no files" and drop them silently. The fallback iterates `clipData` items so those senders now work.
+
+Uses the deprecated non-typed `getParcelableExtra` overloads on purpose: the typed API only exists on API 33\+ and `minSdk` here is 26.
+
+### Admission gates
+
+The alias is enabled for everyone (reinstalling wipes component-enabled state, so gating by disabling the component was unreliable and duplicated logic that had to live here anyway — the component is exported and can be invoked directly). Every share therefore re-derives admission:
+
+- **Signed out** — refused synchronously. `sessionIdFlow` is seeded from SharedPreferences at process start, so this is authoritative immediately, unlike auth state which may still be restoring. Import writes to the active user session's directory and DB; with no session there is no correct destination.
+- **Access unknown** — after a bounded `ACCESS_RESOLVE_TIMEOUT_MS` wait for `proAccessFlow` to settle to something other than `UNKNOWN`, an unresolved answer is treated as a refusal. Fail-closed matches `TileStartActivity`. `UNKNOWN` deliberately shows nothing — claiming they need to upgrade could be a lie.
+- **Below Pro** — the app routes to the Upgrade screen via `v2ShareNeedsUpgradePending`, matching what ⋮ → Import does for the same capability.
+- **Pro\+** — the share is accepted; import runs and the app lands on All Recordings via `v2AllRecordingsPending`.
+
+The whole handler is `runCatching`-guarded because a share is reached from another app's UI. A crash here would read as "that app broke my phone" and the user would have no way to retry into a different code path.
+
+## `RecordingImporter`
+
+`RecordingImporter` (`service/RecordingImporter.kt`) is the session-scoped engine that copies external audio into the app and inserts `Recording` rows. It is deliberately NOT owned by a screen ViewModel: import must keep running (and its progress indicator must keep showing) even if the user leaves the All Recordings screen and comes back. Work runs on the importer's own `SupervisorJob + Dispatchers.IO` scope; the in-flight count is a `StateFlow` any screen can re-observe.
+
+- **`importingCount: StateFlow<Int>`** — total files currently being copied across all in-flight batches. Drives the shimmer ghost cards at the top of the Manual list. Additive so a second batch started before the first finishes stacks.
+- **`results: SharedFlow<ImportResult>`** — one-shot per-batch outcome (`succeeded`, `failed`) with no replay. If no screen is listening, the newly-inserted cards are the feedback instead.
+- **`close()`** (Closeable) — called automatically by Koin when the user-session scope closes. Cancels in-flight imports on sign-out so an import running during a sign-out cannot keep writing recording rows into the outgoing user's DB.
+- **Not process-death survivable.** A mid-import app kill abandons in-flight copies. Acceptable; a WorkManager job would be needed for process-death survival and is out of scope.
+
+Per-file flow (`import(uris)`):
+
+1. Read `DISPLAY_NAME` from the ContentResolver. Fall back to `"Import ${index + 1}"`.
+2. **Cap the derived name at 40 chars** (`IMPORT_NAME_MAX_CHARS`), matching `LibraryNameEntrySheet.maxLength`, so an imported file with a long filename cannot produce a recording name longer than the rename UI would allow the user to type.
+3. **Resolve the extension** via `resolveExtension(uri, displayName)`: filename extension wins when it names a format we support; otherwise fall back to the declared MIME (`audio/mpeg`, `audio/mp4`, `audio/wav`, `audio/ogg`, `audio/opus`, `audio/flac`, `audio/3gpp`, `audio/amr`, and common variants). Generic wildcard audio types and `application/octet-stream` are deliberately absent — those say "some bytes", not a format, and saving them under a guessed extension just moves the failure to the duration probe with a corrupt file on disk. An unresolved extension increments `failed` and skips.
+4. Copy the URI into `filesDir/recordings/{user-segment}/imported_${now}_${index}.$ext`.
+5. Probe duration and sample rate via `MediaMetadataRetriever`. Null/0 duration on a non-trivial file (`> 1 KiB`) means the format is unplayable — delete the copy and fail rather than inserting a broken row.
+6. `RecordingRepository.insertRecording(Recording(..., mode = MANUAL, sessionId = null, createdAt = now + index, ...))`. The `+ index` offset preserves ordering.
+7. Decrement `importingCount` as each file resolves so the ghost cards shrink toward the real cards as they appear.
+
+Supported audio extensions: `mp3`, `aac`, `m4a`, `mp4`, `wav`, `ogg`, `oga`, `opus`, `flac`, `3gp`, `3gpp`, `amr`.
+
+## Sharing recordings OUT
+
+`ShareUtils.shareFiles(context, filePaths, chooserTitle)` (`util/ShareUtils.kt`) launches the native Android share sheet:
+
+- One file → `Intent.ACTION_SEND` with `type = "audio/*"`.
+- Multiple files → `Intent.ACTION_SEND_MULTIPLE`.
+
+Paths are deduplicated by canonical path so sharing a session does not double-attach individual segments. Each path is wrapped as a content Uri via `FileProvider.getUriForFile(context, "${packageName}.provider", file)` with `FLAG_GRANT_READ_URI_PERMISSION` on the outgoing intent.
+
+## Saving to Downloads
+
+`ShareUtils.saveToDownloads(context, filePaths)` copies recordings directly into the device's Downloads folder:
+
+- **API 29\+** — via `MediaStore.Downloads.EXTERNAL_CONTENT_URI` with `ContentValues` for filename and MIME type.
+- **Older APIs** — writes into `Environment.getExternalStoragePublicDirectory(DIRECTORY_DOWNLOADS)`.
+
+Returns the number of files successfully saved. Callers dispatch this off the main thread — file IO runs inline.
+
+## Bulk export
+
+`RecordingsZipExporter.export(context, destination, onProgress)` (`util/RecordingsZipExporter.kt`) walks `filesDir/recordings/` and writes every audio file (`.m4a`, `.aac`, `.wav`, `.mp3`, `.ogg`, `.opus`) into a single zip at a user-chosen destination Uri (typically picked through the Storage Access Framework's Create Document intent, landing in Downloads).
+
+- **Never touches the database.** Designed to work even in the `FatalDbErrorScreen` recovery path when Room is unopenable. Per-user segments become top-level folders in the zip so a device with both signed-in and anonymous recordings still exports everything.
+- **Manifest marker.** The first entry is `manifest.json` (`MANIFEST_FILENAME`) with `format = "rollingrecord_recordings_export"` (`MANIFEST_FORMAT`). `RecordingsZipImporter` rejects any zip that does not begin with a valid manifest, so hand-built zips of random audio cannot be imported by accident or on purpose.
+- **Progress callback.** `onProgress(current, total)` fires after each entry completes so the UI can render a determinate progress bar.
+- **Audio only.** No metadata, names, categories, or transcripts are exported. Re-import brings audio back as fresh `Recording` rows through the orphan-scanner path.
+
+## Bulk import
+
+`RecordingsZipImporter` (`util/RecordingsZipImporter.kt`) streams a zip Uri, extracts each audio entry into `filesDir/recordings/{relative-path-from-zip}/`, and reimports the new files via `OrphanedAudioScanner.importFiles`.
+
+### Manifest and version gate
+
+The importer reads the first entry and rejects the zip unless:
+
+- The entry name is `manifest.json`.
+- `format` is `"rollingrecord_recordings_export"`.
+- `version` is within `MIN_SUPPORTED_MANIFEST_VERSION..MANIFEST_VERSION`.
+
+Zips built by hand, or old exports whose format has been retired, or newer exports the current app cannot understand, are refused rather than silently doing the wrong thing.
+
+### Dedup
+
+Deduplication runs on both layers:
+
+1. **True duplicate (disk \+ DB).** File exists on disk **and** its absolute path is already in the DB → skipped entirely. Neither the file nor the row is touched. Counted as `skippedFiles`.
+2. **On disk but unknown to DB.** File exists but has no row (typical of a prior import that extracted but failed to insert) → the existing file is preserved and the path is passed to `OrphanedAudioScanner.importFiles` so a `Recording` row is created.
+3. **Not on disk.** Extracted from the zip and passed to the orphan scanner for a fresh row.
+
+Result: importing the same zip twice produces zero duplicate files on disk and zero duplicate rows in the DB.
+
+### Zip-slip guard
+
+Zip entry names are user-supplied. A malicious zip could contain entries like `../../../etc/passwd`. Every target path is canonicalized and verified to live under `filesDir/recordings/` before any write. Entries that escape the root are skipped silently.
+
+### Import summary
+
+The importer returns an `ImportSummary` (via `OrphanedAudioScanner.ImportSummary`) with per-outcome counts:
+
+- `imported` — recording rows successfully inserted.
+- `alreadyKnownPath` — files filtered out at the DB layer because their absolute path was already known.
+- `probeFailed` — files that could not be decoded by `MediaMetadataRetriever`. The file is on disk but invisible to the app.
+- `insertFailed` — recordings whose `insertRecording` call threw. See `AppLogger` for underlying errors.
+- `sessionInsertFailed` — sessions whose `insertSession` call threw. Every segment in that session is also counted under `insertFailed`.
+
+The Settings **Backup and restore** section exposes both flows and displays the summary counts to the user.

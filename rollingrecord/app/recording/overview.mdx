@@ -3,14 +3,47 @@ title: "Recording System Overview"
 description: "How manual and rolling capture share one foreground pipeline."
 ---
 
-Both capture modes run through a shared foreground recording pipeline built around a small set of service objects and data models.
+Both capture modes run through a shared foreground recording pipeline built around a small set of service objects and data models. Manual and Rolling only differ in how the pipeline treats the output files: Manual writes one continuous file per session, Rolling splits into segments and prunes the oldest ones to hold to a storage cap.
 
-## What this covers
+## Capture modes
 
-- Manual vs Rolling modes (`RecordingMode`) and how the foreground pipeline is shared between them.
-- Core service objects: `RecordingService`, `RecordingController`, `RecordingServiceState`.
-- Data models: `RecordingSession`, `Recording`, `RecordingProfile`.
+`RecordingMode` (`com.intuisoftllc.rollingrecord.data.models.RecordingMode`) is a two-value enum:
 
-<Note>
-Scaffold generated from the codebase map — expand with full detail, examples, and specifics.
-</Note>
+- **`MANUAL`** — one recording per start/stop cycle. Optionally split into segments after a duration threshold, but no pruning. See [Manual Record Mode](/rollingrecord/app/recording/manual-mode).
+- **`ROLLING`** — indefinite capture into a fixed number of segments. Oldest unprotected segments are pruned to hold the session under the user's storage cap. See [Rolling Record Mode](/rollingrecord/app/recording/rolling-mode).
+
+The mode is passed to the recording foreground service as `EXTRA_MODE` on `ACTION_START` and stored in `RecordingServiceState.mode`. Everything downstream of the state machine (encoders, rotation, notifications, tiles) reads the mode off the state.
+
+## The pipeline
+
+Every recording, regardless of mode, flows through the same three objects:
+
+- **`RecordingController`** (`service/RecordingController.kt`). Thin wrapper the UI, tiles, and workers call. It only builds `Intent`s and dispatches them to the service via `startForegroundService` / `startService`. It does not hold any recording state itself.
+- **`RecordingService`** (`service/RecordingService.kt`). The foreground service that owns the microphone, the encoder, the rotation timer, the notification, and the wake lock. All `ACTION_*` intents from the controller, the schedule alarm receiver, and the notification actions land here.
+- **`RecordingServiceState`** (`service/RecordingServiceState.kt`). Immutable snapshot of what the service is currently doing (mode, phase, session id, elapsed time, segment index, storage used, etc.). Exposed as a `StateFlow` on `RecordingService.state` and observed by the UI and Quick Settings tiles.
+
+The service also emits four `SharedFlow`s for one-shot events the UI needs to react to:
+
+| Flow | Fires when |
+| --- | --- |
+| `continueSessionFailed` | A "continue a rolling session" start failed (e.g. the session no longer exists). |
+| `storageLimitResult` | A `UPDATE_STORAGE_LIMIT` request completed. |
+| `batteryTooLow` | Recording was blocked or stopped by the low-battery gate (15% unplugged / 5% while charging). See `BatteryGate` and [Interruption handling](/rollingrecord/app/recording/interruption-recovery). |
+| `deviceStorageTooLow` | Recording was blocked or stopped because the device is under the 250 MB free-space floor. |
+
+The admission layer emits a parallel set of one-shot events on `RecordingAdmissionBus.events` (`RouteToRecordingScreen`, `Blocked`, `BatteryTooLow`, `StorageTooLow`) so the UI can react to gatekeeper rejections before any capture-side signal fires. See [Admission and concurrency](/rollingrecord/app/recording/admission-control).
+
+## Data models
+
+Recordings are persisted through Room. Three models cover the recording lifecycle:
+
+- **`RecordingSession`** — a Rolling session. One row per Rolling recording. Segments belong to a session via `sessionId`. Manual recordings have no session row.
+- **`Recording`** — a single audio file. For Manual this is one row per recording. For Rolling it is one row per segment, all sharing a `sessionId`. Fields include `filePath`, `durationMs`, `fileSizeBytes`, `format`, `sampleRate`, `isProtected`, and `createdAt`.
+- Recording quality preferences (bitrate, sample rate, format preference, Voice vs. High Fidelity) live in `SettingsRepository`. There is no separate `RecordingProfile` type in V2; the recorder reads the current values off settings at start-time and stores the resolved values on each `Recording` row.
+
+## Where to go next
+
+- [Recording foreground service](/rollingrecord/app/recording/recording-service) — the service lifecycle, state machine, and notification.
+- [Admission and concurrency](/rollingrecord/app/recording/admission-control) — what has to be true before a start is accepted.
+- [Segment rotation](/rollingrecord/app/recording/segment-rotation) — how long captures split into rotating files.
+- [Interruption handling](/rollingrecord/app/recording/interruption-recovery) — calls, audio-focus loss, and OS kills.

@@ -3,14 +3,62 @@ title: "Rolling Record Mode"
 description: "Indefinite capture within a storage cap by pruning the oldest segments."
 ---
 
-Rolling mode records indefinitely within a user-defined storage cap, pruning the oldest segments to make room like a dashcam.
+Rolling mode records indefinitely within a user-defined storage cap, pruning the oldest unprotected segments to make room like a dashcam. Every Rolling recording is a `RecordingSession` made up of rotated segments, backed by the same [segment rotation](/rollingrecord/app/recording/segment-rotation) machinery Manual uses.
 
-## What this covers
+## Storage cap
 
-- Indefinite capture within a user storage cap by pruning oldest segments; `StorageManager` + `StorageLimitHandler`.
-- Rolling storage-usage indicator and live session viewer (Pro).
-- Protecting an in-progress segment from pruning.
+Each Rolling session has a `sessionStorageLimitBytes` value set at session start from `SettingsRepository.maxStorageLimitBytes` (default 250 MB — `262_144_000`). The Settings UI lets the user pick a cap in the low-MB-to-multiple-GB range; the value is stored in bytes.
 
-<Note>
-Scaffold generated from the codebase map — expand with full detail, examples, and specifics.
-</Note>
+The cap can be updated mid-session via `ACTION_UPDATE_STORAGE_LIMIT` (`EXTRA_STORAGE_LIMIT_BYTES`). The service applies the new value to `RecordingServiceState.sessionStorageLimitBytes` and re-runs a prune pass on the next segment rotation.
+
+The service also enforces a **device-level 250 MB free-storage floor** (`StorageManager.MIN_FREE_STORAGE_BYTES`) independent of the per-session cap. If free space on `filesDir` falls under that at start-time or between segments, the session refuses to start or stops.
+
+## Pruning
+
+At the end of each segment rotation, `StorageManager.ensureSpaceForNextSegment(session)` decides whether to prune:
+
+1. Compute `estimatedNextSegmentBytes = AudioConfigHandler.estimateSegmentSize(quality, currentSegmentDurationMs)`.
+2. If `rollingStorageUsedBytes + estimatedNextSegmentBytes <= sessionStorageLimitBytes`, no prune is needed.
+3. Otherwise, select the oldest **unprotected** segments in the current session in `createdAt` order until enough bytes have been reclaimed (`StorageLimitHandler.selectSegmentsToPrune`).
+4. Delete the selected files from disk and their `Recording` rows from Room, then update `RecordingServiceState.rollingStorageUsedBytes`.
+
+`StorageLimitHandler` is the pure-logic layer: `shouldPrune`, `bytesToPrune(current, max, buffer)`, `selectSegmentsToPrune(segments, bytesNeeded)`, `hasSpaceForSegment`. All storage-cap decisions are made through it so they can be unit tested without touching the filesystem.
+
+## Protecting a segment
+
+While a Rolling session is active, the user can protect the in-progress segment so it (and any other protected segments in the session) survive pruning. This is what makes Rolling usable for "capture this specific moment" workflows.
+
+- **How.** Tap the protect action in the recording UI or the Protected Mode Quick Settings tile. The tile sends `ACTION_SET_SEGMENT_PROTECTED` with `EXTRA_SEGMENT_PROTECTED = true`. Clearing the flag before rotation "un-protects" the current segment.
+- **What it does.** Sets `RecordingServiceState.isCurrentSegmentProtected` and, when the segment finalizes at rotation time, sets `Recording.isProtected = true` on the row. Protected segments are excluded from `selectSegmentsToPrune`.
+- **Warning at 70%.** `StorageManager` fires a per-session warning on the `recording_alerts` channel when protected segments occupy 70% of the session cap. The flag `firedProtectedWarningThisSession` prevents repeated notifications inside one session.
+- **Full protected storage.** If the prune pass has nothing left to reclaim (every segment is protected), `outOfPrunableSpace` triggers `fireProtectedSpaceFullNotification` on the `recording_urgent` channel and the session stops. This is the only case where Rolling stops itself due to storage.
+
+`protectedRollingStorageUsedBytes` on the state flow tracks the running total of protected bytes and is what the storage-usage bar splits into "used" vs. "protected".
+
+## Storage-usage indicator
+
+The Home screen's recording layout shows a horizontal bar with:
+
+- Total used bytes (`rollingStorageUsedBytes`) as a proportion of `sessionStorageLimitBytes`.
+- A distinct fill for `protectedRollingStorageUsedBytes` inside that.
+- A numeric readout formatted via `FormatHandler.formatFileSize` and `formatStorageLimit`.
+
+The bar updates on every rotation and whenever the storage limit is changed mid-session.
+
+## Live session viewer (Pro)
+
+Pro users can open a live Rolling session's Session Detail while the session is still recording. It shows the segments as they commit, refreshes on rotation, and lets the user protect individual completed segments. Free users can open the session only after it stops.
+
+## Continuing a Rolling session
+
+`RecordingController.continueSession(sessionId)` starts a Rolling recording that extends an existing session rather than creating a new one. The service opens the session's directory, resumes segment numbering from `currentSegmentIndex + 1`, and inherits the original session's storage cap and segment duration. Used both from Session Detail and the Rolling-pinned Quick Settings tile.
+
+If the session no longer exists (deleted between the tap and the intent arriving), `RecordingService` emits `continueSessionFailed` on its `SharedFlow` and the UI shows a "session not found" message.
+
+## Discarding the in-progress segment
+
+Rolling does not use `ACTION_CANCEL` (Manual only). The Rolling equivalent is `ACTION_DISCARD_ROLLING_SEGMENT` (via `RecordingController.discardCurrentRollingSegment(fallbackName)`), which stops the session and drops the **in-progress** segment without saving it. Previously-rotated segments stay in the DB as the session. If the session has no prior segments (the user discarded the very first one), the now-empty session is removed. The intent carries an `EXTRA_RECORDING_NAME` fallback so a session the user never named still gets a date-stamped default rather than becoming a nameless orphan. After teardown, if an upcoming schedule is active, the service transitions to `STANDBY` rather than fully stopping.
+
+## Boot behavior
+
+`BootReceiver` starts `RecordingService` with `ACTION_BOOT_CHECK` after device reboot. If the last-persisted state indicates a Rolling session was active when the device restarted, the service can bring the session back to a stopped-with-segments state so the user doesn't lose the segments that did finalize. It does not auto-resume capture — the user must explicitly continue the session.

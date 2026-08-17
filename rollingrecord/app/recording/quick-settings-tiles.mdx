@@ -3,13 +3,89 @@ title: "Quick Settings Tiles"
 description: "Start/stop and protect recordings from the notification shade."
 ---
 
-Quick Settings tiles let users start, stop, and protect recordings straight from the notification shade.
+Quick Settings tiles let users start, stop, and protect recordings straight from the notification shade. Both tiles require a signed-in **Pro** account.
 
-## What this covers
+## Tiles
 
-- `RecordingTileService` (start/stop from the shade) and `ProtectedModeTileService` (protect a rolling segment).
-- `TileStartActivity` launch path, `TileRefresher` state updates, and `TileHaptics`; the `TileMode` setting (Manual / Rolling new / Rolling pinned session).
+- **Record tile** (`tiles/service/RecordingTileService.kt`) — starts or stops a recording depending on the active mode. Its exact behavior is set by `TileMode`.
+- **Protected Mode tile** (`tiles/service/ProtectedModeTileService.kt`) — toggles the in-progress Rolling segment's protected flag by sending `ACTION_SET_SEGMENT_PROTECTED` to `RecordingService`.
 
-<Note>
-Scaffold generated from the codebase map — expand with full detail, examples, and specifics.
-</Note>
+Both extend `android.service.quicksettings.TileService` and are declared `ACTIVE_TILE=true` in the manifest, which means Android does **not** call `onStartListening` when the user pulls down the shade — only when the tile is added, when it is tapped, and when something calls `TileService.requestListeningState`. See [Refreshing tiles](#refreshing-tiles-from-the-app) below.
+
+They resolve per-user dependencies (`SettingsRepository`, `EntitlementRepository`) through Koin's user-scoped container so a sign-in/out mid-service-life picks up the new user's preferences on the next tile update.
+
+## Deliberately always clickable
+
+Neither tile is ever painted `STATE_UNAVAILABLE` for entitlement or safety reasons. An unclickable tile cannot self-correct a stale render, which is what once left genuinely-paid users locked out of the tiles when RevenueCat was mid-hydration on a cold boot. Both tiles paint only the **action** ("Record", "Tap to protect", session name), never account status, and both re-derive admission from scratch on every tap. The trade-off is that taps which cannot do anything reach the handler, so they have to feel rejected. `TileHaptics.rejected(context)` (`tiles/TileHaptics.kt`) plays a short three-pulse waveform (`longArrayOf(0, 25, 50, 25, 50, 25)`) via `VibrationEffect.createWaveform` so a refused tap is recognizable wherever it happens.
+
+## `TileMode`
+
+`TileMode` (`data/models/TileMode.kt`) drives the Record tile's behavior:
+
+- **`MANUAL`** (default) — the tile starts and stops Manual recordings only. While a Rolling recording is active, the tile paints `STATE_UNAVAILABLE` with subtitle **"Manual only"** and rejects taps.
+- **`ROLLING_NEW`** — the tile starts a new Rolling session on each tap and stops the current Rolling recording on tap-to-stop.
+- **`ROLLING_PINNED`** — the tile always continues a specific pinned session (`settingsRepository.tilePinnedSessionId`); the subtitle shows the pinned session name.
+
+`TileMode.isRolling` is true for the two rolling variants. Users configure this from **Settings → Quick Settings Tiles**.
+
+## `RecordingTileService`
+
+### State updates
+
+`onStartListening` starts a coroutine that `combine`s `RecordingService.state`, `settingsRepository.tileMode`, and `settingsRepository.tilePinnedSessionName`, then calls `updateTile(state, mode, pinnedName)` on each change. `updateTile` sets `Tile.state`, `Tile.label` ("Record"), and `Tile.subtitle` (API 29\+).
+
+Painted states:
+
+- **Idle, Manual tile mode** — `STATE_INACTIVE`, subtitle **"Tap to start"**.
+- **Recording, Manual** — `STATE_ACTIVE`, subtitle **"Recording — tap to stop"**.
+- **Paused, Manual** — `STATE_ACTIVE`, subtitle **"Paused — tap to stop"**.
+- **Rolling active while tile is Manual** — `STATE_UNAVAILABLE`, subtitle **"Manual only"**.
+- **Manual active while tile is Rolling** — `STATE_UNAVAILABLE`, subtitle **"Manual recording active"**.
+- **Rolling active, tile is Rolling** — `STATE_ACTIVE`, subtitle either the session name (pinned) or **"Rolling — tap to stop"**.
+- **Scheduled recording active** — `STATE_ACTIVE`, subtitle **"Scheduled recording"** / **"Scheduled — paused"** depending on state.
+
+The tile never paints "Requires Pro" or "Sign in to use" as its subtitle. Entitlement is enforced at the tap, not on the render.
+
+### Click routing
+
+`onClick` reads the current service state and either dispatches `ACTION_STOP` directly to `RecordingService` (when the tile can stop the current recording without needing an Activity context) or launches `TileStartActivity` for start paths and for stopping a Rolling recording. The Activity route is required because Android 14\+ blocks microphone-FGS starts from Quick Settings context (the "eligible state" restriction, enforced strictly on Samsung). Routing through a foreground Activity satisfies the eligibility check.
+
+## `TileStartActivity`
+
+`TileStartActivity` (`tiles/TileStartActivity.kt`) is a transparent Activity that finishes immediately after dispatching the right start intent. `moveTaskToBack(true)` collapses the shade so only the recording notification appears — no visible transition.
+
+Per-tap flow:
+
+1. Read `RecordingService.state`, `settingsRepository.tileMode`, and the active mode.
+2. **Start-path admission** (only when the tap would start a recording; stopping a live recording is never blocked, so a momentary Free/UNKNOWN tier or drained battery cannot strand a running recording):
+   - **`isStartAllowed()`** — requires a signed-in session (definitive `SignedOut` blocks; a Loading auth state falls back to the synchronous session id read from SharedPreferences to avoid a slow Clerk restore being mistaken for signed-out) **and** tier ≥ `PRO`. Tier reads `entitlementRepository.currentTier`; if that never resolves within `TIER_RESOLVE_TIMEOUT_MS` it falls back to `userSettings.lastKnownTier`, which is per-user and only ever written for a `SignedIn`, owner-matched RevenueCat response — so it cannot leak across accounts or manufacture a tier a free user never had. No blocking RevenueCat network call is made; that would add latency to every tap and fail outright offline. On rejection: `TileHaptics.rejected(this)` and `moveTaskToBack`.
+   - **`isBatteryTooLow()`** — `BatteryGate.tooLow(pct, isCharging)`. Refuses at/below 15% unplugged, or below 5% even while charging. On rejection: fires the "Battery too low" notification on `tile_alerts` with the exact required percent from `BatteryGate.requiredPercent(isCharging)` (so the copy can never quote a floor the gate does not actually enforce), plays the reject haptic, and returns.
+3. **Dispatch by `TileMode` and current activity:**
+   - **`MANUAL` tile mode:** Rolling running → reject; Manual running → send `ACTION_STOP`; idle/standby → `gatekeeper.requestStart(RecordStartRequest(MANUAL, TILE, requestForegroundRoute = true))`.
+   - **Rolling tile modes:** Manual running → reject; Rolling running → send `ACTION_STOP`; idle/standby → for `ROLLING_NEW` call the gatekeeper with `mode = ROLLING`, for `ROLLING_PINNED` call `startPinnedSession()`.
+
+`requestForegroundRoute = true` means the gatekeeper will emit `RouteToRecordingScreen` on `RecordingAdmissionBus.events` so the recording screen opens on the next foreground moment. See [Admission and concurrency](/rollingrecord/app/recording/admission-control).
+
+### Pinned session
+
+`startPinnedSession()` reads `settingsRepository.tilePinnedSessionId`. If empty, it fires the **"No session pinned"** notification and rejects. If the pinned session no longer exists (deleted after being pinned), it fires **"Pinned session no longer exists"**, resets the tile mode to `ROLLING_NEW`, clears the pinned id and name, and requests a tile refresh.
+
+### Rejection channel
+
+Tile rejections that need to explain themselves (battery, no pinned session, deleted pinned session) use a dedicated `tile_alerts` `IMPORTANCE_HIGH` channel with per-cause notification IDs so a follow-up refusal replaces the previous notification instead of stacking.
+
+## `ProtectedModeTileService`
+
+`onStartListening` observes `RecordingService.state` and paints:
+
+- **Rolling active, current segment protected** — `STATE_ACTIVE`, subtitle **"Protected"**.
+- **Rolling active, current segment unprotected** — `STATE_INACTIVE`, subtitle **"Tap to protect"**.
+- **No Rolling recording active** — `STATE_UNAVAILABLE`, subtitle **"Rolling record only"** (informative label, still clickable; a tap outside a Rolling recording falls through to a haptic reject in the same way).
+
+`onClick` sends `ACTION_SET_SEGMENT_PROTECTED` with `EXTRA_SEGMENT_PROTECTED = !state.isCurrentSegmentProtected`. The tile also updates its own visuals optimistically because the `StateFlow` update is async.
+
+## Refreshing tiles from the app
+
+`TileRefresher.refreshAll(context)` (`tiles/TileRefresher.kt`) calls `TileService.requestListeningState(context, ComponentName(...))` for both `RecordingTileService` and `ProtectedModeTileService`. Because both tiles declare `ACTIVE_TILE=true`, anything that changes what a tile should display has to poke them explicitly or the shade keeps showing a stale render indefinitely.
+
+`RecordingService`'s state transitions call `RecordingNotificationManager.notifyTile()` on every mode / phase change. `App.observeTierAndManageSchedulers` also calls `TileRefresher.refreshAll(context)` on every tier change (sign-in, purchase, lapse, session switch) so a user who genuinely upgraded stops being locked out of the tiles until they happen to start a recording from inside the app.

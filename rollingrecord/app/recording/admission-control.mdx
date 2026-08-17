@@ -3,13 +3,94 @@ title: "Recording Admission & Concurrency"
 description: "How recording start requests are admitted, queued, and de-conflicted."
 ---
 
-A small admission layer decides when a recording may start and prevents microphone and playback contention.
+Every record start in RollingRecord flows through a single admission funnel, `RecordingGatekeeper`. The Home buttons, Quick Settings tiles, continue-recording, and continue-session all call `requestStart(...)` on the same object, so conflict and safety checks can never drift between entry points.
 
-## What this covers
+## `RecordingGatekeeper`
 
-- `RecordingGatekeeper`, `RecordingAdmissionBus`, `RecordStartRequest`, and `BlockingOp` for admitting/queuing start requests.
-- `BusyGuard` mutual exclusion and `PlaybackCoordinator` to avoid mic/playback contention.
+`RecordingGatekeeper` (`service/admission/RecordingGatekeeper.kt`) is a synchronous funnel that runs five gates in order and returns a `RecordStartResult`:
 
-<Note>
-Scaffold generated from the codebase map — expand with full detail, examples, and specifics.
-</Note>
+1. **Already-recording** — if `RecordingService.state.value.recordingState` is not `IDLE` or `STANDBY`, reject. A second recording never starts.
+2. **HARD block on a dangerous file op** — if `BusyGuard.firstBlocking(continueFromRecordingId)` returns a non-null `BlockingOp`, reject and emit `RecordingAdmissionEvent.Blocked` so the UI can show "blocked, try again".
+3. **Battery floor** — `BatteryGate.tooLow(percent, isCharging)`. Reject and emit `BatteryTooLow` if so.
+4. **Device storage floor** — `StorageManager.hasMinimumFreeStorage(context)`. Reject and emit `StorageTooLow` if so.
+5. **SOFT resolve** — `PlaybackCoordinator.stopActivePlayback()` (pauses the active playback ViewModel if one is registered), then dispatch the real start through `RecordingController`.
+
+For tile / background starts the request also carries `requestForegroundRoute = true`; on admission the gatekeeper emits `RouteToRecordingScreen` on `RecordingAdmissionBus.events` so the app opens the recording screen on the next foreground moment. Every admission decision is logged with `save = true` (source, mode, op, booleans — no user content) so field logs show what was blocked, routed, or stopped.
+
+## `RecordStartRequest`
+
+`RecordStartRequest` (`service/admission/RecordStartRequest.kt`) is the pure-data input to `requestStart`:
+
+| Field | Meaning |
+| --- | --- |
+| `mode: RecordingMode` | `MANUAL` or `ROLLING`. |
+| `source: RecordStartSource` | `V2_HOME`, `TILE`, `CONTINUE_SESSION`, or `CONTINUE_MANUAL`. Origin tag for logs. |
+| `continueSessionId: String?` | Non-null when extending an existing Rolling session; routed to `RecordingController.continueSession`. |
+| `continueFromRecordingId: String?` | Non-null for a Manual continue-recording; routed to `startContinueRecording`. Also scopes the busy check to that recording. |
+| `requestForegroundRoute: Boolean` | Backgrounded starts (tiles) set this so the recording screen opens on the next foreground. |
+
+The outcome is `RecordStartResult.Started` or `RecordStartResult.Blocked`. Every entry point respects the result: on `Blocked` no navigation happens; on `Started` the UI either follows the standard nav or waits for `RouteToRecordingScreen`.
+
+## `BusyGuard` and `BlockingOp`
+
+`BusyGuard` (`service/admission/BusyGuard.kt`) is an app-scoped registry of in-flight dangerous file-mutating operations. Dangerous ops bracket their critical section with `enter` / `exit` (or the `withBusy` / `guard` helpers), and the gatekeeper reads `firstBlocking(recordingId)` to hard-block a start while one is live.
+
+`BlockingOp` values:
+
+- **`MERGE`** — `MergeWorker` is stitching a continuation onto the original file. Replacing the original mid-record would corrupt it.
+- **`CLIP_RESAVE`** — Trim is overwriting an original recording's file (`TrimViewModel`).
+- **`FINALIZING`** — `RecordingService` is committing a just-stopped recording or rotated segment (DB insert plus file rename window).
+
+Scoping: a `continueFromRecordingId` non-null request matches only global entries and entries targeting the same recording. A null-target request (fresh recording) matches **any** entry, because a global op like `FINALIZING` overlaps every start. Mutations go through `MutableStateFlow.update` (atomic CAS) so concurrent enter/exit calls cannot lose state.
+
+## `PlaybackCoordinator`
+
+`PlaybackCoordinator` (`service/admission/PlaybackCoordinator.kt`) is a single-slot registry the active playback ViewModel writes into on screen open and clears on teardown. `stopActivePlayback()` calls the registered `PlaybackStopHandle.stopPlayback()` (which invokes the VM's `pause()` — same behavior as an audio-focus-loss transient) so the recorder can take the mic without contention. Single slot is safe because only one playback screen is alive at a time; `unregister` uses `compareAndSet` so the outgoing screen does not clear the incoming one.
+
+## `RecordingAdmissionBus`
+
+`RecordingAdmissionBus` (`service/admission/RecordingAdmissionBus.kt`) is a stateless app-scoped event bus with `replay = 0`, `extraBufferCapacity = 8`, `DROP_OLDEST`. Emitted events:
+
+- **`RouteToRecordingScreen`** — a background start (tile) wants the recording screen to open. `V2MainNavHost` listens and, once `RecordingService.state` actually reports `RECORDING` / `PAUSED`, navigates.
+- **`Blocked`** — a start was refused by a busy op; the UI shows a "try again" snackbar.
+- **`BatteryTooLow`** / **`StorageTooLow`** — the corresponding safety-gate refusals.
+
+The bus deliberately holds no state across a session switch: a route request that nobody was listening for is already gone, which is what stops the stale route flag that used to open a phantom recording screen after cancel-from-notification.
+
+## Safety floors: battery
+
+`BatteryGate` (`util/BatteryGate.kt`) is the single source of truth for the low-battery rule. It is used by the gatekeeper (start gate), the recording service (mid-recording auto-stop and pre-start check), the Quick Settings tile activity, and the Home record button.
+
+The rule:
+
+- Above **15%** — always allowed.
+- **5–15%** while charging — allowed (charging exception).
+- **5–15%** unplugged — blocked. Unplugging a sub-15% charging recording auto-stops it.
+- Below **5%** — blocked even while charging.
+- Percent unknown (`-1`) — allowed. Never block on missing data.
+
+`STOP_THRESHOLD = 15`, `CHARGING_FLOOR = 5`. `requiredPercent(isCharging)` returns the lowest allowed value so refusal copy can never quote a floor the gate does not actually enforce. `RecordingService`'s in-recording battery observer watches `ACTION_BATTERY_CHANGED` and, when `tooLow(pct, charging)` becomes true, stops the session and emits `batteryTooLow`.
+
+## Safety floors: storage
+
+`StorageManager.hasMinimumFreeStorage(context)` enforces `MIN_FREE_STORAGE_BYTES = 250 MB` on `filesDir`. Checked at the gatekeeper, at start-time inside the service, and between segments. Failure at start emits `deviceStorageTooLow` on the service's `SharedFlow` and `StorageTooLow` on the admission bus. A running Rolling session that trips this mid-flight stops on the `recording_urgent` channel.
+
+## Only one recorder at a time
+
+`RecordingService` is a singleton foreground service. Every start intent routes to the same instance. The state machine (`RecordingStateHandler`) accepts `START` only from `IDLE` or `STANDBY`, so a second `START` racing an already-active one is rejected with no side effects. The gatekeeper's already-recording gate catches this earlier, but the state machine is the belt-and-braces enforcement inside the service itself.
+
+Playback is prevented from talking over recording through `PlaybackCoordinator` (registered handles pause before the mic is taken) and Android's own audio-focus mechanics on the playback side.
+
+## Standby: pre-warmed admission for scheduled starts
+
+Scheduled recordings dodge Android 14\+'s microphone-FGS background-start restriction by warming the service to `STANDBY` from a foreground context before the alarm fires. When the exact alarm fires, `ScheduleAlarmReceiver.handleStart` calls plain `context.startService(...)` — the service is already up as a `MICROPHONE` foreground service, so no background-start check applies. See [Scheduled recordings](/rollingrecord/app/recording/scheduled-recordings).
+
+## Contention with an active recording
+
+- **Tile taps.** `TileStartActivity` reads the current service state; a Manual tile while Rolling is active (or vice versa) is rejected via `TileHaptics.rejected(context)` with no notification. See [Quick settings tiles](/rollingrecord/app/recording/quick-settings-tiles).
+- **Schedule alarms.** `ScheduleAlarmReceiver.handleStart` reads `RecordingService.state.value.recordingState`. If it is `RECORDING` or `PAUSED`, the occurrence is skipped (recurring schedules re-enqueue the next one) rather than preempting.
+- **Continue Manual mid-merge.** If a `MergeWorker` is running against a specific recording, `BusyGuard.firstBlocking(originalRecordingId)` returns `MERGE`, the gatekeeper's HARD block rejects the start, and the UI receives `Blocked`.
+
+## Audio-focus loss during recording
+
+Losing audio focus while recording does not stop the microphone — the mic still captures. Behavior differs per mode; see [Interruption handling](/rollingrecord/app/recording/interruption-recovery).

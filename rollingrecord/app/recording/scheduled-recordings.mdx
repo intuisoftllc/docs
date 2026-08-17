@@ -3,14 +3,94 @@ title: "Scheduled Recordings"
 description: "Time-based recordings via AlarmManager and WorkManager."
 ---
 
-Scheduled recordings start and stop themselves at planned times using AlarmManager and WorkManager, re-arming across reboots.
+Scheduled recordings start and stop themselves at planned times using `AlarmManager` exact alarms, re-arm across reboots via `BootReceiver`, and route through the same foreground service the rest of the app uses.
 
-## What this covers
+## Data model
 
-- `ScheduledRecording` model + `RepeatMode`, `ScheduleLogic`, `ScheduledRecordingRepository`, `ScheduleEnqueuer`.
-- AlarmManager path: `ScheduleAlarmReceiver`, `ScheduledRecordingStartWorker`/`StopWorker`, `PreStartNotificationWorker`; re-arm on boot via `BootReceiver`.
-- Schedule UI: `V2ScheduleScreen` / `V2AddScheduleScreen` / `V2ScheduleViewModel`.
+`ScheduledRecording` (`data/models/ScheduledRecording.kt`):
 
-<Note>
-Scaffold generated from the codebase map — expand with full detail, examples, and specifics.
-</Note>
+- `id: String` (UUID).
+- `name: String?` — surfaced as the recording name on start (via `ACTION_SET_NAME`). Null means "Untitled".
+- `startTimeMs: Long` — epoch ms of the first (or only) occurrence. For recurring schedules, the time-of-day component is used and the date component is recomputed each occurrence.
+- `durationMs: Long` — cap of 24 h.
+- `repeatMode: RepeatMode` — one of `ONCE`, `DAILY`, `WEEKLY`.
+- `repeatDays: Set<Int>` — day-of-week numbers (1 = Mon, 7 = Sun). Only used for `WEEKLY`.
+- `isEnabled: Boolean` and `skipUntilMs: Long?` — a schedule is "active" if enabled and not currently inside a skip window.
+- `preStartNotification: Boolean` — whether to fire a 5-minute-ahead reminder notification.
+- `cloudExcludedAt: Long?` — user-controlled cloud-exclusion timestamp (null = synced).
+
+`isActive()` returns true if the schedule is enabled and `System.currentTimeMillis() >= (skipUntilMs ?: 0)`.
+
+`ScheduledRecordingRepository` owns CRUD, `setEnabled`, `setSkipUntil`, and `nextFireTime(schedule, afterMs)`. `nextFireTime` computes the next real fire timestamp by walking forward from `afterMs` respecting the schedule's `repeatMode` and `repeatDays`.
+
+## Enqueue path
+
+`ScheduleEnqueuer` (`worker/ScheduleEnqueuer.kt`) is the single place that sets exact alarms:
+
+- `enqueue(context, schedule, fireAtMs)` — cancels any existing alarms for the id, then sets up to two alarms:
+  - **Pre-start notification** at `fireAtMs - 5 min` (or \+1s from now if the schedule is less than 5 min away). Fires `ACTION_NOTIFY` on `ScheduleAlarmReceiver`.
+  - **Start alarm** at `fireAtMs`. Fires `ACTION_START` on `ScheduleAlarmReceiver`.
+- `enqueueStop(context, scheduleId, durationMs)` — sets the stop alarm relative to `now + durationMs` after recording has actually started, so drift is bounded by the alarm-callback exemption window rather than the originally scheduled start.
+- `cancel(context, scheduleId)` — cancels the notify, start, and stop alarms for a given schedule id.
+- `reEnqueueAll(context, repository)` — used from `BootReceiver` after device reboot and from `App` on cold start; idempotent because `enqueue` cancels first.
+
+Alarms use `AlarmManager.setExactAndAllowWhileIdle(RTC_WAKEUP, …)`. Exact alarms are required for two reasons: WorkManager's `setInitialDelay` is inexact and can be deferred by Doze mode by minutes or longer, and, more importantly, Android 14\+ only exempts microphone FGS background-start restrictions when the caller is on-stack inside an exact-alarm callback.
+
+## Firing the recording
+
+`ScheduleAlarmReceiver` (`receiver/ScheduleAlarmReceiver.kt`) is a `BroadcastReceiver` registered in the manifest. It handles four actions:
+
+- `ACTION_START` — start the recording.
+- `ACTION_STOP` — stop it.
+- `ACTION_NOTIFY` — fire the pre-start reminder.
+- `ACTION_SKIP` — user tapped **Skip** on the reminder notification.
+
+### `ACTION_START` details
+
+1. Cancel the pre-start reminder notification.
+2. Read `RecordingService.state.value.recordingState`. If it is `RECORDING` or `PAUSED`, skip this occurrence via `skipOccurrence` and return. This is how contention with an active manual/rolling recording is handled: the schedule steps aside.
+3. Read battery percentage. If in `0..10`, skip this occurrence.
+4. Start the service **synchronously, inside `onReceive`**. This matters: the Android 14\+ mic-FGS background-start exemption is only guaranteed while the receiver is on-stack. `goAsync()` extends the receiver's lifetime but not the OS-level exemption window on strict OEM builds.
+   - If `state == STANDBY`, use plain `startService(...)`. The service is already up as a mic FGS, so no background-start check applies.
+   - Otherwise use `startForegroundService(...)` while the alarm callback exemption is still active.
+5. Then, in `goAsync` \+ coroutine, do the DB-only follow-up work: fetch the schedule, re-check `isActive` in case it was disabled between the alarm being set and firing, send `ACTION_SET_NAME` if the schedule has a name, disable one-time schedules, and `ScheduleEnqueuer.enqueueStop(context, scheduleId, schedule.durationMs)`.
+
+### `ACTION_STOP` details
+
+- Only stop the recording if `serviceState.activeScheduleId == scheduleId` and the state is `RECORDING` or `PAUSED`. This guards against a stop alarm killing an unrelated recording the user started manually after the schedule fired.
+- For recurring schedules, re-enqueue the next occurrence via `ScheduleEnqueuer.enqueue`.
+
+### `ACTION_NOTIFY` details
+
+Fires 5 minutes before start. Also pre-warms the recording service into `STANDBY` if the state is `IDLE`, so that the start alarm 5 minutes later can use plain `startService` and dodge OEM background-start restrictions. Posts a notification on the `schedule_reminders_v2` channel with two actions:
+
+- **Skip** — fires `ACTION_SKIP` back to the receiver.
+- **Show** — opens `MainActivity` with `EXTRA_NAVIGATE_TO_SCHEDULE`.
+
+### `ACTION_SKIP` details
+
+Cancels the pending start alarm, then either disables the schedule (for `ONCE`) or sets `skipUntilMs` to the next fire time and re-enqueues the one after that (for `DAILY` and `WEEKLY`). Replaces the reminder notification with a 4-second confirmation via `setTimeoutAfter`.
+
+## Boot re-arm
+
+`BootReceiver` (`receiver/BootReceiver.kt`) handles `Intent.ACTION_BOOT_COMPLETED`:
+
+1. If `RECORD_AUDIO` is not granted, do nothing.
+2. Start `RecordingService` with `ACTION_BOOT_CHECK` so it can check for post-kill audio recovery. See [Interruption handling](/rollingrecord/app/recording/interruption-recovery).
+3. On an IO coroutine, call `ScheduleEnqueuer.reEnqueueAll(context, scheduleRepository)`. If any schedule is currently active, also start the service with `ACTION_STANDBY` so it is pre-warmed for the next fire.
+
+## Standby lifecycle
+
+The recording service enters `STANDBY` from three places: the schedule UI when the user creates or edits a schedule (to warm the service ahead of the first pre-start), the pre-start notification handler (5 minutes before fire), and `BootReceiver` after reboot. Standby is a full microphone foreground service with no active capture — it exists solely to make the alarm-callback start use `startService` instead of `startForegroundService`. `ACTION_CANCEL_STANDBY` exits standby and stops the service.
+
+## Workers
+
+Three workers back the schedule stack:
+
+- **`ScheduledRecordingStartWorker`** — used when a schedule is enqueued through the WorkManager path instead of exact alarms. Checks `isActive` (skips or reschedules recurring on false), starts the service via an `Intent`, and returns `Result.success`. Present for compatibility; the primary path is the exact-alarm receiver above.
+- **`ScheduledRecordingStopWorker`** — stop counterpart.
+- **`PreStartNotificationWorker`** — WorkManager-side pre-start notification. Same considerations as `ACTION_NOTIFY`.
+
+## Schedule UI
+
+The schedule list and add/edit screens live under `ui/screens/schedule/` and are backed by `ScheduleViewModel`. The list shows every schedule with its next fire time and enabled/skip state. The add/edit screen writes to `ScheduledRecordingRepository` and calls `ScheduleEnqueuer.enqueue` (or `cancel`) on save so alarms stay in sync with the row.

@@ -3,14 +3,64 @@ title: "Interruption Handling & Recovery"
 description: "How calls, audio-focus loss, and kills are handled during recording."
 ---
 
-Recording survives interruptions gracefully — pausing on calls, auto-recovering from audio-focus loss, and reporting recovery after a kill.
+Recording is designed to survive interruptions without user intervention where possible. Calls pause capture (and auto-resume after), audio-focus loss does not stop capture on Rolling, and post-kill files are recovered and surfaced to the user through a modal sheet.
 
-## What this covers
+## Phone calls
 
-- `CallStateHandler` pauses on phone calls (manual resume); audio-focus loss and mic contention auto-recover rather than pausing.
-- `RecordingInterruptedState` + `V2RecordingInterruptedSheet` surfacing the outcome to the user.
-- The "Block calls while recording" setting.
+`CallStateHandler` (`service/CallStateHandler.kt`) registers a `TelephonyCallback` (API 31\+) or a legacy `PhoneStateListener` when the service starts. It requires `READ_PHONE_STATE`; if the permission is missing, the listener is not registered and calls have no effect on recording. The handler tracks a `pausedForCall` flag so it can auto-resume after a call-driven pause.
 
-<Note>
-Scaffold generated from the codebase map — expand with full detail, examples, and specifics.
-</Note>
+Transitions:
+
+- **`RINGING`.** If `SettingsRepository.blockCallsWhileRecording` is enabled, the handler calls `TelecomManager.endCall()` to decline the call — recording continues uninterrupted. If the setting is off, or the decline fails, the handler dispatches `ACTION_PAUSE` to the service and sets `pausedForCall = true`.
+- **`OFFHOOK`.** Call answered or outgoing call started. If not already paused, the handler pauses and sets `pausedForCall = true`.
+- **`IDLE`.** Call ended. If `pausedForCall` is true, the handler dispatches `ACTION_RESUME` and clears the flag. If the recording was paused for another reason, `IDLE` does nothing.
+
+`CallStateHandler.reset()` is called from the service's stop and cancel paths so a fresh recording starts with `pausedForCall = false`.
+
+### "Block calls while recording"
+
+`SettingsRepository.blockCallsWhileRecording` is a boolean Flow surfaced in Recording settings as **Block calls while recording**. Requires `READ_PHONE_STATE` and typically `ANSWER_PHONE_CALLS` on newer OS versions. If either runtime permission is missing, `tryDeclineCall` returns `false` and the handler falls through to the pause path. Decline happens at the OS level via `TelecomManager.endCall()`; the caller hears whatever the carrier's decline behavior is.
+
+## Audio-focus loss
+
+The audio-focus policy differs by mode:
+
+- **Rolling** ignores `AUDIOFOCUS_LOSS`. The microphone keeps capturing — Rolling exists to preserve audio through interruptions, so pausing on focus loss would defeat the purpose.
+- **Manual** pauses on `AUDIOFOCUS_LOSS` and resumes on `AUDIOFOCUS_GAIN`.
+- Both modes ignore `AUDIOFOCUS_LOSS_TRANSIENT` and `AUDIOFOCUS_LOSS_TRANSIENT_CAN_DUCK`. Those are output-side directives that do not apply to a recorder.
+
+## OS kills
+
+If `RecordingService` is torn down while its state is `RECORDING`, `PAUSED`, or `STANDBY`, `OsKillSentinel` records a typed kill event to Crashlytics with the last-known state. This is how OEM-specific background-kill patterns surface in reporting.
+
+The next time the process starts, `App.onCreate` runs on-launch recovery in this order:
+
+1. **WAV header patch** via `WavHeaderRecovery.recoverInDir(dir)` for each recordings directory (per-user, legacy, and external). Any WAV whose header was never finalized becomes playable up to the point of interruption. See [Audio formats](/rollingrecord/app/recording/audio-formats).
+2. **Dangling Rolling session finalize** — any session left mid-record has its metadata closed so it appears cleanly in the library.
+3. **Interrupted-recording signal** — if the sentinel indicates an in-progress recording was killed, `App.recoverInterruptedRecording(finalizedDuringShutdown)` writes an `Outcome` to `RecordingInterruptedState`.
+
+Auto-resume of capture is deliberately not attempted. For Rolling, the user taps **Continue** on Session Detail to append a new segment.
+
+## `RecordingInterruptedState`
+
+`RecordingInterruptedState` (`states/RecordingInterruptedState.kt`) is an app-scoped `object` that holds a `StateFlow<Outcome?>`:
+
+- **`RECOVERED`** — the sentinel showed the service got a shutdown window and `onDestroy` finalized the file. The recording is in the library.
+- **`FAILED`** — the sentinel showed no shutdown window (hard kill, force-stop, power-off). Compressed audio killed mid-write cannot be salvaged after the fact.
+
+`V2App` collects the flow and, when non-null, shows `V2RecordingInterruptedSheet`. The sheet uses `reopenAfterUnlock = true` on `V2ModalBottomSheet` so it waits out the App Lock overlay on a cold start rather than flashing behind it and being missed. `RecordingInterruptedState.clear()` runs on user dismiss so it shows exactly once per kill.
+
+`RecordingInterruptedState` is deliberately outside `UserScopedCache` (a plain object, not a Koin single). The payload is a generic enum with no user data, so it carries nothing that would leak across a session switch.
+
+## Recovery surfacing
+
+Interruption outcomes reach the user through four channels, chosen to fit the situation:
+
+- **Modal sheet.** `V2RecordingInterruptedSheet` for the after-kill outcome. Waits out App Lock.
+- **Ongoing notifications.** `recording_urgent` fires for hard stops — battery too low, device storage full, protected storage full. `recording_alerts` fires for the mid-range battery warning (15%..20% band) and storage-limit updates.
+- **Home screen state.** `HomeViewModel` and `V2RecordingViewModel` observe `RecordingService.state` and update the UI so the user sees the current mode, elapsed time, and paused status without a modal.
+- **One-shot flows.** `RecordingService.batteryTooLow`, `deviceStorageTooLow`, `storageLimitResult`, and `continueSessionFailed` are collected by the Home / recording screens for snackbars.
+
+## Diagnostic logging
+
+`CallStateHandler` uses `AppLogger` with `save = true` on transitions that actually drive a pause or resume, so the rolling log records the sequence of events during a call-driven interruption without being flooded by spurious `IDLE` events at startup. `AacRecorder` and `WavRecorder` set `diskFull` and call an `onDiskFull` callback that `RecordingService` uses to stop the session cleanly on `recording_urgent` rather than crashing on the next write. Admission decisions are also `save = true` on the gatekeeper so a field log shows what was blocked, routed, or stopped leading up to a report.

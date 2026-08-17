@@ -3,14 +3,106 @@ title: "Recording Foreground Service"
 description: "The foreground service lifecycle, state machine, and notification."
 ---
 
-Recording runs in a foreground service driven by a controller and a state machine, surfaced to the UI through observable state.
+Recording runs in a foreground service driven by a controller and a state machine, surfaced to the UI through an observable state snapshot.
 
-## What this covers
+## `RecordingController`
 
-- `RecordingService` lifecycle, `RecordingController` orchestration, and the `RecordingStateHandler` state machine.
-- `RecordingNotificationManager` foreground notification and controls.
-- `RecordingServiceState` exposure to `V2RecordingScreen` / `V2RecordingViewModel`.
+`RecordingController` is a stateless intent builder. Every entry point that wants to change the recording — the Home screen, Quick Settings tiles, notification actions, schedule alarms, boot receiver — calls one of its methods:
 
-<Note>
-Scaffold generated from the codebase map — expand with full detail, examples, and specifics.
-</Note>
+- `startRecording(mode)`, `stopRecording()`, `pauseRecording()`, `resumeRecording()`, `cancelRecording()`
+- `continueSession(sessionId)` (start a new Rolling session that extends an existing one)
+- `startContinueRecording(originalRecordingId)` (Manual continuation)
+- `cancelContinueRecording()`
+- `discardCurrentRollingSegment(fallbackName)` (Rolling equivalent of cancel — drops the in-progress segment, keeps previously-rotated ones)
+- `markPosition()` (Manual only — drop a live-mark bookmark; see [Manual Record Mode](/rollingrecord/app/recording/manual-mode))
+- `setRecordingName(name)`, `setSegmentProtected(protected)`
+
+The controller only constructs an `Intent` targeting `RecordingService` and dispatches it. Foreground-start-requiring intents (`ACTION_START`) use `startForegroundService`; all others use plain `startService` because the service is already running by then.
+
+`RecordingController` also exposes `serviceState: StateFlow<RecordingServiceState>`, `amplitudes: StateFlow<List<Int>>`, and `pendingMarks: StateFlow<List<Long>>` as passthroughs to the corresponding fields on `RecordingService`, so callers don't need to touch the service class directly.
+
+Every record start in the app goes through `RecordingGatekeeper.requestStart(...)` before reaching the controller. The controller is the intent layer; the gatekeeper is the admission layer. See [Admission and concurrency](/rollingrecord/app/recording/admission-control).
+
+## Service intent actions
+
+`RecordingService` handles the following actions (companion constants on the class):
+
+| Action | Purpose |
+| --- | --- |
+| `ACTION_START` | Start a new recording (Manual, Rolling, or Rolling continuation). |
+| `ACTION_STOP` | Stop and finalize the current recording. |
+| `ACTION_STANDBY` | Enter STANDBY (pre-warmed foreground service, no active capture). Used before scheduled recordings. |
+| `ACTION_CANCEL_STANDBY` | Leave STANDBY and stop the service. |
+| `ACTION_PAUSE` / `ACTION_RESUME` | Pause or resume the active capture. |
+| `ACTION_CANCEL` | Discard the current recording (deletes files, no DB row). Manual only. |
+| `ACTION_CANCEL_CONTINUE` | Cancel an in-progress Manual continuation without touching the original recording. |
+| `ACTION_DISCARD_ROLLING_SEGMENT` | Rolling equivalent of cancel — drop the in-progress segment and keep previously-rotated ones. If no prior segments exist, the empty session is removed. |
+| `ACTION_MARK` | Drop a live-mark bookmark on a Manual recording. See [Manual Record Mode](/rollingrecord/app/recording/manual-mode). |
+| `ACTION_SET_NAME` | Update the display name of the current recording. |
+| `ACTION_SET_CATEGORY` | Stash a category id for the manual finalize path. |
+| `ACTION_BOOT_CHECK` | Post-reboot check to reconcile any recording that was active when the device restarted. |
+| `ACTION_UPDATE_STORAGE_LIMIT` | Change the Rolling storage cap mid-session. |
+| `ACTION_SET_SEGMENT_PROTECTED` | Mark the in-progress Rolling segment protected (or clear the flag). |
+
+The relevant extras are `EXTRA_MODE`, `EXTRA_RECORDING_NAME`, `EXTRA_CATEGORY_ID`, `EXTRA_CONTINUE_SESSION_ID`, `EXTRA_CONTINUE_FROM_ID`, `EXTRA_SCHEDULE_ID`, `EXTRA_STORAGE_LIMIT_BYTES`, `EXTRA_SEGMENT_PROTECTED`, and `EXTRA_FORCE_STANDALONE_FINALIZE` (set by `UserSessionManager` when a recording is still running at a session switch so a continuation is saved standalone instead of enqueueing a `MergeWorker` that would follow the new session).
+
+## State machine
+
+`RecordingStateHandler` (`handlers/RecordingStateHandler.kt`) is the finite state machine that gates every recording action. It has four states:
+
+- **`IDLE`** — service not running or running with nothing to do.
+- **`STANDBY`** — service is up as a microphone foreground service but not capturing. Used to pre-warm the service so that a scheduled alarm can bring it out of standby with a plain `startService` call, bypassing OEM background-start restrictions.
+- **`RECORDING`** — actively capturing audio.
+- **`PAUSED`** — captured audio dropped, but session and file are still open.
+
+Transitions are triggered by `START`, `STOP`, `PAUSE`, and `RESUME` events. Invalid transitions (for example, `PAUSE` while `IDLE`) are rejected without side effects. The state handler emits state changes into `RecordingServiceState` so the UI and tiles observe them consistently.
+
+## Foreground service type strategy
+
+`RecordingService.startForegroundCompat` picks the FGS type at runtime:
+
+- On API 34\+ it first tries `FOREGROUND_SERVICE_TYPE_MICROPHONE`.
+- If that throws `SecurityException` (typically when an alarm callback tries to start a mic FGS from the background on Android 14/15), it falls back to `FOREGROUND_SERVICE_TYPE_DATA_SYNC` and immediately schedules a promotion back to `MICROPHONE` on the next foreground opportunity.
+- `microphoneFgsGranted` is a boolean on the state that gates capture. If the service is running with `DATA_SYNC` type only, capture is deferred so we don't produce silent files.
+
+Scheduled recordings avoid this fallback path entirely by pre-warming the service into `STANDBY` with `MICROPHONE` type before the alarm fires. See [Scheduled recordings](/rollingrecord/app/recording/scheduled-recordings).
+
+## `RecordingServiceState`
+
+`RecordingServiceState` is an immutable data class exposed via `RecordingService.state: StateFlow<RecordingServiceState>`. Fields include:
+
+- `recordingState` — one of the four state-machine states above.
+- `mode` — `RecordingMode.MANUAL` or `RecordingMode.ROLLING`.
+- `sessionId`, `startTimeMs`, `currentSegmentIndex`, `currentRecordingName`.
+- `rollingStorageUsedBytes`, `protectedRollingStorageUsedBytes`, `sessionStorageLimitBytes`.
+- `isContinueRecording`, `isCurrentSegmentProtected`, `activeScheduleId`.
+- `totalPausedMs`, `pausedAtMs` (used to compute effective elapsed time).
+
+The Home screen's `HomeViewModel` observes this flow through `RecordingController.serviceState` and derives its UI state from it. Quick Settings tiles observe `RecordingService.state` directly.
+
+Amplitude samples used to draw the live waveform are exposed on a parallel `RecordingService.amplitudes: StateFlow<List<Int>>`. Samples are collected every ~80 ms; the list is a rolling ring buffer of the most recent 30 samples.
+
+Live marks captured during a Manual recording are held on `RecordingService.pendingMarks: StateFlow<List<Long>>` as recording-relative elapsed-ms. See [Manual Record Mode](/rollingrecord/app/recording/manual-mode) for how they are persisted at stop.
+
+## Notifications
+
+`RecordingNotificationManager` (`service/RecordingNotificationManager.kt`) owns the recording notification. It creates three notification channels on first use:
+
+| Channel id | Importance | Purpose |
+| --- | --- | --- |
+| `recording_channel_v2` | `IMPORTANCE_LOW` | The ongoing "Recording…" notification. Silent to avoid noise on every rotation. |
+| `recording_alerts` | `IMPORTANCE_DEFAULT` | Non-urgent alerts (protected storage 70% warning, storage limit updates). |
+| `recording_urgent` | `IMPORTANCE_HIGH` | Urgent alerts (device storage full, protected storage full, battery too low). |
+
+The ongoing notification uses the app brand color (`0xFFD32F2F`) and includes action buttons that change with state and mode:
+
+- **Manual**: Pause / Resume / Stop / Cancel.
+- **Rolling**: Pause / Resume / Stop. (No Cancel: Rolling always keeps its segments.)
+
+Actions are `PendingIntent`s pointed back at `RecordingService` with the corresponding `ACTION_*`.
+
+## Kill tracking
+
+`OsKillSentinel` writes lifecycle markers (`markStandbyStarted`, `markRecordingStarted`, `markServiceStopped`) so that if the service is torn down while `RECORDING` or `STANDBY`, `RecordingService.onDestroy` records a typed kill event to Crashlytics. This is how OEM-specific background kills surface in reporting.
+
+On the next process start, `App.recoverInterruptedRecording(finalizedDuringShutdown)` runs the WAV-header patch and dangling-session finalize, then writes an `Outcome` to `RecordingInterruptedState` (`RECOVERED` or `FAILED`). `V2App` observes the flow and shows `V2RecordingInterruptedSheet`, which uses `reopenAfterUnlock = true` so it waits out the App Lock overlay. See [Interruption handling](/rollingrecord/app/recording/interruption-recovery).

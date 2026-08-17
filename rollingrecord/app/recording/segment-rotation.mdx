@@ -3,13 +3,47 @@ title: "Segment Rotation"
 description: "How long and rolling captures are split into rotating segments."
 ---
 
-Long and rolling captures are split into fixed-duration segments that roll over as recording continues.
+Long and rolling captures are split into fixed-duration segments that roll over as recording continues. Segment rotation is what lets Rolling mode keep a bounded on-disk footprint and lets long Manual captures survive individual-file corruption or storage failures.
 
-## What this covers
+## Duration choices
 
-- `SegmentRotationManager` + `SegmentRotationHandler` split long/rolling captures into segments (1 / 5 / 15 / 30 min).
-- How segments relate to a `RecordingSession` and appear in Session Detail.
+Segment duration is a user setting exposed by `SettingsRepository.segmentDurationMs` and defaults to 5 minutes (`300_000` ms). The Settings UI offers **1**, **5**, **15**, and **30** minute options.
 
-<Note>
-Scaffold generated from the codebase map — expand with full detail, examples, and specifics.
-</Note>
+Once a Rolling session starts, the duration is locked at session-creation time and stored in `RecordingServiceState.currentSegmentDurationMs`. Changing the setting mid-session does not affect the running session — the new value only applies to the next session. This keeps existing segments in a session all the same length, which matters for the storage-cap math.
+
+## Rotation loop
+
+`SegmentRotationManager` (`service/SegmentRotationManager.kt`) drives rotation. It runs a 1-second tick loop while recording is active and calls `shouldRotate(elapsedMs)` on each tick. `shouldRotate` returns `true` once `elapsedMs >= currentSegmentDurationMs`, at which point the manager:
+
+1. Stops the current recorder (`stop()` \+ `release()`).
+2. Finalizes the current file: writes a Recording row, extracts a waveform on the IO dispatcher via `WaveformExtractor.extract(path)`, and — for Rolling — updates the session's used-bytes counters on `RecordingServiceState`.
+3. Runs the storage-cap pass (`StorageManager.ensureSpaceForNextSegment`) for Rolling sessions. See [Rolling Record Mode](/rollingrecord/app/recording/rolling-mode).
+4. Starts a new recorder against the next segment file, incrementing `currentSegmentIndex`.
+
+`SegmentRotationHandler` (`handlers/SegmentRotationHandler.kt`) is the pure-logic side: it holds the tick job and forwards rotation events without touching Android APIs, so it can be unit tested.
+
+## Failure handling
+
+Rotations don't always succeed. `SegmentRotationManager` classifies failures:
+
+- **Retryable failure** (transient encoder error, brief disk latency). The manager retries after a 3-second backoff. **Three consecutive retryable failures stop the session** and surface a notification on the `recording_urgent` channel.
+- **`DeviceStorageFull`** (the device is out of space on `filesDir`) or **`Stop`** (an explicit stop was requested during rotation). The session stops immediately — no retry.
+
+Files from a failed rotation are cleaned up so a partial WAV/M4A doesn't linger. Session Detail sees the segments that did commit and no others.
+
+## Segments and `RecordingSession`
+
+Rolling recordings produce one `RecordingSession` row plus one `Recording` row per segment. Manual recordings that never reach the rotation threshold produce one `Recording` and no session row.
+
+- `Recording.sessionId` links the segment back to its session.
+- `Recording.filePath` follows one of these patterns, resolved under `filesDir/recordings/{authUserSegment or "anonymous"}/`:
+  - `{name}_seg{N}_yyyyMMdd_HHmmss_SSS.{ext}` — named session segment.
+  - `{name}_yyyyMMdd_HHmmss_SSS.{ext}` — named Manual recording.
+  - `manual_yyyyMMdd_HHmmss_SSS.{ext}` — unnamed Manual recording.
+  - `session_{id}_seg_{N}.{ext}` and 13-digit epoch variants — legacy session naming, still readable.
+
+Session Detail groups segments by `sessionId`, orders by `createdAt` (or by segment index when it is set), and shows the concatenated total duration and file size on the session header row. Individual segments are still playable on their own from the same screen.
+
+## Continue Manual and rotation
+
+Manual recordings can be extended via **Continue** (`RecordingController.startContinueRecording(originalRecordingId)`). The continuation is a new capture that will eventually be merged back into the original. It still goes through rotation while it's live, but the merge step in `MergeWorker` produces a single file for the original recording after the user stops. See [Manual Record Mode](/rollingrecord/app/recording/manual-mode) for the merge flow.

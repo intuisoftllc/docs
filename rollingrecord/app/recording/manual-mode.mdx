@@ -3,13 +3,57 @@ title: "Manual Record Mode"
 description: "Standard start/stop capture with live marks and continuations."
 ---
 
-Manual mode is standard start/stop/pause/resume capture, with Pro live marks and continuation recordings on top.
+Manual mode is standard start/stop/pause/resume capture. One tap starts, one tap stops. It produces a single `Recording` row (no `RecordingSession` row) with a single audio file. Live marks let the user drop position bookmarks during recording that become notes on the saved file. Continuation lets a user append to an existing Manual recording after the fact and end up with one merged file.
 
-## What this covers
+## Start / stop / pause / resume flow
 
-- Start/stop/pause/resume flow (Free tier) and live marks (Pro) that become empty notes.
-- Continuation recordings and how marks rebase onto the merged timeline.
+The recording UI's mode selector is only interactive while `recordingState == IDLE`. Tap Record and the request goes through `RecordingGatekeeper.requestStart(RecordStartRequest(mode = MANUAL, source = V2_HOME))`, which runs admission (battery, storage, busy-op) and then dispatches through `RecordingController.startRecording(MANUAL)`. See [Admission and concurrency](/rollingrecord/app/recording/admission-control). The service:
 
-<Note>
-Scaffold generated from the codebase map — expand with full detail, examples, and specifics.
-</Note>
+1. Comes up as a `MICROPHONE` foreground service, posts the ongoing recording notification, and starts the encoder for the format chosen in settings.
+2. Sets `RecordingServiceState.mode = MANUAL`, transitions the state machine to `RECORDING`, and starts the amplitude / rotation loop.
+3. Clears `_pendingMarks` so a fresh recording starts with no marks.
+
+Pause and Resume dispatch `ACTION_PAUSE` / `ACTION_RESUME`. Paused audio is dropped by both `AacRecorder` (`MediaRecorder.pause()`) and `WavRecorder` (drain loop discards frames while `paused == true`). `RecordingServiceState.pausedAtMs` and `totalPausedMs` are tracked so the elapsed-time readout excludes paused intervals.
+
+Stop dispatches `ACTION_STOP`. The service finalizes the current file, writes the `Recording` row, extracts a waveform via `WaveformExtractor.extract(path)` on IO, persists any live marks as notes (see below), and enqueues transcription if `settingsRepository.autoTranscribe` is on (expedited, with an unexpedited fallback if the OS declines).
+
+Cancel (`ACTION_CANCEL`) discards the current recording: the file is deleted, no `Recording` row is written, marks are dropped, and the service returns to `IDLE`. Cancel is Manual-only — the notification for Rolling recordings does not offer it. A brief post-start hold window (`withinMinRecordHold`) rejects `ACTION_STOP` / `ACTION_PAUSE` / `ACTION_CANCEL` for the first fraction of a second so an accidental notification/tile double-tap cannot immediately file a half-second unnamed recording.
+
+## Manual duration cap
+
+Manual has a wall-clock cap of **24 hours** (`MAX_MANUAL_RECORDING_MS`). The cap counts pauses as well as active time. The service holds a partial wakelock for 25 hours as a safety margin (1 hour of headroom past the cap for the cleanup write to flush). On hitting the cap the service auto-stops, finalizes the file, and posts a notification on `recording_alerts` explaining why. Continuation lets the user pick up again.
+
+## Manual segments
+
+If a Manual recording runs past the configured segment duration, the segment rotation loop still runs and produces multiple files with a shared name. Unlike Rolling, no `RecordingSession` row is written and no pruning happens — every segment is kept. The UI presents the multi-file recording as a single item in the library.
+
+## Live marks
+
+Live marks are recording-time bookmarks. Tapping the mark icon on the recording screen sends `ACTION_MARK` to the service, which computes a recording-relative elapsed time and appends it to a `pendingMarks: StateFlow<List<Long>>`. On stop, each mark is persisted as an empty note (`text = null`) on the saved recording via `NoteRepository.addNote(recordingId, positionMs)`.
+
+Rules:
+
+- **Manual only.** Rolling does not use live marks.
+- **Only while `RECORDING`.** Paused / idle taps are ignored (the UI also disables the icon then).
+- **Minimum spacing of 1 second.** `MIN_MARK_SPACING_MS = 1000L`. A mark within 1000 ms of an existing mark is rejected. The UI greys the icon as a hint; the service is the authoritative guard and matches the playback note spacing rule (`PlaybackViewModel.MIN_NOTE_SPACING_MS`).
+- **Position math.** `elapsedMs = now - segmentStartTime - totalPausedMs`, coerced to at least 0. Same formula the duration uses at finalize, so a mark lands on the right spot in the saved audio.
+- **Reset semantics.** Cleared on start, consumed and cleared on stop, dropped on cancel and on `discardCurrentRollingSegment` (which does not apply to Manual but shares the teardown code).
+
+Continuation marks: marks recorded during a Manual continuation are held on the same `pendingMarks` flow but persisted by `MergeWorker` instead of the service, because the merged file's timeline offsets them. See below.
+
+## Continue Manual
+
+Manual continuations let a user resume a recording after it has stopped and end up with one file.
+
+- **Entry point.** From the playback of an existing Manual recording, the user taps "Continue recording". The UI calls `RecordingGatekeeper.requestStart(RecordStartRequest(mode = MANUAL, source = CONTINUE_MANUAL, continueFromRecordingId = originalRecordingId))`. The gatekeeper's HARD-block check is scoped to `originalRecordingId` — if a `MERGE` or `CLIP_RESAVE` on that recording is in flight, the start is rejected with `Blocked`.
+- **Dispatch.** On admission, the gatekeeper calls `RecordingController.startContinueRecording(originalRecordingId)`, which starts the service with `ACTION_START`, `EXTRA_MODE = MANUAL`, `EXTRA_CONTINUE_FROM_ID = originalRecordingId`. `RecordingServiceState.isContinueRecording = true`.
+- **Capture.** The continuation runs as a normal Manual recording (same encoder, rotation, admission). The notification shows a **Cancel Continuation** action wired to `ACTION_CANCEL_CONTINUE`, which discards the continuation file without touching the original recording.
+- **Stop and merge.** On stop the continuation file does **not** become a `Recording` row. The service captures `_pendingMarks.value` and the original's pre-merge `durationMs` (needed to rebase continuation-relative mark positions), then hands the file path, duration, size, format, sample rate, protected flag, `createdAt`, `originalDurationMs`, and `markPositionsMs` to `MergeWorker.enqueue(...)` as `WorkData`. This "no DB row" contract keeps a transient continuation out of lists and the sync outbox.
+- **`MergeWorker`.** `BusyGuard.guard(MERGE, originalRecordingId)` around the whole job. `AudioMerger.merge(original, continuation)` replaces the original file, updates the row's `durationMs` and `fileSizeBytes`, re-triggers transcription, and calls `applyMarksToMerged(originalId, originalDurationMs, markPositionsMs)` — each mark is offset by `originalDurationMs` so a 0:30 mark on a 5:00 original lands at 5:30. Resume-safe: on process death, WorkManager retries with the same `WorkData` and uses a sentinel file (`${newPath}.merge_sentinel`) plus a size-tolerance check against the row (`fileSizeBytes` vs. actual file length, 1 KiB tolerance) to detect whether the merge already completed on a previous run and skip to finalization.
+- **Failure fallback.** If `AudioMerger.merge` fails three times (corrupt segment, decoder mismatch), `MergeWorker.saveAsStandalone(...)` inserts the continuation file as its own `Recording` through `RecordingRepository.insertRecording`. Marks stay at their continuation-relative positions on the standalone file (there is no original to offset against). The user sees a second recording in the library instead of a merged extension — audio is never lost.
+
+## Notes on a Manual recording
+
+Notes are also added from playback: on the playback screen, the add-note button calls `PlaybackViewModel.addNoteAtCurrentPosition`, which calls `NoteRepository.addNote(recordingId, positionMs)`. A `Note` has an id, `recordingId`, `positionMs`, `createdAt`, and an optional `text`. Notes with `text == null` render as position markers only — this is the same shape live marks produce.
+
+Notes are keyed to `positionMs` on the original recording. After a continuation merge, notes on the original half keep their existing positions; new live-mark notes from the continuation land at `originalDurationMs + markPositionMs`.

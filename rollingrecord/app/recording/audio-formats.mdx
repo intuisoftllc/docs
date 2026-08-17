@@ -3,14 +3,69 @@ title: "Audio Formats & Encoders"
 description: "The recorder abstraction, formats, quality knobs, and WAV recovery."
 ---
 
-Recording is backed by an encoder abstraction that supports AAC, Opus, and WAV, with configurable quality and WAV corruption resilience.
+Recording is backed by an encoder abstraction that supports AAC, Opus, and WAV, with configurable quality and header-corruption recovery for WAV files.
 
-## What this covers
+## The recorder abstraction
 
-- `AudioRecorder` abstraction with `AacRecorder` and `WavRecorder` implementations; `AudioFormat` model (AAC / Auto / Opus / WAV).
-- Recording-quality knobs: Voice/Hi-Fi mode, bitrate (64–320 kbps), sample rate — via `AudioConfigHandler` and `FormatHandler`.
-- WAV corruption resilience via `WavHeaderRecovery`.
+`AudioRecorder` (`audio/AudioRecorder.kt`) is a common interface shared by two concrete implementations:
 
-<Note>
-Scaffold generated from the codebase map — expand with full detail, examples, and specifics.
-</Note>
+- **`AacRecorder`** — wraps `android.media.MediaRecorder`. Used for AAC/M4A and Opus/OGG.
+- **`WavRecorder`** — uses `android.media.AudioRecord` directly, drains PCM in an IO coroutine, and writes a valid RIFF/WAV file. `MediaRecorder` doesn't support PCM output, so WAV can't share the AAC path.
+
+Both expose the same lifecycle: `start(file, config, …)` → `pause()` / `resume()` → `stop()` → `release()`. `RecordingService` holds a single `activeRecorder: AudioRecorder` field and calls into it format-agnostically. Both also expose:
+
+- `maxAmplitude: Int` in the range `[0, 32767]` for the live waveform.
+- `diskFull: Boolean` — set to `true` when the underlying writer sees an `ENOSPC` (`errno 28`) failure. `RecordingService` polls this in its amplitude loop and stops the session gracefully when it flips.
+
+## Format selection
+
+Format preference is a user setting (`SettingsRepository`, key surfaced as "Audio format" in the Recording settings section). `AudioConfigHandler.getConfig` resolves the preference into a concrete `AudioConfig`:
+
+| Preference | Container | Encoder | Notes |
+| --- | --- | --- | --- |
+| `"aac"` | MPEG-4 (`.m4a`) | AAC | Universally compatible. |
+| `"opus"` | OGG (`.ogg`) | Opus | Requires API 29\+; falls back to AAC on older devices. Sample rate is forced to 48 kHz regardless of the user setting (see below). |
+| `"wav"` | WAV (`.wav`) | PCM 16-bit | Uncompressed. Uses `WavRecorder`, bypassing `MediaRecorder`. |
+| `"auto"` | Opus on API 29\+ with bitrate ≤ 128 kbps, otherwise AAC |  | Default. |
+
+`"auto"` prefers Opus because at ≤ 128 kbps it is roughly 30–40% smaller than AAC at the same perceived quality, which matters for Rolling's storage cap and cloud upload bandwidth.
+
+### Opus is always captured at 48 kHz
+
+Android's `MediaRecorder` writes 48 kHz into the OpusHead of the OGG container regardless of what sample rate you actually feed the encoder, which produces a container/rate mismatch that plays back at the wrong speed on any non-48 kHz capture (the "chipmunk" effect). `AudioConfigHandler.getConfig` clamps `sampleRate` to `48_000` whenever the resolved encoder is Opus. The user's sample-rate setting still applies to AAC and WAV.
+
+## Quality knobs
+
+Three settings feed into `AudioConfig`:
+
+- **Bitrate** — a numeric string in bits/sec, e.g. `"128000"`. `parseBitRate` falls back to `128_000` if parsing fails. Higher bitrates (up to `320_000` in the UI) force `"auto"` off Opus onto AAC.
+- **Sample rate** — commonly `16_000`, `44_100`, or `48_000`. Ignored for Opus (see above). Voice recognition works well at 16 kHz; music/high-fidelity recording defaults to 44.1 or 48 kHz.
+- **Voice vs. High Fidelity** (`isHighFidelity`) — a mode passed to `AacRecorder.start`. High Fidelity requests `AudioSource.UNPROCESSED` if `AudioManager.PROPERTY_SUPPORT_AUDIO_SOURCE_UNPROCESSED` is true (falling back to `VOICE_RECOGNITION`), and forces stereo (2 channels). Voice mode always uses `VOICE_RECOGNITION` and honors the channel count from `AudioConfig`.
+
+`AudioConfigHandler.estimateFileSizeBytes(bitRate, durationMs)` and `estimateSegmentSize(quality, segmentDurationMs)` are used by the Rolling storage-cap math and the segment-size preview in the schedule/session UI. WAV size is computed from `sampleRate × channels × 16 bits`.
+
+## Diagnostic and disk-full handling
+
+### `AacRecorder`
+
+`AacRecorder` installs `setOnErrorListener` and `setOnInfoListener` on `MediaRecorder`. Disk-full is detected two ways: the `extra == -28` code (POSIX `ENOSPC`), or `StatFs(filesDir).availableBytes < 512 KiB`. On disk-full it sets `diskFull = true` and calls the `onDiskFull` callback the service supplies; on any other error it calls `onError`.
+
+Vendor-specific `MediaRecorder` info codes (Samsung firmware fires `what=268436456` on every clean stop, for example) are ignored so they don't bloat the rolling log.
+
+### `WavRecorder`
+
+`WavRecorder` writes a placeholder 44-byte WAV header on start (data size = 0), streams PCM to a `RandomAccessFile`, and patches the header with the real sizes on `stop()`. Peak amplitude is computed per drain cycle (not RMS — speech peaks are 12 to 20 dB higher than RMS, so RMS would render quiet audio as a flat waveform).
+
+IO exceptions during the drain loop are inspected for disk-full markers (`"no space left"`, `"enospc"`, `"not enough space"`, `"disk full"`). On match, `diskFull` flips to `true` and the drain loop exits.
+
+## WAV header recovery
+
+If `WavRecorder.stop` never runs — the app is force-stopped, the device reboots, or the process is killed while recording — the file on disk has valid PCM data after byte 44 but the RIFF header still says `dataSize = 0`. Most players see the header and report 0 seconds.
+
+`WavHeaderRecovery.recoverInDir(dir)` (`audio/WavHeaderRecovery.kt`) scans a directory for orphaned WAV files and patches them in place:
+
+1. Skip non-WAV files and files shorter than 44 bytes.
+2. Read the 32-bit little-endian data-chunk size at offset 40. If it's non-zero, the header is already valid — skip.
+3. Compute `actualDataSize = fileLength - 44`, clamp to `0xFFFFFFFF` (WAV's unsigned 32-bit limit, roughly 4 GB), and patch the RIFF chunk size at offset 4 and the data chunk size at offset 40.
+
+Recovery is best-effort: any read/write exception leaves the file untouched. `RecordingService` calls this on startup so post-kill WAV files become playable up to the point of interruption.
