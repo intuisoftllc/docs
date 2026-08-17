@@ -1,15 +1,66 @@
 ---
 title: "Envelope Encryption Model"
-description: "The KEK/DEK envelope model that protects audio, and its deliberate non-E2EE tradeoffs."
+description: "The KEK/DEK envelope that protects cloud-synced content — a Vault master key, per-item Data Encryption Keys wrapped as _ct/_iv column pairs, and AES-256-GCM everywhere."
 ---
 
-Audio is protected by envelope encryption — a Vault master key wrapping per-file keys — with the plaintext key existing only in RAM.
+Every piece of cloud-synced content — per-recording audio, per-user synced text, and the sealed embedding bundles derived from that text — is protected by one envelope defined in `functions/_shared/crypto/envelope.ts`. The envelope has two layers: a **KEK layer** that wraps a Data Encryption Key (DEK) under a Vault-held master key, and a **DEK layer** that encrypts the content itself under that DEK.
 
-## What this covers
+## Two layers, two jobs
 
-- The plain-English KEK (Vault master) / DEK (per-file) / wrapped DEK / IV design from docs/encryption/01-overview.md; three-system defense-in-depth (Storage + Postgres + Vault); the explicitly-not-E2EE tradeoffs.
-- Client-side streaming AES-256-GCM on upload/download; the plaintext DEK exists in RAM only.
+The KEK layer manages a DEK's lifecycle; the DEK layer encrypts bytes. They are independent — a DEK can be wrapped and unwrapped without ever touching content, and content can be encrypted under a DEK the caller already holds.
 
-<Note>
-Scaffold generated from the codebase map — expand with full detail, examples, and specifics.
-</Note>
+| Layer | Functions | What it protects | At-rest form |
+| --- | --- | --- | --- |
+| KEK layer | `generateDek`, `wrapDek`, `unwrapDek` | the DEK itself | wrapped DEK in a `dek_ct` / `dek_iv` / `kek_version` column trio |
+| DEK layer | `encryptWithDek`, `decryptWithDek`, `sealJsonWithDek`, `openJsonWithDek` | the content | a `<field>_ct` / `<field>_iv` column pair |
+
+All encryption is **AES-256-GCM** with a fresh random **12-byte IV** per operation and **no AAD**; the 16-byte GCM auth tag is appended to the ciphertext. This is a byte-for-byte match with the two call sites that hand-rolled the same dance before the DEK layer was consolidated in RR-503, so it is a drop-in for existing rows.
+
+## Key sizes and where each form lives
+
+| Element | Constant | Size | Where the at-rest form lives |
+| --- | --- | --- | --- |
+| Per-item DEK | `DEK_BYTES` = 32 | 32 bytes (AES-256) | never persisted in plaintext; wrapped into `dek_ct` |
+| Master KEK | `KEK_BYTES` = 32 | 32 bytes (AES-256) | Supabase Vault secret `audio_backup_kek_v{N}` — never in a table |
+| IV | `IV_BYTES` = 12 | 12 bytes (AES-GCM 96-bit) | `dek_iv` (the wrap) / `audio_iv` / any `<field>_iv` |
+| GCM auth tag | — | 16 bytes | appended inside every `_ct` ciphertext |
+
+## The DEK lifecycle
+
+`generateDek()` mints a fresh 32-byte DEK plus a 12-byte content IV, returned as `GeneratedDek`. One DEK is generated per item and never reused across items; its plaintext lifetime is measured in milliseconds because the caller wraps it immediately.
+
+`wrapDek(dek)` wraps the DEK under the **current, highest-version** KEK from Vault and returns a `WrappedDek` — `{ wrappedDek, ivDek, kekVersion }`. It throws if the DEK is not exactly 32 bytes.
+
+`unwrapDek(wrappedDek, ivDek, kekVersion)` reverses the wrap. Critically it takes `kekVersion` **explicitly** rather than resolving the current KEK, so a row wrapped under an older KEK stays decryptable after a rotation — the row's stored `kek_version` is what pins the correct generation. It throws if `ivDek` is not 12 bytes. See [KEK Lifecycle & user_crypto](/rollingrecord/backend/storage/key-management) for how versions rotate.
+
+`zeroDek(buf)` is a best-effort in-place `buf.fill(0)`. JS cannot guarantee a buffer clears before GC runs and the JIT may retain register copies, so this is hygiene, not a guarantee — `get-user-key` still calls it after serializing the response.
+
+## The content layer
+
+The DEK content layer is what the **server** uses when it is the one encrypting — transcribe results and extraction job payloads:
+
+| Function | Behavior |
+| --- | --- |
+| `encryptWithDek(dek, plaintext, iv?)` | AES-256-GCM under a DEK; fresh random 12-byte IV unless one is passed. Returns `DekCipher` `{ ct, iv }` for a `<field>_ct` / `<field>_iv` pair. Passing `iv` reuses the `generateDek` IV (the audio-upload flow does this); an IV is **never** reused across two encryptions under the same DEK. |
+| `decryptWithDek(dek, ct, iv)` | Reverses the above. A bad auth tag — tampered ciphertext, wrong DEK, or wrong IV — **throws**, and the throw is DETERMINISTIC: a retry fails identically, so callers persisting jobs must not treat it as transient. |
+| `sealJsonWithDek(dek, value)` / `openJsonWithDek(dek, ct, iv)` | JSON convenience: serialize + UTF-8 encode then encrypt / decrypt then `JSON.parse`. `open` throws on a bad tag OR malformed JSON. |
+
+## Where plaintext actually lives
+
+The envelope keeps the KEK and, for client-encrypted audio, the plaintext content out of the server's hands — but "the server never sees plaintext" is not unconditional. Two facts scope it precisely:
+
+- **Client-encrypted audio never reaches the server in plaintext.** The device fetches its DEK from `get-user-key`, encrypts the audio on-device, and uploads only ciphertext. The server signs an upload URL and stores opaque bytes.
+- **The server does hold plaintext for the flows it encrypts itself.** `encryptWithDek` / `decryptWithDek` mean the Edge Function momentarily holds plaintext content and a plaintext DEK when it seals transcribe results or extraction payloads. And `get-user-key` is, by its own header, "THE ONE PLACE PLAINTEXT DEKs CROSS THE WIRE" — it unwraps and returns the per-user DEK to the device.
+
+What holds unconditionally is that the **KEK never leaves** the two `SECURITY DEFINER` RPCs (`get_current_audio_backup_kek` / `get_audio_backup_kek_by_version`), each granted to `service_role` only and cached per-invocation by `loadCurrentKek` / `loadKekByVersion`. A KEK that fails its 32-byte validation on load throws rather than proceeding.
+
+## Byte encoding
+
+`functions/_shared/crypto/encoding.ts` bridges the two representations these keys pass through. `bytesToPgBytea` / `pgByteaToBytes` convert `Uint8Array` to and from the PostgREST `\x<hex>` BYTEA literal used for `dek_ct`, `dek_iv`, `audio_iv`; `pgByteaToBytes` throws loudly on any format drift. `bytesToPgBytea` writes into one preallocated hex buffer and decodes in a single pass — the per-byte string version churned enough GC to trip the Edge Function's 256 MB ceiling on multi-MB writes. `bytesToBase64` encodes the DEK and IV handed to the device in a JSON response body.
+
+## Related pages
+
+- [KEK Lifecycle & user_crypto](/rollingrecord/backend/storage/key-management) — the Vault master KEK, rotation via `kek_version`, and the per-user DEK row
+- [Storage Buckets](/rollingrecord/backend/storage/buckets) — where the ciphertext blobs land
+- [Server-Side Embeddings](/rollingrecord/backend/storage/semantic-search) — bundles sealed with the per-user DEK
+- [Storage Janitors & Orphan Reaping](/rollingrecord/backend/storage/janitors) — reaping blobs whose crypto material is gone

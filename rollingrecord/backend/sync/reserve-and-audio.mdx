@@ -1,15 +1,67 @@
 ---
 title: "sync-reserve & sync-audio"
-description: "The signed-URL issuer for encrypted audio uploads and the download/delete companion."
+description: "The signed-URL issuer for encrypted audio uploads (mint + wrap a per-file DEK, write zero rows) and its download / delete companion (unwrap DEK + signed GET, sanctioned rolling-demote blob delete)."
 ---
 
-sync-reserve mints and wraps a per-file key and signs an upload URL; sync-audio handles encrypted download and sanctioned deletes.
+These two Edge Functions bracket the lifecycle of a cloud-backed audio blob. `sync-reserve` (`functions/sync-reserve/index.ts`) hands a device everything it needs to encrypt and upload one recording; `sync-audio` (`functions/sync-audio/index.ts`) later reverses the wrap so any device can play it back, and removes an orphaned blob after a rolling demote.
 
-## What this covers
+## sync-reserve — the upload dance
 
-- sync-reserve: a stateless signed-URL issuer — mints a DEK, wraps it under the KEK, signs an upload URL at audio-storage/&#123;uid&#125;/&#123;rid&#125;.enc, writes zero rows; backup_quota_exceeded.
-- sync-audio: download (unwrap DEK + signed GET) and delete (the sanctioned orphaned-blob removal on rolling demote); grace-window download throttling via sync_download_grace.
+`sync-reserve` is a stateless signed-URL issuer. Given `{ recording_id, size_bytes }` it validates the id (`parseInput` accepts an optional `rec-` prefix) and the size (a positive integer, else `invalid_size_bytes`), then:
 
-<Note>
-Scaffold generated from the codebase map — expand with full detail, examples, and specifics.
-</Note>
+1. Enforces the `audio_file_size_limit_bytes` ceiling — a structural check that applies even to dev callers, since it protects the server from a compromised device. Over-limit → `audio_too_large`.
+2. Pre-checks storage quota via `loadQuotaState` (`functions/_shared/db/storage-quota.ts`) — skipped for dev. Over-quota → `backup_quota_exceeded`, rejected before minting anything.
+3. Generates a fresh DEK and wraps it under the current KEK (`generateDek` + `wrapDek`).
+4. Mints a Supabase signed upload URL at `storage_path` with `upsert: true` so the continue-recording flow can re-upload the merged audio over the same key.
+5. Returns the crypto material and the URL, then best-effort zeroes the plaintext DEK buffer.
+
+It writes ZERO rows — `sync-push` commits the crypto columns onto `c_recordings` after the PUT completes. The `storage_path` is `` `${authUserId}/${recordingId}.enc` `` inside the `audio-storage` bucket; because a post-prefix `recordingId` carries the `rec-` prefix, the real object name is `` {uid}/rec-{uuid}.enc `` — which `validateStoragePath` accepts via its optional `(rec-)?` group.
+
+`ReserveResponse` fields:
+
+| Field | Purpose |
+| --- | --- |
+| `dek` | base64 plaintext DEK — the only place it ever leaves the server; the client encrypts, then zeroes it |
+| `audio_iv` | 12-byte IV the client uses with the DEK to encrypt the audio |
+| `storage_path` | where the ciphertext MUST be PUT, and the path echoed to `sync-push` |
+| `signed_url` | signed Supabase PUT URL |
+| `dek_ct` | wrapped DEK the client echoes to `sync-push` for later unwrap |
+| `dek_iv` | IV used to wrap the DEK under the KEK |
+| `kek_version` | KEK generation that did the wrap |
+| `expires_at` | informational upload-window display |
+
+The signed upload URL has a fixed ~2h SDK TTL (`SIGNED_URL_TTL_SEC = 7200` is informational only). The real commit window is shorter: the stale-pending sweeper nulls `storage_path` once `updated_at` is older than `cloud_backup_upload_url_ttl_sec` (default 900s / 15 min), so a commit after ~15 minutes hits a row whose path is gone.
+
+## sync-audio — download and delete
+
+`sync-audio` discriminates on `operation ∈ { download, delete }` (`parseInput`, else `missing_operation`) and validates `recording_id`.
+
+**download** looks up the row's crypto columns (`storage_path, audio_iv, dek_ct, dek_iv, kek_version`), calls `unwrapDek(wrappedDek, ivDek, kek_version)` against the recorded KEK generation, mints a 5-minute (`DOWNLOAD_URL_TTL_SEC = 300`) signed GET URL, audit-logs the DEK access to `l_user_key_access` via `logUserKeyAccess` (`operation: 'get'`, `result: 'success'`), and returns `DownloadResponse` — `{ dek, audio_iv, signed_url, expires_at }` — then zeroes the DEK. A tombstoned row is treated as `not_found` rather than leaking a soon-to-be-purged path; a row whose crypto/storage columns are null returns `blob_missing`.
+
+**delete** (RR-472) is the sanctioned removal of the orphaned Storage object after a rolling demote. The demote push has already nulled the row's crypto/storage columns via the LWW UPDATE path, so this op constructs the deterministic path `` `${authUserId}/${recordingId}.enc` `` from the authenticated caller and removes only the Storage object. It NEVER deletes the `c_recordings` row and NEVER nulls a crypto column on a live row, which keeps it outside the `c_recordings` DELETE sanctioned-caller set — it touches Storage, not the table. Removing a missing object is success, so the op is idempotent.
+
+## Grace-period asymmetry
+
+Both ops opt into `allowGracePeriodRead: true` with `rateLimit: { bucket: SyncAudio, gracePeriodBucket: SyncDownloadGrace }`. The grace bucket throttles the DOWNLOAD op so a lapsed subscriber can rescue their audio before the sweeper wipes it. The DELETE op is a WRITE and is REJECTED outright for a grace-period caller (`ctx.isGracePeriod`) with `subscription_required` — a lapsed user may rescue, never strip a blob they might still want to re-protect.
+
+## Error codes
+
+| code | HTTP | Endpoint / cause |
+| --- | --- | --- |
+| `invalid_size_bytes` | 400 | sync-reserve: `size_bytes` missing or not a positive integer |
+| `audio_too_large` | 400 | sync-reserve: `size_bytes` over `audio_file_size_limit_bytes` (structural — applies to dev) |
+| `backup_quota_exceeded` | 409 | sync-reserve: would exceed the tier storage cap (skipped for dev) |
+| `kek_unavailable` | 500 | `wrapDek` / `unwrapDek` failed (Vault KEK unreachable) |
+| `signed_url_generation_failed` | 500 | `createSignedUploadUrl` / `createSignedUrl` failed |
+| `not_found` | 404 | sync-audio download: row missing or tombstoned |
+| `blob_missing` | 409 | sync-audio download: row exists but crypto/storage columns are null (never uploaded / excluded) |
+| `subscription_required` | 403 | sync-audio delete: grace-period caller may only rescue, not delete |
+| `validation_failed` | 400 | bad `recording_id` |
+| `missing_operation` | 400 | sync-audio: `operation` not `download` or `delete` |
+
+## Related pages
+
+- [Sync Engine Overview](/rollingrecord/backend/sync/overview) — the per-file envelope-crypto model.
+- [sync-push](/rollingrecord/backend/sync/push) — the commit that persists the crypto columns after upload.
+- [Sync Shared Modules](/rollingrecord/backend/sync/shared-transforms) — `validateStoragePath` and the encrypted-column convention.
+- [sync-reconcile & sync-group-exclude](/rollingrecord/backend/sync/reconcile-and-groups) — how group exclusion detaches audio from the cloud.

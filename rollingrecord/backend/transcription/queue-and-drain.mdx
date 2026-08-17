@@ -1,15 +1,86 @@
 ---
 title: "Queue, Drain & Concurrency"
-description: "The transcription queue, the two-layer drain, and provider concurrency control."
+description: "The transcription_queue table, the two-layer drain (inline plus a minute cron), the concurrent-job ceiling, orphan reconciliation, and 429 exponential backoff."
 ---
 
-A queue plus a two-layer drain keeps transcription within provider concurrency limits and backs off on 429s.
+`transcription_queue` sits between `transcribe_submit` and AssemblyAI as an operational rate-limiting buffer. It exists because AssemblyAI enforces a concurrent-job limit per API key, and every RollingRecord submission uses the same key — bursts would otherwise exhaust the ceiling and 429. The drain worker submits queued jobs within a configured ceiling and retries 429s with exponential backoff.
 
-## What this covers
+## `transcription_queue`
 
-- transcription_queue + transcribe-drain (Layer 1 inline runDrain(), Layer 2 Deno.cron every minute for overflow/backoff); concurrent-job ceiling + 429 exponential backoff.
-- _shared/transcribe/ — queue.ts, jobs.ts, assemblyai.ts, results.ts, pricing.ts; medical-mode queue + usage multiplier.
+Created in `migrations/20260514000000_transcription_queue.sql` with FK + `CASCADE` to both `canonical_users` and `transcribe_jobs`, RLS enabled, and three partial/user indexes (drain lookup, in-flight count, user wipe).
+
+| Column | Type | Notes |
+| --- | --- | --- |
+| `auth_user_id` | `TEXT NOT NULL` | FK → `canonical_users(auth_user_id)` `ON DELETE CASCADE` |
+| `id` | `UUID` | PK, `gen_random_uuid()` |
+| `transcribe_job_id` | `UUID NOT NULL` | FK → `transcribe_jobs(transcribe_job_id)` `ON DELETE CASCADE` |
+| `created_at` / `updated_at` | `TIMESTAMPTZ NOT NULL` | default `NOW()` |
+| `storage_path` | `TEXT NOT NULL` | `transcribe-inbox` object path |
+| `diarize` | `BOOLEAN NOT NULL` | default flipped `TRUE` → `FALSE` in `20260524010000` |
+| `language_code` | `TEXT` | null = auto-detect |
+| `medical_mode` | `BOOLEAN NOT NULL DEFAULT FALSE` | added `20260520000000` (RR-467) |
+| `status` | `TEXT NOT NULL DEFAULT 'pending'` | CHECK `pending` / `submitted` / `failed` / `cancelled` |
+| `attempts` | `INTEGER NOT NULL DEFAULT 0` | incremented on each submit try |
+| `next_attempt_at` | `TIMESTAMPTZ NOT NULL` | drain skips rows dated in the future |
+| `assemblyai_job_id` | `TEXT` | provider transcript id once submitted |
+| `error_code` | `TEXT` | `provider_rate_limited` / `assemblyai_submit_failed` on failure |
+
+The `cancelled` status was added to both this table's and `transcribe_jobs`' CHECK constraints in `migrations/20260812210000_transcribe_cancelled_status_and_init_metadata.sql`, which also added display/ops metadata (`diarize` / `medical_mode` / `language_code`) to `transcribe_jobs`. `enqueueTranscriptionJob` (`functions/_shared/transcribe/queue.ts`) reuses an existing live `pending`/`submitted` row for the same `transcribe_job_id` instead of inserting a twin, so a resumed submit never double-submits the same audio.
+
+## The two-layer drain
+
+`runDrain` (`functions/_shared/transcribe/queue.ts`) is the single drain worker, invoked two ways:
+
+- **Layer 1 — inline.** `transcribe_submit` calls `runDrain({ targetQueueId })` immediately after enqueue (step 8 of `functions/ai-engine/operations/transcribe-submit.ts`), so the normal case submits with zero added latency.
+- **Layer 2 — cron.** The `transcribe-drain` Edge Function (`functions/transcribe-drain/index.ts`) runs `Deno.cron("transcribe-drain", "* * * * *", …)` every minute for overflow (ceiling was full at enqueue) and 429-backoff retries.
 
 <Note>
-Scaffold generated from the codebase map — expand with full detail, examples, and specifics.
+`transcribe-drain` is **cron-only** — it has no `Deno.serve`, no `runGates`, and no `config.toml` entry. It runs on the service role via the auto-injected `SUPABASE_URL` / `SUPABASE_SERVICE_ROLE_KEY`, and also needs the `ASSEMBLYAI_API_KEY` and `ASSEMBLYAI_WEBHOOK_SECRET` secrets.
 </Note>
+
+Each drain cycle:
+
+1. Runs `reconcileOrphanedJobs` first, so any freed in-flight slot is usable the same tick (see below).
+2. Reads `assemblyai_max_concurrent_jobs` (default 9) and `transcription_queue_batch_size` (default 5) from `server_config`.
+3. Counts `status = 'submitted'` rows; if the count is at or above the ceiling it returns `skippedDueToCeiling` and submits nothing.
+4. Selects up to `MIN(batchSize, ceiling − inFlight)` `pending` rows whose `next_attempt_at` is due, ordered `created_at` ascending (restricted to `targetQueueId` when Layer 1 passes one).
+5. Generates a fresh signed download URL per row (the submit-time URL may have expired on a retry) and submits via `submitTranscript`, passing the webhook callback config from `resolveWebhookUrl`.
+
+Write order is deliberate: the **job row is updated first** (`status = 'processing'` + `assemblyai_transcript_id`) and only then is the queue row marked `submitted`. The webhook matches jobs by `assemblyai_transcript_id`, so the job must carry it the instant AssemblyAI has the audio; a crash between the two writes leaves the queue row `pending` (safely re-picked and reconciled) rather than a job wedged with a null id.
+
+## Concurrency knobs
+
+| Key | Default | Controls |
+| --- | --- | --- |
+| `assemblyai_max_concurrent_jobs` | 9 | Max in-flight (`submitted`) jobs — one below the assumed 10-job PAYG ceiling |
+| `transcription_queue_batch_size` | 5 | Max new submissions per drain cycle |
+| `transcription_queue_drain_interval_sec` | 60 | Documentation only — the real interval is the `Deno.cron` `* * * * *` schedule |
+| `assemblyai_webhook_url` | `''` | Optional dev-tunnel override for the callback URL; otherwise derived as `{SUPABASE_URL}/functions/v1/assemblyai-webhook` |
+
+`resolveWebhookUrl` reads `assemblyai_webhook_url` when set (dev tunnel) and otherwise derives the callback from `SUPABASE_URL`. See [Config tables](/rollingrecord/backend/database/config-tables).
+
+## Orphan reconciliation
+
+`reconcileOrphanedJobs` runs at the top of every drain cycle (bounded to 5 per tick, since each costs one 10s AssemblyAI GET). An orphan is a crash signature: a queue row `submitted` with a transcript id, but its `transcribe_jobs` row wedged at `pending` with a null `assemblyai_transcript_id`. The webhook can't match a null id, so nothing else ever revisits these rows and each pins an in-flight slot forever. The pure, unit-tested `classifyOrphanTranscriptStatus` decides the fix from the transcript's live AssemblyAI status:
+
+| AssemblyAI status | Classification | Action |
+| --- | --- | --- |
+| `queued` / `processing` | `await_webhook` | Copy the id onto the job (`processing`); the webhook matches normally when it fires — full recovery |
+| `completed` / `error` | `unrecoverable` | The webhook already fired and was discarded; `deleteTranscript`, then fail both rows (nothing was charged) |
+| 404 (not found) | `unrecoverable` | Fail both rows |
+
+## 429 backoff and permanent failure
+
+On a 429 from AssemblyAI, `handle429` increments `attempts` and pushes `next_attempt_at` out by `backoffMs(attempt) = min(30000 × 2^(attempt−1), 600000)`. On reaching `MAX_ATTEMPTS` (5) it permanently fails both the queue row and the job with `provider_rate_limited` and writes a best-effort `h_transcribe_history` failure via `writeTranscribeHistoryFailure`. Any non-429 error fails immediately (`handleOtherError` → `assemblyai_submit_failed` for an `AssemblyAiError`, else `internal_error`).
+
+| Attempt | Delay before retry |
+| --- | --- |
+| 1 | 30s |
+| 2 | 60s |
+| 3 | 120s |
+| 4 | 240s |
+| 5 (`MAX_ATTEMPTS`) | permanent failure (`provider_rate_limited`) |
+
+## Cleanup
+
+Queue-row cleanup is two-tiered. On the happy path the FK `CASCADE` from `transcribe_jobs` removes the `submitted` queue row when the webhook deletes the job. Everything else — `submitted`/`failed` rows older than 7 days — is swept by `prune_transcription_queue()`, a `SECURITY DEFINER` function scheduled daily at 03:50 UTC via `pg_cron`. The `transcribe_jobs` row + its `transcribe-inbox` blob use a separate 24h `expires_at` TTL, swept by the `storage-orphan-lister` Edge Function (the standalone `sweep-transcribe-inbox` job was consolidated into `storage-orphan-lister` on 2026-07-31). See [Cron sweepers](/rollingrecord/backend/database/cron-sweepers) and [Storage janitors](/rollingrecord/backend/storage/janitors).

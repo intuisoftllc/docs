@@ -1,14 +1,75 @@
 ---
-title: "delete-user (GDPR Erasure)"
-description: "The account-deletion function, its guards, and the wipe ladder."
+title: "delete-user"
+description: "The GDPR right-to-erasure endpoint — its subscription, rate-limit, and step-up guards, the check_only preflight, and the shared wipeUser ladder."
 ---
 
-delete-user runs the full GDPR erasure ladder behind subscription, rate-limit, and step-up-OTP guards, idempotently.
+`functions/delete-user/index.ts` is the authoritative account-deletion endpoint. The Edge Function owns only the admission chain, the `check_only` preflight, and mapping the result and typed errors to the wire response — the actual teardown lives in the shared `wipeUser()` ladder in `functions/_shared/users/wipe.ts`, which the admin support-ops `delete_user_account` path also calls. That single shared implementation is what stops a new user-data table from being wiped on one path but leaking on the other.
 
-## What this covers
+## Admission and destructive sequence
 
-- Delegates to _shared/users/wipe.ts wipeUser() ladder; gates (active-subscription block active_subscription, a tight delete_user rate limit, a step-up OTP ticket account_deletion); check_only preflight; snapshot + TABLES_TO_WIPE + bucket wipe + RC customer delete + Auth teardown; idempotent.
+The gate chain runs without chain-sugar rate limiting so the active-subscription check can run between JWT and the rate limit. The OTP ticket is consumed only after the active-sub and rate-limit checks pass, so a definite `409`/`429` never burns the user's ticket.
+
+| Order | Step | Reject / effect |
+| --- | --- | --- |
+| 1 | method POST + App Check + App Version + JWT (+entitlement fetch) | standard gate rejections |
+| 2 | active-subscription block | `409 active_subscription` for `pro` / `pro_cloud` / `pro_cloud_ai`; lifetime / founders / developer are **not** blocked |
+| 3 | rate limit `delete_user` (2/hr) | `429` (dev-bypassed); applies to preflight too |
+| 4 | preflight `check_only` | `200 { status: "deletable" }` — no destructive work, no OTP |
+| 5 | consume `account_deletion` OTP ticket | `403 step_up_required` on failure |
+| 6 | `wipeUser()` ladder | `200` `DeleteResponse` or `502` partial |
+
+The active-subscription block uses `activeRecurringSubKeys()` (`functions/_shared/billing/entitlements.ts`). Store subscriptions keep billing after the RC customer is deleted, so a recurring subscriber must cancel through the Play/App Store first; lifetime, founders, and developer entitlements have no renewal cycle and are deliberately allowed through. This check runs in **both** the Edge Function (fast-path, before rate limit) and inside `wipeUser()` (source of truth) — intentional, cheap duplication that both resolve identically.
+
+## Preflight mode
+
+A body of `{ "check_only": true }` runs the gates and returns `200 { status: "deletable" }` or the same `409 active_subscription` the destructive path would, doing no destructive work and consuming no OTP. The app uses this to preview the outcome before signing the user out — avoiding the trap of signing out and then being blocked, forcing a sign-back-in.
+
+## The step-up ticket
+
+The destructive path requires a consumed `account_deletion` email-OTP ticket via `consumeOtpTicket()` (`functions/_shared/otp/consume.ts`), so a bare or leaked session token can't irreversibly wipe an account. Preflight never reaches the consume step, so a deletability probe needs no OTP. See [Email OTP Step-Up](/rollingrecord/backend/accounts/account-otp) for how the ticket is minted.
+
+## The wipeUser ladder
+
+`wipeUser()` runs a ten-step ladder. Best-effort steps log-and-continue so a partial failure doesn't block the user's right to erasure; `not_found` is a clean idempotent result, and a second call for an already-deleted user returns `200 { status: "not_found" }`. It returns per-table and per-bucket counts.
+
+| Step | Action |
+| --- | --- |
+| 1 | subscription re-check (unless `skipSubscriptionCheck`) |
+| 2 | `canonical_users` lookup — `not_found` → idempotent `200` |
+| 3 | snapshot usage → `l_deleted_identity` (before `usage` is deleted) |
+| 4 | delete the RC customer (fires cancellation/expiration webhooks) |
+| 5 | local lifetime-entitlement revoke (belt-and-suspenders) |
+| 6 | wipe Storage buckets |
+| 7 | wipe `TABLES_TO_WIPE` by `auth_user_id` |
+| 8 | hard-delete `usage` |
+| 9 | delete `canonical_users` (fires remaining CASCADEs) |
+| 10 | delete the **Clerk** user (404 = success) |
 
 <Note>
-Scaffold generated from the codebase map — expand with full detail, examples, and specifics.
+The final step deletes the **Clerk** user via `deleteClerkUser()` (`functions/_shared/users/clerk-admin.ts`, Clerk Backend API), which treats HTTP 200 **or** 404 (already gone) as success. The stale "Hard-delete the Supabase Auth row" docstring inside `wipe.ts` predates the Clerk migration — the code deletes the Clerk user, not a Supabase Auth row.
 </Note>
+
+## What gets wiped
+
+`TABLES_TO_WIPE` and `BUCKETS_TO_WIPE` are the single source of truth for where user data lives. `usage` is wiped separately after the snapshot (step 8), and `user_storage_usage` is wiped **last** on purpose — the `maintain_storage_*` triggers on the `c_*` deletes recompute it, so deleting it earlier would leave a zeroed counter next to live rows.
+
+- **Buckets (3)**: `transcribe-inbox`, `audio-storage`, `embedding-storage`. Storage objects never CASCADE, so the bucket wipe is the only thing that removes the files.
+- **Tables (~30)**: keyed by `auth_user_id` (`user_blueprints`, `transcribe_jobs`, `query_sessions`, `user_credits`, `l_credit_log`, `f_user_financials`, `user_crypto`, `l_user_key_access`, the `c_*` sync tables, `user_sync_preferences`, and `user_storage_usage` last). Many are FK + CASCADE-covered and listed only for per-table counts and belt-and-suspenders cleanup if a FK is ever dropped.
+
+`wipeTable()` deletes rows by `auth_user_id` and returns an exact count. `wipeBucketFolder()` recursively enumerates every object under `{bucket}/{authUserId}/` via `collectStorageObjectPaths()` (paged, collect-then-delete, depth-bounded) and batches removes with `chunkPaths()`; an incomplete enumeration reports `failed` rather than a false clean wipe.
+
+## Typed errors
+
+| Error | Status | Cause |
+| --- | --- | --- |
+| `active_subscription` | 409 | recurring subscription active; body carries `active_keys` |
+| `step_up_required` | 403 | `account_deletion` OTP ticket missing/expired/used |
+| `identity_lookup_failed` | 502 | `canonical_users` lookup errored (distinct from "no row") |
+| `canonical_user_delete_failed` | 502 | delete failed after wiping dependents; body carries `partial: true` + partial counts |
+| `database_error` | 500 | OTP consume DB error |
+
+## Related
+
+- [Deletion cascade](/rollingrecord/backend/architecture/deletion-cascade) — the CASCADE guarantee `wipeUser` backs up.
+- [Email OTP Step-Up](/rollingrecord/backend/accounts/account-otp) and [anti-abuse carryover](/rollingrecord/backend/accounts/anti-abuse).
+- [RevenueCat](/rollingrecord/backend/billing/revenuecat), [Storage buckets](/rollingrecord/backend/storage/buckets), and [entitlement & grace](/rollingrecord/backend/gates/entitlement-and-grace).

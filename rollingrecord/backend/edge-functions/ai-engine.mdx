@@ -1,15 +1,93 @@
 ---
 title: "ai-engine"
-description: "The POST proxy for every synchronous AI operation, with per-op validation, caps, and rate limiting."
+description: "The single POST proxy fronting every synchronous AI operation, dispatching by operation name through a typed handler registry after the shared gate chain."
 ---
 
-ai-engine is the single POST proxy fronting every synchronous AI operation, dispatching by operation after the shared gate chain.
+`ai-engine` (`functions/ai-engine/index.ts`) is a `Deno.serve` POST endpoint. One request carries a `body.operation` field; the dispatcher looks the operation up in a handler registry, runs per-operation gates, executes the handler, and maps its result to an HTTP response. There is no legacy switch — every operation is a typed `OperationHandler`.
 
-## What this covers
+## The outer gate chain
 
-- POST proxy for every synchronous AI operation; outer runGates (method/App Check/JWT/entitlement fetch), then dispatchOperation() runs per-op validation, per-op entitlement, feature kill-switch, cap check, ai_engine rate limit, execute, counter increment.
-- Cap categories user_facing / runaway_protection / handler_owned; computeEffectiveCap() (parent x multiplier); x-developer-bypass + x-ai-stubbed response headers for the smoke harness.
+The `Deno.serve` entry calls `runGates(req, { method: HttpMethod.Post, auth: AuthMode.Jwt })` — method + App Check + App Version + Clerk JWT + entitlement fetch (which derives `isDeveloper`). It deliberately declares **no** `rateLimit` sugar: the rate limit is checked inside `dispatchOperation` instead, so the `x-developer-bypass` header and per-operation observability sit alongside it. After the chain passes, the body is parsed (`INVALID_BODY` on failure), `body.operation` is read (`MISSING_OPERATION` with the valid list, or `INVALID_OPERATION`), and `findHandler` resolves the handler.
+
+## Per-operation dispatch
+
+`dispatchOperation` (`functions/ai-engine/index.ts`) runs the per-op policy in a fixed order and executes the handler:
+
+| Gate | Check | Skipped for dev? | Failure code / status |
+| --- | --- | --- | --- |
+| 0 (outer `runGates`) | HTTP method POST | no | `method_not_allowed` / 405 |
+| 1 (outer) | App Check `X-Firebase-AppCheck` | no | `invalid_app_check` / 401 |
+| 1.4 (outer) | App Version floor | no | `client_too_old` / 410 |
+| 1.5 (outer) | Clerk JWT | no | `missing_bearer_token` / `invalid_jwt` / 401 |
+| 1.6 (outer) | Entitlement fetch (derives `isDeveloper`) | n/a | `entitlement_check_failed` / 502 |
+| 2 | Operation lookup (`findHandler`) | no | `missing_operation` / `invalid_operation` / 400 |
+| 3 | `handler.validateInput()` | no | (handler's error code) / 400 |
+| 4 | Per-op entitlement (`requiredEntitlement` in `activeKeys`) | yes (cascade) | `subscription_required` / 403 |
+| 4.5 | Feature kill-switch (`getBool(featureFlag)`) | no | `feature_disabled` / 403 |
+| 5 | Cap check (skipped for `handler_owned`) | yes | `cap_reached` or `runaway_protection` / 429 |
+| 6 | Rate limit `checkRateLimit(Bucket.AiEngine)` | yes | `rate_limited` / 429 |
+| 7 | `handler.execute()` | no | `handler_threw` / 500 (or the handler's own status) |
+| 8 | `incrementUsageColumn` (non-`handler_owned` only) | yes | (non-fatal on error) |
+
+Structural validation (App Check, body parse, operation name, `validateInput`) runs identically for developer accounts per the Developer Bypass Scope rule — only the limit-style gates (per-op entitlement, cap, rate limit, counter increment) are dev-skipped. `dispatchOperation` also stamps `x-developer-bypass` on the response and, when `shouldStubAi()` (`functions/_shared/ai/client.ts`) fires, `x-ai-stubbed: true` (prod never sets `AI_STUBBING_ENABLED`, so that header is never emitted there). Before any FK-child insert it calls `ensureCanonicalUserRow` — an idempotent `ON CONFLICT DO NOTHING` upsert that covers first-launch races where `resolve-identity` hasn't run yet.
+
+## The rate limit is a single global bucket
+
+There is exactly one rate-limit call in `ai-engine`: `checkRateLimit(Bucket.AiEngine, authUserId, isDeveloper)` (`functions/ai-engine/index.ts`). It is a single fixed-window `ai_engine` bucket shared across **every** operation for the same user, sized for crash-loop / runaway-client protection rather than per-operation budgeting. A grep of `operations/` for `checkRateLimit` returns nothing — no operation defines its own bucket. What varies per operation is the **cap** check, driven by each handler's `capCategory` / `capKey` / `usageColumn`; monthly caps do the per-op budgeting.
+
+## The handler contract
+
+Every operation implements `OperationHandler` (`functions/ai-engine/operations/handler.ts`), a stateless data-plus-function bundle instantiated once at module load:
+
+| Field | Meaning |
+| --- | --- |
+| `name` | Operation string, matched against `body.operation` |
+| `requiredEntitlement` | `TierKey` or `'none'` — the per-op tier gate |
+| `capCategory` | `user_facing` \| `runaway_protection` \| `handler_owned` |
+| `capKey` / `parentCapKey` | `server_config` cap key (or multiplier key + parent for runaway) |
+| `usageColumn` | `usage`-table column incremented on success |
+| `featureFlag` | Optional `server_config` boolean kill-switch |
+| `validateInput(input)` | Returns an error string (`400`) or `null` |
+| `execute(ctx)` | Runs the operation, returns a `HandlerResult` |
+
+`HandlerContext` carries `{ authUserId, isDeveloper, rawBody, input, requestHeaders }`. `HandlerResult` is a union: `ok` (payload), `ok_passthrough` (the handler built its own `Response` — `kb_query` and `synthesis` pipe the raw Anthropic body straight back), `validation_failed`, `upstream_failed`, `forbidden`, `not_found`, `limit_reached`, and `input_too_large`. `ok_passthrough` is also the contract `_shared/extraction/extract-handler.ts` returns.
+
+### Cap categories
+
+| Category | Dispatcher behavior |
+| --- | --- |
+| `user_facing` | Generic cap check; `429 cap_reached`; `+1` on success |
+| `runaway_protection` | Same flow but `429 runaway_protection`; cap is `parent × multiplier` when `parentCapKey` is set (via `computeEffectiveCap`) |
+| `handler_owned` | Dispatcher skips **both** the cap check and the counter increment — the handler does unit conversion / multi-column budgeting inside `execute()` (transcribe, `kb_query`) |
+
+In practice the generic index-level cap gate only trips for `runaway_protection` handlers; user-facing counted caps are implemented as `handler_owned` and gate themselves in `execute()`. `computeEffectiveCap` falls back to the provided default when a `server_config` row is missing, so a deploy-order glitch never takes an operation offline.
+
+## Registered operations
+
+The registry is `OPERATIONS` in `functions/ai-engine/operations/index.ts` — 13 handlers, instantiated once, looked up by name via `findHandler` (`OPERATION_NAMES` is `Object.keys`):
+
+| Operation | Group | Handler file |
+| --- | --- | --- |
+| `kb_query` | primary user-facing | `operations/kb-query.ts` |
+| `synthesis` | primary user-facing | `operations/synthesis.ts` |
+| `transcribe_submit` | transcribe (submit → webhook → fetch) | `operations/transcribe-submit.ts` |
+| `transcribe_fetch` | transcribe | `operations/transcribe-fetch.ts` |
+| `transcribe_upload_init` | transcribe | `operations/transcribe-upload-init.ts` |
+| `keywords` | runaway-protection sub-op | `operations/keywords.ts` |
+| `context_summary` | runaway-protection sub-op | `operations/context-summary.ts` |
+| `thread_naming` | runaway-protection sub-op | `operations/thread-naming.ts` |
+| `template_moderation` | runaway-protection sub-op | `operations/template-moderation.ts` |
+| `query_expand` | runaway-protection sub-op | `operations/query-expand.ts` |
+| `save_user_blueprint` | user blueprint mgmt (RR-134) | `operations/save-user-blueprint.ts` |
+| `list_user_blueprints` | user blueprint mgmt | `operations/list-user-blueprints.ts` |
+| `delete_user_blueprint` | user blueprint mgmt | `operations/delete-user-blueprint.ts` |
 
 <Note>
-Scaffold generated from the codebase map — expand with full detail, examples, and specifics.
+There is **no** `extract` operation here. `operations/index.ts` documents this explicitly: extraction is fully async, driven by `extract-submit` → `extract-runner` → `extract-results`, and the runner imports `ExtractHandler` from `_shared/extraction/extract-handler.ts` directly rather than dispatching through this registry.
 </Note>
+
+## Related pages
+
+- [Edge Function catalog](/rollingrecord/backend/edge-functions/overview) — the shared `runGates()` chain and the full function list.
+- [get-user-usage](/rollingrecord/backend/edge-functions/get-user-usage) — where the monthly caps these operations count against are surfaced.
+- [Inbound webhooks](/rollingrecord/backend/edge-functions/webhooks) — the `assemblyai-webhook` that completes the async transcribe flow.

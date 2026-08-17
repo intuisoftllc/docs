@@ -1,15 +1,70 @@
 ---
 title: "Testing Strategy"
-description: "The two testing layers — Deno pure-logic unit tests and the gate-chain smoke suite."
+description: "Two disjoint layers: Deno pure-logic unit tests mirroring the source tree, and the smoke suite that drives the real Edge Function gate chain."
 ---
 
-Pure logic is unit-tested with Deno mirroring the source layout, while the smoke suite drives the real Edge Function gate chain.
+Server logic is tested in two disjoint layers. Deno unit tests under `supabase/tests/` cover deterministic pure logic in milliseconds; the standalone `smoketest/` Gradle build drives behavior through the real Edge Function HTTP surface and its full gate chain. A `CLAUDE.md` HARD RULE decides which layer a given piece of new code belongs to.
 
-## What this covers
+## The two layers
 
-- Deno pure-logic unit tests mirror the source layout under supabase/tests/ (deno task test) — cost math, sync transforms, validators, registries, extraction/transcribe/billing/crypto helpers.
-- Smoke tests (smoketest/) must drive the real Edge Function gate chain (service-role only for preconditioning/assertion reads); no raw DELETE / crypto-column nulling on c_recordings.
+| Layer | Location / runner | Scope | Uses |
+|---|---|---|---|
+| Deno pure-logic unit tests | `supabase/tests/` · `deno task test` (`deno test --no-check`) | deterministic logic **only** — no network, DB, env, filesystem, or gate chain | cost math, parsers, validators, formatters, prompt assembly, registries, sync / extraction / crypto transforms |
+| Gate-chain smoke tests | `smoketest/` (standalone Gradle) · `cd smoketest && ./gradlew test` | the real Edge Function HTTP path — full gate chain, Clerk auth, App Check, validation, RPC | service-role key for **preconditioning + assertion reads only**, never to execute the op under test |
+
+The two are complementary, not redundant: the unit layer pins logic without an HTTP round-trip, and the smoke layer proves the whole pipeline admits and rejects requests correctly.
+
+## Layer 1 — Deno unit tests
+
+`supabase/tests/` mirrors the source tree: `functions/_shared/ai/pricing.ts` is tested by `tests/_shared/ai/pricing_test.ts`. Tests use `Deno.test` blocks and `@std/assert`, imported back into `functions/` by relative path. The `test` task is defined in `tests/deno.json`:
+
+```bash
+cd supabase/tests
+deno task test        # → deno test --no-check
+```
 
 <Note>
-Scaffold generated from the codebase map — expand with full detail, examples, and specifics.
+The task passes `--no-check` deliberately. Some test files transitively import source modules (`sync-push` / `sync-pull`, `usage-counters`) that carry pre-existing TypeScript errors unrelated to the tests — a dual `@supabase/supabase-js` version plus a few stale casts. The tests verify runtime behavior; cleaning up those source type errors is tracked separately.
 </Note>
+
+Representative coverage across the mirrored tree:
+
+| Area | Test files (`tests/`) |
+|---|---|
+| Error registry | `_shared/errors_test.ts` — no duplicate codes, size parity, snake_case, 4xx/5xx status, non-empty descriptions |
+| Cost math | `_shared/ai/pricing_test.ts`, `_shared/transcribe/pricing_test.ts` |
+| Sync transforms | `_shared/sync/*_test.ts`, `sync-pull/*`, `sync-push/*` — cursor encode/decode, entity/group mapping, request/response shaping |
+| Extraction logic | `_shared/extraction/*_test.ts` — accumulator, billing, context-budget, job-status, messages, runner-classify, runner-plan |
+| Crypto / OTP / email / billing / db | `_shared/crypto/*`, `_shared/otp/*`, `_shared/email/otp-email_test.ts`, `_shared/billing/entitlements_test.ts`, `_shared/db/*_test.ts` (credit-ceiling, metered-ops, storage-quota, usage-caps) |
+| Per-function pure logic | `ai-engine/*`, `support-ops/operations/*`, `indexing/bundle-requests_test.ts`, `storage-janitor/buckets_test.ts`, `storage-orphan-lister/predicates_test.ts`, `set-user-pin/pin-settings_test.ts`, `analytics/validation_test.ts` |
+
+## Layer 2 — Gate-chain smoke tests
+
+`smoketest/` is a **standalone** Gradle build — not a module of the app build. Run it from its own directory:
+
+```bash
+cd smoketest && ./gradlew test
+```
+
+The suite has 60-plus `*SmokeTest.kt` classes (`AiEngine*`, `Sync*`, `Extract*`, `SupportOps*`, `Bundle*`, `DeleteUser*`, `RateLimit*`, `Search`, `Indexing`, tier-gate enforcement, and more). Each drives the operation under test through the real Edge Function HTTP surface so the whole admission chain — App Check, Clerk JWT, entitlement, rate limit, structural validation, RPC — executes for real.
+
+The service-role key exists in the harness for **preconditioning** state (seeding `user_storage_usage` near a cap, `usage` rows near a limit, specific ciphertext for a trigger) and for **assertion reads** against internal tables the response body doesn't expose. It must never execute the operation under test — that would bypass every enforcement layer and test only the SQL layer. The `c_recordings` crypto-integrity rule applies here too: smoke tests never raw-`DELETE` `c_recordings` or null its crypto columns for real-user-flow rows; teardown routes through the matching Edge Function, and only synthetic throwaway rows may be REST-deleted.
+
+## Classifying new server code
+
+The HARD RULE **Deno Unit Tests for New Server Logic** requires you to classify every new or changed function in `functions/` before considering the work done:
+
+| Kind | Where it's tested |
+|---|---|
+| Pure (deterministic, no I/O) | **must** add / update a `*_test.ts` under `supabase/tests/`, mirroring the source path |
+| Impure (DB / provider HTTP / env / gate chain / the HTTP handler itself) | covered by `smoketest/` per the gate-chain rule — not a Deno unit test |
+| Mixed | export the isolable pure function and unit-test that; leave the rest to `smoketest/` |
+| Unsure | default to writing the Deno unit test — a pure function with a test is never wrong |
+
+A pure function shipped without a test erodes the fast-feedback coverage one commit at a time, which is exactly what `supabase/tests/` exists to prevent.
+
+## Where to go next
+
+- [Function Deployment (config.toml)](/rollingrecord/backend/operations/config-toml) — the gate chain the smoke layer exercises.
+- [Error-Code Registry & Kotlin Mirror](/rollingrecord/backend/operations/error-registry) — pinned by `errors_test.ts` in the unit layer.
+- [Privacy & Customer-Data Posture](/rollingrecord/backend/operations/privacy-posture) — why both layers touch only internal fixtures.

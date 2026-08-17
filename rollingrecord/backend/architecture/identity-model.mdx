@@ -1,16 +1,55 @@
 ---
-title: "Identity & the canonical_users Hub"
-description: "The single platform-agnostic identity column and the cascade hub every user-data table hangs off."
+title: "Identity Model"
+description: "The single platform-agnostic identity column — auth_user_id = the Clerk sub claim — and the canonical_users hub every user-data table cascades off."
 ---
 
-Every user is identified by one column, auth_user_id, and every user-data table cascades off the canonical_users hub.
+Every user is exactly one row in `canonical_users`, keyed by `auth_user_id TEXT` — the Clerk user id carried in the JWT `sub` claim. That one column is the join key across the whole schema and the cascade hub the user-data tables hang off — 26 in the baseline schema, 30+ today. It is `TEXT`, not `UUID`, and holds only the Clerk `sub` (e.g. `user_2ab...`). The client's prefixed sync ids (`rec-`, `ctx-`, `sec-`, `bp-`) are a separate concern — they live in the `c_*.id` / `user_blueprints.id` columns (also `TEXT`, per `migrations/20260524000000_uuid_to_text_for_prefix_support.sql`), never in `auth_user_id`.
 
-## What this covers
+## `canonical_users`, the hub
 
-- Single platform-agnostic identity: auth_user_id TEXT (the Clerk/Supabase Auth sub claim); migration history collapsed the old triple (canonical_user_id/rc_customer_id/auth_user_id) into one column, but the TABLE stays canonical_users.
-- canonical_users is the cascade hub — every user-data table FKs to it ON DELETE CASCADE; deleting one row wipes the user everywhere.
-- The row is provisioned idempotently by resolve-identity (on app launch) and clerk-webhook (user.created), with a belt-and-suspenders ensureCanonicalUserRow() upsert inside ai-engine.
+Defined in `migrations/20260508000000_baseline.sql`.
 
-<Note>
-Scaffold generated from the codebase map — expand with full detail, examples, and specifics.
-</Note>
+| Column | Type | Purpose |
+| --- | --- | --- |
+| `auth_user_id` | `text NOT NULL PRIMARY KEY` | the Clerk `sub`; the cascade hub |
+| `created_at` / `last_seen_at` | `timestamptz` | lifecycle timestamps |
+| `frozen_at` / `frozen_reason` | `timestamptz` / `text` | soft-block → 403 `account_frozen` (checked before the rate limit) |
+| `subscription_lapsed_at` / `subscription_lapsed_tier` | `timestamptz` / `text` | 30-day grace window; paired `CHECK`, tier in `pro_cloud` / `pro_cloud_ai` |
+| `email_hash` | `text` (added by `migrations/20260518020000_canonical_users_email_hash.sql`) | peppered hash keying the `l_deleted_identity` anti-abuse snapshot |
+
+`email_hash` lets `wipeUser()` write the anti-abuse snapshot without a live Clerk API call at deletion time. It is set by `clerk-webhook` on `user.created` / `user.updated` and refreshed by `resolve-identity` on every cold start. Every user-data table's cascade FK targets this table's `auth_user_id` — see [the deletion cascade](/rollingrecord/backend/architecture/deletion-cascade).
+
+## `auth_user_id` = the verified Clerk `sub`
+
+Edge Functions verify the `Authorization: Bearer <jwt>` header in `functions/_shared/gates/jwt.ts`. `verifyClerkJwt()` parses the header `kid`, fetches Clerk's JWKS (`CLERK_JWKS_URL`, 5-minute TTL cache), verifies the RS256 signature via Web Crypto, checks `exp`, and requires `sub` to be a non-empty string. It then pins `iss` to the origin of `CLERK_JWKS_URL` (RR-451) — signature and expiry alone would accept any Clerk-signed token, including one minted by the dev environment or an unrelated Clerk app, so the issuer check rejects cross-environment and cross-app reuse. It fails closed: any failure maps to a 401 with the deliberately opaque `invalid_jwt`. The verified `sub` becomes `canonical_users.auth_user_id`; `runJwtGate()` / `verifyBearerToken()` return the `VerifiedAuthUser { authUserId, email }`.
+
+This replaced the original `supabase.auth.getUser()` approach. Supabase Auth was the 2026-04 plan; Clerk replaced it, and several in-code comments that still say "Supabase Auth" are themselves stale. Supabase still hosts Postgres, Edge Functions, and Storage — it just no longer owns identity.
+
+## One column, three retired identities
+
+The schema originally carried three identifiers. The rename migration `migrations_archive/20260415090000_rename_to_auth_user_id.sql` collapsed them into one:
+
+| Old identifier | Fate |
+| --- | --- |
+| RC anonymous id (`$RCAnonymousID:...`) | per-install, reset on reinstall — abandoned |
+| `canonical_user_id` (UUID surrogate) | dropped by the rename migration |
+| `rc_customer_id` (RevenueCat) | renamed → `auth_user_id` |
+| `auth_user_id` (`TEXT`) | the surviving single identity = Clerk JWT `sub` claim |
+
+`auth_user_id` is the **new** surviving name, not one of the retired surrogates. The rename kept the column `TEXT` (test rows used `$RCAnonymousID:...` strings), and its note about "tightening to UUID later" never landed. `migrations/20260524000000_uuid_to_text_for_prefix_support.sql` confirms this by converting the `c_*` id / FK columns and `user_blueprints` ids from `uuid` → `text`, so the client's prefixed ids (`rec-`, `ctx-`, `sec-`, `bp-`) cross the sync wire natively. The `developer_accounts` table referenced in the old rename migration no longer exists — dev bypass is now derived from the `developer` RevenueCat entitlement, not a table. See [dev bypass scope](/rollingrecord/backend/gates/dev-bypass-scope).
+
+## Provisioning the row — idempotent everywhere
+
+Exactly one `canonical_users` row must exist before any FK-bound child insert. Three paths provision it, all idempotent via `INSERT ... ON CONFLICT (auth_user_id) DO NOTHING`:
+
+| Path | When |
+| --- | --- |
+| `resolve-identity` | every cold start — the authoritative upsert |
+| `clerk-webhook` `user.created` | Clerk provisioning webhook (Svix-signed) |
+| `ensureCanonicalUserRow()` | belt-and-suspenders inside `ai-engine`, `get-user-key`, and `set-user-pin` |
+
+`resolve-identity` (`functions/resolve-identity/index.ts`) is authoritative. It runs `runGates()` (POST + App Check + App Version + JWT + `ResolveIdentity` rate limit), upserts with `ignoreDuplicates` so exactly one of N parallel first-launches sees `status: "created"`, runs the anti-abuse carryover only on fresh creation, and returns `{ auth_user_id, status, carryover, is_founder, lifetime_tier, subscription_lapsed_at, subscription_lapsed_tier }`. It takes no body fields — identity comes only from the verified JWT.
+
+`handleUserCreated()` in `clerk-webhook` (`functions/clerk-webhook/index.ts`) runs the same upsert without App Check or a user JWT (the Svix signature is the auth layer), so FK-bound child inserts work from the moment the Clerk user exists; it also handles `user.updated` (refresh `email_hash`) and `user.deleted` (full wipe). `ensureCanonicalUserRow()` is the same idempotent upsert (`{ auth_user_id }`, `onConflict: auth_user_id`, `ignoreDuplicates`), run by three Edge Functions before any handler that inserts FK-bound child rows, in case a call races the sign-in flow.
+
+Related: [`resolve-identity`](/rollingrecord/backend/edge-functions/resolve-identity) · [webhooks](/rollingrecord/backend/edge-functions/webhooks) · [JWT auth](/rollingrecord/backend/gates/jwt-auth) · [the deletion cascade](/rollingrecord/backend/architecture/deletion-cascade) · [table-naming conventions](/rollingrecord/backend/database/table-naming-conventions).

@@ -178,6 +178,7 @@
           {
             "group": "Backend",
             "pages": [
+              "rollingrecord/backend/overview",
               {
                 "group": "Architecture",
                 "pages": [

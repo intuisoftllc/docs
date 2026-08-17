@@ -1,15 +1,64 @@
 ---
-title: "Table Naming l_ / h_ / f_ / c_"
-description: "The prefix conventions that encode a table's retention and purpose."
+title: "Table Naming Conventions"
+description: "The l_ / h_ / f_ / c_ table prefixes that encode retention class and purpose, and the sweepers behind each."
 ---
 
-Table-name prefixes encode purpose and retention — long-retention logs, short-retention history, financial state, and cloud-synced tables.
+A table's prefix encodes what it is and how long its rows live. Four prefixes carry meaning — `l_` (long-retention log), `h_` (short-retention history), `f_` (financial state), and `c_` (cloud-synced content) — while state, counter, config, and queue tables take no prefix. The prefixes also cluster related tables together in Supabase Studio's alphabetical list.
 
-## What this covers
+## The prefixes
 
-- l_* long-retention audit/compliance/financial-event logs (l_user_key_access, l_admin_audit, l_user_abuse_event, l_deleted_identity, l_credit_consumption, l_entitlement_events), swept by prune_log_tables().
-- h_* short-retention support history (h_transcribe_history, h_ai_engine_sessions), swept by prune_h_tables(); f_* financial state (f_user_financials); c_* cloud-synced tables.
+| Prefix | Meaning | Retention | Sweeper |
+| --- | --- | --- | --- |
+| `l_` | long-retention audit / compliance / financial-event log | `server_config.log_retention_months` (default 36) | `prune_log_tables()`, weekly Sun 03:00 UTC |
+| `h_` | short-retention support history | `server_config.support_history_retention_days` (default 90) | `prune_h_tables()`, weekly Sun 04:00 UTC |
+| `f_` | mutable financial state (micro-USD, not floats) | none — CASCADEs on user delete | n/a |
+| `c_` | cloud-synced user content | tombstone GC past `cloud_tombstone_grace_days` | `prune_tombstones()`, nightly |
+| (none) | current state / counters / config / queues | n/a | dedicated sweepers |
 
-<Note>
-Scaffold generated from the codebase map — expand with full detail, examples, and specifics.
-</Note>
+## `l_*` — long-retention logs
+
+Append-only rows that may be referenced months or years later — compliance/legal, financial, and abuse-forensics events. Retained for `server_config.log_retention_months` (default 36). `prune_log_tables()` (`supabase/migrations/20260508000000_baseline.sql`) sweeps five of them by their timestamp columns: `l_user_key_access` (by `happened_at`); `l_user_abuse_event`, `l_admin_audit`, and `l_credit_log` (all by `created_at`); and `l_storage_drift` (by `detected_at`, added in `supabase/migrations/20260513000000_storage_drift_detection.sql`). Other `l_*` tables carry their own lifecycle and are **not** in that sweeper's body.
+
+| Table | What it records | Notes |
+| --- | --- | --- |
+| `l_user_key_access` | DEK-access audit | FK + CASCADE; swept by `prune_log_tables()` |
+| `l_user_abuse_event` | Abuse-signal log | Nullable user id, no FK; swept by `prune_log_tables()` |
+| `l_admin_audit` | Support-ops actions | Write-once; no FK; deliberately excluded from `delete-user` (admin history, not user data) |
+| `l_credit_log` | Unified credit ledger | Renamed from `l_credit_consumption` (`consumed_at` → `created_at`); `UNIQUE(purchase_token)` guards duplicate purchases; in `delete-user` (no FK) |
+| `l_storage_drift` | Storage counter-drift log (RR-356) | FK + CASCADE; swept by `prune_log_tables()` (by `detected_at`) |
+| `l_deleted_identity` | Account-deletion identity log | Keyed on salted `email_hash` + period; own retention |
+| `l_entitlement_events` | RC webhook event log | FK + CASCADE; own dedup index |
+| `l_eval_run` | AI eval-run cost log | `BIGINT` id sequence; own lifecycle |
+
+> `l_user_abuse_event`'s own table comment claims it was added to `delete-user`'s `TABLES_TO_WIPE`, but the current list in `supabase/functions/_shared/users/wipe.ts` does not include it — a discrepancy worth flagging rather than trusting the comment.
+
+## `h_*` — short-retention history
+
+Recent activity for live support cases and "what just happened" debugging, where an escalation past ~90 days would route to a different system. Retained for `server_config.support_history_retention_days` (default 90). `prune_h_tables()` sweeps `h_transcribe_history` (by `completed_at`), `h_ai_engine_sessions` (by `ended_at`), and `h_extraction_charge` (by `charged_at`).
+
+| Table | What it records | Sweep key |
+| --- | --- | --- |
+| `h_ai_engine_sessions` | One row per ai-engine session (`op_type` = `kb_query`/`extract`/`synthesis`, an `outcome` enum) | `ended_at` |
+| `h_transcribe_history` | One row per transcribe job outcome | `completed_at` |
+| `h_extraction_charge` | Idempotency ledger for minute-based extraction billing (one row per `auth_user_id` + `run_id`) | `charged_at` |
+
+All three have FK + CASCADE to `canonical_users`.
+
+## `f_*` — financial state
+
+Mutable per-user financial state in micro-USD (`BIGINT`, not floats, to avoid floating-point drift). Distinct from `l_*`: these hold *current state*, not events. The only `f_*` table today is `f_user_financials` (`supabase/migrations/20260527100000_create_f_user_financials.sql`), keyed per `(auth_user_id, period)` with `revenue_micros`, `ai_cost_micros`, and `storage_cost_estimate_micros`. It has FK + CASCADE, RLS enabled, and follows the column spine. Pure consumption counters (`usage`) stay un-prefixed even when a financial estimate is computed from them.
+
+## `c_*` — cloud-synced content
+
+The 14 cloud-synced user-content tables, all with FK + CASCADE: `c_recordings`, `c_recording_sessions`, `c_recording_notes`, `c_transcripts`, `c_categories`, `c_scheduled_recordings`, `c_contexts`, `c_context_cards`, `c_context_recordings`, `c_context_sessions`, `c_action_items`, `c_search_threads`, `c_search_messages`, and `c_settings`. `prune_tombstones()` sweeps 13 of them — every one except `c_settings`, which is **not** tombstone-swept. The sweeper's `FOREACH` array carries those 13 tables after `c_extraction_templates` was dropped from it in `supabase/migrations/20260731130000_fix_prune_tombstones_drop_dropped_template_table.sql`; `c_settings` was never added.
+
+## Picking a prefix
+
+Ask: *"Could a user dispute this 6+ months later, and would we need this row to investigate?"* Yes → `l_*` (money, legal, compliance, abuse forensics). No → `h_*` (recent operational debugging only). If genuinely unsure, default to `l_*` — over-retention is recoverable, under-retention is not. Rows that represent *current state* rather than *events* take no history prefix; financial current state takes `f_*`; cloud-synced content takes `c_*`. When adding a history table, extend the matching sweeper (`prune_log_tables()` for `l_*`, `prune_h_tables()` for `h_*`) in the same commit.
+
+## Related pages
+
+- [Scheduled pg_cron sweepers](/rollingrecord/backend/database/cron-sweepers) — the jobs behind each retention class
+- [usage table & metered counters](/rollingrecord/backend/database/usage-table) — the un-prefixed counter table
+- [Column spine & encrypted pairs](/rollingrecord/backend/database/column-conventions) — the column ordering every table follows
+- [High-risk tables registry](/rollingrecord/backend/database/high-risk-tables)

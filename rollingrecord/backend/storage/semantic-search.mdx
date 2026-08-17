@@ -1,15 +1,86 @@
 ---
 title: "Server-Side Embeddings"
-description: "The search and indexing endpoints that back semantic search, and the embedding bundle cache."
+description: "The stateless query embedder, the batch indexing embedder, and the embedding-bundle cache — the server turns text into Cohere vectors but stores none and matches none."
 ---
 
-Server-side embeddings power semantic search — a stateless query embedder, a batch indexer, and a bundle cache plane.
+Two Edge Functions back semantic search. `search` embeds one query string; `indexing` embeds a batch of document chunks and also fronts the embedding-bundle cache. Both use Cohere v2 and both gate at entitlement `[ProCloud, ProCloudAi]` (which excludes plain Pro and founders). The crucial architectural fact: the **server holds no vectors and does no cosine matching**. It sees the transient text, returns vectors, and the client does the similarity match on-device against its own local document vectors.
 
-## What this covers
+## search vs indexing
 
-- search (embeds a single query, holds no vectors, returns a 1024-dim vector), indexing (batch document-chunk embeddings, up to 96/call), the embedding bundle cache plane (get_bundles/put_bundle, embedding_cache bucket + bundle_too_large).
-- Cohere provider (_shared/ai/providers/embeddings/cohere.ts), exact billed tokens to f_user_financials; semantic_search_disabled kill switch; Pro+Cloud entitlement.
+| Function | Operations | Rate-limit bucket(s) | Input caps | Returns |
+| --- | --- | --- | --- | --- |
+| `search` | embed one query | `Bucket.Search` (chain sugar; 300/hr in-code, 600/hr live) | query ≤ 2000 chars | `{ vector, model_version }` |
+| `indexing` | `embed` / `get_bundles` / `put_bundle` | `embed` → `Bucket.Indexing` (150/hr in-code); bundle ops → `Bucket.EmbeddingCache` (300/hr in-code, 600/hr live) | texts array 1–96, each ≤ 8000 chars; want ≤ 100; sealed ≤ 5 MiB | `{ vectors, model_version }` or bundle hits/misses |
+
+### search
+
+`functions/search/index.ts` validates the query (string, non-empty, `MAX_QUERY_CHARS` = 2000), checks the `isSemanticSearchEnabled` kill switch, then calls `embed([query], "query")` and returns `{ vector, model_version }`. Its header states the posture plainly: the server "holds no vectors and never sees results — it sees only the transient query string, embeds it, and returns the vector."
+
+### indexing
+
+`functions/indexing/index.ts` dispatches on an `operation` field. An absent operation defaults to `embed`; an unrecognized value is rejected with `validation_failed` rather than treated as embed. Because the operations have opposite cost profiles — an `embed` spends real money at Cohere, a bundle op is a DB read plus a signed URL — there is **no chain-sugar rate limit**; each operation charges its own bucket from the handler body. The `embed` operation validates `texts` (array of 1–`MAX_TEXTS`=96 strings, each non-empty and ≤ `MAX_TEXT_CHARS`=8000), checks the kill switch, calls `embed(texts, "document")`, and returns `{ vectors, model_version }`.
+
+## Cost and telemetry
+
+Both functions record the **exact Cohere billed input tokens** as cost to `f_user_financials.ai_cost_micros` for every caller, including dev — dev bypass is a quota exception, not a cost-or-diagnostics one. Telemetry is likewise recorded for every caller and is not enforced: `search` increments `searches`, or `ai_searches` when `body.source === "ai"` (KB-chat tool searches); `indexing` increments `usage.items_indexed` by the chunk count. All of these writes are fire-and-forget so a financials hiccup never fails the embed.
+
+## The Cohere provider
+
+`CohereEmbeddingProvider` (`functions/_shared/ai/providers/embeddings/cohere.ts`) POSTs `https://api.cohere.com/v2/embed` with a 60-second timeout, batching internally at `COHERE_MAX_TEXTS_PER_CALL` = 96. Its pure helpers are unit-tested: `mapInputType` (`document` → `search_document`, `query` → `search_query`), `modelSupportsOutputDimension` (v4+ only, which gates whether `output_dimension` is sent), `maxInputTokensFor` (128k on v4+, 512 on v3), `buildCohereEmbedBody` (sends `truncate: "NONE"` to fail loud on overflow rather than silently embed a truncated chunk), `parseCohereEmbedResponse` (reads `embeddings.float` and `meta.billed_units.input_tokens`), and `classifyCohereFailure` (429 → `rate_limited`, 5xx → `unavailable`, else `failed`).
+
+`embed` and `getEmbeddingProvider` (`functions/_shared/ai/providers/embeddings/index.ts`) resolve the provider from the `EMBEDDING_API_KEY` secret plus `server_config`, and `isSemanticSearchEnabled` reads the kill switch. `EmbedResult` carries `{ vectors, model, inputTokens }`.
+
+### Failure kind to error code
+
+`errorFor` at each call site maps an `EmbeddingError.kind` to a canonical registry code:
+
+| kind | AppError code | HTTP |
+| --- | --- | --- |
+| `key_missing` | `embedding_key_missing` | 500 |
+| `misconfigured` | `server_misconfiguration` | 500 |
+| `rate_limited` | `query_embed_rate_limited` | 429 |
+| `unavailable` | `embedding_provider_unavailable` | 503 |
+| `failed` | `embedding_failed` | 502 |
+
+### Pricing
+
+`EMBEDDING_PRICING` (`functions/_shared/ai/pricing.ts`) is per million input tokens: `embed-v4.0` = 0.12, `embed-multilingual-v3.0` = 0.10. `computeEmbeddingCostUsd(model, inputTokens)` returns 0 with a console warning for an unknown model; `usdToMicros` rounds to integer micro-USD for the financials column.
+
+## Server-authoritative config
+
+Model and dimensions come from `server_config` (non-public), so document and query embeds always read the **same** model — the prerequisite for their vectors to be comparable. The in-code fallbacks (`config.ts`) are conservative cold-start values only.
+
+| Key | Default | Controls |
+| --- | --- | --- |
+| `embedding_model` | `embed-v4.0` | model for both document and query embeds (must match) |
+| `embedding_dims` | 1024 | output dimensionality; matches the on-device `float32[1024]` BLOB |
+| `embedding_model_allowlist` | `["embed-v4.0", "embed-multilingual-v3.0"]` | cost/safety guard; empty = allow all |
+| `semantic_search_enabled` | true | kill switch → `semantic_search_disabled` (403) when off |
+| `embedding_cache_enabled` | true (in-code fallback FALSE) | bundle-cache master switch; off = every bundle reported as a miss |
+
+The 1024 dimensionality and `embed-v4.0` model are the **defaults**, not hardcoded — the live values come from `server_config`.
+
+## The embedding-bundle cache
+
+A bundle is every vector belonging to one owner (a recording's transcript chunks, or a context card's vectors) sealed as one encrypted blob in the `embedding-storage` Storage bucket. The cache lets a restored device download vectors instead of re-embedding them.
+
+Its catalog is **not** a table. The earlier standalone `embedding_bundles` table was created (`20260722130000`) and dropped the same day (`20260722160000_embeddings_on_owner_rows.sql`); the catalog now lives as the `emb_bundle_hash` + `emb_bundle_iv` columns **on the owner rows** `c_recordings` and `c_contexts` (nullable, paired-NULL `CHECK`). `emb_bundle_hash` is the SHA-256 of the bundle preimage; `emb_bundle_iv` is the AES-GCM IV for the blob, which is sealed with the **per-user DEK** from `user_crypto` — not a per-bundle key, because the vectors derive from a transcript already encrypted under that same key, so a separate key would isolate nothing. These columns are written only by `put_bundle` and read only by `get_bundles`, and are deliberately not part of the sync wire shape.
+
+`handleGetBundles` / `handlePutBundle` (`functions/indexing/bundles.ts`) use `BUNDLE_BUCKET` = `embedding-storage` and a 300-second (`DOWNLOAD_URL_TTL_SEC`) signed-URL TTL. `get_bundles` resolves each requested owner to a hit (signed URL + `bundle_iv`) or a miss, reading the owner row scoped by `auth_user_id` and `deleted_at IS NULL`; a hash mismatch is a miss, and a miss is a normal result, never an error. `put_bundle` uploads the blob first, then stamps `emb_bundle_hash` / `emb_bundle_iv` on the owner row (same scoping) — blob-first so a catalog row never claims a blob that isn't there.
 
 <Note>
-Scaffold generated from the codebase map — expand with full detail, examples, and specifics.
+`Bucket.EmbeddingCache` (`embedding_cache`) is a **rate-limit bucket**, not a Storage bucket. The Storage bucket that holds the sealed blobs is `embedding-storage`.
 </Note>
+
+## Bundle format
+
+`functions/_shared/embeddings/bundle.ts` is the single definition of how a bundle is ordered, hashed, and laid out, mirrored by the Kotlin `EmbeddingBundleFormat`. Chunks sort by `chunkKey` ascending as raw strings; that one rule fixes both the hash preimage and the byte layout, so the blob needs no internal manifest. `computeBundleHash` is SHA-256 hex over `bundleHashPreimage` (LF-joined `model`, `dims`, then `chunkKey:sourceVersion` lines). Vectors pack as little-endian float32, chunk-major (`encodeVectorBlock` / `decodeVectorBlock`). `bundleStoragePath` is `{auth_user_id}/{owner_kind}-{owner_id}.bin`; `GCM_TAG_BYTES` = 16, `MAX_BUNDLE_BYTES` = 5 MiB, and `sealedBundleBytes(chunkCount, dimensions)` is computable before any encryption — which is what lets an over-cap owner be skipped without any stored "don't retry" flag.
+
+`parseGetBundles` / `parsePutBundle` (`functions/indexing/bundle-requests.ts`) do pure structural validation that runs for dev callers too: `MAX_WANT_ENTRIES` = 100, `IV_BYTES` = 12, a `^[0-9a-f]{64}$` hash pattern, a strict base64 round-trip, and an exact `sealed.length == sealedBundleBytes(...)` assertion — an over-cap body returns `bundle_too_large`.
+
+## Related pages
+
+- [Envelope Encryption Model](/rollingrecord/backend/storage/envelope-encryption) — the AES-256-GCM sealing behind the bundle blobs
+- [KEK Lifecycle & user_crypto](/rollingrecord/backend/storage/key-management) — the per-user DEK that seals a bundle
+- [Storage Buckets](/rollingrecord/backend/storage/buckets) — the `embedding-storage` bucket and its path convention
+- [Storage Janitors & Orphan Reaping](/rollingrecord/backend/storage/janitors) — how orphaned bundle blobs are reaped

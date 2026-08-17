@@ -1,14 +1,54 @@
 ---
-title: "App Lock PIN (set-user-pin)"
-description: "How the App Lock PIN verifier is stored server-side so it syncs across devices."
+title: "App Lock PIN"
+description: "How set-user-pin stores the DEK-encrypted App Lock PIN verifier on user_crypto so App Lock syncs across devices while the server stays zero-knowledge."
 ---
 
-set-user-pin writes a DEK-encrypted PIN verifier to user_crypto so App Lock syncs across devices while the server stays zero-knowledge.
+`functions/set-user-pin/index.ts` (RR-492) writes or clears the caller's App Lock PIN **verifier** on their `user_crypto` row so the PIN syncs across their devices. The verifier is an AES-256-GCM (DEK-encrypted) PBKDF2 one-way blob built client-side by `AppLockCrypto` — the server only ever stores opaque ciphertext plus IV and never sees the PIN or the DEK. It runs the standard JWT gate chain with **no** entitlement gate (App Lock is available on every tier, exactly like `get-user-key`) and no rate-limit bucket, since it's a rare user-initiated settings write.
 
-## What this covers
+## Request body to behavior
 
-- Writes/clears the DEK-encrypted PIN verifier (pin_verifier_ct/_iv) on user_crypto so App Lock syncs across devices; the server is zero-knowledge on the PIN; clearing requires an app_lock_pin_reset OTP ticket, setting does not.
+The body carries base64 ciphertext + IV strings and, on the clear path, an OTP ticket. The pairing mirrors the DB's paired-NULL CHECK.
+
+| `pin_verifier_ct` | `pin_verifier_iv` | `otp_ticket` | Behavior |
+| --- | --- | --- | --- |
+| base64 string | base64 string | not required | set/change the verifier + `pin_settings`; bump `pin_updated_at` |
+| null | null | required (`app_lock_pin_reset`) | clear the verifier + settings after consuming the ticket; else `step_up_required` |
+| one null / one string | — | — | `invalid_body` (400) |
+
+`base64ToBytes()` decodes the strings (a throw becomes `invalid_body`); `bytesToPgBytea()` (`functions/_shared/crypto/encoding.ts`) encodes them into the Postgres `BYTEA` literals written to the columns.
+
+## The asymmetric OTP rule
+
+Setting or changing a PIN requires no OTP: first-enable has nothing to bypass, and a change is guarded by the current PIN client-side. **Clearing** removes a security control, so it requires a consumed email-OTP ticket first. Because the server is zero-knowledge on the PIN, it cannot verify "you know the current PIN" — email ownership is the only factor it can enforce to authorize removing App Lock, whether that's a forgot-PIN reset or a Settings "turn off".
+
+On the clear path the handler calls `consumeOtpTicket()` (`functions/_shared/otp/consume.ts`) with purpose `app_lock_pin_reset` **before any write**, so a failed step-up never mutates the verifier. A missing, expired, used, or wrong-purpose ticket returns `step_up_required` (403). See [Email OTP Step-Up](/rollingrecord/backend/accounts/account-otp) for how the ticket is minted.
 
 <Note>
-Scaffold generated from the codebase map — expand with full detail, examples, and specifics.
+The admin support-ops PIN-clear path is separate — it is admin-secret + HMAC gated and does **not** use this `app_lock_pin_reset` OTP ticket, because a locked-out user can't supply one. Don't conflate the two clear paths.
 </Note>
+
+## Settings and the last-write-wins marker
+
+`normalizePinSettings()` (`functions/set-user-pin/pin-settings.ts`) is a pure canonicalizer for the non-encrypted settings blob: it returns `{ auto_lock_ms }` (floored, finite, `>= 0`) or null, and never throws, so arbitrary JSON can't land in the JSONB column. On clear, settings are nulled alongside the verifier. `pin_updated_at` is a server-assigned last-write-wins marker bumped on **every** write (set, change, or clear); the response returns it as epoch millis so the client stores it as its last-seen marker for future reconciles.
+
+Before the `UPDATE`, `ensureCanonicalUserRow()` best-effort upserts the `canonical_users` row (`ignoreDuplicates`). The `UPDATE` targets `user_crypto` by `auth_user_id` and **fails loudly** (`database_error`) if zero rows matched — the row is provisioned by `get-user-key` at sign-in, so a 0-row update means it was never provisioned or the JWT's `auth_user_id` doesn't match the stored row, and a silent 200 would persist nothing. On success it returns `{ ok, pin_updated_at }`.
+
+## user_crypto App Lock columns
+
+Four nullable columns added to the high-risk `user_crypto` table, covered by its existing FK + CASCADE to `canonical_users`. `get-user-key` returns all four so the PIN and its settings sync across devices.
+
+| Column | Type | Migration | Meaning |
+| --- | --- | --- | --- |
+| `pin_verifier_ct` | `BYTEA` (nullable) | `migrations/20260703120000_app_lock_pin_verifier.sql` | AES-256-GCM DEK-encrypted PBKDF2 verifier ciphertext |
+| `pin_verifier_iv` | `BYTEA` (nullable) | `migrations/20260703120000_app_lock_pin_verifier.sql` | 12-byte IV; NULL iff `pin_verifier_ct` is NULL (paired CHECK) |
+| `pin_settings` | `JSONB` (nullable) | `migrations/20260703180000_app_lock_pin_sync_metadata.sql` | non-encrypted cross-device settings, e.g. `{ auto_lock_ms }` |
+| `pin_updated_at` | `TIMESTAMPTZ` (nullable) | `migrations/20260703180000_app_lock_pin_sync_metadata.sql` | server LWW marker; NULL on legacy rows, treated as epoch 0 by the client |
+
+The verifier pair follows the encrypted-column naming convention and its paired-NULL CHECK — `(pin_verifier_ct IS NULL) = (pin_verifier_iv IS NULL)` — which the body validation mirrors. Encrypted material stays in the `_ct`/`_iv` columns; it never goes in the `pin_settings` JSON blob.
+
+## Related
+
+- [Email OTP Step-Up](/rollingrecord/backend/accounts/account-otp) — mints the `app_lock_pin_reset` ticket the clear path consumes.
+- [get-user-key](/rollingrecord/backend/edge-functions/get-user-key) — provisions `user_crypto` and returns the PIN columns.
+- [Envelope encryption](/rollingrecord/backend/storage/envelope-encryption) and [key management](/rollingrecord/backend/storage/key-management).
+- [High-risk tables](/rollingrecord/backend/database/high-risk-tables) and [column conventions](/rollingrecord/backend/database/column-conventions).

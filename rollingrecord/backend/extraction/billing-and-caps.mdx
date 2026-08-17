@@ -1,15 +1,94 @@
 ---
 title: "Extraction Metering & Caps"
-description: "Millisecond-based extraction metering, caps, and the anti-forgery transcript ceiling."
+description: "Millisecond-based extraction metering against tier-resolved caps plus credits, the anti-forgery transcript ceiling, and where extraction cost lands."
 ---
 
-Extraction is metered in true audio milliseconds against tier-resolved caps and credits, with several structural guards.
+Extraction bills in true audio **milliseconds** (`usage.extraction_ms`), mirroring transcription. For each recording the server reserves the whole recording's ms on its first chunk and commits them only on its final chunk, so a cancelled or abandoned extraction charges nothing. The tier cap is Cloud+AI-only; every other tier resolves to zero.
 
-## What this covers
+## The billing unit
 
-- Millisecond-based extraction_ms metering (tier-resolved + credits); extraction_budget_exhausted, extraction_input_too_large, extraction_context_full, extraction_transcript_exceeds_duration (anti-forgery ~600 tok/min ceiling).
-- _shared/extraction/ modules: billing.ts, caps.ts, context-budget.ts, accumulator.ts, messages.ts, job-status.ts, job-crypto.ts.
+Chunks are an internal API-sizing detail, never a billing unit. The billable amount is one recording's true audio length, computed by `computeBillableMs` (`functions/_shared/extraction/billing.ts`):
 
-<Note>
-Scaffold generated from the codebase map — expand with full detail, examples, and specifics.
-</Note>
+- **Trusted duration path** — when a synced `c_recordings.duration_ms` exists (`readRecordingDurationMs`, `functions/_shared/extraction/caps.ts`, reads the RAW unmultiplied value scoped on `auth_user_id`), `billable_ms = trueDurationMs`, billed exactly, partial minutes and all.
+- **Fallback floor** — when the server has no trusted duration (a local-only, never-synced, on-device-transcribed recording), `billable_ms = ceil(transcriptTokens * 60000 / max_tokens_per_minute)`.
+
+This is a **fallback, not a `max()`**: the earlier `max(trueDurationMs, floor)` let a dense transcript inflate the charge above the true audio length (a 45-minute lecture billed as 60), so the guard was acting as an inflator. Gross padding is still caught by the ceiling below. `CHARS_PER_TOKEN` is `4`.
+
+## Reserve on chunk 0, commit on the last chunk
+
+`ExtractHandler.execute` (`functions/_shared/extraction/extract-handler.ts`) meters per recording through the shared metered-op infra (`functions/_shared/db/metered-ops.ts`, type `METERED_OP_TYPES.EXTRACTION_MS`):
+
+1. **Reserve (chunk 0)** — `reserveMeteredOp(EXTRACTION_MS, opCost = billableMs)` cap-gates the whole recording once. On failure it returns `limit_reached` + `extraction_budget_exhausted` with the normalized cap fields.
+2. **Commit (last chunk)** — claims `h_extraction_charge` then `commitMeteredOp(billableMs)`. A multi-chunk last chunk rebuilds a commit-time reservation via `buildMeteredReservation`, since the chunk-0 reservation lived only in that earlier Edge invocation.
+
+Only a successful, completed recording is charged. The reserve carries no DB-backed hold, so an uncommitted recording "releases" by simply never committing — an interrupted or user-cancelled extraction charges 0 ms, and a failed AI call is not charged. Commit idempotency is a `(auth_user_id, run_id)` claim on `h_extraction_charge` (`claimExtractionCharge` — a `23505` on the PK reads as "already charged, skip"), where `run_id` is `buildExtractionRunId(jobId, recordingId)` = `${jobId}:${recordingId}` — deliberately free of any chunk index, attempt count, or timestamp, so a resumed final chunk across a WorkManager retry never double-charges.
+
+## Extraction caps by tier
+
+`resolveExtractionCapMs` (`functions/_shared/extraction/caps.ts`) resolves the monthly cap in ms from the caller's effective entitlements. Extraction is a Cloud+AI-only feature: the `server_config` cap row is stored in minutes for admin readability and converted `× 60000` in code.
+
+| Tier | `extraction_ms` cap |
+| --- | --- |
+| Free | 0 (every attempt rejected) |
+| Pro | 0 |
+| Pro+Cloud | 0 |
+| Cloud+AI | `cloud_ai_extraction_minutes_per_month` (1800 min) `× 60000` = 108,000,000 ms/mo |
+| Developer | unlimited — reserve/commit are no-ops; cost still recorded |
+
+Bonus ms beyond the monthly cap live in `user_credits.extraction_ms_balance` (drained after the base allotment), with grants and consumption logged to `l_credit_log.extraction_ms_delta` under `resource_type = 'extraction_ms'` — all renamed and retyped from the original `*_minutes` columns by `migrations/20260627100000_extraction_minutes_to_ms.sql`. See [Credits & bundles](/rollingrecord/backend/billing/credits-and-bundles).
+
+## The submit-time headroom check
+
+`extract-submit` runs a **reserve-only** Gate 5 (`functions/extract-submit/index.ts`) — a "do you have ANY extraction headroom?" check via `reserveMeteredOp` with `opCost: 1` against `resolveExtractionCapMs`. It never commits (the runner does the real per-recording bill), so a rejection costs nothing and a pass consumes no quota. On failure it returns `429 extraction_budget_exhausted`. This check is dev-skipped internally.
+
+## The transcript-vs-duration ceiling
+
+`transcriptExceedsDuration` (`functions/_shared/extraction/billing.ts`) is a structural anti-forgery guard: it rejects a transcript carrying more tokens than its true audio length could plausibly produce, i.e. when `transcript_tokens * 60000 > billable_ms * max_tokens_per_minute`. The ceiling is generous by design (~11 tok/sec) so genuine fast speech never trips it. It is validation, not a quota, so **dev accounts are checked exactly like users** and a violation is not charged.
+
+## Cost-control server_config knobs
+
+| Key | Seeded default | Controls |
+| --- | --- | --- |
+| `max_tokens_per_minute` | 650 | Transcript-vs-duration ceiling + the local-only billable-floor denominator. |
+| `extraction_chunk_tokens` | 8500 | Internal per-chunk sizing (raised from 8000); never a billing unit. |
+| `extraction_digest_max_tokens` | 1500 | Hard cap on the re-injected prior-state digest, so cost can't scale with context size. |
+| `cloud_ai_extraction_minutes_per_month` | 1800 | The only live tier cap (Cloud+AI); `× 60000` in code. |
+| `extraction_incremental_max_output_tokens` | 4500 | Output budget for an incremental extraction. |
+| `extraction_rebuild_max_output_tokens` | 16000 (code fallback) | Output budget for a full rebuild. |
+| `extraction_max_input_tokens` | 65000 (code fallback) | Per-chunk input backstop → `extraction_input_too_large`. |
+
+`max_tokens_per_minute` is seeded at 650 (`migrations/20260624000000_extraction_minutes_metering.sql`); the `600` in `getInt("max_tokens_per_minute", 600)` is only the code fallback when the row is unreachable — the live value is 650.
+
+## Where cost lands (dev included)
+
+Dev bypass is a **quota** exception, not a cost or diagnostics exception. A dev account skips the `extraction_ms` quota (`reserveMeteredOp` / `commitMeteredOp` short-circuit to no-ops via `devReservation`) and the `Bucket.AiExtraction` per-chunk rate limit — but every successful AI call still records cost and analytics:
+
+- **Cost** — `trackTokenUsage` in the shared AI client (`functions/_shared/ai/client.ts`) prices the response tokens and increments `f_user_financials.ai_cost_micros` via `increment_financial_counter` (`migrations/20260527100000_create_f_user_financials.sql`), a per-`(user, YYYY-MM UTC)` BIGINT micro-USD accumulator. Recorded for dev callers too.
+- **Token analytics** — every `execute()` writes a row to `h_ai_engine_sessions` (`recordAiEngineSession`, opType `extract`) with input/output tokens, outcome (`completed` / `failed` / `cap_reached`), and any error code.
+
+See [Financials](/rollingrecord/backend/billing/financials) and [Developer bypass scope](/rollingrecord/backend/gates/dev-bypass-scope).
+
+## The idempotency ledger
+
+`h_extraction_charge` (`migrations/20260624000000_extraction_minutes_metering.sql`) is the commit idempotency ledger: PK `(auth_user_id, run_id)`, plus `period`, `ms_charged` (BIGINT), and `charged_at`. It has an FK + `CASCADE` to `canonical_users` and RLS on. Its charge column started as `minutes_charged INTEGER` and was renamed and retyped to `ms_charged BIGINT` (`migrations/20260627100000_extraction_minutes_to_ms.sql`), the same migration that renamed `usage.extraction_minutes` to `usage.extraction_ms`. As a short-retention `h_*` table it is swept by `prune_h_tables()` — see [Extraction sweepers & cron](/rollingrecord/backend/extraction/sweepers).
+
+## Extraction billing error codes
+
+Every code comes from the canonical registry (`functions/_shared/errors.ts`).
+
+| Code | HTTP | Category | Raised when |
+| --- | --- | --- | --- |
+| `extraction_budget_exhausted` | 429 | user | Monthly `extraction_ms` cap reached (submit reserve or per-recording reserve). |
+| `extraction_input_too_large` | 422 | user | One chunk exceeds `extraction_max_input_tokens`. |
+| `extraction_transcript_exceeds_duration` | 422 | user | Transcript tokens exceed the `max_tokens_per_minute` ceiling (anti-forgery). |
+| `extraction_context_full` | 409 | user | The context hit its size ceiling; remaining recordings left pending. |
+| `extraction_payload_too_large` | 413 | developer | Submit payload above `min(server_config, 8 MiB inline cap)`. |
+
+See [Error registry](/rollingrecord/backend/operations/error-registry) for the full list and Kotlin mirror.
+
+## Where to go next
+
+- [Async extraction architecture](/rollingrecord/backend/extraction/architecture) — the plane and job lifecycle.
+- [extract-runner tick engine](/rollingrecord/backend/extraction/runner) — where reserve/commit happens per chunk.
+- [Extraction sweepers & cron](/rollingrecord/backend/extraction/sweepers) — retention for the ledger and job rows.
+- [Transcription metering & cost](/rollingrecord/backend/transcription/metering-and-cost) — the ms-metering pattern extraction mirrors.

@@ -1,15 +1,68 @@
 ---
 title: "usage Table & Metered Counters"
-description: "The per-(user, period) counter table, calendar-month reset, and the add-a-counter checklist."
+description: "The per-user, per-month counter table, its calendar-month reset, and enforced quotas versus token analytics."
 ---
 
-The usage table holds one row per user per calendar month, resetting on the first of the month UTC with no cron.
+The `usage` table holds one row per `(auth_user_id, period)`, where `period` is `YYYY-MM` in UTC. Periods reset implicitly on the first day of each calendar month at 00:00 UTC — never a rolling window. Its columns split into enforced quotas that gate requests and pure analytics counters that nothing gates.
 
-## What this covers
+## The table
 
-- One row per (auth_user_id, period = YYYY-MM UTC); calendar-month reset (never rolling, no cron); the full counter inventory (ai_queries, syntheses, transcription_ms, deep_reasoning_syntheses, runaway *_count, items_indexed, token analytics).
-- Adding a counter: the 10-step checklist (migration + server_config cap + USAGE_COUNTER_COLUMNS + get-user-usage + UserUsageCaps + handler registration + Android mirror + smoke test).
+Defined in `supabase/migrations/20260508000000_baseline.sql`, PK `(auth_user_id, period)`. It has **no** FK to `canonical_users` — a deliberate floating pattern (the FK was removed during the auth rename) so usage rows survive an account-deletion race and can be snapshotted for anti-abuse before the row is wiped. The baseline `CREATE TABLE` predates several renames; the current column set is:
 
-<Note>
-Scaffold generated from the codebase map — expand with full detail, examples, and specifics.
-</Note>
+| Counter | Class | Renamed / added by |
+| --- | --- | --- |
+| `ai_queries` | enforced quota | baseline |
+| `syntheses` | enforced quota | `ai_extractions` → `syntheses` (`20260625140000`) |
+| `extraction_ms` (`BIGINT`) | enforced quota | `extraction_minutes` → `extraction_ms` (`20260627100000`; added `20260624000000`) |
+| `transcription_ms` (`BIGINT`) | enforced quota | baseline |
+| `deep_reasoning_syntheses` | enforced quota | baseline |
+| `keywords_count`, `context_summary_count`, `thread_naming_count`, `template_moderation_count`, `save_user_template_count`, `list_user_templates_count`, `delete_user_template_count`, `query_expand_count` | runaway-protection | baseline |
+| `input_tokens`, `output_tokens` (`BIGINT`) | token analytics | baseline |
+| `searches`, `items_indexed` | search analytics | RR-487 (`20260719140000`) |
+| `ai_searches` | search analytics | RR-487 (`20260719170000`) |
+
+## Enforced quotas vs analytics
+
+| Class | Columns | Gates a request? |
+| --- | --- | --- |
+| Enforced quota | `ai_queries`, `syntheses`, `extraction_ms`, `transcription_ms`, `deep_reasoning_syntheses` | Yes — cap check in the gate chain; dev accounts skip |
+| Runaway-protection | `keywords_count`, `context_summary_count`, `thread_naming_count`, `template_moderation_count`, `save`/`list`/`delete_user_template_count`, `query_expand_count` | Yes — internal anti-abuse ceilings, never shown in the UI |
+| Token analytics | `input_tokens`, `output_tokens` | No — throughput only; failover responses and dev accounts do NOT contribute |
+| Search analytics | `searches`, `ai_searches`, `items_indexed` | No — telemetry only |
+
+The token columns are analytics, not enforced caps, which is why dev accounts still record them: per the Developer Bypass Scope rule, dev bypass is a quota exception, not a diagnostics exception. The `input_tokens`/`output_tokens` column comments note explicitly that failover responses and dev accounts are excluded.
+
+## Reading and incrementing
+
+The helpers live in `supabase/functions/_shared/db/usage-counters.ts`:
+
+| Helper | What it does |
+| --- | --- |
+| `currentPeriod()` | Builds `YYYY-MM` in UTC |
+| `readUsageColumn(uid, col)` | Reads one column; returns 0 when no row exists |
+| `incrementUsageColumn(uid, col, amount)` | Calls the RPC, with a race-tolerant UPSERT fallback |
+
+`increment_usage_counter` (`p_auth_user_id`, `p_period`, `p_column`, `p_amount`) does `INSERT ... ON CONFLICT (auth_user_id, period) DO UPDATE SET col = usage.col + EXCLUDED.col` via `format(%I)`, so it interpolates any column name — a new counter needs no RPC change. The fallback is safe because counters only ever add; an off-by-one under concurrent writes is acceptable for cap enforcement.
+
+## Cap resolution
+
+`resolveUserUsageCaps()` (`supabase/functions/_shared/db/usage-caps.ts`) bundles the display caps for `get-user-usage`, tier-resolved in one call: `aiQueries`, `syntheses`, `extractionMs`, `transcriptionMs`, and `deepReasoningSyntheses`. Defaults mirror the `server_config` seeds — `ai_queries_per_month` 150, `syntheses_per_month` 72, `synthesis_deep_reasoning_monthly_limit` 10 — and AI caps return 0 for a non-`pro_cloud_ai` caller. `resolveTranscriptionCapMs()` reads `pro_cloud_transcription_minutes_per_month` (default 480) or `cloud_ai_transcription_minutes_per_month` (default 1200) and multiplies by 60000. Runaway-protection counters are intentionally not exposed here.
+
+## Cost lives elsewhere
+
+Token *cost* (not the token counters) lands in `f_user_financials.ai_cost_micros` via `incrementFinancialColumn` → `increment_financial_counter`, a separate per-`(user, period)` table. `usage.input_tokens`/`output_tokens` are throughput analytics only. See [server_config & rate_limit_config](/rollingrecord/backend/database/config-tables) and [table naming conventions](/rollingrecord/backend/database/table-naming-conventions) for the `f_*` prefix.
+
+## Deletion path
+
+`usage` is not in the standard `TABLES_TO_WIPE` array. On account delete, `snapshotUsageForDeletion` (defined in `supabase/functions/_shared/users/deleted-identity-history.ts`, imported and called by `wipe.ts`) copies the counters into `l_deleted_identity` (keyed on salted `email_hash` + period) for anti-abuse re-signup carryover, and only then does `wipeUser` call `wipeTable('usage', ...)` separately — after the snapshot, because the snapshot reads it. Because there is no FK, CASCADE does not cover this table.
+
+## Calendar-month reset
+
+Periods reset on the first of each calendar month at 00:00 UTC. There is no rolling 30-day window, no per-user billing anniversary, and no cron rollover — the first write of a new month creates a fresh `(auth_user_id, period)` row implicitly. Every user shares the same boundary regardless of when they subscribed.
+
+## Related pages
+
+- [server_config & rate_limit_config](/rollingrecord/backend/database/config-tables) — where the caps are stored
+- [Table naming conventions](/rollingrecord/backend/database/table-naming-conventions) — the `f_*` financial-state prefix
+- [RLS & service-role model](/rollingrecord/backend/database/rls-and-service-role)
+- [Scheduled pg_cron sweepers](/rollingrecord/backend/database/cron-sweepers)

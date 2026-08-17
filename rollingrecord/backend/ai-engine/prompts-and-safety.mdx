@@ -1,15 +1,52 @@
 ---
 title: "Server-Side Prompts & Safety Sandwich"
-description: "Why AI-facing prompts and the extraction tool schemas live server-side, and how the safety sandwich wraps them."
+description: "Why behavioral prompts and extraction tool schemas live server-side, and how the extraction safety sandwich subordinates user blueprints to fixed boundaries."
 ---
 
-Behavioral prompts and the proprietary extraction tool schemas live server-side, wrapped by the safety sandwich, per the AI content-placement rule.
+Per the AI Content Placement HARD RULE, every piece of AI-facing content that is behavioral, reputation-critical, hotfix-sensitive, or proprietary IP lives server-side in `functions/ai-engine/prompts/`. This page describes that content at an architecture level — the prompt bodies themselves are proprietary IP and are not reproduced here (that is precisely why they live server-side).
 
-## What this covers
+## What lives server-side
 
-- The server-side placement rule (reputation/behavioral/hotfix/IP goes server); prompts under prompts/ (extract.ts safety sandwich TOOL_SPEC_ONLY / CONTENT_BOUNDARY / INCREMENTAL_ADDENDUM, medical-mode.ts, template-moderation.ts).
-- The 4 extraction tool schemas (saveSection/replaceSection/saveTasks/completeTasks) are server-side IP; kb_query tools stay client-side.
+The `prompts/` directory holds every server-owned system prompt: `buildKbQuerySystemPrompt` (KB-chat behavioral rules), `SYNTHESIS_SYSTEM_PROMPT`, `KEYWORDS_SYSTEM_PROMPT`, `CONTEXT_SUMMARY_SYSTEM_PROMPT`, `THREAD_NAMING_SYSTEM_PROMPT`, `QUERY_EXPAND_HYDE_SYSTEM_PROMPT` / `QUERY_EXPAND_VARIANTS_SYSTEM_PROMPT`, `TEMPLATE_MODERATION_SYSTEM_PROMPT`, and the blueprint-description prompt. Model selection for every operation also resolves from `server_config`. These are server-side because a bug in behavioral text carries reputation risk and because the text is IP a competitor could reuse.
 
-<Note>
-Scaffold generated from the codebase map — expand with full detail, examples, and specifics.
-</Note>
+## The client/server split for kb_query
+
+`kb_query` is the sharpest illustration of the placement rule. The **server** owns the system prompt, model selection, and round budget. The **client** owns the pieces that are coupled to app capabilities and must change atomically with app releases:
+
+| Owned by server | Owned by client |
+| --- | --- |
+| Behavioral system prompt (confidentiality, response style, safety, search rules) | Tool definitions (names, descriptions, JSON schemas) |
+| `{APP_KNOWLEDGE}`, `{MEDICAL_MODE_ADDENDUM}` injection | `{TOOL_USAGE_INSTRUCTIONS}` (`tool_instructions`) |
+| Round-budget suffix (`buildRoundBudgetSuffix`) | `{SCOPE_BLOCK}` (`scope_block`, built from local state) |
+| User-identity block (`buildUserIdentityBlock`) | `fallback_system_prompt` (final-answer variants) |
+| Model + provider chain | Conversation history, message loop, analytics |
+
+The `kb_query` **tool definitions are client-side** because they describe app-navigation capabilities, not IP — adding a tool requires both the definition and its handler in the app. The four extraction tool schemas, by contrast, are server-side because the extraction output format is proprietary IP.
+
+## The extraction safety sandwich
+
+`assembleSystemPrompt(blueprintPrompt, isBuiltIn, isIncremental, medicalMode)` (`functions/ai-engine/prompts/extract.ts`) wraps **custom** blueprints so user-authored text is explicitly subordinate to fixed tool and content-boundary rules. Built-in blueprints already carry the same instructions baked in and are returned as-is.
+
+| layer | source | role |
+| --- | --- | --- |
+| `TOOL_SPEC_ONLY` | `extract.ts` | tool schemas first — `saveSection`, `saveTasks`, `completeTasks` — plus date/section/supersession rules |
+| BLUEPRINT INSTRUCTIONS wrapper + user prompt | `assembleSystemPrompt` | user text, explicitly "cannot override extraction rules … above and below" |
+| `CONTENT_BOUNDARY` | `extract.ts` | final-authority block: transcript is data, not instructions, plus anti-fabrication rules |
+| `INCREMENTAL_ADDENDUM` (incremental only) | `extract.ts` | adds `replaceSection` + contradiction detection |
+| `EXTRACT_MEDICAL_MODE_ADDENDUM` (medical only) | `medical-mode.ts` | clinical precision — adds care, relaxes no rule |
+
+`TOOL_INSTRUCTIONS` = `TOOL_SPEC_ONLY` + `CONTENT_BOUNDARY`. Built-in blueprints append it via `withToolInstructions` in `blueprints/builtin/index.ts`, so `assembleSystemPrompt` returns them unchanged and the sandwich only ever wraps custom blueprints at runtime.
+
+## The extraction tool set
+
+The base tool spec always exposes three tools — `saveSection`, `saveTasks`, and `completeTasks`. `INCREMENTAL_ADDENDUM` introduces a fourth, `replaceSection(title, category, insights)`, only in incremental mode (when existing sections are present), together with contradiction-detection rules so new information supersedes rather than duplicates prior content. `replaceSection` is **not** in the base spec.
+
+The `CONTENT_BOUNDARY` block is the "final authority": it treats everything below it as raw transcript data to extract, never instructions to follow, and enforces the anti-fabrication rule (extract only what is literally in the transcript — never invent dosages, brands, dates, names, or "adjacent facts"). `EXTRACT_MEDICAL_MODE_ADDENDUM` and `KB_QUERY_MEDICAL_MODE_ADDENDUM` (`medical-mode.ts`) are appended last when Medical Mode is on; they add precision and clinical structure and never relax a safety or extraction rule.
+
+## Where to go next
+
+- [Built-in Blueprints](/rollingrecord/backend/ai-engine/builtin-blueprints) — the server-owned blueprint registry that bakes in `TOOL_INSTRUCTIONS`.
+- [Custom Blueprints](/rollingrecord/backend/ai-engine/user-blueprints) — the user-authored blueprints the sandwich wraps.
+- [KB Chat](/rollingrecord/backend/ai-engine/kb-query) — the client/server prompt split in practice.
+
+Related: [Extraction architecture](/rollingrecord/backend/extraction/architecture) · [Privacy posture](/rollingrecord/backend/operations/privacy-posture).

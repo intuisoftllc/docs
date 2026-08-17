@@ -1,14 +1,48 @@
 ---
 title: "user-sync-preferences"
-description: "The endpoint that reads and updates a user's per-group sync toggles."
+description: "The GET / PATCH endpoint over the six per-group sync toggles on user_sync_preferences, and how flipping a toggle gates replication without cascading deletes."
 ---
 
-user-sync-preferences exposes GET/PATCH over the six per-group sync toggles that gate what replicates.
+`user-sync-preferences` (`functions/user-sync-preferences/index.ts`) serves the caller's `user_sync_preferences` row for the Account Management Sync UI. It is deliberately dumb: it stores a boolean and returns the row. All destructive and confirmation-flow logic lives at the call site.
 
-## What this covers
+## The two verbs
 
-- GET/PATCH the user_sync_preferences row (6 sync toggles); _shared/sync/groups.ts + preferences.ts; per-group sync gating.
+The gate chain here allows both methods (`method: [Get, Patch]`) and uses the `UserSyncPreferences` rate-limit bucket — differing from the POST-only sibling endpoints.
 
-<Note>
-Scaffold generated from the codebase map — expand with full detail, examples, and specifics.
-</Note>
+| Method | Body | Behavior |
+| --- | --- | --- |
+| GET | — | returns the current row; auto-creates a default all-TRUE row if missing |
+| PATCH | subset of the 6 boolean toggles | updates only the supplied columns; unknown key or non-boolean → `400 validation_failed`; empty body is a no-op read |
+
+`WRITABLE_FLAGS` is the allow-list — `sync_recordings`, `sync_contexts`, `sync_categories`, `sync_schedules`, `sync_threads`, `sync_settings`. `validatePatchBody` rejects any key outside it and any non-boolean value; an empty object falls through to a GET-style read. `ensureRowExists` does a belt-and-suspenders upsert (`ignoreDuplicates`) before any SELECT/UPDATE, in case the RR-217 AFTER INSERT trigger on `canonical_users` was bypassed for an admin-created user. `readRow` and `rowToResponse` select and normalize the six toggles plus the sync-metadata columns, defaulting a missing toggle to `true`.
+
+## Response shape
+
+Both verbs return the same shape via `rowToResponse` — the toggles plus the trigger-maintained sync metadata.
+
+| Field | Type |
+| --- | --- |
+| `sync_recordings` / `sync_contexts` / `sync_categories` / `sync_schedules` / `sync_threads` / `sync_settings` | boolean |
+| `updated_at` | ISO 8601 string |
+| `version` | number |
+
+## Storage shape
+
+The table is six typed `BOOLEAN` columns, not a JSON blob — a PATCH translates to a column-level `UPDATE ... SET sync_recordings = $1 WHERE auth_user_id = $2`. JSON is only the HTTP wire format in and out of the function.
+
+## Non-destructive by design
+
+Flipping a toggle OFF never deletes existing cloud data — this endpoint stores the boolean and nothing more. The client orchestrates the RR-251 "Stop syncing?" confirmation: either push `cloud_excluded_at` on every item in the group first (via [sync-group-exclude](/rollingrecord/backend/sync/reconcile-and-groups) or `sync-push`), or just stop uploading new items. Enforcement is split across the other two endpoints:
+
+- [sync-push](/rollingrecord/backend/sync/push) rejects any future push for a disabled group with `409 sync_disabled_for_group`.
+- [sync-pull](/rollingrecord/backend/sync/pull) bundles the live preferences into every response (RR-334), so all devices converge on the toggle state.
+
+The shared reader `loadSyncPreferences` (`functions/_shared/sync/preferences.ts`) is what `sync-push` and `sync-pull` both use; it falls back to all-TRUE defaults when the row is missing and prefixes its logs with the caller name. The `SyncPreferencesRow` interface (`functions/_shared/sync/groups.ts`) is the six-boolean type returned here and mirrored into pull responses.
+
+## Related pages
+
+- [Sync Engine Overview](/rollingrecord/backend/sync/overview) — the six groups and their entity sets.
+- [sync-push](/rollingrecord/backend/sync/push) — server-side enforcement of a disabled toggle.
+- [sync-pull](/rollingrecord/backend/sync/pull) — the preference bundle mirrored on every pull.
+- [sync-reconcile & sync-group-exclude](/rollingrecord/backend/sync/reconcile-and-groups) — the cloud-exclude flow a toggle-off usually accompanies.
+- [Sync Shared Modules](/rollingrecord/backend/sync/shared-transforms) — `loadSyncPreferences` and the group registry.

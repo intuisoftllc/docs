@@ -1,14 +1,86 @@
 ---
 title: "Function Deployment (config.toml)"
-description: "How functions are configured for deployment and scheduling across branches."
+description: "How every Edge Function is declared with verify_jwt = false, why, and where recurring-job scheduling actually lives."
 ---
 
-config.toml configures every function to run its own Clerk-JWT check and defines cron scheduling, kept in parity across branches.
+`supabase/config.toml` declares every Edge Function and disables the platform's built-in Supabase-JWT check on each one, so each function runs its own admission chain instead. It contains **zero** cron scheduling — every recurring job lives in a `pg_cron` `cron.schedule(...)` call inside a migration or in the single `Deno.cron()` in `transcribe-drain`.
 
-## What this covers
+## `verify_jwt = false` on every function
 
-- All functions run verify_jwt = false (their own Clerk-JWT check via runGates); rationale comments; Deno.cron vs pg_cron scheduling; branch parity (dev + production).
+`config.toml` (path relative to `supabase/`) holds 29 `[functions.<name>]` blocks, and all 29 set `verify_jwt = false`. No function sets it `true`. Disabling the platform check is what lets `runGates()` (`functions/_shared/gates/`) perform the app's own admission chain — App Check, app-version floor, auth, entitlement, rate limit — rather than having Supabase reject a request before any of that code runs. The rationale is stated once in a header comment above `[functions.resolve-identity]`:
+
+> `verify_jwt = false` disables Supabase's built-in JWT verification — we perform our own auth using Firebase App Check (and RevenueCat for user-scoped endpoints), so Supabase's JWT check would block legitimate requests before our code runs.
 
 <Note>
-Scaffold generated from the codebase map — expand with full detail, examples, and specifics.
+That header comment predates the Clerk auth migration. User-facing endpoints today verify a **Clerk** Bearer JWT (`functions/_shared/gates/jwt.ts`) in addition to App Check; RevenueCat is used for the entitlement fetch, not for JWT verification. The comment names App Check and RevenueCat but not Clerk.
 </Note>
+
+The replacement auth is **not** uniform. Only user-facing endpoints run a Clerk-JWT check. Webhooks and server-to-server callers authenticate with a shared bearer secret or an HMAC signature — the second column below names each one. See [Environment Variables & Secrets](/rollingrecord/backend/operations/env-and-secrets) for the secret values and [Gates](/rollingrecord/backend/gates/run-gates) for the chain itself.
+
+| Function | Replacement auth (via `runGates`) | Notes |
+|---|---|---|
+| `resolve-identity` | Clerk JWT + App Check | first-call identity resolution; carries the shared rationale header comment |
+| `ai-engine` | Clerk JWT | all AI operations; per-op rate limit via the `ai_engine` bucket |
+| `server-config` | App Check | `OPT-OUT: skipAppVersion` — bootstrap endpoint serving the floor value itself |
+| `delete-user` | Clerk JWT | GDPR erasure cascade |
+| `revenuecat-webhook` | `REVENUECAT_WEBHOOK_SECRET` | `OPT-OUT: skipAppCheck + skipAppVersion` — RC server-to-server |
+| `clerk-webhook` | Svix HMAC-SHA256 (`CLERK_WEBHOOK_SECRET`) | RR-446; `user.deleted` only |
+| `assemblyai-webhook` | `ASSEMBLYAI_WEBHOOK_SECRET` | transcription completion callback |
+| `storage-janitor` | `STORAGE_JANITOR_SECRET` | service-role only; called by `pg_cron` `net.http_post` |
+| `storage-orphan-lister` | `STORAGE_JANITOR_SECRET` | single orphan-blob discovery sweep across all three buckets |
+| `extract-submit` | Clerk JWT | RR-499 / RR-503; inline sealed payload |
+| `extract-results` | Clerk JWT | RR-502 results pull / ack |
+| `extract-runner` | `EXTRACT_RUNNER_SECRET` (WebhookSecret) | RR-500 / RR-503; server-to-server tick runner — dedicated least-privilege secret, not the service-role key |
+| `get-user-usage` | Clerk JWT | usage read |
+| `get-user-key` | Clerk JWT | key read |
+| `set-user-pin` | Clerk JWT | RR-492 App Lock PIN write |
+| `account-otp` | Clerk JWT | RR-492 App Lock email OTP |
+| `user-sync-preferences` | Clerk JWT | sync toggles |
+| `sync-pull` | Clerk JWT | RR-237 |
+| `sync-reserve` | Clerk JWT | storage reservation |
+| `sync-push` | Clerk JWT | RR-238 |
+| `sync-audio` | Clerk JWT | cloud backup upload / commit / download / delete |
+| `sync-reconcile` | Clerk JWT | reconcile |
+| `support-ops` | `X-Admin-Secret` + HMAC + replay window | RR-308 admin console |
+| `generate-support-token` | own gate | live support token issuance |
+| `recovery-code` | Clerk JWT + rate-limit | RR-315; generate + acknowledge |
+| `sync-group-exclude` | Clerk JWT | RR-355 bulk group ops |
+| `search` | Clerk JWT | RR-487 semantic-search query embeddings |
+| `indexing` | Clerk JWT | RR-487 document-chunk embeddings / reconciler / backfill |
+| `analytics` | `ANALYTICS_INGEST_SECRET` | RR-108 eval-harness ingest |
+
+Several blocks carry their own per-block rationale comment beyond the shared header — `clerk-webhook` (Svix HMAC), `assemblyai-webhook` (shared secret), `extract-runner` / `extract-submit` (service-to-service), the `storage-janitor` / `storage-orphan-lister` consolidation (2026-07-31), `search` / `indexing` (RR-487), `analytics` (RR-108), and `set-user-pin` / `account-otp` / `recovery-code` (RR-492 / RR-315).
+
+<Note>
+Two function directories have **no** `config.toml` entry: `functions/transcribe-drain` (driven by `Deno.cron`, never externally invoked) and `functions/recovery-code-generate` (superseded by `recovery-code`; the `config.toml` comment states the old function should be deleted from both Supabase branches before the next deploy).
+</Note>
+
+## Local-dev CLI configuration
+
+The rest of `config.toml` is the standard Supabase CLI local-development configuration — the `[api]`, `[db]`, `[auth]`, `[storage]`, and `[edge_runtime]` blocks (ports, `deno_version = 2`, `edge_runtime` `policy = "per_worker"`, storage `file_size_limit = "50MiB"`, all auth providers disabled locally). This is generic CLI boilerplate, not RollingRecord-specific, and governs only the local emulator.
+
+## Scheduling lives in migrations, not config.toml
+
+`config.toml` declares no schedules. Every recurring server job is a `pg_cron` job registered by `cron.schedule('name', '<expr>', $cron$…$cron$)` inside a migration under `migrations/`, plus one `Deno.cron("transcribe-drain", "* * * * *", …)` in `functions/transcribe-drain/index.ts` — the only `Deno.cron` in the codebase. Cron jobs that need to invoke an Edge Function do so with `net.http_post`, carrying a bearer secret read from Vault or a GUC.
+
+| Job name | Schedule | Runs | Source file (`migrations/`) |
+|---|---|---|---|
+| `reconcile_pending_delete_counters` | `45 3 * * *` | `reconcile_pending_delete_counters()` | `20260513000000_storage_drift_detection.sql` |
+| `prune_transcription_queue` | `50 3 * * *` | `prune_transcription_queue()` | `20260514000000_transcription_queue.sql` |
+| `cloud_excluded_content_cleanup` | `40 3 * * *` | `cloud_excluded_content_cleanup()` | `20260608000000_cloud_excluded_content_cleanup.sql` |
+| `prune_demoted_rolling` | `25 3 * * *` | `prune_demoted_rolling()` | `20260605210100_prune_demoted_rolling_cron.sql` |
+| `prune_rate_limit_counters` | `15 4 * * *` | `prune_rate_limit_counters()` | `20260628000000_prune_rate_limit_counters_cron.sql` |
+| `prune_account_otp` | `20 * * * *` | `prune_account_otp()` | `20260706120000_account_otp_two_phase.sql` |
+| `c_recordings_audit_blobs` | `0 3 * * *` | `audit_orphan_blobs()` | `20260707120000_reconcile_committed_no_blob.sql` |
+| `c_recordings_reconcile_no_blob_path` | `10 3 * * *` | `reconcile_committed_no_blob_path()` | `20260707120000_reconcile_committed_no_blob.sql` |
+| `sweep_extraction_heartbeats` | `* * * * *` | `sweep_extraction_heartbeats()` | `20260720170000_extraction_sweepers.sql` |
+| `sweep_extraction_jobs_ttl` | `20 * * * *` | `sweep_extraction_jobs_ttl()` | `20260720170000_extraction_sweepers.sql` |
+| `extract-runner-tick` | `* * * * *` | `extract-runner` Edge Function via `net.http_post` | `20260720180000_extraction_runner_cron.sql` (re-scheduled by `20260721020000_extract_runner_dedicated_secret.sql`) |
+| `storage_orphan_lister` | `23 * * * *` | `storage-orphan-lister` Edge Function via `net.http_post` | `20260731150000_storage_janitor_cutover.sql` |
+| `transcribe-drain` | `* * * * *` (`Deno.cron`) | `runDrain()` every minute | `functions/transcribe-drain/index.ts` |
+
+## Where to go next
+
+- [Environment Variables & Secrets](/rollingrecord/backend/operations/env-and-secrets) — every `Deno.env` secret the replacement-auth gates read.
+- [Error-Code Registry & Kotlin Mirror](/rollingrecord/backend/operations/error-registry) — the codes those gates return on rejection.
+- [Testing Strategy](/rollingrecord/backend/operations/testing) — the smoke suite that drives the real gate chain end to end.

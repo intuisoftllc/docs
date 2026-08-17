@@ -1,14 +1,63 @@
 ---
 title: "get-user-usage"
-description: "The one-call endpoint that returns current-period usage, caps, credits, and storage quota."
+description: "The one-call GET that returns current-period usage counters, resolved caps, credit balances, and cloud storage quota for the Android usage screen."
 ---
 
-get-user-usage returns everything the Android usage screen needs — counters, resolved caps, credit balances, and storage quota — in one response.
+`get-user-usage` (`functions/get-user-usage/index.ts`) is a `Deno.serve` GET endpoint that returns everything the Android usage screen needs in one response: current-period counters, tier-resolved caps, credit balances, and the cloud storage breakdown.
 
-## What this covers
+## Gate chain
 
-- Current-period usage counters + resolved caps + credit balances + storage quota in one response for the Android usage screen; period_reset_at = first-of-next-month UTC.
+The entry calls `runGates(req, { method: HttpMethod.Get, auth: AuthMode.Jwt })` — method + App Check + App Version + Clerk JWT. There is **no entitlement gate, no usage-cap gate, and no rate limit**: reading your own usage is cheap and idempotent, and a buggy client that loop-polls it costs nothing at the monthly-cap level. Dev accounts see their own usage identically — their counters just happen to be `0` because dev bypass skips the increments.
 
-<Note>
-Scaffold generated from the codebase map — expand with full detail, examples, and specifics.
-</Note>
+After the chain it fans out four reads in parallel with `Promise.all`:
+
+| Read | Helper | Failure behavior |
+| --- | --- | --- |
+| Tier-resolved caps | `resolveUserUsageCaps` (`functions/_shared/db/usage-caps.ts`) | — |
+| Current-period `usage` row | `readCurrentUsageRow` | DB error → `500 database_error` |
+| Storage breakdown | `loadQuotaState` (`functions/_shared/db/storage-quota.ts`) | `.catch` → all-zeros |
+| Credit balances | `getAllCreditBalances` (`functions/_shared/db/user-credits.ts`) | falls back to zeros |
+
+A missing `usage` row is **not** a 404 — `readCurrentUsageRow` returns a zero-initialized row so the client always renders real numbers; only an actual DB error surfaces `database_error`.
+
+## Response shape
+
+`UserUsageResponse` carries `period`, `period_reset_at`, `tier` (or `null`), a flat `counters` map, `credit_balances`, and `storage`. `period_reset_at` is the ISO timestamp of the first day of the **next** calendar month at 00:00 UTC, computed via `new Date(Date.UTC(y, m + 1, 1))` (which auto-rolls December). The client caches keyed on it and refetches when it passes — this matches the calendar-month usage-period model.
+
+### Counters
+
+The `counters` map is flat, so older clients safely ignore unknown keys. Runaway-protection counters (`keywords_count`, `template_moderation_count`) are never exposed here.
+
+| Counter key | Unit | Cap enforced? |
+| --- | --- | --- |
+| `ai_queries` | queries | yes (tier cap) |
+| `syntheses` | syntheses | yes |
+| `extraction_ms` | milliseconds | yes (live extraction meter) |
+| `transcription_ms` | milliseconds | yes |
+| `deep_reasoning_syntheses` | syntheses | yes |
+| `input_tokens` | tokens | no — `cap: 0`, tracking only (dev screen) |
+| `output_tokens` | tokens | no — `cap: 0`, tracking only |
+
+`transcription_ms` and `extraction_ms` are in **milliseconds** — the client divides by `60000` for minutes. `cap: 0` on the token counters signals "no cap, running total"; the regular UI ignores them and only the dev usage screen renders them (to derive per-user cost).
+
+### Storage breakdown
+
+`StorageUsage` (RR-229) is maintained by triggers on the `c_*` sync tables into `user_storage_usage`:
+
+| Field | Meaning |
+| --- | --- |
+| `used_bytes` | Authoritative total the tier cap is enforced against |
+| `recordings_bytes` / `contexts_bytes` / `categories_bytes` / `schedules_bytes` / `threads_bytes` / `templates_bytes` | Per-sync-group totals |
+| `settings_bytes` | Reserved — always `0` today |
+| `trashed_bytes` | RR-403 trashed-recording bytes; still count against quota, shown separately |
+| `quota_bytes` / `remaining_bytes` | Tier allotment and headroom |
+
+### Credit balances
+
+`credit_balances` (RR-119) carries `transcription_ms`, `ai_queries`, and `extraction_ms` totals (manual + bundle) plus a `breakdown: { manual, bundle }` for support tooling. Each value is in the same native unit as the matching counter, so the client sums them directly.
+
+## Related pages
+
+- [Edge Function catalog](/rollingrecord/backend/edge-functions/overview) — the shared `runGates()` chain.
+- [get-user-key](/rollingrecord/backend/edge-functions/get-user-key) — the other per-user read the client makes at session start.
+- [resolve-identity](/rollingrecord/backend/edge-functions/resolve-identity) — the launch-time identity upsert.

@@ -1,15 +1,88 @@
 ---
 title: "support-ops 3-Layer Gate Chain"
-description: "The admin dispatcher and its three stacked authentication layers."
+description: "The obfuscated admin dispatcher: its three stacked authentication layers, the operation registry, and the per-request routing pipeline."
 ---
 
-support-ops is an obfuscated admin endpoint guarded by JWT, an admin secret, and an HMAC signature with a replay window.
+`support-ops` is a single Edge Function that fronts every server-side admin/support operation. The endpoint name is deliberately NOT `admin` so URL-level discoverability is minimized, and every admitted request clears three independent authentication layers in a fixed order before the dispatcher ever looks at what operation it was asked to run.
 
-## What this covers
+## The three admission layers
 
-- An obfuscated admin endpoint; Layer 1 runGates (JWT, App Check opted out for the CLI), Layer 2 X-Admin-Secret (ADMIN_OPS_SECRET), Layer 3 X-Signature HMAC-SHA256 over timestamp.body (ADMIN_OPS_HMAC_KEY, 60s replay window); _shared/admin/secret.ts, hmac.ts.
-- Rate limit after structural admission (never bypassed even for dev); gate rejections go to l_user_abuse_event, not l_admin_audit.
+The dispatcher (`functions/support-ops/index.ts`) runs `runGates()` for layer 1, then invokes two standalone gates — `verifyAdminSecret` (`functions/_shared/admin/secret.ts`) and `verifyAdminHmac` (`functions/_shared/admin/hmac.ts`) — as layers 2 and 3. Each layer assumes the previous one was bypassed; losing any single layer still requires the other two to misbehave for a compromise.
 
-<Note>
-Scaffold generated from the codebase map — expand with full detail, examples, and specifics.
-</Note>
+| Layer | Mechanism | Header / secret | Failure code (HTTP) |
+| --- | --- | --- | --- |
+| 1 — `runGates()` | POST method, App Check opted out, App-Version floor kept, JWT auth, entitlement fetch | `Authorization: Bearer <JWT>` | gate-chain codes (`missing_bearer_token` / `invalid_jwt`, 401) |
+| 2 — `X-Admin-Secret` | constant-time compare vs env | `X-Admin-Secret` / `ADMIN_OPS_SECRET` | `admin_secret_mismatch` (401) |
+| 3 — `X-Signature` HMAC | HMAC-SHA256 of `` `timestamp + '.' + body` ``, 60-second replay window | `X-Timestamp` + `X-Signature` / `ADMIN_OPS_HMAC_KEY` | `admin_hmac_mismatch` (401) / `admin_replay_detected` (401) |
+
+The JWT (layer 1) proves the caller is a real signed-in user, but not necessarily an admin. `X-Admin-Secret` (layer 2) proves possession of the shared secret distributed only to operators — dev and prod hold different values, so a dev-secret leak cannot compromise prod. `X-Signature` (layer 3) proves the exact request bytes were not tampered with in transit and that the signed `X-Timestamp` is within `MAX_CLOCK_SKEW_SEC = 60`. A replay past that window returns `admin_replay_detected` and logs a weight-10 abuse event; every other signature or timestamp problem collapses to `admin_hmac_mismatch` with the specific reason logged but never returned to the caller.
+
+### `runGates()` config
+
+Layer 1 is `{ method: HttpMethod.Post, skipAppCheck: true, auth: AuthMode.Jwt }` — there is deliberately **no** `rateLimit` sugar. The rate limit is called manually after layers 2 and 3 so a bad-secret or bad-HMAC failure never consumes rate-limit budget; a limit is a quota, not a "you pinged us wrong" counter. The App Check opt-out carries the required greppable justification:
+
+```ts
+// OPT-OUT: CLI scripts don't send X-Firebase-AppCheck.
+```
+
+The App-Version floor is intentionally kept: an old Python CLI cannot silently keep working after a breaking protocol change. See [runGates admission chain](/rollingrecord/backend/gates/run-gates) and [JWT auth](/rollingrecord/backend/gates/jwt-auth).
+
+## Body-as-text, read once
+
+`req.text()` and `req.json()` each consume the request body stream exactly once. Because layer 3 must verify the exact bytes the operator signed, the dispatcher reads the body once as raw text, hands that verbatim string to `verifyAdminHmac`, and only then `JSON.parse`s it for the handler. Reading order matters — HMAC verifies the signed bytes, not a re-serialization. A body that fails to read or fails to parse into a non-array object returns `invalid_body` (400).
+
+## Dispatcher pipeline
+
+After the three layers admit the request, the dispatcher runs a fixed sequence. `extractClientIp` pulls the first `x-forwarded-for` value (raw, not hashed) for the audit row's `admin_ip`, and `isDeveloper` is hardcoded `false` so the rate limit is never bypassed for a dev caller.
+
+| Step | Action | Reject code |
+| --- | --- | --- |
+| Body read | `req.text()` once (the raw bytes are the HMAC payload) | `invalid_body` (400) |
+| JSON parse | must be a non-array object | `invalid_body` (400) |
+| Operation resolve | `body.operation` → `findOperation()` | `missing_operation` (400) / `invalid_operation` (400) |
+| Param validation | `op.validateParams(body.params)` | op-specific code (400) |
+| Permission gate | `getAdminPermissions()` once + `hasAdminPermission()` (or `row !== null` when `requiredPermission` is null) | `admin_permission_denied` (403) + abuse event |
+| Rate limit | `checkRateLimit(Bucket.SupportOps, admin, false)` | `rate_limited` (429) |
+| Dry-run gate | mutating ops need `dry_run: false` + a valid `preview_id` | `dry_run_required` / `preview_expired` / `preview_mismatch` |
+| Handler + audit | `op.handler(params, ctx)`; write one `l_admin_audit` row; build envelope | `handler_threw` (500) or a typed `OperationError` |
+
+The permission row is fetched exactly once and reused for the whole request. The rate limit runs after structural admission so malformed or unauthorized requests never touch the bucket. The `Bucket.SupportOps` wire key is `support_ops`, defaulting to 60 requests / 3600s (`BUCKET_DEFAULTS` in `functions/_shared/gates/rate-limit.ts`) — a low ceiling so a leaked admin credential burns out before real damage accumulates. See [rate limiting](/rollingrecord/backend/gates/rate-limiting).
+
+## The operation registry
+
+`OPERATIONS` (`functions/support-ops/operations/registry.ts`) is a readonly `OperationDef[]` holding all 27 registered ops. `findOperation(name)` linear-scans by `OperationDef.name` and returns `null` (→ `invalid_operation`) on a miss. There is no magic registration — importing a def and including it in the array is the entire contract. An empty registry answers `invalid_operation` for every request.
+
+Each entry is an `OperationDef` (`functions/support-ops/operations/handler.ts`):
+
+| Field | Type | Purpose |
+| --- | --- | --- |
+| `name` | string | Wire value of the request body's `operation` field |
+| `isReadOnly` | boolean | `true` skips the dry-run gate; `false` requires the dry-run → commit flow |
+| `requiredPermission` | `AdminPermissionKey \| null` | Per-op permission column; `null` means "any admin row suffices" (only `whoami`) |
+| `validateParams` | `(params) => string \| null` | Returns an `AppError.*.code` on malformed params, else null |
+| `handler` | `OperationHandlerFn` | The work, called with `params` and an `OperationContext` |
+
+`OperationContext` carries `adminAuthUserId`, `adminIp`, `adminUserAgent`, the full non-null `adminPermissions` row, `mode` (`'dry_run'` / `'commit'`), and `previewId`. A handler returns an `OperationResult` (`targetAuthUserId?`, `previewSummary?`, `responseBody?`). The dispatcher stamps `targetAuthUserId` onto the audit row and best-effort enriches `previewSummary` / `responseBody` with `target_email` via `resolveUserEmail` so an operator can verify by email-tied-to-UUID.
+
+## Handler failures
+
+A handler that needs to surface a clean, coded rejection throws an `OperationError { code, httpStatus, extra }`. The dispatcher returns `` `{ error: code, ...extra }` `` at the given status and still writes a `failed` audit row carrying the message. A raw `throw new Error(...)` instead collapses to `handler_threw` (500). `OperationError` is reserved for expected, actionable rejections (for example `credit_ceiling_exceeded` with its `limit_ms` field); raw throws read as genuine bugs.
+
+## Where gate rejections go
+
+Only admitted operations write `l_admin_audit`, and they always write exactly one row (`dry_run`, `committed`, or `failed`). Secret, HMAC, replay, and permission-denial failures are pre-admission noise — they are **not** audited to `l_admin_audit`. Instead they route to `l_user_abuse_event` via `logAbuseEvent` (`functions/_shared/users/abuse-log.ts`), attributed to the caller's JWT identity so repeated mismatches from one account surface in `get_abuse_top_offenders`.
+
+| Event type | Default weight | Fired by |
+| --- | --- | --- |
+| `admin_hmac_mismatch` | 10 | layer 3 signature failure or replay |
+| `admin_secret_mismatch` | 10 | layer 2 constant-time compare miss |
+| `admin_permission_denied` | 1 | per-op permission gate rejection |
+
+See [anti-abuse](/rollingrecord/backend/accounts/anti-abuse) and [the error registry](/rollingrecord/backend/operations/error-registry).
+
+## Where to go next
+
+- [Operations catalog](/rollingrecord/backend/support-ops/operations-catalog) — the full registry of 27 read-only and mutating operations.
+- [Admin permissions & super-admin](/rollingrecord/backend/support-ops/permissions) — the per-operation permission model and the super-admin bypass.
+- [Dry-run workflow & audit](/rollingrecord/backend/support-ops/dry-run-and-audit) — the mutating-op safety flow and the `l_admin_audit` trail.
+- [Environment & secrets](/rollingrecord/backend/operations/env-and-secrets) — where `ADMIN_OPS_SECRET` and `ADMIN_OPS_HMAC_KEY` come from.

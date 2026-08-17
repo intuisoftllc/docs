@@ -1,14 +1,50 @@
 ---
-title: "Custom Blueprint Management"
-description: "The operations that create, list, and delete user-authored extraction templates."
+title: "Custom Blueprints"
+description: "The save/list/delete operations for user-authored extraction blueprints, with inline moderation on save, idempotent retries, and a per-user hard cap."
 ---
 
-Users manage their own extraction templates through save/list/delete operations, with moderation on save and a per-user limit.
+Users manage their own custom extraction blueprints through three operations — `save_user_blueprint`, `list_user_blueprints`, and `delete_user_blueprint` — all gated on `PRO_CLOUD_AI` and all `runaway_protection`. Rows live on the `user_blueprints` table, uniquely keyed by `(auth_user_id, client_save_request_id)` for idempotency. The `capKey`/`usageColumn` names still use the legacy `..._template...` spelling from the template→blueprint rename, and the three `*-template.ts` handler files are one-line re-export stubs.
 
-## What this covers
+| op | file | capKey | usageColumn | key errors |
+| --- | --- | --- | --- | --- |
+| `save_user_blueprint` | `operations/save-user-blueprint.ts` | `save_user_template_runaway_cap` | `save_user_template_count` | `blueprint_limit_reached` (429), `moderation_failed` (422), `backup_quota_exceeded` (409) |
+| `list_user_blueprints` | `operations/list-user-blueprints.ts` | `list_user_templates_runaway_cap` | `list_user_templates_count` | `missing_auth_user_id` (403) |
+| `delete_user_blueprint` | `operations/delete-user-blueprint.ts` | `delete_user_template_runaway_cap` | `delete_user_template_count` | `blueprint_not_found` (404), `not_owner` (403) |
 
-- save_user_blueprint (with template_moderation), list_user_blueprints, delete_user_blueprint; blueprint_limit_reached; structured fields in _shared/users/blueprint-structured-fields.ts; stored on user_blueprints.
+## save_user_blueprint
 
-<Note>
-Scaffold generated from the codebase map — expand with full detail, examples, and specifics.
-</Note>
+`save_user_blueprint` is the **only** path a custom blueprint enters existence server-side, and it runs moderation inline before persisting — making "this blueprint passed moderation" an architectural guarantee rather than a client-trust relationship. `SaveUserBlueprintInput` carries `save_request_id`, an optional `blueprint_id` (present for edits), `name` (≤50), an optional `description`, `auto_description`, `system_prompt` (≤50,000), and optional `structured_fields`. Validation maps to `developer`-category codes: `missing_save_request_id`, `missing_name`, `name_too_long`, `missing_system_prompt`, `system_prompt_too_large`, `invalid_description`, `invalid_blueprint_id`.
+
+The flow:
+
+1. **Idempotency** — `findExistingByIdempotencyKey(authUserId, save_request_id)`. A hit returns the existing row unchanged with `status: "idempotent_replay"`, so a client retry with the same `save_request_id` neither re-charges moderation nor creates a duplicate. The `UNIQUE(auth_user_id, client_save_request_id)` constraint enforces this at the DB level.
+2. **Edit path** (`blueprint_id` present) — load the owned row, compare `system_prompt`, and re-run moderation **only when the prompt actually changed** (`compareSystemPromptAndMaybeModerate`). Ownership failures return `not_owner` (403); a missing row returns `blueprint_not_found` (404).
+3. **Create path** (no `blueprint_id`) — check the hard cap, run moderation, then insert.
+
+## The per-user hard cap
+
+On the create path `handleCreate` reads `getInt("max_user_templates_per_user", 50)` and compares it to `countUserBlueprints(authUserId)`. At or over the cap it returns `limit_reached` with the exact code `blueprint_limit_reached` (429) and a normalized `custom_templates` cap payload. This is a hard per-user ceiling distinct from the `runaway_protection` cap on the op itself.
+
+## Inline moderation and description generation
+
+`runTemplateModeration` (see [Content Moderation](/rollingrecord/backend/ai-engine/moderation)) runs on create and on edit-with-changed-prompt. A `REJECTED` verdict maps to `moderation_failed` (422) with the verdict's `reason`. When `auto_description` is true, `generateBlueprintDescription` (`operations/blueprint-description.ts`, model `blueprint_description_model`, default Haiku) generates a short description — best-effort, so a null result simply stores no description. It is a helper called by save, **not** a registered operation. `sanitizeStructuredFields` (`functions/_shared/users/blueprint-structured-fields.ts`) coerces the untrusted Guided-authoring `structured_fields` into a clean shape or `null` before persist.
+
+## Storage-quota backstop
+
+Both create and edit are backstopped by a cloud-storage-quota DB trigger, `enforce_user_blueprints_quota`, which atomically blocks an insert/update that would push the user over their cloud storage cap. It raises a `backup_quota_exceeded` error (SQLSTATE `P0001`), which `isQuotaExceededDbError` (`functions/_shared/db/storage-quota.ts`) detects; the handler maps it to `backup_quota_exceeded` (409) with a `cloud_storage` cap payload rather than a generic 500. This is a storage cap, not a blueprint-specific one.
+
+## list and delete
+
+`list_user_blueprints` returns every owned blueprint via `listUserBlueprints` — no pagination, since the list is bounded by the hard cap. It is still runaway-protected (a cheap single DB read) to stop a compromised client from polling it in a loop; a missing auth user returns `missing_auth_user_id` (403).
+
+`delete_user_blueprint` takes a `blueprint_id` and calls `deleteUserBlueprint`, which verifies ownership: `"not_found"` → `blueprint_not_found` (404), `"forbidden"` → `not_owner` (403). The DB helpers (`functions/_shared/users/user-blueprints.ts`) — `countUserBlueprints`, `findExistingByIdempotencyKey`, `insertUserBlueprint`, `loadUserBlueprintForOwner`, `updateUserBlueprint`, `listUserBlueprints`, `deleteUserBlueprint` — all verify ownership by comparing `auth_user_id` against the caller's ID rather than trusting the loaded row.
+
+Error codes (`functions/_shared/errors.ts`): `blueprint_limit_reached` (user, 429), `moderation_failed` (user, 422), `not_owner` (user, 403), `blueprint_not_found` (user, 404), `missing_auth_user_id` (developer, 403), `missing_blueprint_id` (developer, 400), `backup_quota_exceeded` (user, 409).
+
+## Where to go next
+
+- [Content Moderation](/rollingrecord/backend/ai-engine/moderation) — the inline moderation `save` runs before persisting.
+- [Built-in Blueprints](/rollingrecord/backend/ai-engine/builtin-blueprints) — the server-owned counterpart.
+- [Operation Registry](/rollingrecord/backend/ai-engine/operations-registry) — how these three ops are dispatched.
+
+Related: [Extraction billing & caps](/rollingrecord/backend/extraction/billing-and-caps) · [High-risk tables](/rollingrecord/backend/database/high-risk-tables) · [Error registry](/rollingrecord/backend/operations/error-registry).

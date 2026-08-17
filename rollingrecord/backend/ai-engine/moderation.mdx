@@ -1,14 +1,51 @@
 ---
-title: "Content Moderation & Semantic Prefilter"
-description: "The semantic prefilter and template-moderation operation guarding custom templates."
+title: "Content Moderation"
+description: "The two-stage custom-blueprint moderation gate: a fail-open Cohere semantic prefilter in front of an authoritative Claude Haiku moderation check."
 ---
 
-A semantic prefilter plus the template_moderation operation guard user-authored templates against abuse.
+Custom extraction blueprints are moderated by `runTemplateModeration` (`functions/ai-engine/operations/template-moderation.ts`) before they can be persisted. Moderation runs in two stages: a cheap Cohere-embedding semantic prefilter, then — for anything the prefilter doesn't catch — an authoritative Claude Haiku check. The prefilter fails open, so it only ever *saves* a Haiku call, never weakens the gate.
 
-## What this covers
+`template_moderation` is both a registered `runaway_protection` operation (called directly from legacy client call-sites) and a standalone helper called inline by `save_user_blueprint` before a blueprint is saved. That makes "this blueprint passed moderation" an architectural guarantee of the save path, not a client-trust relationship.
 
-- _shared/ai/moderation/ semantic prefilter (prefilter-math.ts, poison-concepts.ts, semantic-prefilter.ts) + the template_moderation op; moderation_failed / moderation_* parsing errors.
+## The operation
 
-<Note>
-Scaffold generated from the codebase map — expand with full detail, examples, and specifics.
-</Note>
+`TemplateModerationHandler` declares `capKey = "template_moderation_runaway_cap"` (absolute, default 100 — generous for a real user), `usageColumn = "template_moderation_count"`, and no feature flag. `validateInput` requires `template_content` (a non-empty string ≤ 50,000 chars, else `missing_blueprint_content` / `blueprint_content_too_large`). The handler runs `runTemplateModeration` and returns the resulting `ModerationVerdict` — `{ result: "APPROVED" | "REJECTED", reason? }` — as its payload.
+
+There is **no** `template_moderation_enabled` `server_config` toggle: the op itself always runs (`featureFlag = null`). The two relevant knobs are `template_semantic_prefilter_enabled` (prefilter on/off) and `semantic_search_enabled` (the global embeddings kill-switch).
+
+## Stage 1 — semantic prefilter (fail-open)
+
+`runSemanticPrefilter` (`functions/_shared/ai/moderation/semantic-prefilter.ts`) embeds the template with Cohere (`document` input type) and compares it by cosine similarity against a fixed poison-concept list. A high-confidence match is rejected for the price of one embed, with the generic reason `SEMANTIC_PREFILTER` — the client surfaces a generic "not permitted" message; the reason is diagnostics only.
+
+Efficiency comes from caching. The poison-concept list is fixed and server-owned, so its vectors are embedded once and cached in the shared `system_cache` table under `conceptCacheKey(model)` = `moderation:concepts:${model}:v${POISON_CONCEPTS_VERSION}` (pure math in `functions/_shared/ai/moderation/prefilter-math.ts`). A warm instance also holds the vectors in module scope. The key changes when the embedding model or `POISON_CONCEPTS_VERSION` changes, self-invalidating the cache. Every moderation then costs at most one embed — the user's template — never N embeds for N concepts.
+
+The prefilter **fails open**: on any unavailability (disabled, `semantic_search_enabled` off, no `EMBEDDING_API_KEY`, or any embed/DB error) it returns `null` and the authoritative Haiku check decides. It is an optimization; the authoritative decision is never blocked by it being down. It still records the embedding cost against `f_user_financials.ai_cost_micros` for every caller including dev, per the cost-visibility HARD RULE.
+
+`POISON_CONCEPTS` (`functions/_shared/ai/moderation/poison-concepts.ts`, `POISON_CONCEPTS_VERSION = 1`) is proprietary safety IP moved server-side off the device, covering ten harm categories (sexual content, CSAM, gore, drug synthesis, weapons, trafficking, cybercrime, fraud, terrorism, and jailbreak). The concept strings are not reproduced here.
+
+## Stage 2 — authoritative Haiku check
+
+When the prefilter misses (or is unavailable), `runTemplateModeration` calls the model returned by `getOperationModel("templateModeration")` (default `CLAUDE_HAIKU`) over `ProviderChains.ANTHROPIC_GEMINI` with a Gemini Flash-Lite fallback, capped at `template_moderation_max_output_tokens` (default 80). The server-owned `TEMPLATE_MODERATION_SYSTEM_PROMPT` instructs strict JSON `APPROVED` / `REJECTED` output.
+
+Because Haiku sometimes wraps its answer in markdown fences or preamble, `extractJsonObject` strips fences and returns the substring between the first `{` and the last `}` before parsing. The parsed shape is validated to `APPROVED` / `REJECTED`. When AI stubbing is active, `isStubbedResponse` short-circuits to a synthetic `{ result: "APPROVED" }` so save flows proceed without a real Anthropic call.
+
+## Config knobs
+
+| key | default | controls |
+| --- | --- | --- |
+| `template_semantic_prefilter_enabled` | `true` | whether the Cohere prefilter runs at all |
+| `template_semantic_prefilter_threshold` | `0.72` | cosine cutoff for a prefilter REJECT |
+| `semantic_search_enabled` | `true` | global embeddings kill-switch (also disables the prefilter) |
+| `template_moderation_model` | Claude Haiku | authoritative moderation model |
+| `template_moderation_max_output_tokens` | `80` | moderation output cap |
+| `template_moderation_runaway_cap` | `100` | absolute runaway cap on the op |
+
+Error codes (`functions/_shared/errors.ts`): `moderation_failed` (user, 422); `empty_moderation_response`, `moderation_no_json_found`, `invalid_moderation_shape`, `moderation_json_parse_failed` (all developer, 502); `missing_blueprint_content`, `blueprint_content_too_large` (developer, 400).
+
+## Where to go next
+
+- [Custom Blueprints](/rollingrecord/backend/ai-engine/user-blueprints) — `save_user_blueprint`, moderation's inline caller.
+- [Runaway-Protected Sub-Ops](/rollingrecord/backend/ai-engine/sub-operations) — the four sibling runaway-protected helpers.
+- [Providers, Models & Pricing](/rollingrecord/backend/ai-engine/providers-and-models) — the embedding provider and stub gate.
+
+Related: [Semantic search](/rollingrecord/backend/storage/semantic-search) · [Financials](/rollingrecord/backend/billing/financials) · [Privacy posture](/rollingrecord/backend/operations/privacy-posture).

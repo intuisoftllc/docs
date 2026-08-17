@@ -1,15 +1,106 @@
 ---
 title: "Edge Function Catalog & Conventions"
-description: "The full list of Edge Functions and the scaffolding conventions every one follows."
+description: "The 31 function directories, their auth modes and rate-limit buckets, and the shared runGates() admission chain every HTTP function scaffolds with."
 ---
 
-Every Edge Function scaffolds with runGates() plus a config object, never inline gate logic, and many use a single-dispatcher pattern.
+The backend is a set of Deno Edge Functions under `supabase/functions/`. There are 31 directories; 29 are HTTP endpoints registered in `config.toml`, and every one of those shares a single admission-chain entry point — `runGates()` — so authentication, App Check, and rate limiting always run in the same fixed order.
 
-## What this covers
+## Function count vs. registered endpoints
 
-- Full list from config.toml (all verify_jwt = false), grouped by purpose; every function scaffolds with runGates() + config, never inline gate logic (Schema HARD RULE 4).
-- Dispatcher pattern (single obfuscated endpoint + operation field) used by ai-engine, support-ops, analytics, sync-audio, sync-reconcile to avoid one-secret-per-function deploys.
+There are **31 directories** under `supabase/functions/` (excluding `_shared/`), but `config.toml` declares only **29** `[functions.<name>]` blocks. Two directories are intentionally unregistered:
+
+| Directory | Why it is not in `config.toml` |
+| --- | --- |
+| `transcribe-drain` | A `Deno.cron("transcribe-drain", "* * * * *", …)` minute job — it has no HTTP handler and never calls `runGates()`. Its primary path is an inline `runDrain()` import from the `transcribe_submit` handler; the cron only mops up overflow and 429-backoff retries. |
+| `recovery-code-generate` | Deprecated. `config.toml` notes it "has been superseded by" `recovery-code` "and should be deleted from both Supabase branches." The live path is the two-op `recovery-code` function. |
+
+Every registered function sets `verify_jwt = false`. That is deliberate: the built-in Supabase JWT check is replaced by our own `runGates()` chain, which verifies a **Clerk** session token (or App Check, or a webhook secret) depending on the function's auth mode. Leaving Supabase's check on would reject legitimate callers.
+
+## The `runGates()` admission chain
+
+`runGates(req, config)` (`functions/_shared/gates/index.ts`) is the single declarative entry point (RR-303). Each function passes one `GateConfig` object and gets back either `{ response: Response }` (a gate failed — return it immediately) or a mode-specific success context. The return type is narrowed by the config's `auth` mode, so reading `authUserId` on a webhook function is a compile error.
+
+Gates always run in a fixed order — per-function reordering is structurally impossible, so a mistake like "rate limit before JWT" cannot be written:
+
+| # | Gate | File | Opt-out / notes |
+| --- | --- | --- | --- |
+| 1 | HTTP method | `functions/_shared/gates/method.ts` | `405 method_not_allowed` on mismatch |
+| 2 | App Check (`X-Firebase-AppCheck`) | `functions/_shared/gates/app-check.ts` | `skipAppCheck` — verifies against Firebase JWKS; `401 invalid_app_check` |
+| 3 | App Version floor (`X-App-Version`) | `functions/_shared/gates/app-version.ts` | `skipAppVersion` — `410 client_too_old` below `min_supported_app_version_code` |
+| 4 | Auth (`Jwt` / `WebhookSecret` / `None`) | `functions/_shared/gates/jwt.ts`, `webhook-secret.ts` | mode-specific |
+| 5 | Entitlement fetch (JWT only) | `functions/_shared/gates/entitlement.ts` | derives `isDeveloper`; `502 entitlement_check_failed` |
+| 6 | Entitlement check (JWT only, if `entitlement: [...]`) | `functions/_shared/gates/entitlement.ts` | at-least-one-of; RR-358 grace fallback when `allowGracePeriodRead` |
+| 7 | Account-freeze check (JWT only, RR-310) | `functions/_shared/gates/account-frozen.ts` | fires **before** rate-limit so frozen attempts burn no quota; applies to dev too |
+| 8 | Rate-limit sugar (if `rateLimit: { bucket }`) | `functions/_shared/gates/rate-limit.ts` | skipped for dev callers |
+
+Entitlement **check** runs before rate limit on purpose: a non-paying caller gets `403 subscription_required` on the first request rather than spending rate budget to also collect a `429`.
+
+### Auth modes
+
+`AuthMode` (`functions/_shared/gates/types.ts`) is a three-value enum:
+
+| Mode | Wire value | Proof of identity |
+| --- | --- | --- |
+| `AuthMode.Jwt` | `jwt` | `Authorization: Bearer <jwt>` — a **Clerk** session token, RS256-verified against Clerk's JWKS (`iss` derived from `CLERK_JWKS_URL`, RR-451). Resolves `authUserId` + `email`. |
+| `AuthMode.WebhookSecret` | `webhook-secret` | `Authorization: Bearer <secret>` matched against the env var named by `secretEnvVar` (default `REVENUECAT_WEBHOOK_SECRET`). No user identity. |
+| `AuthMode.None` | `none` | No auth — App Check only. Public endpoints like `server-config`. Declaring `rateLimit` on this mode throws at startup (no subject-key strategy yet). |
 
 <Note>
-Scaffold generated from the codebase map — expand with full detail, examples, and specifics.
+Several in-code docstrings still say "Supabase Auth JWT". That terminology is stale — `runGates` `AuthMode.Jwt` verifies a **Clerk** token via `jwt.ts`.
 </Note>
+
+## Response helpers are per-function, not shared
+
+`runGates()` is the shared piece. The JSON response helper is **not** — every function declares its own local `function json(body, status): Response` that wraps `JSON.stringify` with `Content-Type: application/json`. `ai-engine` adds an `extraHeaders` parameter to its copy; the rest are plain. There is no shared response-helper module in `_shared/`.
+
+Every `error` string returned to a client comes from the canonical registry in `functions/_shared/errors.ts` (`AppError.X.code` / `AppError.X.httpStatus`), never an inline literal — the Kotlin mirror is `AiEngineErrorCode.kt`.
+
+## The catalog
+
+| Function | Auth mode | Method | Rate-limit bucket | Purpose |
+| --- | --- | --- | --- | --- |
+| `ai-engine` | Jwt | POST | `ai_engine` (in-handler) | Single POST proxy for every synchronous AI operation; dispatches by `operation` field |
+| `resolve-identity` | Jwt | POST | `resolve_identity` (sugar) | Upserts `canonical_users` on every launch; anti-abuse carryover |
+| `get-user-usage` | Jwt | GET | none | Current-period counters + caps + credits + storage for the usage UI |
+| `get-user-key` | Jwt | POST | `user_key_get` (in-handler, + audit) | Unwraps/provisions the caller's DEK (+ App Lock PIN verifier) |
+| `delete-user` | Jwt | POST | `delete_user` (in-handler) | User-initiated GDPR account wipe |
+| `set-user-pin` | Jwt | POST | — | App Lock PIN verifier write (RR-492) |
+| `account-otp` | Jwt | POST | `account_otp_send` / `account_otp_verify` (in-handler) | App Lock email OTP send/verify (RR-492) |
+| `generate-support-token` | Jwt | POST | `support_token_generate` (sugar, `abuseEventOnReject`) | User-initiated support code, emailed to the registered address |
+| `recovery-code` | Jwt | POST | `recovery_code_generate` / `recovery_code_acknowledge` (per-op) | Two-op recovery-code generate + acknowledge (RR-315) |
+| `recovery-code-generate` | — | — | — | DEPRECATED — superseded by `recovery-code`; not in `config.toml` |
+| `support-ops` | Jwt (`skipAppCheck`) | POST | `support_ops` (in-handler) | Admin/support dispatcher; extra `X-Admin-Secret` / HMAC / dry-run gates |
+| `user-sync-preferences` | Jwt | GET/PATCH | `user_sync_preferences` (sugar) | Read/write per-group sync toggles |
+| `sync-pull` | Jwt (`allowGracePeriodRead`) | POST | `sync_pull` / `sync_download_grace` | Paginated delta pull of `c_*` rows |
+| `sync-push` | Jwt | POST | `sync_push` (sugar) | Batched upserts/tombstones against `c_*` tables |
+| `sync-reserve` | Jwt | POST | `sync_reserve` (sugar) | Signed upload URL + pre-wrapped DEK for an audio blob |
+| `sync-audio` | Jwt (`allowGracePeriodRead`) | POST | `sync_audio` / `sync_download_grace` | Cloud audio commit/download/delete |
+| `sync-reconcile` | Jwt | POST | `sync_reconcile` (sugar) | Drift-detection counts/ids handshake |
+| `sync-group-exclude` | Jwt (`ProCloud`/`ProCloudAi`) | POST | `sync_push` (sugar) | Bulk group exclude/restore |
+| `search` | Jwt | POST | `search` (sugar) | Server-side semantic-search query embeddings (RR-487) |
+| `indexing` | Jwt | POST | `indexing` / `embedding_cache` (in-handler) | Server-side chunk embeddings + bundle cache (RR-487) |
+| `extract-submit` | Jwt | POST | `extraction_submit` (sugar) | Submit an async extraction job (inline sealed payload) |
+| `extract-results` | Jwt | POST | `extraction_submit` / `extraction_status` (per-op) | Fetch/ack/status/cancel extraction jobs |
+| `extract-runner` | WebhookSecret (`EXTRACT_RUNNER_SECRET`) | POST | — | Server-to-server async-extraction tick runner (cron self-call) |
+| `revenuecat-webhook` | WebhookSecret (`REVENUECAT_WEBHOOK_SECRET`) | POST | — | Entitlement/lifetime mirror + bundle credits/refunds + revenue |
+| `clerk-webhook` | None (Svix in handler) | POST | — | `user.created` / `user.updated` / `user.deleted` (GDPR wipe on delete) |
+| `assemblyai-webhook` | WebhookSecret (`ASSEMBLYAI_WEBHOOK_SECRET`) | POST | — | Transcription completion callback → `transcribe_results` + cost |
+| `analytics` | WebhookSecret (`ANALYTICS_INGEST_SECRET`) | POST | — | Eval-harness ingest; op `log_eval_run` upserts `l_eval_run` |
+| `server-config` | None (App Check only) | GET | — | Public config bootstrap; `skipAppVersion` opt-out |
+| `storage-janitor` | WebhookSecret (`STORAGE_JANITOR_SECRET`) | POST | — | Generic "delete these paths from this bucket" service (cron) |
+| `storage-orphan-lister` | WebhookSecret (`STORAGE_JANITOR_SECRET`) | POST | — | Orphaned-blob discovery sweep across buckets (cron) |
+| `transcribe-drain` | `Deno.cron` (no `runGates`) | n/a | — | Minute cron draining the transcription queue to AssemblyAI; not in `config.toml` |
+
+## Operation-dispatch functions
+
+Several functions front many logical operations behind one endpoint and switch on a `body.operation` field — the single-secret-deploy pattern. Adding an operation is a new `switch` case plus a client helper, with no new function deployment, secret, or gate config. `ai-engine` (a full handler registry) and `analytics` (`log_eval_run`) are the canonical examples; `extract-results`, `indexing`, `sync-audio`, and `sync-reconcile` also dispatch this way.
+
+## Where to go next
+
+- [ai-engine](/rollingrecord/backend/edge-functions/ai-engine) — the operation registry, per-op dispatch gates, and the single `ai_engine` rate limit.
+- [analytics](/rollingrecord/backend/edge-functions/analytics) — the content-free eval-run ingest endpoint.
+- [get-user-key](/rollingrecord/backend/edge-functions/get-user-key) — the one place a plaintext DEK crosses the wire.
+- [get-user-usage](/rollingrecord/backend/edge-functions/get-user-usage) — the usage-screen read: counters, caps, credits, storage.
+- [resolve-identity](/rollingrecord/backend/edge-functions/resolve-identity) — the launch-time `canonical_users` upsert + anti-abuse carryover.
+- [server-config](/rollingrecord/backend/edge-functions/server-config) — the public bootstrap endpoint and its `skipAppVersion` opt-out.
+- [Inbound webhooks](/rollingrecord/backend/edge-functions/webhooks) — `clerk-webhook`, `revenuecat-webhook`, and `assemblyai-webhook`.

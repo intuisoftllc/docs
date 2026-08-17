@@ -1,14 +1,53 @@
 ---
 title: "Runaway-Protected Sub-Ops"
-description: "The internal helper operations protected by absolute and parent-multiplier caps."
+description: "The invisible helper operations — keywords, context_summary, thread_naming, query_expand — under runaway-protection caps whose rejections are logged, never shown."
 ---
 
-Small internal helper operations run under runaway-protection caps whose rejections are hidden from the UI and logged.
+Four cheap, user-invisible helper operations back the extraction and search pipelines. All are gated on `PRO_CLOUD_AI`, all declare `capCategory = 'runaway_protection'` with no feature flag, and all default to a Gemini Flash-Lite primary / Claude Haiku fallback chain read per-op from `server_config`. Their output never reaches the UI, so a cap hit returns the `runaway_protection` code (429, infra) — a Crashlytics signal, never a user-facing error.
 
-## What this covers
+## The four helpers
 
-- keywords, context_summary, thread_naming, template_moderation, query_expand; parent-multiplier caps and absolute caps; rejections map to runaway_protection (hidden from UI, logged to Crashlytics).
+| op | file | usageColumn | input | output |
+| --- | --- | --- | --- | --- |
+| `keywords` | `operations/keywords.ts` | `keywords_count` | `content_summary` (≤5000 chars) | comma-split, lowercased keywords, ≤50 chars each, no angle brackets, capped at 15 |
+| `context_summary` | `operations/context-summary.ts` | `context_summary_count` | `context_name` + `sections_preview` (≤5000) | a 1–2 sentence FTS5-indexing summary |
+| `thread_naming` | `operations/thread-naming.ts` | `thread_naming_count` | `question` + `answer` (≤5000 each) | a KB-thread title, trimmed to `MAX_TITLE_CHARS` = 40 |
+| `query_expand` | `operations/query-expand.ts` | `query_expand_count` | `question` (≤2000) + `mode` | `variants` (≤5) or a `hyde` excerpt |
 
-<Note>
-Scaffold generated from the codebase map — expand with full detail, examples, and specifics.
-</Note>
+`keywords` bridges vocabulary gaps for the on-device FTS5 index (`keywords_max_output_tokens`, default 120). `context_summary` produces a retrieval-bridging summary (`context_summary_max_output_tokens`, default 80); empty output returns `empty_summary` (502). `thread_naming` names a KB thread from its first Q&A pair, fired once per thread (`THREAD_NAMING_MAX_TOKENS`); empty output returns `empty_title` (502).
+
+## Cap shapes
+
+The generic dispatcher enforces each cap via `computeEffectiveCap`, but the four split into two shapes:
+
+| op | capKey | parent cap | cap shape |
+| --- | --- | --- | --- |
+| `keywords` | `keywords_runaway_cap_multiplier` | `syntheses_per_month` | parent × multiplier |
+| `context_summary` | `context_summary_runaway_cap_multiplier` | `syntheses_per_month` | parent × multiplier |
+| `thread_naming` | `thread_naming_runaway_cap_multiplier` | `ai_queries_per_month` | parent × multiplier (2× headroom) |
+| `query_expand` | `query_expand_runaway_cap` | (none) | absolute |
+
+`keywords`, `context_summary`, and `thread_naming` derive their ceiling from a parent cap: `getInt(parentCapKey, 0) * getInt(capKey, 4)`. `keywords` and `context_summary` inherit from `syntheses_per_month` because both fire once per successful extraction; `thread_naming` inherits from `ai_queries_per_month` with a 2× multiplier for manual-rename headroom. `query_expand` has an absolute cap (`getInt(capKey, 100)`, no parent).
+
+## query_expand's two modes
+
+`query_expand` runs before the main `kb_query` loop and its output is consumed locally as search text, then discarded. `mode: "variants"` rewrites the question in alternate phrasings and returns `{ variants: [...] }` (hard-capped at `MAX_VARIANT_COUNT` = 5); `mode: "hyde"` generates a hypothetical transcript excerpt that would contain the answer and returns `{ text: ... }`. Both share the counter and cap, and both prompts are server-owned (`QUERY_EXPAND_VARIANTS_SYSTEM_PROMPT` / `QUERY_EXPAND_HYDE_SYSTEM_PROMPT`); `query_expand_max_output_tokens` defaults to 200.
+
+It exists as a separate op to keep `ai_queries` a clean 1:1 with user-visible chat turns. Before RR-200-followup the client fired these preprocessing calls through `kb_query` with `is_final = true`, so every user-visible message double-counted `ai_queries` — one for the helper, one for the real chat. Splitting them moves helper cost to `query_expand_count` (never caps the user) with an absolute abuse ceiling.
+
+## Provider chains
+
+These four are the config-driven per-op chains. `getOperationProviderChain` (`functions/_shared/ai/operation-models.ts`) reads each op's `*_provider_chain` key (`keywords_provider_chain`, `thread_naming_provider_chain`, `context_summary_provider_chain`, `query_expand_provider_chain`), defaulting to `ProviderChains.GEMINI_ANTHROPIC` — Gemini Flash-Lite primary, Claude Haiku fallback (`modelSelector({ gemini: GEMINI_FLASH_LITE, anthropic: CLAUDE_HAIKU })`).
+
+`template_moderation` is also `runaway_protection` (absolute cap `template_moderation_runaway_cap`, usage column `template_moderation_count`), but it inverts the chain — Haiku primary, Gemini Flash-Lite fallback (`ANTHROPIC_GEMINI`) — and its behavior is documented on the [Content Moderation](/rollingrecord/backend/ai-engine/moderation) page.
+
+Error codes (`functions/_shared/errors.ts`): `runaway_protection` (infra, 429 — never shown, logged to Crashlytics); `empty_summary` / `empty_title` (developer, 502); `inputs_too_large` (developer, 400); and the per-input `missing_*` / `*_too_large` validation codes.
+
+## Where to go next
+
+- [Content Moderation](/rollingrecord/backend/ai-engine/moderation) — `template_moderation`, the fifth runaway-protected op.
+- [Operation Registry](/rollingrecord/backend/ai-engine/operations-registry) — cap-category enforcement.
+- [Providers, Models & Pricing](/rollingrecord/backend/ai-engine/providers-and-models) — the per-op chain config.
+- [KB Chat](/rollingrecord/backend/ai-engine/kb-query) — `query_expand`'s downstream consumer.
+
+Related: [usage table](/rollingrecord/backend/database/usage-table).

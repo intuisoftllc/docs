@@ -1,15 +1,71 @@
 ---
 title: "Method, App Check & App Version Gates"
-description: "The first three admission gates — HTTP method allowlist, Firebase App Check, and the minimum-version floor."
+description: "The first three admission gates — the HTTP method allowlist, Firebase App Check JWKS verification, and the server-side minimum-version floor."
 ---
 
-The first three gates reject a request before any auth work — wrong method, missing App Check, or an under-floor app version.
+The first three gates reject a request before any auth work happens: the HTTP verb allowlist, Firebase App Check, and the minimum-app-version floor. All three are structural validation, not quota — even developer accounts pass through them, and the only escape is an explicit opt-out with a justifying comment.
 
-## What this covers
+## Method gate
 
-- method.ts (POST/GET/PATCH allowlist), app-check.ts (verifies X-Firebase-AppCheck with Firebase), app-version.ts (compares X-App-Version against min_supported_app_version_code).
-- The App Version floor emits client_too_old (410) with a Play Store deep-link; bootstrap/server-to-server callers opt out.
+`checkMethod(req, allowed)` in `functions/_shared/gates/method.ts` normalizes `allowed` to an array and returns `null` when `req.method` is in it, otherwise a `405` carrying `AppError.METHOD_NOT_ALLOWED.code`. The allowlist is either a single verb or an array — `user-sync-preferences`, for example, declares `[HttpMethod.Get, HttpMethod.Patch]`.
 
-<Note>
-Scaffold generated from the codebase map — expand with full detail, examples, and specifics.
-</Note>
+The `HttpMethod` enum (`functions/_shared/gates/types.ts`) has four members whose wire values match `req.method` exactly:
+
+| Member | Wire value |
+| --- | --- |
+| `HttpMethod.Get` | `GET` |
+| `HttpMethod.Post` | `POST` |
+| `HttpMethod.Patch` | `PATCH` |
+| `HttpMethod.Delete` | `DELETE` |
+
+## App Check gate
+
+`runAppCheckGate(req)` in `functions/_shared/gates/app-check.ts` reads `FIREBASE_PROJECT_NUMBER` from the environment, then verifies the `X-Firebase-AppCheck` header via `verifyAppCheckToken(token, projectNumber)`. Verification uses `jose`'s `jwtVerify` against Firebase's public JWKS — a module-level `createRemoteJWKSet(new URL("https://firebaseappcheck.googleapis.com/v1/jwks"))` that jose caches in memory so warm invocations don't re-fetch — checking two claims:
+
+| Claim | Expected value |
+| --- | --- |
+| `issuer` | `https://firebaseappcheck.googleapis.com/<projectNumber>` |
+| `audience` | `projects/<projectNumber>` |
+
+Both Play Integrity tokens (release builds) and debug tokens (development) verify through this same path once exchanged with Firebase. `verifyAppCheckToken` is exported for smoke tests and returns `false` on any error, logging the reason.
+
+Two failure modes, and they are distinct: a missing `FIREBASE_PROJECT_NUMBER` returns `500 server_misconfiguration` (a server bug, not the caller's fault), while a missing or invalid token returns `401 invalid_app_check`.
+
+## App Version gate
+
+`runAppVersionGate(req)` in `functions/_shared/gates/app-version.ts` (RR-222) enforces the server-side minimum-supported-version floor. It wraps `checkAppVersionFloor(request)`, which returns an `AppVersionCheckResult` of `{ ok, floor, seen }`:
+
+- `floor` comes from `server_config.min_supported_app_version_code`, read via `getServiceClient()` and cached per Edge Function cold start. Any read error or missing row falls back to `0` (allow-all).
+- `seen` is the parsed `X-App-Version` header; missing, blank, or non-numeric values resolve to `0`.
+- `ok` is `seen >= floor`.
+
+On failure the gate returns `410 client_too_old` built by `clientTooOldResponseBody()`, whose body is deliberately minimal — **only the error code**. The `floor` and `seen` values are withheld so a bad actor can't probe the exact floor. The client renders a blocking "Please update" screen with a Play Store deep-link; the code is not retriable.
+
+## Gate outcomes
+
+| Gate | Reads | Pass | Fail response | Dev-skippable? |
+| --- | --- | --- | --- | --- |
+| Method (`method.ts`) | `req.method` vs allowlist | in list | `405 method_not_allowed` | no (structural) |
+| App Check (`app-check.ts`) | `X-Firebase-AppCheck` + `FIREBASE_PROJECT_NUMBER` | valid Firebase JWT | `401 invalid_app_check` (`500 server_misconfiguration` if project number unset) | no — opt-out only via `skipAppCheck` |
+| App Version (`app-version.ts`) | `X-App-Version` vs `server_config.min_supported_app_version_code` | `seen >= floor` | `410 client_too_old` (body: error code only) | no — opt-out only via `skipAppVersion` |
+
+## Opt-outs
+
+`skipAppCheck` and `skipAppVersion` live on `GateConfigBase`, default `false`, and each must be paired with a `// OPT-OUT: <reason>` comment above the flag so the justification is greppable. The current opt-outs:
+
+| Function | `skipAppCheck` | `skipAppVersion` | Reason |
+| --- | --- | --- | --- |
+| `server-config` | no | yes | bootstrap: `min_supported_app_version_code` lives in the very table this endpoint serves |
+| `support-ops` | yes | no | CLI scripts don't send `X-Firebase-AppCheck` |
+| `revenuecat-webhook` | yes | yes | server-to-server from RC; no headers sent |
+| `assemblyai-webhook` | yes | yes | server-to-server webhook; no headers |
+| `clerk-webhook` | yes | yes | server-to-server (`AuthMode.None` + Svix verify); no headers |
+| `storage-janitor` / `storage-orphan-lister` | yes | yes | `pg_cron` `net.http_post`; no headers |
+| `extract-runner` | yes | yes | `pg_cron` self-call + `extract-submit` inline kick; no headers |
+| `analytics` | yes | yes | server-to-server ingest from the eval harness machine |
+
+## Related
+
+- [The runGates() admission chain](/rollingrecord/backend/gates/run-gates) — where these three gates sit in the fixed order.
+- [JWT auth](/rollingrecord/backend/gates/jwt-auth) — the gate that runs immediately after these.
+- [Webhook & server-to-server auth](/rollingrecord/backend/gates/webhook-secret) — the callers that opt out of App Check and App Version.

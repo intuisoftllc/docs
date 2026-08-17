@@ -1,14 +1,77 @@
 ---
 title: "Recovery Codes"
-description: "The two-op recovery-code design and its one-shot-per-account rule."
+description: "The two-op generate/acknowledge recovery-code flow, its one-per-account rule, and the superseded one-shot generator it replaced."
 ---
 
-Recovery codes use a generate-then-acknowledge design, hashed once per account with argon2id.
+A recovery code is a 16-digit (four groups of four) per-user secondary credential, generated **once** per account and stored only as an argon2id hash in `canonical_users.recovery_code_hash`. `functions/recovery-code/index.ts` (RR-315 revised) is a two-operation flow — `generate` then `acknowledge` — that guarantees the client actually received the plaintext before it is permanently hashed. It supersedes the older one-shot `functions/recovery-code-generate/index.ts`.
 
-## What this covers
+## Operations
 
-- The recovery-code two-op design (generate is idempotent to recovery_code_pending, acknowledge stores an argon2id hash in canonical_users.recovery_code_hash); one-shot per account (recovery_code_already_exists); legacy recovery-code-generate; the support-ops Tier-3 regenerate escape hatch.
+Both operations run a JWT gate chain and read `recovery_code_hash` + `recovery_code_pending` off `canonical_users`. Rate limits are applied per-operation so each bucket tunes independently.
+
+| Operation | Success | Errors |
+| --- | --- | --- |
+| `generate` (fresh) | `200 { recovery_code }` (display form) | `database_error` |
+| `generate` (pending already set) | `200` same `{ recovery_code }` — idempotent retry | — |
+| `generate` (hash already set) | — | `recovery_code_already_exists` (409) |
+| `acknowledge` (match) | `200 { acknowledged: true }`, writes hash + clears pending | — |
+| `acknowledge` (mismatch) | — | `recovery_code_mismatch` (422) |
+| `acknowledge` (no pending) | — | `recovery_code_not_pending` (409) |
+| either (bad operation) | — | `recovery_code_invalid_operation` (400) |
+| either (no `canonical_users` row) | — | `not_found` (404) |
+
+`not_found` means `resolve-identity` hasn't created the caller's `canonical_users` row yet (sign-up just landed); the client retries once the row exists.
+
+## The delivery guarantee
+
+`generate` writes the display-formatted plaintext to `recovery_code_pending` (guarded by atomic `IS NULL` `WHERE` clauses against races) and returns it. If the first response is lost to a network error, a retry returns the **same** stored code — no new code is minted. `acknowledge` proves delivery: the client echoes back the exact code, and on a match the server hashes it with argon2id into `recovery_code_hash` and clears `recovery_code_pending` in the same update. Only after acknowledgment is the plaintext replaced by the hash.
+
+Storing the display plaintext in `recovery_code_pending` for the minutes between generate and acknowledge is intentional: Supabase encrypts at rest, RLS + service-role-only access blocks any direct anon-key read, and the column is cleared within minutes of a normal onboarding flow.
+
+## Code generation & hashing
+
+`functions/_shared/auth/recovery_code.ts` holds the pure helpers (no network, DB, or env):
+
+| Symbol | Role |
+| --- | --- |
+| `generateRecoveryCode()` | 16 digits via uniform sampling (rejects bytes `>= 250` to avoid `byte % 10` bias); returns `{ display, raw }` |
+| `hashRecoveryCode()` | argon2id via `npm:hash-wasm@4.11.0` |
+| `verifyRecoveryCode()` | argon2id verify — backs the support-ops validate op |
+| `normalizeRecoveryCode()` | strips whitespace, asserts exactly 16 digits (throws otherwise) |
+| `formatRecoveryCode()` | regroups raw digits into four groups of four |
+
+`DEFAULT_HASH_OPTIONS` has four fields: 3 iterations, 64 MiB memory (`memorySize` 65536), parallelism 1, and `hashLength` 32. The `hashRecoveryCode()` `argon2id()` call passes `outputType` `"encoded"` as a separate argument, not part of that constant. The encoded string embeds the algorithm parameters and salt inline (`$argon2id$v=19$m=65536,t=3,p=1$...`), which is why `recovery_code_hash` is stored as `TEXT`, not `BYTEA` — `argon2Verify` reads params and salt back out of the string, so no separate salt column is needed.
+
+## Columns on canonical_users
+
+| Column | Migration | Meaning |
+| --- | --- | --- |
+| `recovery_code_hash` | `migrations/20260525230000_add_recovery_code_to_canonical_users.sql` | nullable `TEXT`; argon2id encoded hash. Set once at first sign-up |
+| `recovery_code_pending` | `migrations/20260531000000_recovery_code_pending.sql` | nullable `TEXT`; display plaintext awaiting acknowledgment. Set by `generate`, cleared by `acknowledge`. NULL for all pre-RR-315 users who completed the old one-shot flow |
+
+## The superseded one-shot
+
+`functions/recovery-code-generate/index.ts` is the original one-shot generator: it generates a code, hashes it with argon2id immediately, stores only the hash via an atomic `UPDATE ... WHERE recovery_code_hash IS NULL`, and returns the plaintext exactly once. It never stores plaintext. It is still deployed but **legacy** — a dropped network response under this design lost the code permanently, which is precisely the bug the two-op `/recovery-code` fixes. Both functions refuse to re-issue once a hash exists, and both draw on the same `RecoveryCodeGenerate` bucket.
+
+## One code per account
+
+Once `recovery_code_hash` is set, neither function will issue another — the user is expected to keep the code they were given at first sign-up. The only replacement path is the support-ops Tier-3 `regenerate_recovery_code` escape hatch; the user cannot rotate the code themselves.
 
 <Note>
-Scaffold generated from the codebase map — expand with full detail, examples, and specifics.
+Neither `/recovery-code` nor `/recovery-code-generate` reads, wraps, or rewraps the DEK. They only manage `recovery_code_hash` / `recovery_code_pending`. Any DEK-rewrap-on-recovery behavior lives in the support-ops account-recovery operations and [key management](/rollingrecord/backend/storage/key-management), not here.
 </Note>
+
+## Rate limits
+
+| Bucket | Max | Window | Notes |
+| --- | --- | --- | --- |
+| `recovery_code_generate` | 60 | 3600s | shared by the legacy one-shot and the two-op `generate` |
+| `recovery_code_acknowledge` | 60 | 3600s | extra headroom for network-error retries |
+
+Legitimate callers hit each bucket once in the account lifetime; the buckets exist only to throttle stolen-JWT probing.
+
+## Related
+
+- [Operations catalog](/rollingrecord/backend/support-ops/operations-catalog) — the Tier-3 `regenerate_recovery_code` escape hatch.
+- [Identity model](/rollingrecord/backend/architecture/identity-model) and [resolve-identity](/rollingrecord/backend/edge-functions/resolve-identity).
+- [Rate limiting & buckets](/rollingrecord/backend/gates/rate-limiting) and [Error registry](/rollingrecord/backend/operations/error-registry).

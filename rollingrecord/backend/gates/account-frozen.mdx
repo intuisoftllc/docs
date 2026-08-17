@@ -1,15 +1,46 @@
 ---
 title: "Account-Freeze Gate"
-description: "The gate that blocks frozen accounts before they consume any quota."
+description: "The RR-310 soft-block that rejects a frozen account before it can consume rate-limit quota, with no bypass for anyone."
 ---
 
-A frozen account is rejected before the rate-limit gate so the rejection consumes no quota, and every attempt is logged.
+`functions/_shared/gates/account-frozen.ts` (RR-310) is a generic soft-block checked on every JWT-authenticated Edge Function. When `canonical_users.frozen_at` is set, the request is rejected with `403 account_frozen` — and it fires before the rate-limit step, so a frozen account's rejections cost no quota.
 
-## What this covers
+## The gate
 
-- account-frozen.ts fires BEFORE rate limit so frozen-account rejections consume no quota; reads canonical_users.frozen_at/frozen_reason, returns account_frozen (403), writes one l_user_abuse_event row per attempt.
-- Applies to dev accounts too (a safety primitive, not a quota); set/cleared by the support-ops freeze_user_account op.
+`runAccountFrozenGate(_req, authUserId)` reads `frozen_at` and `frozen_reason` from `canonical_users` and returns a `FrozenAccountGateResult` of `{ response }`. When `frozen_at` is non-null it returns a `403 account_frozen` body carrying `reason` — `frozen_reason`, or the fallback string `"Account temporarily locked"` when that column is empty or absent. Otherwise it returns `{ response: null }` and the chain proceeds.
+
+| Situation | Gate outcome |
+| --- | --- |
+| `frozen_at IS NOT NULL` | `403 account_frozen` with `{ reason }` |
+| `frozen_at IS NULL` | proceed (`response: null`) |
+| row missing (first request / race with resolve-identity INSERT) | proceed (fail open) |
+| `canonical_users` read error (DB hiccup) | proceed (fail open) — logged |
+| developer / admin / super-admin caller, frozen | still `403` — no bypass exists |
+
+## Ordering: after JWT, before rate-limit
+
+The gate needs `authUserId` from the JWT to know which user to check, so it runs after auth. It runs before the rate-limit step so frozen-account attempts don't consume rate-limit quota: a legitimate client sees the lock screen once and stops, while an abusive client hammering a frozen account is rejected for free.
+
+Rejections are **not** abuse-logged. The `account_frozen_attempt` abuse event was retired — a frozen account being turned away from normal requests is the freeze working, not a signal worth recording. The gate's own comment states "No abuse-log row here", and `functions/_shared/users/abuse-log.ts` notes the retirement.
 
 <Note>
-Scaffold generated from the codebase map — expand with full detail, examples, and specifics.
+The `ACCOUNT_FROZEN` description in `functions/_shared/errors.ts` still carries stale "one row written to `l_user_abuse_event` per attempt" text, but the gate writes nothing.
 </Note>
+
+## No bypass, ever
+
+Freeze is final until lifted by another party. There is deliberately no `skipFrozenCheck` option on `GateConfig`, no admin or super-admin bypass, and developer accounts are explicitly **not** exempt — a "super admin" is a permission-check bypass, not a freeze bypass. Freeze is a safety primitive (migration-in-progress, investigation hold, compromised-account containment), not a quota, so dev bypass would defeat its purpose. An admin who freezes themselves cannot self-unfreeze via `support-ops` — another admin, or a direct SQL `UPDATE` on `canonical_users`, must lift it.
+
+## Fail-open
+
+If `canonical_users` can't be read (DB hiccup) or the row is missing (first-ever request, or a race with `resolve-identity`'s INSERT), the gate fails **open** and admits. Freeze is a safety net for a small set of users, not a core admission gate; a real DB outage surfaces through the handler's own DB calls, and locking every user out on a transient glitch would be worse than letting a rare frozen request through.
+
+## Setter
+
+The setter and clearer today is the `support-ops` `freeze_user_account` operation (`frozen = true` / `false`), which writes `frozen_at` and `frozen_reason` on `canonical_users` (`migrations/20260508000000_baseline.sql`).
+
+## Related
+
+- [The runGates() admission chain](/rollingrecord/backend/gates/run-gates) — step 7, between entitlement and rate-limit.
+- [Rate limiting & buckets](/rollingrecord/backend/gates/rate-limiting) — the step this gate precedes so frozen rejections cost no quota.
+- [Developer bypass scope](/rollingrecord/backend/gates/dev-bypass-scope) — why the freeze gate is a must-never-skip for dev accounts.

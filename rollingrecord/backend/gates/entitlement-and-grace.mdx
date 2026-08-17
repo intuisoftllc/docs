@@ -1,16 +1,55 @@
 ---
 title: "Entitlement Check, Dev Bypass & Grace Window"
-description: "How tier entitlements are resolved, the post-lapse read-grace window, and implicit developer bypass."
+description: "How the caller's effective tier is resolved with cascade, how developer bypass is derived, and the RR-358 30-day post-lapse read-grace window."
 ---
 
-The entitlement gate resolves the caller's effective tier (with cascade), derives developer bypass, and honors a 30-day post-lapse read grace.
+The entitlement stage resolves the caller's effective tier and whether they hold developer bypass, then enforces an at-least-one-of tier requirement. When that requirement fails and the function opted in, an RR-358 grace fallback can still admit a recently-lapsed subscriber for read-only data rescue.
 
-## What this covers
+## Fetching the effective set
 
-- entitlement.ts fetches effective entitlements (cascade applied) which also derives isDeveloper; the Entitlement enum keys (pro, pro_cloud, pro_cloud_ai); at-least-one-of match.
-- grace.ts — RR-358 30-day post-lapse read grace: admits when subscription_lapsed_at is under 30d and subscription_lapsed_tier matches the required tier; read endpoints opt in via allowGracePeriodRead, writes never do.
-- Dev bypass is implicit (the developer RC entitlement cascades to top tier + flags cap/rate-limit skip).
+`fetchEffectiveEntitlements(authUserId)` in `functions/_shared/gates/entitlement.ts` resolves both dev-bypass status and the effective entitlement set, on two paths:
 
-<Note>
-Scaffold generated from the codebase map — expand with full detail, examples, and specifics.
-</Note>
+1. **`isDeveloperAccount()` first** (`functions/_shared/billing/developer.ts`) — always hits the DB, never cached, with a 3-attempt retry (`[50, 150]`ms backoff). It reads `lifetime_entitlements` for a non-revoked `developer` row and fails closed to `false`.
+2. **If dev** → the set is synthesized locally by `devEntitlementSet()` (`{ developer, pro_cloud_ai, pro_cloud, pro }`), skipping RevenueCat entirely. Dev bypass therefore survives RC outages, webhook drift, and customer-id mismatches.
+3. **If non-dev** → `getEffectiveEntitlementKeys(authUserId)` (`functions/_shared/billing/revenuecat.ts`), RC-backed with a 5-minute per-customer cache and the tier cascade applied. An RC failure for a non-dev caller fails **closed** with `502 entitlement_check_failed`.
+
+## The at-least-one-of check
+
+`checkEntitlement(active, required)` returns `null` when `required` is empty or any required `Entitlement` key is in the set, else `403 subscription_required` with `required_entitlement` set to the first required key so the client can render "upgrade to `<tier>`" without guessing.
+
+The `Entitlement` enum (`functions/_shared/gates/types.ts`) is the requireable subset — `Pro = "pro"`, `ProCloud = "pro_cloud"`, `ProCloudAi = "pro_cloud_ai"`. The cascade means a higher tier satisfies a lower requirement automatically: holding `developer` (which `ENTITLEMENTS.DEVELOPER` maps to the `pro_cloud_ai` tier with `bypassesCaps: true`) auto-satisfies any tier-gated endpoint.
+
+## The grace window (RR-358)
+
+When the entitlement check fails **and** the config set `allowGracePeriodRead: true`, `runGates` falls back to `checkGraceAdmission(authUserId, required)` in `functions/_shared/gates/grace.ts`. It does a single read-only row read of `canonical_users` and admits (`ctx.isGracePeriod = true`) only when all three conditions hold:
+
+| Condition | Source | Notes |
+| --- | --- | --- |
+| `subscription_lapsed_at IS NOT NULL` | `canonical_users` | the user actually lapsed under a tracked tier |
+| `NOW() - subscription_lapsed_at < 30 days` | `GRACE_WINDOW_MS` | also refuses future-dated writes (`ageMs < 0`) |
+| `subscription_lapsed_tier` satisfies `required` (cascade over `pro` → `pro_cloud` → `pro_cloud_ai`) | `canonical_users` | a higher-lapsed user admits to a lower endpoint; a lower-lapsed user cannot admit to a higher one |
+
+`GRACE_WINDOW_MS` is `30 * 24 * 60 * 60 * 1000`, mirroring the daily `subscription_lapse_cleanup` sweeper's cutoff. The tier match uses the **same cascade** as active entitlements — without it, a `pro_cloud_ai`-lapsed user would be denied at a `pro_cloud` endpoint (sync-pull's requirement) and the whole grace policy would be unreachable for them. An empty `required` array admits nothing.
+
+## Grace is opt-in and read-only
+
+Grace is enabled per endpoint and only on reads — the lapsed user is rescuing their data, not using the product normally. When admitted via grace, the rate-limit sugar swaps to `gracePeriodBucket` (typically the tighter `sync_download_grace` bucket).
+
+| Endpoint | `allowGracePeriodRead` | `gracePeriodBucket` |
+| --- | --- | --- |
+| `sync-pull` | true | `sync_download_grace` |
+| `sync-audio` (download) | true | `sync_download_grace` |
+| `sync-reserve` (write) | false | — |
+| `sync-push` / `sync-group-exclude` (write) | false | — |
+| `sync-reconcile` / `user-sync-preferences` | false | — |
+
+## Defense in depth
+
+Only the RC webhook writes `subscription_lapsed_at` / `subscription_lapsed_tier`, filtered to `pro_cloud` / `pro_cloud_ai` EXPIRATION events, and it clears both columns on renewal / uncancellation / initial purchase / product change so resubscribed users never hit the grace branch. The daily sweeper clears rows older than 30 days, and CHECK constraints keep the two columns paired, restrict the tier to `pro_cloud` / `pro_cloud_ai`, and forbid future-dated lapse timestamps.
+
+## Related
+
+- [The runGates() admission chain](/rollingrecord/backend/gates/run-gates) — where steps 5 and 6 sit in the chain.
+- [Rate limiting & buckets](/rollingrecord/backend/gates/rate-limiting) — the `gracePeriodBucket` swap on grace admission.
+- [Developer bypass scope](/rollingrecord/backend/gates/dev-bypass-scope) — the full policy on what dev accounts skip.
+- [Account-freeze gate](/rollingrecord/backend/gates/account-frozen) — the check that runs right after entitlement.

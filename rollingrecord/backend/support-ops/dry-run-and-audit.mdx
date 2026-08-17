@@ -1,14 +1,81 @@
 ---
 title: "Dry-Run Workflow & Audit"
-description: "The dry-run-then-commit safety model and the admin audit trail."
+description: "The mandatory dry-run-then-commit safety flow for mutating support-ops and the l_admin_audit trail with secret scrubbing."
 ---
 
-Mutating admin ops default to a dry-run preview that must be committed within a window, and every action is audited with secrets scrubbed.
+Every mutating support-ops operation is dry-run-by-default: `dry_run` defaults to `true`, and to commit the caller MUST send `dry_run: false` plus a `preview_id` from a recent matching dry-run. Read-only ops skip this entirely and always run in `commit` mode. Every admitted operation writes exactly one `l_admin_audit` row; gate rejections write none.
 
-## What this covers
+## The dry-run to commit flow
 
-- Dry-run-as-default for mutating ops: a preview_id + 15-min window + canonical params-hash match (validateDryRunPreview, dry_run_required/preview_expired/preview_mismatch); every action writes l_admin_audit with secrets scrubbed (redact-audit.ts); ticket_ref linking.
+A dry-run runs the handler in preview mode (no writes), the dispatcher writes an `l_admin_audit` row with `execution_state = 'dry_run'`, and returns that row's id as `preview_id` alongside the preview summary. The operator reviews the preview, then re-fires the SAME op + params with `dry_run: false` and `preview_id = <the UUID>`.
 
-<Note>
-Scaffold generated from the codebase map — expand with full detail, examples, and specifics.
-</Note>
+The dispatcher's mode resolution (`functions/support-ops/index.ts`): read-only ops resolve to `commit`; otherwise `dryRun = body.dry_run !== false` (default true) resolves to `dry_run`; otherwise the request must carry a `preview_id` (else `dry_run_required`), which `validateDryRunPreview` checks before resolving to `commit`. The committed row's `preview_id` points back at the dry_run row.
+
+## Preview validation
+
+`validateDryRunPreview` (`functions/_shared/admin/dry-run.ts`) validates a commit's `preview_id` against `l_admin_audit`. It reads the referenced row and checks, in order:
+
+1. The row exists AND `execution_state = 'dry_run'` (else `dry_run_required`).
+2. `admin_auth_user_id` matches the caller (else `preview_mismatch`).
+3. `operation_type` matches the commit op (else `preview_mismatch`).
+4. `SHA-256` of `canonicalJsonStringify(params)` matches the stored params hash (else `preview_mismatch`).
+5. `created_at` is within `PREVIEW_WINDOW_SEC = 15 * 60` (else `preview_expired`).
+
+`canonicalJsonStringify` produces deterministic JSON — sorted keys at every level, no whitespace, explicit nulls — so a client that re-serializes `{a:1,b:2}` for the dry-run and `{b:2,a:1}` for the commit still hashes identically. Only genuine param edits between the two calls break the match.
+
+| Code | HTTP | When |
+| --- | --- | --- |
+| `dry_run_required` | 409 | commit (`dry_run: false`) with no `preview_id`, or the `preview_id` points at a non-dry_run row |
+| `preview_expired` | 410 | the matching preview row is older than 15 minutes |
+| `preview_mismatch` | 409 | the preview row's admin, `operation_type`, or canonical params-hash differs from the commit |
+
+These are all `user`-category codes in `functions/_shared/errors.ts`, so the CLI prints them as actionable operator failures. See [the error registry](/rollingrecord/backend/operations/error-registry).
+
+## Secret scrubbing before rest
+
+`redactAuditJson` (`functions/_shared/admin/redact-audit.ts`) deep-clones a value, replacing any sensitive-keyed value with `[redacted]`. It walks nested objects and arrays. The key rule is the regex `` `/(pass(word|wd)?|secret|token)/i` `` plus a bare `code`, mirroring the RRSupport client's `AuditEventTransformer.isSecret`.
+
+It is a **clone**, not an in-place mutation, by design: `set_account_password`'s real generated password must survive in the HTTP response envelope the operator needs, while the copy written to `params_json` / `result_json` is scrubbed. The dispatcher applies `redactAuditJson(params)` and `redactAuditJson(auditResultJson)` before insert. Migration `20260811190000_redact_secrets_from_admin_audit.sql` was the one-time backfill that retroactively scrubbed pre-existing plaintext secrets already at rest, pairing with this guard going forward.
+
+## What the dispatcher writes
+
+The audit row is built as `{ operation_type, execution_state, admin_auth_user_id, admin_ip, admin_user_agent, target_auth_user_id, params_json, result_json, message, preview_id, ticket_ref }` and inserted into `l_admin_audit`, capturing the id for the response envelope. Read-only ops pass `result_json = null` per RR-312 — `params_json` already captures the ask, and duplicating returned user state would balloon the log. A thrown `OperationError` writes `execution_state = 'failed'` with its message and returns `` `{ error: code, ...extra, audit_id }` `` at its status; any other throw becomes `handler_threw` (500). The failed row still captures `params_json` and `message`.
+
+`ticket_ref` comes from `body.ticket_ref` at the top level — deliberately NOT inside `params`, so it never enters the dry-run → commit params hash. It is trimmed, sliced to 64 chars, and a blank string becomes `null`. It can also be set retroactively via the `link_audit_ticket` op.
+
+## The `l_admin_audit` table
+
+Defined in `migrations/20260508000000_baseline.sql`. Write-once, with a self-FK on `preview_id` and no FK on the user ids, so rows survive user deletion.
+
+| Column | Type | Notes |
+| --- | --- | --- |
+| `id` | uuid PK (`gen_random_uuid`) | returned to the caller as `preview_id` on a dry-run |
+| `operation_type` | text NOT NULL | wire op name |
+| `execution_state` | text NOT NULL | CHECK in (`dry_run`, `committed`, `failed`) |
+| `admin_auth_user_id` | text NOT NULL | caller; no FK (survives user deletion) |
+| `admin_ip` | text | `X-Forwarded-For` first value (raw) |
+| `admin_user_agent` | text | `User-Agent` header |
+| `target_auth_user_id` | text | acted-on user; no FK; partial index |
+| `params_json` | jsonb NOT NULL | request params, secrets redacted |
+| `result_json` | jsonb | preview / response, redacted; NULL for read-only ops |
+| `message` | text | failure message when `execution_state = 'failed'` |
+| `preview_id` | uuid | self-FK → `l_admin_audit(id)`; set on committed rows |
+| `force_overwrite_used` | boolean default false | legacy (account_migration); NOT set by the current dispatcher |
+| `ticket_ref` | text | optional Zoho ticket reference |
+| `created_at` | timestamptz default `now()` | drives the 15-minute freshness window |
+
+Indexes cover `(admin_auth_user_id, created_at DESC)`, a partial `(target_auth_user_id, created_at DESC)`, and a partial `(preview_id)`. RLS is enabled (service-role only), and the table is excluded from `delete-user`'s `TABLES_TO_WIPE` — it is admin-operation history, not GDPR user data.
+
+## Not everything is audited here
+
+Only ADMITTED operations write `l_admin_audit`, and they always do so exactly once, with `execution_state` of `dry_run`, `committed`, or `failed`. Pre-admission gate rejections — `admin_secret_mismatch`, `admin_hmac_mismatch`, `admin_replay_detected`, and `admin_permission_denied` — are NOT audited to `l_admin_audit`. They route to `l_user_abuse_event` via `logAbuseEvent`, so repeat offenders surface in `get_abuse_top_offenders`. See [anti-abuse](/rollingrecord/backend/accounts/anti-abuse).
+
+## Retention
+
+`l_admin_audit` is a long-retention `l_*` table by the naming convention. `prune_log_tables()` (`migrations/20260508000000_baseline.sql`) is the `l_*` sweeper — it DELETEs rows older than `server_config.log_retention_months` (default 36) and is scheduled weekly via `pg_cron`. See [table naming conventions](/rollingrecord/backend/database/table-naming-conventions) and [cron sweepers](/rollingrecord/backend/database/cron-sweepers).
+
+## Where to go next
+
+- [Dispatcher gate chain](/rollingrecord/backend/support-ops/dispatcher) — where the dry-run gate and audit write sit in the pipeline.
+- [Operations catalog](/rollingrecord/backend/support-ops/operations-catalog) — which ops are mutating (dry-run) and which are read-only.
+- [Admin permissions](/rollingrecord/backend/support-ops/permissions) — why permission denials never reach this audit trail.

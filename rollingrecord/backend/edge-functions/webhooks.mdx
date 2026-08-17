@@ -1,16 +1,70 @@
 ---
 title: "Inbound Webhooks"
-description: "The three inbound webhooks — Clerk, RevenueCat, and AssemblyAI — and what each writes."
+description: "The three inbound webhooks — clerk-webhook, revenuecat-webhook, and assemblyai-webhook — their auth mechanisms, and what each one writes."
 ---
 
-Three inbound webhooks drive identity, entitlements, and transcription completion: clerk-webhook, revenuecat-webhook, and assemblyai-webhook.
+Three inbound webhooks drive identity, entitlements, and transcription completion. All three are server-to-server callers that cannot send App Check or App Version headers, so both are opted out; all three are replay-safe because Clerk (Svix), RevenueCat, and AssemblyAI all retry failed deliveries.
 
-## What this covers
+| Webhook | Auth (`runGates`) | Secret env var | Primary writes |
+| --- | --- | --- | --- |
+| `clerk-webhook` | `AuthMode.None` + Svix HMAC in handler | `CLERK_WEBHOOK_SECRET` | `canonical_users` provision (created/updated), full GDPR `wipeUser` (deleted) |
+| `revenuecat-webhook` | `AuthMode.WebhookSecret` | `REVENUECAT_WEBHOOK_SECRET` | `lifetime_entitlements`, `canonical_users` lapse columns, `l_entitlement_events`, bundle credits/refunds, `f_user_financials.revenue_micros` |
+| `assemblyai-webhook` | `AuthMode.WebhookSecret` | `ASSEMBLYAI_WEBHOOK_SECRET` | `transcribe_results` (encrypted), metered-op commit, `f_user_financials.ai_cost_micros`, `h_transcribe_history` |
 
-- clerk-webhook: Svix-signed; user.created provisions the row; user.deleted triggers a full GDPR wipeUser().
-- revenuecat-webhook: shared-secret only (App Check + App Version opted out); authoritative writer of lifetime_entitlements; mirrors only WEBHOOK_MIRRORED_LOOKUP_KEYS; handles bundle credit grants/refunds and records transcription/LLM cost.
-- assemblyai-webhook: completion callback writes transcribe_results, commits metered ms, records cost to f_user_financials, records h_transcribe_history.
+## clerk-webhook
 
-<Note>
-Scaffold generated from the codebase map — expand with full detail, examples, and specifics.
-</Note>
+`functions/clerk-webhook/index.ts` calls `runGates(req, { method: Post, skipAppCheck: true, skipAppVersion: true, auth: AuthMode.None })`. Unlike the other two, its auth is **not** a `runGates` mode — it reads the raw body once and calls `verifySvixSignature(headers, rawBody, "CLERK_WEBHOOK_SECRET")` (`functions/_shared/auth/svix.ts`), an HMAC-SHA256 over `svix-id.svix-timestamp.rawBody` against the `whsec_…` secret. A mismatch returns `401 invalid_signature` — Svix does **not** retry 4xx. It routes on `event.type`:
+
+| Event | Handler | Effect |
+| --- | --- | --- |
+| `user.created` | `handleUserCreated` | Upsert `canonical_users` (`ON CONFLICT DO NOTHING`, stores `email_hash`) + `carryForwardOnResignup` on fresh creation |
+| `user.updated` | `handleUserUpdated` | Refresh `canonical_users.email_hash` |
+| `user.deleted` | `handleUserDeleted` | `wipeUser(authUserId, { skipSubscriptionCheck: true })` — full GDPR cascade |
+| any other | default | `200` no-op |
+
+A missing `data.id` returns `missing_event_fields`. `wipeUser` (`functions/_shared/users/wipe.ts`) is the shared erasure ladder used by both this webhook and the in-app `delete-user` function: it wipes every user-data table and Storage bucket, writes the `l_deleted_identity` anti-abuse snapshot, and deletes the RC customer + Clerk user. On partial failure it throws `IdentityLookupFailedError` / `CanonicalUserDeleteFailedError`, which map to `500` so Svix retries — `wipeUser` is idempotent, so the retry resumes cleanly.
+
+## revenuecat-webhook
+
+`functions/revenuecat-webhook/index.ts` calls `runGates(req, { method: Post, skipAppCheck: true, skipAppVersion: true, auth: AuthMode.WebhookSecret })` (default `REVENUECAT_WEBHOOK_SECRET`). It is the authoritative writer of `lifetime_entitlements` — every path (admin script, real purchase, refund) flows through RC and arrives here. `dispatchEvent` runs, in order:
+
+1. `logEntitlementEvents` — upserts one `l_entitlement_events` row per entitlement-in-event for **every** delivery (`onConflict: "event_id,entitlement_id"`), returning `isFreshEvent` for downstream dedup.
+2. `handleRecurringSubEvent` — RR-358 lapse tracking on `canonical_users.subscription_lapsed_at` + `subscription_lapsed_tier`.
+3. `handleRecurringSubRevenue` — writes `f_user_financials.revenue_micros` for `INITIAL_PURCHASE` / `RENEWAL` on `pro` / `pro_cloud` / `pro_cloud_ai`, gated on `isFreshEvent`.
+4. `NON_SUBSCRIPTION_PURCHASE` → `handleNonSubscriptionPurchase` (bundle credit); `CANCELLATION` on a non-entitlement product → `handleBundleRefund`.
+5. Lifetime grant / revoke for mirrored keys.
+
+Only entitlements in `WEBHOOK_MIRRORED_LOOKUP_KEYS` (lifetime + `developer`) are mirrored to the DB — recurring subs are log-only because the gate chain reads entitlements live from RC. Grants (`INITIAL_PURCHASE` / `NON_RENEWING_PURCHASE` / `TEMPORARY_ENTITLEMENT_GRANT`) insert with a `source` from `attributeSource()` (`developer` / `manual_admin` / `employee_perk` / `founders_edition_purchase`); revocations (`CANCELLATION` → `cancel_reason`, `EXPIRATION` → `rc_expiration` fallback) are idempotent via the partial `UNIQUE (email_hash, rc_entitlement) WHERE revoked_at IS NULL`.
+
+**Lapse tracking** only fires for `RECURRING_CLOUD_KEYS` (`pro_cloud`, `pro_cloud_ai`): `EXPIRATION` sets both lapse columns; `INITIAL_PURCHASE` / `RENEWAL` / `UNCANCELLATION` / `PRODUCT_CHANGE` clear both; `CANCELLATION` is a no-op (it waits for `EXPIRATION`). `developer`, `lifetime`, and `pro` are deliberately excluded — a hard cutoff with no grace window. **Bundle IAPs** read `bundle_config` for the SKU and grant tier-aware credits via `creditBundle` (idempotent on `l_credit_log UNIQUE(purchase_token)`); refunds clamp-at-zero via `refundBundle` keyed on `refund_of_token`. The handler always returns 2xx to RC unless a transient error (`500` → RC retries).
+
+<Warning>
+`revenuecat-webhook` records **revenue** into `f_user_financials.revenue_micros` (from `event.price` via `usdToMicros`). It never writes transcription or LLM cost. Transcription cost goes to `f_user_financials.ai_cost_micros` via `assemblyai-webhook`; LLM cost goes to the same column via the AI dispatcher (`_shared/ai/client.ts::trackTokenUsage`).
+</Warning>
+
+| Webhook | `f_user_financials` column | Direction |
+| --- | --- | --- |
+| `revenuecat-webhook` | `revenue_micros` | money **in** (`event.price` → `usdToMicros`) |
+| `assemblyai-webhook` | `ai_cost_micros` | cost **out** (transcription cost, incl. dev accounts) |
+
+## assemblyai-webhook
+
+`functions/assemblyai-webhook/index.ts` calls `runGates(req, { method: Post, skipAppCheck: true, skipAppVersion: true, auth: AuthMode.WebhookSecret, secretEnvVar: "ASSEMBLYAI_WEBHOOK_SECRET" })`. It is the completion callback for the async transcribe flow. The payload is `{ transcript_id, status }`; `status` must be `completed` or `error` (else `webhook_invalid_status`). `loadTranscribeJobByAssemblyAiId` resolves the job — a miss returns `200 { outcome: "already_processed" }` (idempotent duplicate delivery). It then routes to `handleCompletedStatus` or `handleErrorStatus`; an `isNoSpeechError` on the error path routes to `handleNoSpeech`, which stores an empty completed transcript and charges nothing.
+
+`handleCompletedStatus` runs the success ladder:
+
+1. `fetchCompletedTranscript` → the full text + per-word data.
+2. `insertCompletedResult` — an **encrypted** `transcribe_results` row (PK `transcribe_job_id`; a duplicate short-circuits to `200`).
+3. `deleteTranscript` — fire-and-forget cleanup on AssemblyAI's side.
+4. `commitMeteredOp` — commits the metered-ms reservation persisted at submit time.
+5. `incrementFinancialColumn("ai_cost_micros", usdToMicros(computeTranscriptionCostUsd(...)))` — recorded for **every** caller including devs (dev bypass is a quota exception, not a cost-visibility one).
+6. `recordTranscribeHistory` — an `h_transcribe_history` row.
+7. `updateTranscribeJobStatus("completed")` then `deleteTranscribeJob`.
+
+Billing uses the server-measured reservation (`opCostMs`) as the source of truth; a missing reservation (legacy in-flight rows from the old synchronous op) charges zero rather than guessing. Deliveries return 2xx to stop retries, 5xx to trigger a retry, and avoid 4xx on the job-found path so a real job is never orphaned.
+
+## Related pages
+
+- [Edge Function catalog](/rollingrecord/backend/edge-functions/overview) — the shared `runGates()` chain and webhook-secret auth mode.
+- [resolve-identity](/rollingrecord/backend/edge-functions/resolve-identity) — the in-app path that mirrors `clerk-webhook`'s provisioning + carryover.
+- [ai-engine](/rollingrecord/backend/edge-functions/ai-engine) — the `transcribe_submit` operation that opens the job this webhook completes.

@@ -1,15 +1,48 @@
 ---
 title: "Migration Discipline"
-description: "The non-negotiable rules for writing and shipping Supabase migrations."
+description: "The non-negotiable rules for writing and shipping Supabase migrations: file-only, append-only, preview-first, RLS-on-create."
 ---
 
-Migrations are file-only, append-only, preview-first, and require a written risk paragraph before any destructive change.
+Every schema change is a migration file under `supabase/migrations/` — never the dashboard. Migrations are append-only after they push, preview-first, and branch-parity enforced; every `CREATE TABLE` is followed by `ENABLE ROW LEVEL SECURITY`; and every migration opens with a plain-English risk paragraph.
 
-## What this covers
+## The lifecycle
 
-- Migration-file-only (never the dashboard), append-only with push-state verification, preview-first, branch parity, a risk-paragraph before writing, destructive-migration written-confirmation.
-- ~130 migrations under supabase/migrations/ (baseline 20260508000000_baseline.sql + incremental); migrations_archive/.
+| Step | Rule |
+| --- | --- |
+| Author | A migration file under `supabase/migrations/` only — never the dashboard / SQL editor for schema |
+| Risk paragraph | A plain-English statement of table/column/data impact and forward-compatibility, before any SQL |
+| Preview | Push to `develop` → Supabase runs it on the preview DB → verify in the Table Editor |
+| Promote | PR `develop` → `main`; deploy-on-push runs it on production; verify after merge |
+| Append-only | Never edit a pushed migration (ask "has this been pushed?" first); forward-fix instead |
+| Destructive | `DROP` / lossy `ALTER` / `DELETE` / `TRUNCATE` / in-place `UPDATE` need explicit written confirmation; `c_recordings` `TRUNCATE`/`DROP` is banned with no override |
 
-<Note>
-Scaffold generated from the codebase map — expand with full detail, examples, and specifics.
-</Note>
+## The baseline
+
+The applied chain starts from `supabase/migrations/20260508000000_baseline.sql`, a squashed `pg_dump` (~4958 lines) that every later migration builds on — all tables, functions, triggers, indexes, FKs, and per-table `ENABLE ROW LEVEL SECURITY`. There are 114 migration files under `supabase/migrations/` (the baseline plus 113 incremental, timestamp-prefixed `YYYYMMDDHHMMSS`). A sibling `supabase/migrations_archive/` holds ~115 pre-baseline / never-applied files kept for reference — those are **not** part of the applied chain.
+
+## RLS on create
+
+Every `CREATE TABLE` is paired with `ALTER TABLE ... ENABLE ROW LEVEL SECURITY` and no policies. This is verifiable in-repo: there are **zero** `CREATE POLICY` statements across all migrations, so "RLS on, no policies" is the literal state, not an aspiration. `supabase/migrations/20260527100000_create_f_user_financials.sql` is the canonical new-table shape — `CREATE TABLE`, then FK + CASCADE to `canonical_users`, then `ENABLE ROW LEVEL SECURITY`, plus a risk paragraph. See [RLS & service-role model](/rollingrecord/backend/database/rls-and-service-role).
+
+## Idempotent seeds & forward-fixes
+
+| Pattern | Example |
+| --- | --- |
+| Idempotent seed | `INSERT ... ON CONFLICT DO NOTHING / DO UPDATE` so a migration re-runs cleanly on a reset preview DB (`supabase/migrations/20260703150000_account_otp_rate_limits.sql`) |
+| Forward-fix | `CREATE OR REPLACE FUNCTION` to correct a shipped function's body forward, never editing the original migration (`supabase/migrations/20260731150000_storage_janitor_cutover.sql`) |
+| Destructive | `DROP COLUMN` with a full risk statement acknowledging HARD RULE 9 and the pre-launch dev-DB-is-wiped framing (`supabase/migrations/20260605210000_c_recordings_protected_at_retype.sql`) |
+
+## Append-only, with a check
+
+A migration that has pushed to `develop` has already run on the preview DB; editing the file afterward only diverges the file from what the DB actually ran. So before editing any existing migration, the rule is to *ask whether it has been pushed* — not to guess from timestamps or git log. Not pushed → edit freely. Pushed → write a new forward-fix migration. The one exception is a migration that *failed* on preview: it never ran, so there is no drift to protect, and the file may be edited in place.
+
+## Index names
+
+The Room-style `index_{table}_{column}` auto-generated format is a client-side (Room) concern. Postgres index names in these migrations follow their own `idx_*` convention (e.g. `idx_c_recordings_sync`) — keep the two rules separate; the Room index-name-matching rule does not apply to the Supabase migrations.
+
+## Related pages
+
+- [RLS & service-role model](/rollingrecord/backend/database/rls-and-service-role) — the default-safe state every migration must preserve
+- [c_recordings integrity](/rollingrecord/backend/database/c-recordings-integrity) — the one table with an unconditional TRUNCATE/DROP ban
+- [High-risk tables registry](/rollingrecord/backend/database/high-risk-tables) — tables where a destructive migration has no recovery path
+- [Table naming conventions](/rollingrecord/backend/database/table-naming-conventions)

@@ -1,15 +1,69 @@
 ---
 title: "Async Extraction Architecture"
-description: "The three-function async extraction plane and where its encrypted payload lives."
+description: "The three-Edge-Function async extraction plane, the extraction_jobs lifecycle, and where its envelope-encrypted payload lives."
 ---
 
-Extraction is fully asynchronous across three functions, with all job state stored as encrypted columns rather than a Storage bucket.
+Extraction — turning a context's recordings into a merged card of sections, insights, and tasks — runs fully asynchronously across three Edge Functions plus one Postgres claim RPC. The client submits a whole job in one request, a background tick engine drains it chunk by chunk, and the client polls for progress and pulls the finished results. Since RR-503 the entire payload is envelope-encrypted columns on the job row; there is no Storage bucket in the pipeline any more.
 
-## What this covers
+## The three Edge Functions
 
-- Three functions: extract-submit (client submit + reserve-only headroom check), extract-runner (server-paced tick), extract-results (fetch/ack/status/cancel); single-flight enforced by a partial unique index (extraction_already_running).
-- Payload/accumulator/results live as encrypted columns on extraction_jobs (payload_ct, state_ct, results_ct under one per-job DEK in dek_ct) — the former job-plane Storage bucket was removed (RR-503).
+The plane is a submit endpoint, a server-to-server tick engine, and a client status/pull endpoint. Each routes through `runGates()` (`functions/_shared/gates/index.ts`) with its own auth mode.
+
+| Function | Auth mode | Rate-limit bucket | Role |
+| --- | --- | --- | --- |
+| `extract-submit` (`functions/extract-submit/index.ts`) | JWT, entitlement `ProCloudAi` | `extraction_submit` (chain sugar) | Validate + seal + `INSERT` a `QUEUED` job, then inline-kick the runner. Runs the `ai_extraction_enabled` kill switch and a reserve-only Gate 5 headroom check. |
+| `extract-runner` (`functions/extract-runner/index.ts`) | WebhookSecret (`EXTRACT_RUNNER_SECRET`) | none (server-to-server) | Claim one job, process chunks under a wall budget, checkpoint, finalize. Poison vs retryable error lanes. |
+| `extract-results` (`functions/extract-results/index.ts`) | JWT, entitlement `ProCloudAi` | per-op: `extraction_status` or `extraction_submit` | The client's status / pending / fetch / ack / cancel plane. **No usage-cap gate** — reading your own results costs no quota. |
+
+`extract-runner` opts out of App Check and App Version (`skipAppCheck` / `skipAppVersion`) because its callers — the inline kick, the `pg_cron` tick, and its own self re-kick — never send device headers. See [Webhook & server-to-server auth](/rollingrecord/backend/gates/webhook-secret) and [The runGates() admission chain](/rollingrecord/backend/gates/run-gates).
+
+## The extraction_jobs lifecycle
+
+`extraction_jobs` (`migrations/20260720160000_extraction_jobs_foundation.sql`) is the job queue: `auth_user_id`, `id` (UUID PK), `context_id` (TEXT, not an FK — a context may be local-only), `status`, `chunks_total` / `chunks_done`, `attempt_count`, `heartbeat_at`, `error_code`, `blueprint_id` (TEXT), `is_rebuild`, timestamps. It has an FK + `ON DELETE CASCADE` to `canonical_users`, a `CHECK` on the seven statuses, and RLS enabled with no policies (service-role only). The `status` column moves through seven states, split into an active class and a terminal class.
+
+| Status | Class | Meaning |
+| --- | --- | --- |
+| `QUEUED` | active | Submitted, awaiting a runner claim. |
+| `RUNNING` | active | Claimed by a live tick; `heartbeat_at` refreshed each chunk. |
+| `CANCEL_REQUESTED` | active | User cancelled a live run; the runner writes `CANCELLED` between chunks. |
+| `DONE` | terminal | Finalized; `results_ct` populated, `payload_ct` nulled. |
+| `FAILED` | terminal | Poison, exhausted attempts, or a non-recoverable extract; `error_code` set. |
+| `CANCELLED` | terminal | Cancel honored — from `QUEUED`, a live `RUNNING`, or a stale sweep. |
+| `ACKED` | terminal | Reserved in the `CHECK` constraint; the ack path DELETEs the row instead of using it. |
+
+The active/terminal split is codified in `ACTIVE_JOB_STATUSES` / `TERMINAL_JOB_STATUSES` (`functions/_shared/extraction/job-status.ts`), with `isTerminalJobStatus()` and `cancelTargetStatus()` as the shared predicates.
+
+## Single-flight and the claim
+
+Two independent limits bound extraction. A **per-user single-flight** partial unique index, `idx_extraction_jobs_single_flight ON (auth_user_id) WHERE status IN ('QUEUED','RUNNING','CANCEL_REQUESTED')`, allows at most one active extraction per user globally — a duplicate submit raises Postgres `23505`, which `extract-submit` maps to `409 extraction_already_running` and returns the live `job_id` (via `loadActiveJobId`) so the second device attaches instead of starting a duplicate. A separate **global concurrency ceiling**, `extraction_max_concurrent_jobs` (default 25), is enforced inside `claim_extraction_job` (`migrations/20260720180000_extraction_runner_cron.sql`) at claim time across all users. A second index, `idx_extraction_jobs_claim (status, created_at)`, drives both the claim scan and the sweepers. See [Table naming conventions](/rollingrecord/backend/database/table-naming-conventions) for why this queue table carries no `l_`/`h_`/`f_` prefix.
+
+## extract-results operations
+
+`extract-results` dispatches on a `body.operation` field. Since RR-504 there are **five** operations — `EXTRACT_RESULTS_OPERATIONS = ['fetch','ack','status','cancel','pending']` (`functions/_shared/extraction/job-status.ts`), narrowed by `parseExtractResultsOperation()`. Every row filter is scoped `.eq('auth_user_id', authUserId)`, so a caller can only ever touch its own job.
+
+| operation | job_id required | Behavior |
+| --- | --- | --- |
+| `status` | yes | Scalar poll read (`status`, `chunks_done`/`chunks_total`, `error_code`, `context_id`); never selects ciphertext. |
+| `pending` | no | Reconcile read: lists up to 20 unacked jobs so a client that lost the id (WorkManager) can recover it. |
+| `fetch` | yes | Decrypts `results_ct` under the job DEK and returns results inline; non-`DONE` → `409 extraction_results_not_ready`; undecryptable → `410`. |
+| `ack` | yes | DELETEs the row — that is the entire cleanup. Missing row → idempotent success; still-active → `409`. |
+| `cancel` | yes | Flips status via `cancelTargetStatus`, conditional on the read status; returns the new status. |
+
+`status`, `cancel`, and `pending` ride the dedicated `extraction_status` bucket (progress is polled ~45 times a run); `fetch` and `ack` ride the `extraction_submit` bucket (~3 calls per extraction). The polling bucket is separate so a poll storm can never starve the handful of submit-side calls an extraction needs to finish.
+
+## Where the encrypted payload lives
+
+RR-503 (`migrations/20260721000000_extraction_payload_in_db.sql`) added eight nullable `BYTEA` envelope columns plus `kek_version` to `extraction_jobs`: `dek_ct`/`dek_iv`, `payload_ct`/`payload_iv`, `state_ct`/`state_iv`, `results_ct`/`results_iv`. One **per-job DEK** (`mintJobEnvelope`, `functions/_shared/extraction/job-crypto.ts`) encrypts all three blobs and is itself wrapped under the shared, versioned Vault KEK — the same key that protects `user_crypto` and `transcribe_results` — so the DEK never leaves the server and a KEK rotation never orphans an in-flight job. `payload_ct`, `state_ct`, and `results_ct` are `SET STORAGE EXTERNAL`, and each pair carries a `CHECK ((x_ct IS NULL) = (x_iv IS NULL))`. See [Envelope encryption model](/rollingrecord/backend/storage/envelope-encryption) and [Key management](/rollingrecord/backend/storage/key-management).
+
+`payload_ct` holds only a **slim manifest** — recording ids, `source_version`s, `transcript_chars`, `prior_state`, and `medical_mode`. Each recording's transcript is a separate row in `extraction_job_items` (`migrations/20260723140000_extraction_job_items.sql`), sealed under the **same** job DEK, so the runner holds exactly one recording's text in memory at a time — the fix for the fixed 256 MB Edge Function memory ceiling. Both `extraction_jobs` and `extraction_job_items` FK to `canonical_users` with `CASCADE`, so a user delete reaps everything.
 
 <Note>
-Scaffold generated from the codebase map — expand with full detail, examples, and specifics.
+The E1 foundation migration created a private `job-plane` Storage bucket. RR-503 retired it and it has since been deleted — the extraction pipeline touches no Storage bucket at all. Payload, accumulator, and results are row columns; transcripts are `extraction_job_items` rows.
 </Note>
+
+## Where to go next
+
+- [extract-runner tick engine](/rollingrecord/backend/extraction/runner) — how a job is claimed, chunk-processed, checkpointed, and finalized.
+- [Extraction metering & caps](/rollingrecord/backend/extraction/billing-and-caps) — millisecond billing, tier caps, and where cost lands.
+- [Extraction sweepers & cron](/rollingrecord/backend/extraction/sweepers) — the scheduled jobs that tick, requeue, finalize, and reap.
+- [Error registry](/rollingrecord/backend/operations/error-registry) — the canonical extraction error codes.

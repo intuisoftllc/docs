@@ -1,14 +1,101 @@
 ---
 title: "Email OTP Step-Up"
-description: "The general-purpose email OTP used to step up sensitive operations."
+description: "The two-phase email OTP that mints single-use tickets sensitive operations consume to prove the caller controls their account email."
 ---
 
-account-otp is a general two-phase email OTP that mints single-use tickets consumed by sensitive operations.
+`functions/account-otp/index.ts` (RR-492) is a general-purpose email-ownership step-up. Clerk can't drive an email OTP for an already-signed-in user, so the server issues its own 6-digit code, delivers it via Brevo, verifies it, and mints a single-use **ticket** that a sensitive endpoint later consumes. It is two operations — `send` then `verify` — behind a JWT gate chain with no entitlement gate, so every tier can use it.
 
-## What this covers
+## Two-phase flow
 
-- account-otp general two-phase (send emails via Brevo, verify issues a single-use ticket); _shared/otp/ (purposes.ts scoping, ticket.ts, consume.ts); consumed by delete-user and set-user-pin clear; otp_code_incorrect, step_up_required.
+`send` resolves the account email server-side, stores the code, and emails it. `verify` checks the code and, on success, mints a ticket. A separate sensitive endpoint consumes that ticket later — account-otp itself never consumes.
+
+| Operation | Body | Success | Effect |
+| --- | --- | --- | --- |
+| `send` | `{ operation, purpose }` | `200 { ok, email_masked }` | Rate-limits `AccountOtpSend`, resolves email, upserts a SHA-256 code hash + `purpose`, emails the code via Brevo |
+| `verify` | `{ operation, purpose, code }` | `200 { ok, ticket }` | Rate-limits `AccountOtpVerify`, matches the code hash, stamps `validated_at` + `ticket_hash`, returns the plaintext ticket once |
+
+Both operations are scoped to a `purpose` from the allowlist. `send` stamps it on the row; `verify` mints the ticket under it; the consuming endpoint requires a matching purpose, so a ticket minted for one flow can't authorize another.
+
+## Purposes
+
+`functions/_shared/otp/purposes.ts` holds `OTP_PURPOSES` and the `isOtpPurpose()` narrower. A body whose `operation` is `send`/`verify` but whose `purpose` is not in the allowlist is rejected with `invalid_body`.
+
+| Purpose | Consumed by |
+| --- | --- |
+| `app_lock_pin_reset` | [set-user-pin clear path](/rollingrecord/backend/accounts/app-lock-pin) |
+| `account_deletion` | [delete-user destructive path](/rollingrecord/backend/accounts/delete-user) |
+
+Adding a step-up flow needs only a new purpose here — no migration, since purpose validation lives in code.
+
+## Codes and tickets
+
+Two distinct secrets, both stored only as SHA-256 hashes (`sha256Hex()` in `functions/_shared/otp/ticket.ts`):
+
+- **Code** — `generateCode()` returns a cryptographically-random 6-digit code, rejection-sampled against `1_000_000` to avoid modulo bias. Stored as `code_hash`, delivered to the user, 10-minute TTL (`OTP_TTL_MS`), 5-attempt cap (`MAX_ATTEMPTS`).
+- **Ticket** — `generateTicket()` returns a 256-bit crypto-random, base64url-no-padding value (~43 chars). Its high entropy means no brute-force surface at consume time, so the consuming endpoint never needs the low-entropy 6-digit code. Returned once on `verify`; stored only as `ticket_hash`.
+
+Re-verifying the same code is allowed (e.g. the sensitive op failed and the user retries): the new `ticket_hash` overwrites any prior one, so at most one ticket is ever live. The `verify` update carries a `consumed_at IS NULL` guard so it stays atomic against a concurrent consume.
+
+## verify decision path
+
+| Row state | Outcome | Attempt burned? |
+| --- | --- | --- |
+| no row | `not_found` (404) | — |
+| expired or `attempts >= 5` | row deleted, `otp_code_incorrect` (422) | — |
+| wrong code | `attempts` incremented, `otp_code_incorrect` (422) | yes |
+| correct but already consumed / purpose mismatch | `otp_code_incorrect` (422) | no |
+| correct, in-window, matching purpose, unconsumed | `200 { ok, ticket }` | — |
+
+## Consuming a ticket
+
+`consumeOtpTicket()` in `functions/_shared/otp/consume.ts` is called by the sensitive endpoints — **not** by account-otp. It runs a single conditional UPDATE that flips `consumed_at` only when the row matches `(authUserId, purpose, ticket_hash)` AND is validated, unconsumed, and unexpired. Two concurrent consumes race on `consumed_at IS NULL`; exactly one wins (the `RETURNING` result tells which), so a ticket is single-use by construction. `authUserId` is always the caller's own JWT `sub`, so a ticket only ever authorizes an action on the account that minted it.
 
 <Note>
-Scaffold generated from the codebase map — expand with full detail, examples, and specifics.
+`step_up_required` is returned by the **consuming** endpoints (set-user-pin clear, delete-user) when `consumeOtpTicket()` fails — never by account-otp itself. account-otp only returns `otp_code_incorrect`, `invalid_body`, `invalid_operation`, `not_found`, `database_error`, `internal_error`, and `handler_threw` (the top-level catch on any uncaught throw).
 </Note>
+
+## Email delivery
+
+`sendBrevoEmail()` in `functions/_shared/email/brevo.ts` POSTs one transactional email to `https://api.brevo.com/v3/smtp/email`. The template lives in `functions/_shared/email/otp-email.ts` (`otpEmailSubject`, `renderOtpEmailHtml`, `renderOtpEmailText`) — across the template family the interpolated values are the code, the year, and the app name (`renderOtpEmailHtml` alone interpolates just the code and year), and the 10-minute-expiry copy is hardcoded to match `OTP_TTL_MS`. The account email is resolved server-side — the JWT `email` claim first, else `getClerkUserEmail()` (`functions/_shared/users/clerk-admin.ts`) — and is never client-supplied.
+
+| Secret | Purpose | Default |
+| --- | --- | --- |
+| `BREVO_API_KEY` | Brevo v3 API key; send fails (returns false) if unset | required |
+| `BREVO_SENDER_EMAIL` | verified from-address | `noreply@rollingrecord.ai` |
+| `BREVO_SENDER_NAME` | display name | `Rolling Record` |
+
+A dev-only convenience: emails carrying the `+clerk_test` subaddress get the fixed code `424242` and skip the Brevo send, gated behind `CLERK_TEST_EMAILS_ENABLED === "true"`. That flag is set on the dev Supabase branch only, so a `+clerk_test` email in production still gets a real random code and a real send.
+
+## account_otp table
+
+One row per user, defined in `migrations/20260703140000_account_otp.sql` and extended to two-phase in `migrations/20260706120000_account_otp_two_phase.sql`.
+
+| Column | Type | Notes |
+| --- | --- | --- |
+| `auth_user_id` | `TEXT NOT NULL PRIMARY KEY` | FK to `canonical_users(auth_user_id) ON DELETE CASCADE` |
+| `created_at` | `TIMESTAMPTZ NOT NULL DEFAULT now()` | reset on each send |
+| `code_hash` | `TEXT NOT NULL` | SHA-256 hex of the 6-digit code |
+| `expires_at` | `TIMESTAMPTZ NOT NULL` | `now() + 10 min` |
+| `attempts` | `INTEGER NOT NULL DEFAULT 0` | per-code wrong-guess counter, cap 5 |
+| `purpose` | `TEXT NOT NULL` | scopes the ticket |
+| `validated_at` | `TIMESTAMPTZ` | stamped on verify |
+| `consumed_at` | `TIMESTAMPTZ` | stamped by `consumeOtpTicket()` |
+| `ticket_hash` | `TEXT` | SHA-256 of the ticket |
+
+Two CHECK constraints enforce the lifecycle: `(ticket_hash IS NULL) = (validated_at IS NULL)`, and `consumed_at IS NULL OR validated_at IS NOT NULL`. `prune_account_otp()` sweeps consumed or expired rows hourly at `:20` via pg_cron — the PK already bounds the table to one row per user, so the sweep only reaps consumed/abandoned rows.
+
+## Rate limits
+
+Both buckets are keyed on `authUserId`, applied via standalone `checkRateLimit()`, and skipped for dev callers. A legitimate user never trips them, so a rejection fire-and-forget logs a `rate_limit_hit` [abuse event](/rollingrecord/backend/accounts/anti-abuse).
+
+| Bucket | Max | Window | Guards |
+| --- | --- | --- | --- |
+| `account_otp_send` | 20 | 3600s | email-bomb / Brevo-cost guard on send |
+| `account_otp_verify` | 30 | 3600s | defense-in-depth over the per-code 5-attempt cap |
+
+## Related
+
+- [App Lock PIN](/rollingrecord/backend/accounts/app-lock-pin) — consumes an `app_lock_pin_reset` ticket to clear the PIN.
+- [delete-user](/rollingrecord/backend/accounts/delete-user) — consumes an `account_deletion` ticket before wiping.
+- [The runGates() admission chain](/rollingrecord/backend/gates/run-gates) and [Rate limiting & buckets](/rollingrecord/backend/gates/rate-limiting).
+- [Environment & secrets](/rollingrecord/backend/operations/env-and-secrets) and [Error registry](/rollingrecord/backend/operations/error-registry).

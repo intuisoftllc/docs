@@ -1,14 +1,80 @@
 ---
 title: "KEK Lifecycle & user_crypto"
-description: "The key-encryption-key lifecycle and the per-user text DEK."
+description: "The Vault master KEK reached only through two SECURITY DEFINER RPCs, the per-user DEK row on user_crypto, and get-user-key's lazy-provision, audit, and PIN-sync flow."
 ---
 
-The master KEK lives in Vault with a documented lifecycle, while each user has a text DEK on user_crypto for synced content.
+The master Key Encryption Key (KEK) lives in Supabase Vault as secrets named `audio_backup_kek_v{N}`. Edge Functions never read Vault directly — they reach the KEK only through two `SECURITY DEFINER` RPCs granted to `service_role`, and each user's Data Encryption Key (DEK) lives wrapped on one `user_crypto` row that `get-user-key` fetches or lazily provisions.
 
-## What this covers
+## The two Vault RPCs
 
-- docs/encryption/02-key-management.md: KEK in Vault, bootstrap migration, cold-backup step, rotation, kek_version; the per-user text DEK on user_crypto (one DEK encrypts all synced text columns); get-user-key provisioning.
+Both are defined in `migrations/20260508000000_baseline.sql` (RR-204), `SECURITY DEFINER`, and granted `EXECUTE` to `service_role` only. Keeping Vault access behind two tightly-scoped functions narrows the privilege escalation that `vault.decrypted_secrets` would otherwise require.
 
-<Note>
-Scaffold generated from the codebase map — expand with full detail, examples, and specifics.
-</Note>
+| RPC | Signature | Purpose |
+| --- | --- | --- |
+| `get_current_audio_backup_kek` | `RETURNS TABLE(version INT, kek_base64 TEXT)` | picks the highest-numbered `audio_backup_kek_v%` secret — the KEK used at wrap time |
+| `get_audio_backup_kek_by_version` | `(p_version INT) RETURNS TEXT` | fetches a specific version so rows wrapped under an older KEK stay decryptable |
+
+`envelope.ts`'s `loadCurrentKek` calls the first at wrap time; `loadKekByVersion` calls the second at unwrap time. See [Envelope Encryption Model](/rollingrecord/backend/storage/envelope-encryption) for the wrap/unwrap mechanics.
+
+## Rotation is a versioning scheme, not an endpoint
+
+There is no rotation Edge Function in this scope. Rotation is a **designed capability** implemented by the `kek_version` column: every wrapped-DEK row records the KEK generation that wrapped it, and `unwrapDek` takes that version explicitly so a row survives any number of rotations. Introducing a new `audio_backup_kek_v{N+1}` Vault secret makes it the current KEK for new wraps while `get_audio_backup_kek_by_version` keeps old rows readable. The audit module's header explicitly anticipates a future key-handling function for "rotation, revocation" — until one lands, rotation is supported by versioning, not by a callable.
+
+## The user_crypto table
+
+`user_crypto` (PK `auth_user_id`) holds one wrapped per-user DEK. It has an FK + `ON DELETE CASCADE` to `canonical_users`, RLS enabled with no policies (service-role only), and is flagged HIGH-RISK: losing a row permanently loses that user's synced text corpus, because that one DEK encrypts every synced text column.
+
+| Column | Type | Null | Purpose |
+| --- | --- | --- | --- |
+| `auth_user_id` | TEXT | NOT NULL (PK) | owner; FK + CASCADE to `canonical_users` |
+| `dek_ct` | BYTEA | NOT NULL | per-user DEK wrapped under the KEK (renamed from `wrapped_dek` in RR-320) |
+| `dek_iv` | BYTEA | NOT NULL | IV used to wrap the DEK (renamed from `iv` in RR-320) |
+| `kek_version` | INTEGER | NOT NULL `CHECK (> 0)` | which KEK generation wrapped this DEK |
+| `created_at` | TIMESTAMPTZ | NOT NULL default `now()` | provisioning time |
+| `pin_verifier_ct` | BYTEA | nullable | RR-492 DEK-encrypted PBKDF2 App-Lock PIN verifier |
+| `pin_verifier_iv` | BYTEA | nullable | RR-492 12-byte IV for `pin_verifier_ct` |
+| `pin_settings` | JSONB | nullable | RR-492 non-encrypted synced App-Lock settings, e.g. `{"auto_lock_ms": 0}` |
+| `pin_updated_at` | TIMESTAMPTZ | nullable | RR-492 server last-write-wins marker (NULL on legacy rows = epoch 0) |
+
+The `pin_verifier_ct` / `pin_verifier_iv` pair (migration `20260703120000_app_lock_pin_verifier.sql`) carries a paired-NULL `CHECK ((pin_verifier_ct IS NULL) = (pin_verifier_iv IS NULL))`. `pin_settings` and `pin_updated_at` (migration `20260703180000_app_lock_pin_sync_metadata.sql`) hold the App-Lock settings and their LWW marker. `set-user-pin` writes these; `get-user-key` returns them so the PIN syncs across a user's devices.
+
+## get-user-key
+
+`functions/get-user-key/index.ts` returns the plaintext DEK for the caller's row, unwrapped from the KEK. It is the one endpoint where a plaintext DEK crosses the wire, so two admission details are load-bearing:
+
+- **No entitlement gate.** `runGates` enforces only POST + JWT here. The DEK now also derives the local SQLCipher DB key, so any device signing into the account needs it regardless of subscription tier.
+- **Rate limit runs manually in the handler body**, not via chain sugar. `checkRateLimit(Bucket.UserKeyGet, ...)` is called inline specifically so the rejection path can also write an `l_user_key_access` audit row — this endpoint is where a stolen JWT would go shopping for the DEK, so forensic visibility matters most here.
+
+On each call the handler calls `ensureCanonicalUserRow` (upsert with `onConflict: auth_user_id, ignoreDuplicates` — a failure is swallowed to console.error) so the FK is satisfiable, then selects the `user_crypto` row. If none exists it lazily provisions: `generateDek` → `wrapDek` → insert, handling a `23505` unique-violation race by re-selecting whichever row landed first. It unwraps with the matching KEK version, `zeroDek`s the plaintext, and returns `GetResponse`.
+
+### GetResponse
+
+| Field | Type | Meaning |
+| --- | --- | --- |
+| `dek` | base64 string | plaintext DEK; the client decodes to 32 bytes for AES-256 |
+| `kek_version` | number | KEK generation that wrapped this DEK |
+| `pin_verifier_ct` | string \| null | App-Lock PIN verifier ciphertext (base64), or null when unset |
+| `pin_verifier_iv` | string \| null | base64 IV paired with `pin_verifier_ct` |
+| `pin_settings` | `{ auto_lock_ms? }` \| null | synced App-Lock settings |
+| `pin_updated_at` | number \| null | epoch-ms LWW marker (null on legacy rows) |
+
+## Audit logging
+
+Every call writes one `l_user_key_access` row via `logUserKeyAccess` (`functions/_shared/crypto/user-key-audit.ts`) — `auth_user_id`, `operation`, `result`, the client IP (`cf-connecting-ip`, falling back to the first `x-forwarded-for` entry), and `user_agent`. The write is fire-and-forget: an audit failure logs to console but never fails the DEK fetch.
+
+| Field | Value | Meaning |
+| --- | --- | --- |
+| `operation` | `init` | the INSERT branch ran — the row was provisioned (or observed-needed) this call |
+| `operation` | `get` | the SELECT hit an existing row |
+| `result` | `success` | DEK returned |
+| `result` | `rate_limited` | the `UserKeyGet` bucket tripped (429), still audited |
+| `result` | `db_error` | a select / insert / unwrap failed (mapped to `database_error` or `handler_threw`) |
+
+The `UserKeyGet` bucket's in-code fallback is `{ max: 40, windowSec: 3600, enabled: true }` (`functions/_shared/gates/rate-limit.ts`); the live ceiling is the `rate_limit_config` row.
+
+## Related pages
+
+- [Envelope Encryption Model](/rollingrecord/backend/storage/envelope-encryption) — the wrap/unwrap primitives these RPCs feed
+- [Storage Buckets](/rollingrecord/backend/storage/buckets) — the ciphertext these keys decrypt
+- [Server-Side Embeddings](/rollingrecord/backend/storage/semantic-search) — bundles sealed with the per-user DEK
+- [Storage Janitors & Orphan Reaping](/rollingrecord/backend/storage/janitors) — reaping blobs whose crypto material is gone

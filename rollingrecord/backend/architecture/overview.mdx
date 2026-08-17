@@ -1,16 +1,31 @@
 ---
-title: "Backend Overview"
-description: "The Supabase backend at a glance — Edge Functions, storage, and the external services behind RollingRecord."
+title: "Architecture"
+description: "The cross-cutting design decisions that shape the whole backend: the monorepo part, the config split, the deletion cascade, and the single-identity model."
 ---
 
-RollingRecord's backend is one self-contained monorepo part (supabase/) combining Supabase Postgres, Deno/TypeScript Edge Functions, and Storage.
+This section covers the design decisions that are not owned by any one Edge Function but constrain all of them. For the runtime map — which functions exist and what each plane does — start at the [Backend Overview](/rollingrecord/backend/overview).
 
-## What this covers
+## One monorepo part, split-ready
 
-- The backend is one monorepo "part" (supabase/) designed for a future clean git filter-repo split; components are Supabase Postgres + Edge Functions (Deno/TypeScript) + Storage, fronted by Firebase App Check and paid via RevenueCat.
-- The real runtime pieces: the ai-engine proxy, the sync engine (sync-push/sync-pull/sync-reserve/sync-audio/sync-reconcile), the async extraction plane (extract-submit/extract-runner/extract-results), transcription (transcribe-* ops + assemblyai-webhook + transcribe-drain), and identity/webhooks (resolve-identity, clerk-webhook, revenuecat-webhook).
-- External services: Anthropic + Gemini (LLM), AssemblyAI (transcription), Cohere (embeddings), Brevo (transactional email), Clerk (auth/JWT + Svix webhooks), RevenueCat (entitlements), Supabase Vault (KEK).
+The entire backend is the `supabase/` part of the RollingRecord monorepo. The repository is deliberately organized so each part (client, backend, evals) maps 1:1 to a future standalone repository, extractable with a mechanical `git filter-repo` rather than an archaeology project. Nothing about the backend assumes it shares a process, a deploy, or a build with the Android client; the only sanctioned cross-part contracts are the error-code registry mirror and the wire shapes the client and server agree on.
 
-<Note>
-Scaffold generated from the codebase map — expand with full detail, examples, and specifics.
-</Note>
+Inside `supabase/`, functions live under `functions/`, shared logic under `functions/_shared/`, schema under `migrations/`, human-facing docs under `docs/`, admin tooling under `scripts/`, and Deno unit tests under `tests/`.
+
+## The recurring invariants
+
+Three decisions recur so often they get their own pages:
+
+| Decision | What it fixes | Page |
+| --- | --- | --- |
+| **Config split** | Every config value has exactly one home — `server_config` (server-authoritative ceilings, caps, allowlists) or Firebase Remote Config (client-only preferences). No value is intentionally duplicated. | [The config split](/rollingrecord/backend/architecture/config-split) |
+| **Deletion cascade** | Deleting one `canonical_users` row erases the user everywhere — every table via `auth_user_id` foreign keys with `ON DELETE CASCADE`, every Storage object via the user-id path prefix, and the no-FK stragglers via `delete-user`. | [The deletion cascade](/rollingrecord/backend/architecture/deletion-cascade) |
+| **Single identity** | One platform-agnostic identity column, `auth_user_id TEXT`, is the join key across the whole schema. The historical `canonical_user_id` / `rc_customer_id` surrogates were collapsed into it. | [The identity model](/rollingrecord/backend/architecture/identity-model) |
+
+These are enforced, not aspirational: the deletion cascade is exercised by the `delete-user` wipe list, the config split is checked at review time against the `server_config` migration + `ServerConfig.kt` pairing, and the identity column is the FK target every user-data migration must reference.
+
+## Where to go next
+
+- [The config split](/rollingrecord/backend/architecture/config-split) — where each config value lives and why duplication is the exception.
+- [The deletion cascade](/rollingrecord/backend/architecture/deletion-cascade) — how account deletion reaches every row and object.
+- [The identity model](/rollingrecord/backend/architecture/identity-model) — the single `auth_user_id` column and the identities behind it.
+- [The gate chain](/rollingrecord/backend/gates/run-gates) — the admission order every function shares.

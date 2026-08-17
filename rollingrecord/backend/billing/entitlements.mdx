@@ -1,14 +1,82 @@
 ---
 title: "Entitlement Taxonomy"
-description: "The full entitlement taxonomy and how the tier cascade resolves."
+description: "The eight-entitlement RevenueCat taxonomy, the tier cascade that builds a user's effective set, the developer bypass, and the at-least-one-of tier gate."
 ---
 
-A central taxonomy defines every entitlement key and the cascade that resolves a user's effective tier.
+Entitlements are how the backend decides what a caller is allowed to do. The system has three layers: a pure taxonomy that declares the entitlements, a resolver that cascades tiers into an effective set, and a gate wrapper that enforces an at-least-one-of match. RevenueCat is authoritative for entitlement state; the database only mirrors lifetimes and dev grants as an audit ledger.
 
-## What this covers
+## The taxonomy
 
-- _shared/billing/entitlements.ts full taxonomy + cascade (getEffectiveEntitlementKeys); tiers pro/pro_cloud/pro_cloud_ai, developer, lifetime variants, founders_edition; activeRecurringSubKeys for the delete-user block.
+`_shared/billing/entitlements.ts` is a pure registry — no network, no database. It declares exactly eight entitlements in `ENTITLEMENTS` (typed `as const satisfies Record<string, EntitlementMeta>`), each with a `lookupKey`, `displayName`, `tier`, `kind`, `hasSku`, `description`, and `bypassesCaps`. `bypassesCaps` is `true` on `developer` and nothing else.
 
-<Note>
-Scaffold generated from the codebase map — expand with full detail, examples, and specifics.
-</Note>
+| lookupKey | tier | kind | hasSku | bypassesCaps |
+| --- | --- | --- | --- | --- |
+| `pro` | `pro` | `recurring_sub` | yes | no |
+| `pro_cloud` | `pro_cloud` | `recurring_sub` | yes | no |
+| `pro_cloud_ai` | `pro_cloud_ai` | `recurring_sub` | yes | no |
+| `lifetime_pro` | `pro` | `internal_lifetime` | no | no |
+| `lifetime_pro_cloud` | `pro_cloud` | `internal_lifetime` | no | no |
+| `lifetime_pro_cloud_ai` | `pro_cloud_ai` | `internal_lifetime` | no | no |
+| `founders_edition` | `pro` | `public_lifetime` | yes | no |
+| `developer` | `pro_cloud_ai` | `internal_ops` | no | yes |
+
+`EntitlementKind` is the union `'recurring_sub' | 'internal_lifetime' | 'public_lifetime' | 'internal_ops'`. Only `founders_edition` is a **public** lifetime (sold with a one-time SKU); the three `lifetime_*` keys are **internal** comp/employee grants that are never sold. `developer` is `internal_ops` — not a commerce construct at all, granted through the RC dashboard for internal testing.
+
+## Tiers and the cascade
+
+`TIER` names the three capability levels — `PRO='pro'`, `PRO_CLOUD='pro_cloud'`, `PRO_CLOUD_AI='pro_cloud_ai'` — ordered so each includes the ones below it. Those strings appear as the `lifetime_entitlements.tier` CHECK values, as keys added to the effective-entitlement `Set`, and as the `required` field in a `subscription_required` response.
+
+`getEffectiveEntitlementKeys` (in `_shared/billing/revenuecat.ts`, **not** `entitlements.ts`) applies the cascade. It reads the raw active keys, finds the highest tier held via `ENTITLEMENT_BY_LOOKUP`, and adds every tier at-or-below it to the set. The raw RC keys stay in the set too, so callers that need to distinguish "lifetime vs recurring" or "founders vs employee-comp" can still read the raw key.
+
+| Raw key held | Effective set after cascade |
+| --- | --- |
+| `pro_cloud_ai` (recurring) | `{pro_cloud_ai, pro_cloud, pro}` |
+| `lifetime_pro_cloud_ai` | `{lifetime_pro_cloud_ai, pro_cloud_ai, pro_cloud, pro}` |
+| `founders_edition` | `{founders_edition, pro}` |
+| `developer` (synthesized) | `{developer, pro_cloud_ai, pro_cloud, pro}` |
+
+## The gate wrapper
+
+`_shared/gates/entitlement.ts` is the thin gate-shaped wrapper around the taxonomy and the RC client. It exposes two functions:
+
+- `fetchEffectiveEntitlements(authUserId)` — the orchestrator. It runs `isDeveloperAccount()` first (always-DB), and if the caller is a dev it returns `devEntitlementSet()` without ever touching RC. Non-dev callers fall through to `getEffectiveEntitlementKeys()`; an RC error fails **closed** to `entitlement_check_failed` (502). Returns `{response, isDeveloper, activeEntitlements}`.
+- `checkEntitlement(active, required)` — enforces an at-least-one-of match. Returns `null` on pass, or a 403 `subscription_required` whose body carries `required_entitlement = required[0]` so the client can render "upgrade to `<tier>`" messaging. An empty `required` list always passes.
+
+Because a dev's synthesized set already contains `pro_cloud_ai` and the lower tiers, any `requiredEntitlement` list is satisfied transparently by the cascade — no special-casing inside `checkEntitlement`.
+
+## The developer bypass
+
+Dev status lives in its own file, `_shared/billing/developer.ts`, deliberately separated from the RC path to stay cache-immune. `isDeveloperAccount(authUserId)` **always** hits the database — no caching — reading `lifetime_entitlements` for a row with `rc_entitlement = 'developer'` and `revoked_at IS NULL`. It retries up to `DEV_LOOKUP_MAX_ATTEMPTS` (3) with `DEV_LOOKUP_BACKOFF_MS` of `[50, 150]` and fails closed to `false` when all attempts are exhausted.
+
+This separation fixed a cache-poisoning bug: the dev check used to live inside `getActiveEntitlementKeys()`, and a transient DB miss would fall through to RC, cache an empty set for 5 minutes, and silently deny dev-bypass for hundreds of subsequent requests. `devEntitlementSet()` returns `{developer, pro_cloud_ai, pro_cloud, pro}`, mirroring the cascade so RC is never hit for a confirmed dev.
+
+Because `DEVELOPER.tier` is `pro_cloud_ai`, the cascade auto-adds `pro_cloud` and `pro`, satisfying every tier gate; combined with `bypassesCaps = true` (the only entitlement with it) this also skips the usage-cap check and the rate-limit check. Dev bypass is a quota exception only — see [Dev bypass scope](/rollingrecord/backend/gates/dev-bypass-scope).
+
+## Derived helpers
+
+The taxonomy exports several slices used across the backend:
+
+| Symbol | Purpose |
+| --- | --- |
+| `ENTITLEMENT_BY_LOOKUP` | Reverse index `lookup_key` → `EntitlementMeta`; resolves any raw RC key to its tier/kind. |
+| `LIFETIME_LOOKUP_KEYS` | Every internal + public lifetime key (includes `founders_edition`, excludes recurring subs and `developer`). |
+| `INTERNAL_OPS_LOOKUP_KEYS` | Internal-ops keys — currently just `['developer']`. |
+| `WEBHOOK_MIRRORED_LOOKUP_KEYS` | `LIFETIME_LOOKUP_KEYS` + `INTERNAL_OPS_LOOKUP_KEYS` — exactly what the webhook mirrors into `lifetime_entitlements`. Recurring subs are excluded because Gate 2 reads them live from RC. |
+| `hasCapBypass(keys)` | `true` if any key has `bypassesCaps = true`. Drives the ai-engine usage-cap and rate-limit dev skip (replaced the old `developer_accounts` table lookup). |
+| `activeRecurringSubKeys(keys)` | Every `recurring_sub` key in the set; `delete-user` uses it to block deletion while a live store sub exists. Lifetimes and `developer` are never returned. |
+| `computeLifetimeStatus(keys)` | `{isFounder, lifetimeTier}` — `isFounder` is `true` only when `founders_edition` is present; `lifetimeTier` is the tier of the highest lifetime held, `null` if none. |
+| `ENTITLEMENT_TO_TIER` | `lookup_key` → tier map, used to populate `lifetime_entitlements.tier` on ingest. |
+
+## The `lifetime_entitlements` audit table
+
+Defined in `migrations/20260508000000_baseline.sql`, this is the audit ledger for persistent tier grants — the intent record behind RC's authoritative enforcement. Columns: `id` (uuid PK), `email_hash` (`TEXT NOT NULL`), `auth_user_id` (`TEXT`, nullable — nulled on revoke to pseudonymize), `tier`, `source`, `rc_entitlement`, `granted_at`, `granted_by`, `revoked_at`, `revoked_reason`, `notes`.
+
+CHECK constraints pin the vocabulary: `rc_entitlement` ∈ `{lifetime_pro, lifetime_pro_cloud, lifetime_pro_cloud_ai, founders_edition, developer}`; `source` ∈ `{founders_edition_purchase, employee_perk, manual_admin, developer}`; `tier` ∈ `{pro, pro_cloud, pro_cloud_ai}`. The `revenuecat-webhook` Edge Function is the sole writer; `isDeveloperAccount` is the only reader (`is_founder` is derived live from the RC effective entitlement set via `computeLifetimeStatus`, with no DB reads — it does not read this table). The one non-webhook mutation is `revokeOnAccountDeletion` (in `_shared/billing/lifetime-entitlements.ts`), a belt-and-suspenders backup called by `delete-user` that sets `revoked_at` + `revoked_reason = 'account_deletion'` and nulls `auth_user_id` on every active row while retaining `email_hash` for audit.
+
+## Related pages
+
+- [RevenueCat integration](/rollingrecord/backend/billing/revenuecat) — how the webhook writes this table and reads entitlements live.
+- [Credits & bundles](/rollingrecord/backend/billing/credits-and-bundles) — bonus credit beyond tier caps.
+- [Per-user financials](/rollingrecord/backend/billing/financials) — revenue and cost accounting.
+- [Entitlement & grace gate](/rollingrecord/backend/gates/entitlement-and-grace) and [Dev bypass scope](/rollingrecord/backend/gates/dev-bypass-scope) — enforcement in the gate chain.
+- [delete-user](/rollingrecord/backend/accounts/delete-user) — active-sub deletion block and lifetime revoke.

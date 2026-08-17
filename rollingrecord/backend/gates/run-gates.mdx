@@ -1,16 +1,81 @@
 ---
 title: "The runGates() Admission Chain"
-description: "The single declarative admission chain every Edge Function routes through, in a fixed non-reorderable order."
+description: "The single declarative dispatcher every Edge Function routes through, running a fixed non-reorderable admission order derived from one GateConfig object."
 ---
 
-Every Edge Function admits requests through one declarative runGates() call with a fixed, non-reorderable gate order.
+Every Edge Function replaces a hand-rolled gate chain with one call: `runGates(req, config)` in `functions/_shared/gates/index.ts`. The dispatcher runs a fixed, non-reorderable sequence and returns either a short-circuit failure or a type-narrowed success context — so a mistake like "rate limit before JWT" is structurally impossible.
 
-## What this covers
+## The dispatcher
 
-- Single declarative entry point in _shared/gates/index.ts; fixed, non-reorderable order: method to App Check to App Version to JWT to entitlement fetch to entitlement check to account-freeze to rate-limit sugar.
-- The GateConfig union (JwtGateConfig / WebhookSecretGateConfig / NoAuthGateConfig) drives a type-narrowed ResolvedContext (reading authUserId on a webhook handler is a compile error).
-- Opt-outs (skipAppCheck, skipAppVersion) require a // OPT-OUT: reason comment; current opt-outs include server-config and revenuecat-webhook.
+`runGates<C extends GateConfig>(req, config)` returns `Promise<ResolvedContext<C>>`, which is a union of two shapes:
 
-<Note>
-Scaffold generated from the codebase map — expand with full detail, examples, and specifics.
-</Note>
+| Outcome | Shape | Meaning |
+| --- | --- | --- |
+| Failure | `GateFailureCtx` — `{ response: Response }` | A gate rejected the caller; the handler returns `ctx.response` verbatim. |
+| Success | mode-specific context, `response: null` | Admitted; the handler reads the fields for its auth mode. |
+
+The success type is narrowed by `config.auth`. A `JwtGateConfig` yields `JwtSuccessCtx` with `authUserId` typed; a `WebhookSecretGateConfig` yields `WebhookSuccessCtx` with no user fields at all — reading `authUserId` on a webhook handler is a compile error, not a runtime surprise.
+
+```ts
+const ctx = await runGates(req, {
+  method: HttpMethod.Post,
+  auth: AuthMode.Jwt,
+  entitlement: [Entitlement.ProCloudAi],
+  rateLimit: { bucket: Bucket.AiEngine },
+})
+if (ctx.response) return ctx.response
+const { authUserId, isDeveloper, isGracePeriod } = ctx
+```
+
+## Fixed admission order
+
+For a JWT function with every option set, the chain runs in this order. Each gate lives in its own file under `functions/_shared/gates/`.
+
+| Step | Gate | Runs when | Opt-out / skip | File |
+| --- | --- | --- | --- | --- |
+| 1 | HTTP method | always | none (`method` required) | `method.ts` |
+| 2 | App Check | `!config.skipAppCheck` | `skipAppCheck: true` | `app-check.ts` |
+| 3 | App Version floor | `!config.skipAppVersion` | `skipAppVersion: true` | `app-version.ts` |
+| 4 | Auth | always (mode-specific) | `AuthMode.None` does no auth | `jwt.ts` / `webhook-secret.ts` |
+| 5 | Entitlement fetch | JWT only | always — derives `isDeveloper` | `entitlement.ts` |
+| 6 | Entitlement check | JWT only, when `entitlement: [...]` set | grace fallback via `allowGracePeriodRead` | `entitlement.ts` + `grace.ts` |
+| 7 | Account-freeze check | JWT only (RR-310) | none — no bypass, even for dev | `account-frozen.ts` |
+| 8 | Rate-limit sugar | when `rateLimit: { bucket }` set | skipped for developer callers | `rate-limit.ts` |
+
+Step 5 runs for **every** JWT caller even when no `entitlement: [...]` is declared, because it is what derives `isDeveloper` for the dev-bypass path. Step 6 — the at-least-one-of match — is the part that only runs when a requirement is declared.
+
+## Why rate-limit sits last
+
+The entitlement check (step 6) is deliberately ahead of the rate-limit step (step 8). A non-paying caller gets `403 subscription_required` on their first request rather than spending rate budget to also collect a `429`. Dev callers never reach the rate-limit step at all (chain sugar is skipped for them), so the only population that actually hits the limiter is entitled, non-developer callers — exactly the set worth rate-limiting. The account-freeze check (step 7) also precedes rate-limit so a frozen account's rejections consume no quota.
+
+## GateConfig shapes
+
+`GateConfig` is a discriminated union of three concrete configs, all extending `GateConfigBase` (which carries the required `method` plus the `skipAppCheck` / `skipAppVersion` opt-outs). Each endpoint passes exactly one.
+
+| Config | `auth` | Extra fields |
+| --- | --- | --- |
+| `JwtGateConfig` | `AuthMode.Jwt` | `entitlement?`, `allowGracePeriodRead?`, `rateLimit?` |
+| `WebhookSecretGateConfig` | `AuthMode.WebhookSecret` | `secretEnvVar?` (default `REVENUECAT_WEBHOOK_SECRET`), `rateLimit?` |
+| `NoAuthGateConfig` | `AuthMode.None` | `rateLimit?` — but declaring it **throws at startup** |
+
+`AuthMode.None` with a `rateLimit` set is not silently ignored: the dispatcher throws `Error("runGates: rateLimit sugar is not supported for AuthMode.None...")` because there is no subject-key strategy for anonymous callers yet.
+
+## The resolved success context
+
+| Context | Fields |
+| --- | --- |
+| `JwtSuccessCtx` | `response: null`, `auth`, `authUserId`, `email`, `isDeveloper`, `activeEntitlements`, `isGracePeriod` |
+| `WebhookSuccessCtx` | `response: null`, `auth` — no user identity |
+| `NoAuthSuccessCtx` | `response: null`, `auth` — no user identity |
+
+`RateLimitSugar` (`bucket`, optional `gracePeriodBucket`, optional `abuseEventOnReject`) is the chain-sugar shape for "one limit, keyed on `authUserId`, after auth." On a webhook function the subject key is the prefixed string `__webhook__:<bucket>`, so all webhook callers of that bucket share one counter; there is no dev bypass in that branch.
+
+## Where to go next
+
+- [Method, App Check & App Version](/rollingrecord/backend/gates/method-appcheck-version) — the first three structural gates and their skip opt-outs.
+- [JWT auth](/rollingrecord/backend/gates/jwt-auth) — Clerk RS256 verification and the `VerifyBearerResult` union.
+- [Webhook & server-to-server auth](/rollingrecord/backend/gates/webhook-secret) — the shared-secret branch.
+- [Entitlement, dev bypass & grace](/rollingrecord/backend/gates/entitlement-and-grace) — tier resolution and the 30-day read-grace window.
+- [Rate limiting & buckets](/rollingrecord/backend/gates/rate-limiting) — the bucket taxonomy and chain-sugar vs standalone wiring.
+- [Account-freeze gate](/rollingrecord/backend/gates/account-frozen) — the RR-310 soft-block.
+- [Developer bypass scope](/rollingrecord/backend/gates/dev-bypass-scope) — exactly what a dev account may and may not skip.

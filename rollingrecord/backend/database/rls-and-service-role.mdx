@@ -1,14 +1,46 @@
 ---
 title: "RLS & Service-Role Model"
-description: "Why every table has RLS enabled with no policies, and how Edge Functions access data."
+description: "Why every table enables RLS with no policies, and how Edge Functions reach the data while direct callers get nothing."
 ---
 
-Every table enables Row Level Security with no policies — the safe default — while Edge Functions use the service role key.
+Every table runs with Row Level Security enabled and zero policies — the default-safe state for this architecture. Edge Functions reach data through a service-role client that bypasses RLS; a direct anon-key or user-JWT caller resolves to zero rows. There is no client-direct table access by design — every read and write routes through an Edge Function behind the gate chain.
 
-## What this covers
+## Who can reach a row
 
-- Every table has ENABLE ROW LEVEL SECURITY with no policies = the safe default; Edge Functions use the service role key (bypass RLS), the anon key gets nothing.
+| Caller | Key | RLS effect |
+| --- | --- | --- |
+| Edge Function | service role (`SUPABASE_SERVICE_ROLE_KEY`) | Bypasses RLS — full access |
+| Direct anon caller | anon key (extractable from the APK) | RLS on + no policies → zero rows |
+| Direct authenticated caller | user JWT | RLS on + no policies → zero rows (no client-direct access by design) |
 
-<Note>
-Scaffold generated from the codebase map — expand with full detail, examples, and specifics.
-</Note>
+Because RLS is enabled with no permissive policy, the gate chain — not RLS policies — is the actual authorization layer. `runGates()` / `GateConfig` (`supabase/functions/_shared/gates/types.ts`) fronts every Edge Function with a fixed admission order (method → App Check → app-version → JWT → entitlement fetch → entitlement check → optional rate-limit).
+
+## The service-role client
+
+`getServiceClient()` (`supabase/functions/_shared/db/client.ts`) is the single service-role client factory, with supabase-js pinned at `2.45.4`. It reads the auto-injected `SUPABASE_URL` and `SUPABASE_SERVICE_ROLE_KEY`, disables session persistence and auto-refresh, and bypasses RLS. Its header comment is explicit: never expose it to client-facing code.
+
+## RLS on every table, no policies
+
+The baseline (`supabase/migrations/20260508000000_baseline.sql`) issues `ALTER TABLE ... ENABLE ROW LEVEL SECURITY` for every table and defines no `CREATE POLICY` anywhere. The tables also carry `GRANT ALL ... TO anon`, `TO authenticated`, and `TO service_role`, but with RLS enabled and no permissive policy those anon/authenticated grants resolve to nothing — only the service role reaches rows. The grant is present; the policy that would make it usable is deliberately absent.
+
+## Deletion integrity is what makes closed-RLS safe
+
+A closed-RLS model is only complete if account deletion still reaches every row. That guarantee comes from `auth_user_id` FK + CASCADE, not from RLS. Every user-data table carries `auth_user_id TEXT NOT NULL` with `fk_<table>_user REFERENCES canonical_users(auth_user_id) ON DELETE CASCADE`, so deleting one `canonical_users` row cascades the whole account. Cross-row FKs use CASCADE (session → recording) or SET NULL (category).
+
+A few tables deliberately have **no** FK to `canonical_users` and are cleaned explicitly by `wipeUser()` (`supabase/functions/_shared/users/wipe.ts`) instead of by CASCADE:
+
+| No-FK table | Why it floats |
+| --- | --- |
+| `usage` | Anti-abuse: counters survive a deletion race to be snapshotted first |
+| `query_sessions` | Ephemeral, often written before the caller's `canonical_users` row exists |
+| `l_credit_log` | Financial-audit survival across deletion races |
+| `user_credits` | Bundle / admin-grant balances survive long enough for an explicit wipe |
+
+Storage objects never CASCADE either, so `wipeUser`'s `BUCKETS_TO_WIPE` removes those separately. The model is therefore not "CASCADE handles everything" — it is "CASCADE plus an explicit wipe list for the floating tables and buckets."
+
+## Related pages
+
+- [Migration discipline](/rollingrecord/backend/database/migrations-discipline) — the RLS-on-create rule at migration write time
+- [server_config & rate_limit_config](/rollingrecord/backend/database/config-tables) — service-role-only config reads
+- [High-risk tables registry](/rollingrecord/backend/database/high-risk-tables)
+- [c_recordings integrity](/rollingrecord/backend/database/c-recordings-integrity)

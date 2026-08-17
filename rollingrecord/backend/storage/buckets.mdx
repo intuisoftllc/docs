@@ -1,15 +1,49 @@
 ---
 title: "Storage Buckets"
-description: "The Storage buckets, their contents, and the user-scoped path convention."
+description: "The five Storage buckets, their privacy posture, the auth_user_id-first path convention, and which ones the janitor allowlist and delete-user wipe cover."
 ---
 
-A few Storage buckets hold encrypted audio, embedding bundles, and public brand assets, all under a user-scoped path convention.
+RollingRecord uses five Supabase Storage buckets. Four are private and hold user data keyed by the caller's `auth_user_id`; one is public and deliberately sits outside that convention. Every user-data object's first path segment is the owner's `auth_user_id` (the Storage HARD RULE), which is what makes account-deletion cleanup a recursive walk of one folder per user.
 
-## What this covers
+## The buckets
 
-- audio-storage (encrypted .enc audio blobs at &#123;uid&#125;/&#123;rid&#125;.enc), embedding-storage (embedding bundle cache), brand-assets (public, migration 20260816120000); the retired job-plane bucket (extraction moved to DB columns).
-- The path convention &#123;bucket&#125;/&#123;auth_user_id&#125;/... and its role in deletion cleanup.
+| Bucket | Public | Contents | Object path | In janitor allowlist | In delete-user wipe |
+| --- | --- | --- | --- | --- | --- |
+| `audio-storage` | private | AES-256-GCM audio ciphertext | `{auth_user_id}/{recording_id}.enc` | yes | yes |
+| `embedding-storage` | private | sealed embedding-bundle blobs | `{auth_user_id}/{owner_kind}-{owner_id}.bin` | yes | yes |
+| `transcribe-inbox` | private | transcription source audio | `{auth_user_id}/...` | yes | yes |
+| `job-plane` | private | transient extraction input / results / state | `{auth_user_id}/jobs/{job_id}/...` | no | no |
+| `brand-assets` | public | static brand images (app icon for emails) | `<path>` (no user segment) | no | no |
 
-<Note>
-Scaffold generated from the codebase map — expand with full detail, examples, and specifics.
-</Note>
+Two of these bucket **rows are not created by any migration** in the repo — `audio-storage` and `transcribe-inbox` are only referenced (e.g. the baseline's `bucket_id = 'audio-storage'` predicate), so they were created via the dashboard before the baseline was captured. Only `embedding-storage`, `job-plane`, and `brand-assets` have an `INSERT INTO storage.buckets` migration.
+
+## audio-storage
+
+The private home for cloud-synced recordings. `sync-reserve` (`functions/sync-reserve/index.ts`) builds the deterministic path `${authUserId}/${recordingId}.enc` and mints a signed upload URL via `createSignedUploadUrl(..., { upsert: true })`; `sync-audio` uses the same path. The `.enc` extension is a cue that the blob is ciphertext — the bytes were sealed on-device with the recording's DEK, so the server stores opaque data. The row's crypto columns live on `c_recordings`; see [Envelope Encryption Model](/rollingrecord/backend/storage/envelope-encryption).
+
+## embedding-storage
+
+Private, service-role only, created by migration `20260722130000_embedding_bundle_catalog.sql` (`public = FALSE`). It holds the sealed vector blobs for semantic search. `bundleStoragePath` (`functions/_shared/embeddings/bundle.ts`) computes `${authUserId}/${ownerKind}-${ownerId}.bin` — flat under the user folder, with `owner_kind` as a filename **prefix**, not a folder level, so the delete-user wipe reaps every bundle in one recursive walk while `auth_user_id` stays the first segment. See [Server-Side Embeddings](/rollingrecord/backend/storage/semantic-search).
+
+## transcribe-inbox
+
+Private. Holds the source audio a transcription job runs against, keyed under `{auth_user_id}/`. It is a first-class user-data bucket: it appears in both the janitor allowlist and the delete-user wipe, and the orphan-lister runs a dedicated `sweepTranscribe` pass against it (see [Storage Janitors & Orphan Reaping](/rollingrecord/backend/storage/janitors)).
+
+## job-plane
+
+Private, created by migration `20260720160000_extraction_jobs_foundation.sql` (`public = FALSE`) as the extraction "kitchen" — transient per-job input, results, and `state.json` at `job-plane/{auth_user_id}/jobs/{job_id}/...`. It is **largely superseded**: migration `20260721000000_extraction_payload_in_db.sql` moved the extraction payload to DB columns and retired the direct `storage.objects` DELETE. The bucket row is never dropped, so it still exists, but it is out of scope for the storage section — it is neither in the janitor allowlist nor the delete-user wipe.
+
+## brand-assets
+
+The one **public** bucket, created by migration `20260816120000_create_brand_assets_public_bucket.sql`: `public = TRUE`, a 5 MiB (`5242880`) per-object size limit, and an allowed-MIME list of `image/png`, `image/jpeg`, `image/webp`, `image/svg+xml`. It serves static brand images (the app icon referenced by server-sent transactional emails) read-only at `/storage/v1/object/public/brand-assets/<path>`; writes are service-role only. Because it holds no user data, it is intentionally **outside** the `auth_user_id`-path convention and outside delete-user's scope.
+
+## Deletion coverage
+
+Storage objects never CASCADE with a row delete, so a bucket is only cleaned when it is named in a wipe list. `BUCKETS_TO_WIPE` in `functions/_shared/users/wipe.ts` is exactly `['transcribe-inbox', 'audio-storage', 'embedding-storage']`; delete-user walks each recursively via `wipeBucketFolder(bucket, authUserId)`. The janitor's `ALLOWED_BUCKETS` (`functions/storage-janitor/buckets.ts`) is the same three buckets — the only buckets any sweep is permitted to delete from. `job-plane` and `brand-assets` are in neither list by design.
+
+## Related pages
+
+- [Storage Janitors & Orphan Reaping](/rollingrecord/backend/storage/janitors) — the allowlist and the per-bucket orphan sweeps
+- [Envelope Encryption Model](/rollingrecord/backend/storage/envelope-encryption) — how the audio ciphertext is sealed
+- [Server-Side Embeddings](/rollingrecord/backend/storage/semantic-search) — the bundle format stored in embedding-storage
+- [KEK Lifecycle & user_crypto](/rollingrecord/backend/storage/key-management) — the keys that decrypt these blobs

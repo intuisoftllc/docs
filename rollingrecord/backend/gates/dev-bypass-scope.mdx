@@ -1,16 +1,49 @@
 ---
 title: "Developer Bypass Scope"
-description: "Exactly what developer accounts may skip (quotas) and what they must never skip (structural validation and cost accounting)."
+description: "Exactly what a developer account may skip — entitlement, caps, rate limits — and what it must never skip: structural validation, cost accounting, and the freeze gate."
 ---
 
-Developer bypass is a quota exception, not a validation-or-cost exception — structural checks and cost accounting always run.
+A developer account holds the `developer` RC entitlement, whose metadata (`ENTITLEMENTS.DEVELOPER` in `functions/_shared/billing/entitlements.ts`) sets `bypassesCaps: true` and maps to the `pro_cloud_ai` tier. Dev bypass means **unlimited access, not "anything goes."** It skips quotas; it never skips structural validation, cost accounting, or safety primitives.
 
-## What this covers
+## How isDeveloper is derived
 
-- What dev bypass MAY skip: Gate 4 entitlement, Gate 5 caps + enforced quota-counter increments, Gate 6 rate limits.
-- What it MUST NEVER skip: structural validation (App Check, body parse, operation/model allowlist, transcribe duration format, kb_query round budget) AND cost accounting (f_user_financials.ai_cost_micros) + token-throughput analytics (usage.input_tokens/output_tokens).
-- The classification rule for new checks: a limit/quota is dev-skippable; structural/format/safety is unconditional.
+`isDeveloper` is resolved by `isDeveloperAccount()` (`functions/_shared/billing/developer.ts`) — always-DB, never cached, 3-attempt retry, fails closed — inside `fetchEffectiveEntitlements`. A confirmed dev gets a locally-synthesized set from `devEntitlementSet()` (`{ developer, pro_cloud_ai, pro_cloud, pro }`), skipping RevenueCat entirely so the bypass survives RC outages. `hasCapBypass(keys)` confirms the flag by checking whether any held key's metadata sets `bypassesCaps` — currently only `developer` does.
 
-<Note>
-Scaffold generated from the codebase map — expand with full detail, examples, and specifics.
-</Note>
+## What dev bypass MAY skip vs MUST NEVER skip
+
+| Category | Dev behavior | Examples |
+| --- | --- | --- |
+| Entitlement check (Gate 6) | MAY skip (held implicitly via cascade) | any `requiredEntitlement` is auto-satisfied |
+| Usage caps + enforced quota increments (in-handler, e.g. ai-engine — not a runGates step) | MAY skip | `ai_queries`, `transcription_ms`, `extraction_ms`, `syntheses`, `custom_templates` |
+| Rate limits (Gate 8) | MAY skip | `checkRateLimit` short-circuits, counter untouched |
+| Cost accounting + token analytics | MUST NEVER skip | `f_user_financials.ai_cost_micros`, `usage.input_tokens` / `output_tokens` |
+| Structural / format / safety validation | MUST NEVER skip | method, App Check, body parse, operation validation, model allowlist, `missing_request_body` / `missing_model`, `invalid_audio_duration_seconds`, kb_query round budget |
+| Account-freeze gate | MUST NEVER skip | `runAccountFrozenGate` applies to dev too |
+
+## The skip mechanics
+
+In `functions/_shared/gates/rate-limit.ts`, `isDeveloper = true` short-circuits `checkRateLimit` to `allowed: true` **without incrementing** `rate_limit_counters` — a dev never consumes or trips a rate limit, and every caller threads `isDeveloper` through. The entitlement check is held implicitly: the cascade in `devEntitlementSet()` already satisfies any `entitlement: [...]` requirement, so a dev never fails Gate 6 and — because they pass entitlement normally — never reaches the grace fallback, so `isGracePeriod` is always `false` for a dev.
+
+## Cost and token analytics are recorded
+
+Dev bypass is a quota exception, not a diagnostics exception. `f_user_financials.ai_cost_micros` (via `trackTokenUsage` and the `assemblyai-webhook`) and the throughput counters `usage.input_tokens` / `usage.output_tokens` are **still recorded** for dev accounts — a dev's real spend and token throughput are useful, harmless data, and neither token column is an enforced cap. Only the enforced quota counters incremented in the gate chain are dev-skipped.
+
+## Structural validation stays on
+
+Everything that is a bug or a forged payload rather than a quota still applies to dev requests: HTTP method, App Check, body parsing, operation-field validation, the model allowlist (a cost + safety gate, not a quota), the `missing_request_body` / `missing_model` envelope checks, `invalid_audio_duration_seconds`, and the kb_query round budget. In particular `max_rounds_exceeded` / session-token round enforcement still applies to dev so the round-budget mechanism is exercised end-to-end during testing — only the monthly quota counters are dev-skipped. The account-freeze gate (see [account-freeze](/rollingrecord/backend/gates/account-frozen)) applies to dev accounts too, because a freeze is a safety primitive, not a quota.
+
+## The classification rule for new checks
+
+When adding a new Edge Function check, classify it first:
+
+- **A limit or quota** (cap, rate limit, tier gate) → dev may skip it; gate behind `!ctx.isDeveloper`.
+- **A structural / format / safety validation** (type check, allowlist, required field, session-token round budget, freeze) → dev must not skip it; keep it unconditional.
+
+When unsure, the default is **don't skip for dev** — validating a dev request the same way as a regular user's is always safe, and the dev account still gets the unlimited access it needs from the quota bypass.
+
+## Related
+
+- [The runGates() admission chain](/rollingrecord/backend/gates/run-gates) — the gate steps dev bypass affects.
+- [Entitlement, dev bypass & grace](/rollingrecord/backend/gates/entitlement-and-grace) — how `isDeveloper` is derived during entitlement fetch.
+- [Rate limiting & buckets](/rollingrecord/backend/gates/rate-limiting) — the counter short-circuit for dev callers.
+- [Account-freeze gate](/rollingrecord/backend/gates/account-frozen) — a must-never-skip that applies to dev accounts.

@@ -1,16 +1,83 @@
 ---
 title: "Rate Limiting & Buckets"
-description: "The fixed-window rate limiter, the bucket taxonomy, and how to add a new bucket."
+description: "The atomic fixed-window rate limiter, the bucket taxonomy, the rate_limit_config table with BUCKET_DEFAULTS fallback, and chain-sugar vs standalone usage."
 ---
 
-Fixed-window counters keyed on the caller enforce per-bucket velocity limits, with developers short-circuited.
+Rate limiting is a standalone callable, not a fixed slot in the chain. `checkRateLimit(bucket, authUserId, isDeveloper, weight)` in `functions/_shared/gates/rate-limit.ts` reads the bucket's config, runs an atomic increment RPC, and returns a gate result the caller pattern-matches. `runGates` offers optional chain sugar around it for the common case; handlers that need per-operation or non-`authUserId` limits call it directly.
 
-## What this covers
+## The check
 
-- rate-limit.ts fixed-window counters keyed on authUserId, short-circuits for developers; chain-sugar (rateLimit with a bucket) vs standalone checkRateLimit() for per-op/multi-dimensional cases.
-- The Bucket enum (_shared/gates/types.ts) with real buckets: ai_engine, ai_extraction, extraction_submit, extraction_status, sync_push/sync_pull/sync_reserve/sync_reconcile, sync_audio, sync_download_grace, search, indexing, embedding_cache, support_ops, support_token_generate, recovery_code_*, account_otp_*, delete_user.
-- Adding a bucket: enum member + BUCKET_DEFAULTS fallback + rate_limit_config seed migration; abuseEventOnReject for security-sensitive buckets; counters swept by the prune_rate_limit_counters cron.
+`checkRateLimit(bucket, authUserId, isDeveloper = false, weight = 1)` returns a `RateLimitGateResult` — `{ response }` to return immediately, or `{ response: null, result }` when admitted. Its logic:
+
+- **Dev bypass** — `isDeveloper === true` admits without touching the counter (see [dev bypass scope](/rollingrecord/backend/gates/dev-bypass-scope)).
+- **Kill-switch** — a `rate_limit_config` row with `enabled = false` admits without counting, so a bucket can be disabled live without a deploy.
+- **Atomic increment** — otherwise it calls the `check_and_increment_rate_limit` RPC and returns admitted or `429 rate_limited`.
+
+Windows are fixed and anchor to the first request after a reset, not to clock-hour boundaries. The optional `weight` (default 1) lets a caller consume more than one slot per call — a weighted increment that would exceed the cap is rejected as a whole, never partially admitted.
+
+## Configuration and fallback
+
+`getBucketConfig(bucket)` reads `rate_limit_config` (`max_requests`, `window_sec`, `enabled`) keyed on `bucket_key`, with a per-isolate `configCache`. On a missing row or DB error it falls back to the in-code `BUCKET_DEFAULTS` map — a `Record<Bucket, { max; windowSec; enabled }>` — with `enabled: true` by default, so a missing row still **enforces** at the code default rather than opening the gate.
+
+Several fallbacks are held at deliberately **half the live ceiling** so a missing-row fallback always errs below the real limit, never above it: `sync_pull` 275 vs live 550, `search` 300 vs 600, `indexing` 150 vs 300, `embedding_cache` 300 vs 600.
+
+## Fail-closed and minimal leakage
+
+An RPC error fails **closed**: `checkRateLimit` returns `500 database_error` with a `bucket` tag rather than admitting — fail-open would melt every user's limit on a single DB hiccup. On a rejection the `429` body from `rateLimitedResponseBody()` is deliberately minimal, `{ error, bucket, reset_at_sec }` — `max`, `count`, `window_sec`, and `retry_after` are all withheld so the ceiling can't be reverse-engineered.
+
+## Near-limit signal
+
+The RPC also returns `near_limit_crossed` (added by migration `20260601000000_rate_limit_near_limit_flag.sql`) — `true` the first time a call crosses 90% of `max` in a window. On that crossing `checkRateLimit` fire-and-forgets a `NearLimitApproach` (`near_limit_approach`, default weight 2) abuse event; a log failure never blocks the primary request. The chain-sugar `abuseEventOnReject` path separately logs `RateLimitHit` (`rate_limit_hit`, weight 1) on a rejection for security-sensitive buckets.
+
+## Registered buckets
+
+Every `Bucket` enum member (`functions/_shared/gates/types.ts`) has a `bucket_key` wire value, a `BUCKET_DEFAULTS` fallback, and a seeded `rate_limit_config` row.
+
+| Bucket member | `bucket_key` | Fallback max / window_sec | Purpose |
+| --- | --- | --- | --- |
+| `AiEngine` | `ai_engine` | 60 / 3600 | ai-engine runaway guard (one counter across all ops) |
+| `AiExtraction` | `ai_extraction` | 300 / 3600 | per-chunk extraction model calls, keyed on job owner |
+| `ExtractionSubmit` | `extraction_submit` | 60 / 3600 | `extract-submit` + `extract-results` (~3 calls/attempt) |
+| `ExtractionStatus` | `extraction_status` | 600 / 3600 | polled `extract-results` status / cancel progress plane |
+| `ResolveIdentity` | `resolve_identity` | 10 / 3600 | `resolve-identity` |
+| `DeleteUser` | `delete_user` | 2 / 3600 | `delete-user` |
+| `SyncAudio` | `sync_audio` | 100 / 3600 | `sync-audio` |
+| `UserKeyGet` | `user_key_get` | 40 / 3600 | `get-user-key` |
+| `UserSyncPreferences` | `user_sync_preferences` | 60 / 3600 | `user-sync-preferences` |
+| `SyncPull` | `sync_pull` | 275 (live 550) / 3600 | `sync-pull` delta pull |
+| `SyncReserve` | `sync_reserve` | 30 / 3600 | `sync-reserve` signed-URL + DEK |
+| `SyncPush` | `sync_push` | 240 / 3600 | `sync-push` + `sync-group-exclude` |
+| `SyncReconcile` | `sync_reconcile` | 60 / 3600 | `sync-reconcile` drift handshake |
+| `SupportOps` | `support_ops` | 60 / 3600 | `support-ops` admin dispatcher (after admin gates) |
+| `SupportTokenGenerate` | `support_token_generate` | 20 / 3600 | `generate-support-token` (email-spam guard) |
+| `RecoveryCodeGenerate` | `recovery_code_generate` | 60 / 3600 | `recovery-code-generate` (one-shot per account) |
+| `RecoveryCodeAcknowledge` | `recovery_code_acknowledge` | 60 / 3600 | recovery-code acknowledge |
+| `AccountOtpSend` | `account_otp_send` | 20 / 3600 | `account-otp` send (Forgot-PIN email) |
+| `AccountOtpVerify` | `account_otp_verify` | 30 / 3600 | `account-otp` verify |
+| `SyncDownloadGrace` | `sync_download_grace` | 100 / 86400 | lapsed-grace audio downloads (`gracePeriodBucket`) |
+| `Search` | `search` | 300 (live 600) / 3600 | search query embeddings |
+| `Indexing` | `indexing` | 150 (live 300) / 3600 | background reconciler / backfill embeddings |
+| `EmbeddingCache` | `embedding_cache` | 300 (live 600) / 3600 | indexing `get_bundles` / `put_bundle` cache plane |
 
 <Note>
-Scaffold generated from the codebase map — expand with full detail, examples, and specifics.
+`RecoveryCodeGenerate`'s enum doc-comment mentions a `5/hr` original intent, but the shipped `BUCKET_DEFAULTS` and live value are both `60/hr`.
 </Note>
+
+## Storage and sweeping
+
+`rate_limit_config` (one row per bucket: `bucket_key`, `max_requests > 0`, `window_sec > 0`, `enabled`, `description`, `updated_at`) is service-role only and edited live via the dashboard to tune ceilings or flip a kill-switch — it replaced per-bucket rows in `server_config` (RR-291). `rate_limit_counters` (`auth_user_id`, `bucket_key`, `window_start_sec`, `count`, PK `(auth_user_id, bucket_key)`) is written **only** by the RPC, which row-locks and uses `ON CONFLICT` for concurrency. Both are defined in `migrations/20260508000000_baseline.sql`. The `prune_rate_limit_counters` `pg_cron` sweeper (`migrations/20260628000000_prune_rate_limit_counters_cron.sql`) hard-deletes counter rows whose window started more than 86400s (24h) ago — 24h is the longest window across all buckets, so such a row is expired under every configuration.
+
+## Chain-sugar vs standalone
+
+| Path | When | Skipped for dev? |
+| --- | --- | --- |
+| `rateLimit: { bucket }` on the gate config | one limit, keyed on `authUserId`, after auth (resolve-identity, sync-pull / push / reserve / reconcile, sync-audio, user-sync-preferences, recovery-code-generate) | yes (chain sugar not run for dev) |
+| standalone `checkRateLimit()` in the handler | per-op / multi-dimensional / non-`authUserId` subject (ai-engine, extract-results, indexing, account-otp, get-user-key, delete-user, support-ops) | yes (the `isDeveloper` arg short-circuits) |
+
+Adding a bucket is a three-part change in one commit: the `Bucket` enum member, a `BUCKET_DEFAULTS` entry, and a `rate_limit_config` seed-row migration.
+
+## Related
+
+- [The runGates() admission chain](/rollingrecord/backend/gates/run-gates) — where the rate-limit sugar sits in the fixed order.
+- [Developer bypass scope](/rollingrecord/backend/gates/dev-bypass-scope) — how `isDeveloper` short-circuits the counter.
+- [Entitlement, dev bypass & grace](/rollingrecord/backend/gates/entitlement-and-grace) — the `gracePeriodBucket` swap.

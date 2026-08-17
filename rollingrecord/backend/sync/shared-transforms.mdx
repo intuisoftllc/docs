@@ -1,14 +1,64 @@
 ---
 title: "Sync Shared Modules"
-description: "The shared sync helpers that translate between wire shape and row shape."
+description: "The _shared/sync helpers every endpoint reuses: the entity registry, wire↔DB transform + per-type validation, the opaque cursor, group resolution, protocol constants, and preference loading."
 ---
 
-Shared modules under _shared/sync/ define the constants, cursor, entities, and wire-to-row transforms every sync endpoint reuses.
+`functions/_shared/sync/` holds the reusable core of the sync protocol. Six modules — the entity registry, the transform layer, the cursor, the group registry, the protocol constants, and the preference loader — are what keep all seven Edge Functions agreeing on one wire shape.
 
-## What this covers
+## The entity registry
 
-- _shared/sync/ — constants.ts, cursor.ts, entities.ts, transform.ts (wire to row shape), groups.ts; the column-spine parity between DB shape and wire shape.
+`entities.ts` is the single source of truth for what replicates. `ENTITY_REGISTRY` is 14 `EntityDef`s; each declares its `WireEntity` name, physical `c_*` table, `SyncGroup`, and an ordered list of `ColumnDef`s. `ColumnDef` is `{ wireField, dbColumn, type, nullable, writable, maxSize? }`; `EntityDef` is `{ wire, table, group, columns }`. Two shared bundles compose most rows, and `encPair` builds encrypted column pairs.
 
-<Note>
-Scaffold generated from the codebase map — expand with full detail, examples, and specifics.
-</Note>
+| Bundle | Columns | Writable? |
+| --- | --- | --- |
+| `IDENTITY` | `id` (client-writable), `auth_user_id` (server-owned) | mixed |
+| `SYNC_QUARTET` | `updated_at` (server), `deleted_at` (client), `version` (server), `cloud_excluded_at` (client) | mixed |
+| `encPair(field)` | `field_ct`, `field_iv` (both bytea, client-writable) | yes |
+
+Derived helpers: `entityByWire` / `entityByTable` (registry lookups), `writableColumns` (push), `selectColumnList` (pull SELECT list), and the RR-491 two-phase support — `isTwoPhaseEntity`, `maxRowBytes`, `tagColumnList`, and `TWO_PHASE_ROW_BYTES_THRESHOLD` (64 KB). An entity is two-phase when it has a unique `id` column AND its `maxRowBytes` ceiling exceeds the threshold; `tagColumnList` is then `` `{idCol}, updated_at` `` for the phase-1 tag select.
+
+## The transform layer
+
+`transform.ts` crosses every request and response.
+
+- `wireRowToDb(entity, wireRow, authUserId)` is the inbound transform. An unknown wire field is `validation_failed` (carries `field`); a `writable=false` column is silently dropped; a null passes through if the column is nullable, else rejects; each value is validated and converted per its type; and `auth_user_id` is always injected as the JWT caller regardless of what the client sent. Bytea values become `` \x<hex> `` for PostgREST.
+- `dbRowToWire(entity, dbRow)` is the outbound transform. It projects ONLY registry-declared columns (no `SELECT *` leak), re-encodes bytea `` \x<hex> `` → base64, and passes Postgres timestamps through VERBATIM.
+
+The verbatim-timestamp behavior is load-bearing, not incidental: Postgres `timestamptz` carries microsecond precision, but a JS `Date.toISOString()` round-trip truncates to milliseconds. Canonicalizing outbound would make a `.123456` timestamp compare as `.123` — breaking the `sync-push` LWW `known_updated_at` gate and the `sync-pull` cursor advance. Only the INBOUND `validateTimestamp` canonicalizes.
+
+## Validation vocabulary
+
+`validateAndConvert` dispatches on the `WireType`. Strict validators — `validateTimestamp`, `isValidUuid`, and `validateStoragePath` — sit in `transform.ts`.
+
+| type | Wire form → DB form | Validation |
+| --- | --- | --- |
+| `uuid` | string | `UUID_REGEX` (optional `rec-` / `ctx-` / `bp-` prefix) |
+| `string` | string | UTF-8, `maxSize` char cap |
+| `number` | number | `Number.isFinite` |
+| `boolean` | boolean | strictly `true` / `false` |
+| `bytea` | base64 → `` \x<hex> `` | base64 decode, `maxSize` byte cap |
+| `timestamp` | ISO 8601 → canonical | strict round-trip; date-only or `now()` rejected |
+| `json-string` | string | round-trip `JSON.parse`, `maxSize` |
+| `storage-path` | string | exactly `` {authUserId}/(rec-)?{uuid}.enc `` |
+
+`validateStoragePath` enforces the full path shape and blocks traversal, backslash, null-byte, and wrong-extension paths. `UUID_REGEX` accepts the three known prefixes because the underlying columns became `text` (migration `20260524000000`) to support prefixed ids.
+
+## The opaque cursor
+
+`cursor.ts` encodes and decodes the base64-JSON cursor clients treat as an opaque blob. `CURSOR_VERSION = 2` carries `CursorData` `{ ts, id, syncedAt }`; `LEGACY_CURSOR_VERSION = 1` (no `syncedAt`) still parses and forces one resync. `parseCursor` returns `empty` | `valid` | `invalid`, with strict UUID + ISO validation because `ts` and `id` are interpolated straight into the PostgREST filter DSL. `isCursorExpired` measures freshness from `syncedAt` (RR-489), not from `ts`, so a dormant caught-up account is never wedged in a resync loop.
+
+## Groups, constants, and preferences
+
+`groups.ts` derives the group registry from the entity registry: `SYNC_GROUPS` maps each group to its `user_sync_preferences` column, `resolveEnabledEntities` intersects requested groups with enabled toggles (pull), and `groupForEntity` maps an entity to its toggle (the push preference check). `constants.ts` holds every tuning numeric — `clampPullPageSize` bounds `sync_pull_page_size` into `[1, 500]`, alongside `SYNC_PUSH_MAX_BATCH_OPS = 500`, `SYNC_PUSH_MAX_BATCH_BYTES = 5 MB`, `SYNC_PULL_HYDRATION_MAX_BYTES = 64 MB`, `SYNC_PULL_MAX_PAGE_SIZE_BYTES = 5 MB`, `CLOCK_SKEW_BUFFER_SEC = 1`, and `FALLBACK_TOMBSTONE_GRACE_DAYS = 30`. `preferences.ts` exposes `loadSyncPreferences`, the all-TRUE-fallback reader shared by `sync-push` and `sync-pull`.
+
+## Server-owned columns and hidden renames
+
+The `writable=false` columns clients can never set are `updated_at`, `version`, `auth_user_id`, and `total_tokens_used` — `wireRowToDb` drops them silently and forces `auth_user_id` to the caller. `cloud_excluded_at`, `deleted_at`, and `protected_at` ARE client-writable. Two column-name subtleties the transform hides: the wire always exposes `id` even when the db PK is `recording_id` (transcripts) or `context_id` (context cards); and encrypted columns follow the `<field>_ct` / `<field>_iv` convention, including `dek_ct` / `dek_iv` / `audio_iv` on `c_recordings` (renamed from `wrapped_dek` / `iv_dek` / `iv_audio` in RR-320).
+
+## Related pages
+
+- [Sync Engine Overview](/rollingrecord/backend/sync/overview) — how the registry drives all seven endpoints.
+- [sync-push](/rollingrecord/backend/sync/push) — `wireRowToDb` and the writable-column rules in action.
+- [sync-pull](/rollingrecord/backend/sync/pull) — `dbRowToWire`, the cursor, and two-phase selection.
+- [sync-reserve & sync-audio](/rollingrecord/backend/sync/reserve-and-audio) — `validateStoragePath` and the encrypted-column pairs on `c_recordings`.
+- [user-sync-preferences](/rollingrecord/backend/sync/preferences) — the toggles `groups.ts` resolves against.

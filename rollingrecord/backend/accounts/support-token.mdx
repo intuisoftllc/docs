@@ -1,14 +1,63 @@
 ---
-title: "generate-support-token"
-description: "The user-initiated support code and its abuse defenses."
+title: "Support Tokens"
+description: "The short-lived 6-digit code a user reads to a support agent, its return-existing semantics and abuse defenses, and the admin-side verify."
 ---
 
-generate-support-token mints a short-lived, single-use 6-digit code a user reads to a support agent for verification.
+`functions/generate-support-token/index.ts` (RR-313) mints a 6-digit numeric code a user reads back to a support agent to prove their identity during a call. The code is valid 60 minutes, single-use, and displayed **in-app** — there is no email delivery. It runs a JWT gate chain with no entitlement gate (support is available to every tier), and the [account-freeze gate](/rollingrecord/backend/gates/account-frozen) applies automatically, so frozen users get a `403`.
 
-## What this covers
+## Return-existing semantics
 
-- A user-initiated 6-digit code for support verification (60-min, single-use, return-existing semantics); the support_token_generate bucket with abuseEventOnReject; brute-force defense on the verify side.
+If the caller already has an **active** row (not consumed, not expired) the function returns that code with `reused: true`; only when no active token exists does it UPSERT a fresh one. Because `support_tokens` is keyed one row per user (PK `auth_user_id`), the same active code is shown wherever and whenever the user re-fetches until it expires or is consumed — no token churn on client re-fetch, app restart, or navigation. A 2-minute in-memory client cache sits on top so repeat taps in a session don't even hit the network.
 
-<Note>
-Scaffold generated from the codebase map — expand with full detail, examples, and specifics.
-</Note>
+| Response field | Meaning |
+| --- | --- |
+| `code` | 6-digit numeric string (`generate6DigitCode()`, rejection-sampled, leading zeros preserved) |
+| `expires_at` | ISO 8601; the client renders a countdown against it |
+| `reused` | true when an existing active code was returned, false when freshly minted (UX identical) |
+
+`TOKEN_TTL_MS` is 60 minutes — long enough to cover the gap between the user tapping the button and the agent reading the code back, short enough that a live 6-digit code isn't a standing risk. The code is stored **raw** by design: hashing adds nothing for a 60-minute, one-in-a-million code.
+
+## support_tokens table
+
+| Column | Type | Notes |
+| --- | --- | --- |
+| `auth_user_id` | `text NOT NULL PK` | one active row per user |
+| `code` | `text NOT NULL` | CHECK `code ~ '^[0-9]{6}$'`; stored raw |
+| `created_at` | `timestamptz NOT NULL DEFAULT now()` | |
+| `expires_at` | `timestamptz NOT NULL` | `now() + 60 min` |
+| `consumed_at` | `timestamptz` (nullable) | set by `verify_support_token` on match |
+
+## Two lifetimes: consumable vs recognisable
+
+`prune_support_tokens()` (`migrations/20260811180000_support_token_expired_retention.sql`, hourly pg_cron) splits two windows that were once collapsed:
+
+- **Consumable** — how long `verify_support_token` can mark a code verified. 60 minutes; consumed rows are deleted promptly once spent.
+- **Recognisable** — how long an operator can still see that an expired code was validly generated. Expired-but-unconsumed rows are retained until older than `server_config.support_token_expired_retention_sec` (default 4h), so verify can still return `reason=expired` as identity evidence well after the code stops being usable.
+
+One row per user means a retained expired row is simply overwritten the moment the user generates a new code, so retention adds no bloat.
+
+## Rate limit
+
+`Bucket.SupportTokenGenerate` is `support_token_generate` at 20/hr, keyed on the caller's `authUserId` and applied via chain sugar. This is an email-spam-style throttle — well above any legitimate support workflow — **not** brute-force defense; brute-force resistance lives on the verify side. The bucket carries `abuseEventOnReject: RateLimitHit`, so slamming it fire-and-forget logs a [`rate_limit_hit` abuse event](/rollingrecord/backend/accounts/anti-abuse): a buggy client or someone probing the verify path.
+
+## Admin-side verify
+
+There is no consumer-facing verify Edge Function. Verification is the support-ops `verify_support_token` operation (`functions/support-ops/operations/verify-support-token/index.ts`), gated by `can_validate_codes` and marked `isReadOnly: true` despite the `consumed_at` write (a 2FA check has no meaningful dry-run/commit distinction — a preview would leak the match result). Its pure `evaluate()` maps the row state and whether the submitted code matched onto two orthogonal axes — a `reason` and a `token_state` — so an operator can tell a typo apart from an impersonation attempt. On `reason=verified` it writes `consumed_at` fire-and-wait; a failed write throws so the dispatcher audits the op as `failed`.
+
+| Row state | code matched | `reason` | `token_state` |
+| --- | --- | --- | --- |
+| no row | — | `no_active_code` | `none` |
+| consumed | yes | `already_consumed` | `consumed` |
+| consumed | no | `no_active_code` | `consumed` (fraud signal) |
+| expired | yes | `expired` | `expired` |
+| expired | no | `no_active_code` | `expired` (fraud signal) |
+| active | yes | `verified` (writes `consumed_at`) | `active` |
+| active | no | `mismatch` | `active` (typo or fraud) |
+
+`reason=no_active_code` (the user couldn't have generated the code they read out) and `reason=mismatch` + `token_state=active` (the user has a real code, but not this one) are the two combinations worth investigating.
+
+## Related
+
+- [Operations catalog](/rollingrecord/backend/support-ops/operations-catalog), [permissions](/rollingrecord/backend/support-ops/permissions), and the [dispatcher](/rollingrecord/backend/support-ops/dispatcher).
+- [Rate limiting & buckets](/rollingrecord/backend/gates/rate-limiting) and the [Account-Freeze Gate](/rollingrecord/backend/gates/account-frozen).
+- [Cron sweepers](/rollingrecord/backend/database/cron-sweepers) — where `prune_support_tokens` runs.

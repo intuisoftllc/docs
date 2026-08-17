@@ -1,14 +1,69 @@
 ---
 title: "c_recordings Cryptographic-Column Integrity"
-description: "The four sanctioned delete callers and the permanent ban on TRUNCATE/DROP for c_recordings."
+description: "The four sanctioned DELETE callers for c_recordings crypto columns and the unconditional ban on TRUNCATE and DROP."
 ---
 
-The crypto columns on c_recordings make audio decryptable, so deletes are limited to four callers and TRUNCATE/DROP is permanently banned.
+Each `c_recordings` row's crypto column-set is what makes its `audio-storage` blob decryptable. Only four caller classes may delete a row or null those columns, and `TRUNCATE`/`DROP TABLE` on the table is permanently banned — a stricter rule than the general destructive-migration confirmation path, because there is no engineering recovery once the wrapped DEKs are gone.
 
-## What this covers
+## The crypto column-set
 
-- The four sanctioned DELETE callers (delete-user, sync-push tombstone, sync-audio delete, pg_cron sweepers); TRUNCATE/DROP is permanently banned (overriding the destructive-migration escape hatch); expand-migrate-contract if restructuring is ever needed.
+Defined on `c_recordings` in `supabase/migrations/20260508000000_baseline.sql`. The five columns are NULL together for a local-only recording and non-NULL together for a cloud-backed one; `cloud_backup_committed_at` marks the commit.
 
-<Note>
-Scaffold generated from the codebase map — expand with full detail, examples, and specifics.
-</Note>
+| Column | Type | Purpose |
+| --- | --- | --- |
+| `storage_path` | `TEXT` | Path of the encrypted blob in the `audio-storage` bucket. NULL = not in cloud |
+| `dek_ct` | `BYTEA` | Per-recording DEK, wrapped (ciphertext) under the KEK |
+| `audio_iv` | `BYTEA` | IV the client used to AES-GCM encrypt the audio blob |
+| `dek_iv` | `BYTEA` | IV used to wrap the DEK under the KEK |
+| `kek_version` | `INTEGER` | KEK generation that wrapped the DEK — input to the rotation worker |
+| `cloud_backup_committed_at` | `TIMESTAMPTZ` | Commit marker; NULL while `storage_path` is non-NULL means the upload is in flight |
+
+The `COMMENT ON COLUMN` entries record the RR-320 rename to the `_ct` / `_iv` convention (`wrapped_dek` → `dek_ct`, `iv_audio` → `audio_iv`, `iv_dek` → `dek_iv`). The baseline `CREATE TABLE` still shows two since-removed columns: `is_protected` was replaced by `protected_at` (`TIMESTAMPTZ`) in `supabase/migrations/20260605210000_c_recordings_protected_at_retype.sql`, and `is_imported` was dropped in `supabase/migrations/20260605210200_drop_c_recordings_is_imported.sql`. `content_updated_at` was added in `supabase/migrations/20260615030000_c_recordings_content_updated_at.sql`.
+
+## The four sanctioned callers
+
+Every path that deletes a `c_recordings` row or strips its crypto material must be one of these. Anything else — an inline `DELETE FROM c_recordings`, an `UPDATE ... SET dek_ct = NULL` on a row whose blob still exists — is banned.
+
+| Caller | Kind | What it does |
+| --- | --- | --- |
+| `delete-user` (`wipeUser`) | Edge Function | GDPR cascade: deletes rows and wipes the `audio-storage` bucket |
+| `sync-push` tombstone | Edge Function | User-initiated trash → tombstone (sets `deleted_at`) |
+| `sync-audio` delete | Edge Function | User-initiated cloud-detach |
+| pg_cron sweepers | Scheduled | GC of tombstoned / expired / demoted / orphaned rows |
+
+`wipeUser` (`supabase/functions/_shared/users/wipe.ts`) is documented as a sanctioned DELETE caller in the file header; it lists `c_recordings` in `TABLES_TO_WIPE` and `audio-storage` in `BUCKETS_TO_WIPE`.
+
+## The sanctioned sweepers
+
+Four pg_cron functions are the "scheduled" caller class. See [cron sweepers](/rollingrecord/backend/database/cron-sweepers) for schedules.
+
+| Sweeper | Action on `c_recordings` |
+| --- | --- |
+| `prune_tombstones` | Hard-deletes rows whose `deleted_at` is past `cloud_tombstone_grace_days` (default 30) |
+| `purge_expired_trash` | Tombstones rows whose `trashed_at` is past `trash_retention_days`, then tombstones orphaned sessions in the same transaction (sets `deleted_at`, does not raw-delete) |
+| `prune_demoted_rolling` | Hard-deletes husks where `mode='ROLLING'` and `protected_at IS NULL` and `deleted_at IS NULL` past the grace window — demoted rolling segments that carry no crypto/blob (`supabase/migrations/20260605210100_prune_demoted_rolling_cron.sql`) |
+| orphan-blob sweeper | The hourly `storage-orphan-lister` reaps blobs no longer claimed by a row |
+
+## Server functions that null crypto legitimately
+
+Several functions null the crypto set to force the client to re-upload. Each does so only when the blob is already gone or intentionally detached, so no still-decryptable blob is orphaned.
+
+| Function | When it nulls crypto | Migration |
+| --- | --- | --- |
+| `audit_orphan_blobs` | Committed row whose `audio-storage` object is verified MISSING — nulls `storage_path` + all crypto + `cloud_backup_committed_at` | baseline / `20260707120000_reconcile_committed_no_blob.sql` |
+| `reconcile_committed_no_blob_path` | Row claims a commit but has no `storage_path` — nulls `cloud_backup_committed_at` | `20260707120000_reconcile_committed_no_blob.sql` |
+| `sweep_stale_pending_uploads` | Upload never committed within the window — nulls `storage_path` + crypto so the client retries from scratch | baseline |
+| `cloud_excluded_storage_cleanup` | Row past `cloud_excluded_grace_days` — nulls `storage_path` + `dek_ct`/`dek_iv`/`audio_iv`; the hourly lister then reaps the unclaimed blob | `20260731150000_storage_janitor_cutover.sql` |
+
+`cloud_excluded_storage_cleanup` is the one consciously-accepted case where crypto is nulled while the blob briefly survives — a raw `DELETE FROM storage.objects` is blocked by `protect_delete()`, so nulling `storage_path` drops the row's claim and the hourly lister removes the object on its next pass (a window of at most ~1 hour). `enforce_committed_requires_blob` is a trigger that guards the invariant that `cloud_backup_committed_at` requires a `storage_path`.
+
+## The TRUNCATE / DROP ban
+
+`TRUNCATE c_recordings` and `DROP TABLE c_recordings` are **never** permitted in a migration. This overrides HARD RULE 9's written-confirmation escape hatch — there is no confirmation phrase, no pre-launch exception, no "the dev DB is empty" override. Dropping the table orphans every `audio-storage` object with no forward-fix path to restore the wrapped DEKs. The only permitted restructuring is expand-migrate-contract: create `c_recordings_v2`, backfill every row preserving the crypto columns byte-for-byte, dual-write, cut reads over, stop writes, and finally `ALTER TABLE ... RENAME TO c_recordings_deprecated_YYYYMMDD` — a rename, never a drop.
+
+## Related pages
+
+- [High-risk tables registry](/rollingrecord/backend/database/high-risk-tables) — why these columns have no recovery path
+- [Scheduled pg_cron sweepers](/rollingrecord/backend/database/cron-sweepers) — the schedules behind the sanctioned sweepers
+- [Column spine & encrypted pairs](/rollingrecord/backend/database/column-conventions) — the `_ct` / `_iv` naming convention
+- [Migration discipline](/rollingrecord/backend/database/migrations-discipline) — the destructive-migration rules

@@ -1,14 +1,50 @@
 ---
 title: "resolve-identity"
-description: "The launch-time function that provisions the canonical_users row and carries anti-abuse counters forward."
+description: "The launch-time endpoint that upserts the caller's canonical_users row, carries anti-abuse counters forward on same-email re-signup, and reports lifetime + lapse status."
 ---
 
-Called every app launch, resolve-identity upserts the caller's canonical_users row and carries forward anti-abuse snapshots on re-signup.
+`resolve-identity` (`functions/resolve-identity/index.ts`) is a `Deno.serve` POST endpoint called on every app launch after sign-in. It guarantees the caller's `canonical_users` row exists (so FK-bound child inserts work), carries anti-abuse usage counters forward on a same-email re-signup, and returns lifetime + subscription-lapse status. It takes **no body fields** — every identity value comes from the verified JWT, not from anything the client can fake.
 
-## What this covers
+## Gate chain
 
-- Called every launch: upserts canonical_users, carries forward anti-abuse counter snapshots from l_deleted_identity on same-email re-signup within the period; computes lifetime status.
+The entry calls `runGates(req, { method: HttpMethod.Post, auth: AuthMode.Jwt, rateLimit: { bucket: Bucket.ResolveIdentity } })` — method + App Check + App Version + Clerk JWT + a `resolve_identity` rate limit (skipped for developers). Legit clients call this once per cold start; the bucket leaves headroom for retries and account switches. The handler reads `{ authUserId, email, activeEntitlements }` from the resolved context and computes `hashEmail(email)` up front (non-fatal on failure) using `EMAIL_HASH_PEPPER`.
+
+## The atomic upsert
+
+The row is created with `upsert({ auth_user_id, email_hash? }, { onConflict: "auth_user_id", ignoreDuplicates: true }).select(...)` — an `INSERT … ON CONFLICT DO NOTHING RETURNING`. Non-empty returned rows mean this call inserted the row (`status: "created"`); an empty result means it already existed (`status: "existed"`). With N devices launching in parallel, exactly one sees `created`, which is the correct semantics for the carryover branch (it must run at most once).
+
+| Condition | `status` | Carryover branch |
+| --- | --- | --- |
+| This call inserted the `canonical_users` row | `created` | runs `carryForwardOnResignup` (once) |
+| Row already existed | `existed` | skipped — refreshes `last_seen_at` + `email_hash`, re-reads lapse state |
+| N parallel first-launches | one `created`, rest `existed` | only the `created` winner carries forward |
+
+On the `created` path the lapse columns come back on the same round-trip (the upsert's `.select()` returned them). On the `existed` path the upsert returns empty, so the handler updates `last_seen_at` / backfills `email_hash` and re-reads `subscription_lapsed_at` / `subscription_lapsed_tier` separately.
+
+## Anti-abuse carryover
+
+Only on fresh creation, `carryForwardOnResignup` (`functions/_shared/users/deleted-identity-history.ts`) consumes a matching `l_deleted_identity` snapshot keyed on `(email_hash, current period)` and applies its usage counters to the new account — so a delete-and-resignup can't reset the monthly cap. It is best-effort: a failure logs and continues, because sign-in must never block on bookkeeping. `carryover: true` in the response means such a snapshot was consumed.
+
+## Lifetime + lapse status
+
+`computeLifetimeStatus` (`functions/_shared/billing/entitlements.ts`) derives `{ isFounder, lifetimeTier }` purely from the `activeEntitlements` set that `runGates` already fetched — no DB reads. RevenueCat is the single source of truth here; the [revenuecat-webhook](/rollingrecord/backend/edge-functions/webhooks) handles audit-ledger mirroring. `ResolveIdentityResponse` returns:
+
+| Field | Meaning |
+| --- | --- |
+| `auth_user_id` | The verified Clerk `sub` |
+| `status` | `created` \| `existed` |
+| `carryover` | Whether an `l_deleted_identity` snapshot was consumed |
+| `is_founder` / `lifetime_tier` | Lifetime status from the effective entitlement set |
+| `subscription_lapsed_at` / `subscription_lapsed_tier` | RR-358 grace-banner state; non-null together or null together (paired CHECK on `canonical_users`) |
+
+The `hashEmail` peppered hash (`functions/_shared/auth/email-hash.ts`) is stored on `canonical_users.email_hash` so `wipeUser()` can write the deletion snapshot without a live Clerk call, and it is the carryover key. The same normalization runs in `resolve-identity`, `clerk-webhook`, and `revenuecat-webhook`, so the hashes match across surfaces.
 
 <Note>
-Scaffold generated from the codebase map — expand with full detail, examples, and specifics.
+The `clerk-webhook` `user.created` handler mirrors this same `canonical_users` upsert + carryover for users provisioned outside the app (Clerk dashboard, admin API). `resolve-identity` remains the authoritative, fully-idempotent path.
 </Note>
+
+## Related pages
+
+- [Edge Function catalog](/rollingrecord/backend/edge-functions/overview) — the shared `runGates()` chain.
+- [Inbound webhooks](/rollingrecord/backend/edge-functions/webhooks) — the `clerk-webhook` that mirrors provisioning + carryover.
+- [get-user-key](/rollingrecord/backend/edge-functions/get-user-key) — the DEK fetch the client makes alongside this at launch.

@@ -1,15 +1,55 @@
 ---
 title: "JWT Auth Gate"
-description: "How Clerk session tokens are verified and turned into an auth_user_id."
+description: "How Clerk RS256 session tokens are verified against Clerk's JWKS and turned into an auth_user_id, with a typed VerifyBearerResult union."
 ---
 
-The JWT gate verifies the Clerk-issued RS256 session token against Clerk's JWKS and extracts the caller's identity.
+The JWT gate in `functions/_shared/gates/jwt.ts` verifies the `Authorization: Bearer <jwt>` header against Clerk's JWKS and resolves it to an `authUserId`. It replaced the old `supabase.auth.getUser(jwt)` approach: Clerk JWTs are signed by Clerk's private RSA key and must be verified against Clerk's public keys, not Supabase's.
 
-## What this covers
+## Verification flow
 
-- jwt.ts verifies RS256 Clerk session tokens against Clerk's JWKS, extracts authUserId from sub; the single exception to the error-registry rule — returns typed VerifyBearerResult literals (missing_bearer_token, invalid_jwt) that must match registry codes.
-- All functions set verify_jwt = false in config.toml so Supabase's built-in check doesn't reject the Clerk token before runGates runs.
+`verifyBearerToken(header)` handles step 1 — parsing the `Authorization: Bearer <jwt>` header and returning `missing_bearer_token` when it's absent, malformed, or empty — then hands the extracted token to `verifyClerkJwt(jwt)`, which runs the remaining five checks (steps 2–6). Any failure inside `verifyClerkJwt` returns `null`, which the gate maps to an opaque `401 invalid_jwt` so a forged token can't probe which user exists.
+
+| Step | Action | Fail mode |
+| --- | --- | --- |
+| 1 | Parse `Authorization: Bearer <jwt>` (case-insensitive) | `missing_bearer_token` (401) when absent / malformed / empty |
+| 2 | Split into 3 parts, decode header, read `kid` | `invalid_jwt` (401) when parts `!= 3` or `kid` missing |
+| 3 | Fetch Clerk JWKS (5-min cache), match `kid` | `invalid_jwt` when JWKS unavailable or no key matches |
+| 4 | Verify RS256 signature via `crypto.subtle` (`RSASSA-PKCS1-v1_5` + `SHA-256`) | `invalid_jwt` on bad signature |
+| 5 | Validate `exp` (not expired) and `sub` (non-empty string) | `invalid_jwt` when expired or `sub` missing |
+| 6 | RR-451: require `iss === getExpectedIssuer()` | `invalid_jwt` on cross-env / cross-app reuse (fails closed if issuer unresolvable) |
+
+On success it returns a `VerifiedAuthUser` of `{ authUserId, email }`. `authUserId` is the Clerk `sub` claim and matches `canonical_users.auth_user_id`; `email` is the `email` claim or `""` when absent — Clerk omits `email` from session tokens unless a session-token customization adds it.
+
+## The issuer check (RR-451)
+
+Signature and expiry alone would accept **any** Clerk-signed token — one minted by the dev Clerk environment, or by an unrelated app that also uses Clerk. `getExpectedIssuer()` derives the accepted `iss` from `new URL(CLERK_JWKS_URL).origin`, so one env var pins both the signing-key source and the accepted issuer to the same Clerk environment; they can't drift apart. When `CLERK_JWKS_URL` is unset or unparseable the function returns `null` and verification fails closed.
+
+## JWKS caching
+
+`getClerkJwks()` fetches `CLERK_JWKS_URL` and caches the result for `JWKS_TTL_MS` (`5 * 60 * 1000` — five minutes) via `cachedJwks` / `jwksCachedAt`. This is why a rotated or revoked Clerk **signing key** stops verifying within one TTL window even on a warm isolate, rather than waiting for a cold start that Supabase can defer for hours. It has no effect on user session length — these are Clerk's server keys, not user tokens. The fetch returns `null` (fail closed) when the env var is unset or the request fails.
+
+## Result types
+
+`verifyBearerToken(authorizationHeader)` is the exported entry point (used directly by smoke tests). It returns the discriminated union `VerifyBearerResult`:
+
+| Variant | Shape |
+| --- | --- |
+| ok | `{ status: "ok"; user: VerifiedAuthUser }` |
+| missing bearer | `{ status: "missing_bearer"; error: "missing_bearer_token" }` |
+| invalid | `{ status: "invalid"; error: "invalid_jwt" }` |
+
+The `error` literals are the **single registry exception** noted in CLAUDE.md: they are narrow string types (not `AppError.*.code`) so consumers can exhaustively pattern-match, but they MUST match `AppError.MISSING_BEARER_TOKEN.code` and `AppError.INVALID_JWT.code` exactly — rename either in the registry and these literals change in the same commit. `runJwtGate(req)` wraps the result into the dispatcher's `JwtGateResult` shape (`{ response: Response } | { response: null; user }`), building a `401` on any failure.
 
 <Note>
-Scaffold generated from the codebase map — expand with full detail, examples, and specifics.
+The registry description for `INVALID_JWT` in `functions/_shared/errors.ts` still reads "Supabase Auth Bearer JWT verification failed" — stale phrasing. The actual verifier is Clerk RS256 against Clerk's JWKS.
 </Note>
+
+## Gateway configuration
+
+Every Edge Function sets `verify_jwt = false` in `config.toml` so Supabase's built-in gateway JWT check doesn't reject the Clerk token before `runGates` runs. Clerk verification is done entirely inside this gate.
+
+## Related
+
+- [The runGates() admission chain](/rollingrecord/backend/gates/run-gates) — the JWT branch and how it feeds entitlement fetch.
+- [Webhook & server-to-server auth](/rollingrecord/backend/gates/webhook-secret) — the non-JWT auth mode for trusted callers.
+- [Entitlement, dev bypass & grace](/rollingrecord/backend/gates/entitlement-and-grace) — what happens with `authUserId` after verification.

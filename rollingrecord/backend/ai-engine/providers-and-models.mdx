@@ -1,16 +1,79 @@
 ---
-title: "Provider Chain, Models & Pricing"
-description: "Config-driven provider failover, the model allowlist, and token cost tracking."
+title: "Providers, Models & Pricing"
+description: "The failover-aware AI client, the Anthropic and Gemini providers, server-config-driven model and chain selection, the AI stub gate, and per-call cost tracking."
 ---
 
-Per-operation provider chains, an enforced model allowlist, and per-token cost tracking are all driven from server_config for redeploy-free changes.
+Every AI call in `ai-engine` goes through `createAiClient` (`functions/_shared/ai/client.ts`), a resilient client over an ordered provider chain. It instantiates providers, tries them in order, fails over on transient errors, records exact per-call cost, and — in non-production branches — can short-circuit to a synthetic stub.
 
-## What this covers
+## The resilient client
 
-- _shared/ai/provider-chain.ts reads per-op provider chains from server_config (e.g. extract_provider_chain) for redeploy-free failover; providers under _shared/ai/providers/ (anthropic, gemini); all_providers_failed/provider_rate_limited.
-- models.ts allowlist enforcement (model_not_allowed, dev cannot bypass), operation-models.ts per-op selection, pricing.ts + client.ts cost tracking via trackTokenUsage to f_user_financials.ai_cost_micros.
-- AI stubbing gate (shouldStubAi) for smoke tests.
+`createAiClient(providerChain)` walks the chain and instantiates only providers that have **both** a registered factory in `PROVIDER_REGISTRY` (`{ anthropic: AnthropicProvider, gemini: GeminiProvider }`) **and** an API-key secret from `PROVIDER_API_KEY_ENV` (`anthropic → ANTHROPIC_API_KEY`, `gemini → GEMINI_API_KEY`). Providers missing a key are skipped with a warning. If zero providers qualify it throws `Error("ai-client: no providers available …")` at construction time — which surfaces as `handler_threw` (500), distinct from the call-time failure below.
 
-<Note>
-Scaffold generated from the codebase map — expand with full detail, examples, and specifics.
-</Note>
+`sendMessage(request, options)` tries each provider in order. It fails over to the next provider only when the current provider's `shouldFailOver(response)` returns true, or when the call throws a network/timeout error. Request-level or config-level errors (bad request, auth failure) are returned as-is so the handler surfaces the real problem instead of masking it. When every configured provider fails at call time, it either returns the last non-ok response or — only when every provider threw a network error — throws. The handlers map the **throw** path to `all_providers_failed` (503); when the client instead returns a non-ok HTTP response, the handler's `!aiResponse.ok` branch maps it to `provider_rate_limited` (429) or `ai_call_failed` (502), never 503.
+
+`AiClientCallOptions` carries `isDeveloper` (stub gate only), `requestHeaders` (inspected for the stub header), `modelForProvider(provider)` (the failover model-selection callback), and `authUserId` (enables auto cost tracking).
+
+## The providers
+
+| provider | file | endpoint | timeout | notes |
+| --- | --- | --- | --- | --- |
+| `anthropic` | `providers/anthropic/index.ts` | `api.anthropic.com/v1/messages` | `ANTHROPIC_TIMEOUT_MS` = 180,000 | primary; `anthropic-version` `2023-06-01`; `anthropic-beta` `extended-cache-ttl-2025-04-11` for 1-hour prompt caching |
+| `gemini` | `providers/gemini/index.ts` | `generativelanguage` v1beta | `GEMINI_TIMEOUT_MS` = 90,000 | full function-calling; translates Anthropic `tool_use`/`tool_result` ↔ Gemini `functionCall`/`functionResponse`; surfaces no cache tokens |
+
+`AnthropicProvider.shouldFailOver` returns true only for error types in `ANTHROPIC_FAILOVER_ERROR_TYPES` — `rate_limit_error` (429), `overloaded_error` (529), `api_error` (500), and `timeout_error` (504). Unknown types default to no-failover with a warning, so a genuinely new error surfaces rather than being masked. Prompt caching attaches `cache_control` (`{ type: "ephemeral", ttl: "1h" }`) to the first, static system block and the last tool, so the static prefix and tool list stay cached across a session's rounds. Any dynamic per-round `systemSuffix` is appended as a separate block *after* the marker and is deliberately left uncached, so the per-round content stays out of the cache key (the RR-430 split).
+
+## Models and per-op selection
+
+`Models` (`functions/_shared/ai/models.ts`) is the single source of truth for model IDs. `ProviderChains.ANTHROPIC_GEMINI = ["anthropic", "gemini"]` and `ProviderChains.GEMINI_ANTHROPIC = ["gemini", "anthropic"]`. `modelSelector` builds the `modelForProvider` callback.
+
+| constant | model id | input $/Mtok | output $/Mtok |
+| --- | --- | --- | --- |
+| `CLAUDE_HAIKU` | `claude-haiku-4-5-20251001` | 1.00 | 5.00 |
+| `CLAUDE_SONNET` | `claude-sonnet-4-6` | 3.00 | 15.00 |
+| `GEMINI_PRO` | `gemini-2.5-pro` | 1.25 | 10.00 |
+| `GEMINI_FLASH` | `gemini-2.5-flash` | 0.30 | 2.50 |
+| `GEMINI_FLASH_LITE` | `gemini-2.5-flash-lite` | 0.10 | 0.40 |
+
+`operation-models.ts` maps each operation to its `server_config` key. `MODEL_CONFIGS` (single-model ops) covers `extraction`, `synthesis`, `synthesisDeepReasoning`, `templateModeration`, `blueprintDescription`, and `kbQuery` — all default to Haiku, with deep-reasoning defaulting to Sonnet. `CHAIN_CONFIGS` (config-driven provider chains) covers only `keywords`, `threadNaming`, `contextSummary`, and `queryExpand`, all defaulting to `GEMINI_ANTHROPIC`.
+
+| operation | primary | fallback | chain |
+| --- | --- | --- | --- |
+| `kb_query` | `CLAUDE_HAIKU` (`kb_query_model`) | `GEMINI_FLASH` | `ANTHROPIC_GEMINI` (hardcoded) |
+| `synthesis` (standard) | `CLAUDE_HAIKU` (`synthesis_model`) | `GEMINI_FLASH` | `ANTHROPIC_GEMINI` (hardcoded) |
+| `synthesis` (deep) | `CLAUDE_SONNET` (`synthesis_deep_reasoning_model`) | `GEMINI_PRO` | `ANTHROPIC_GEMINI` (hardcoded) |
+| `template_moderation` | `CLAUDE_HAIKU` (`template_moderation_model`) | `GEMINI_FLASH_LITE` | `ANTHROPIC_GEMINI` (hardcoded) |
+| `keywords` / `context_summary` / `query_expand` / `thread_naming` | `GEMINI_FLASH_LITE` | `CLAUDE_HAIKU` | `GEMINI_ANTHROPIC` (config-driven) |
+
+`kb_query`, `synthesis`, and `template_moderation` pass a **hardcoded** `ProviderChains.ANTHROPIC_GEMINI` to `createAiClient`, not a `server_config` chain. Only the four sub-ops read their chain from config.
+
+## No model allowlist for chat/extract
+
+There is no request-time model allowlist for the chat and extract model stack. `models.ts` contains only model constants, `ProviderChains`, and `modelSelector` — `getAllowedModels()` was removed in RR-164 because model selection is now server-owned (the client no longer sends model names). `MODEL_NOT_ALLOWED` (`model_not_allowed`, developer, 400) still exists in the error registry but is not emitted for these models.
+
+The only live allowlist in the AI stack is on **embeddings**: `isModelAllowed` + `parseAllowlist` + `DEFAULT_EMBEDDING_ALLOWLIST` (`functions/_shared/ai/providers/embeddings/config.ts`), enforced in `getEmbeddingProvider()` as a `server_config` integrity guard that throws `EmbeddingError("misconfigured")`. It is a config-integrity check, not a per-request user-facing gate.
+
+## The AI stub gate
+
+`shouldStubAi(isDeveloper, requestHeaders)` gates a synthetic response behind three independent conditions, all required (misconfig fails closed):
+
+1. `AI_STUBBING_ENABLED = "true"` in the Edge Function env — the master switch, unset/false in prod, so stubbing is physically impossible there.
+2. `X-AI-Stub: true` inbound request header — only the smoke harness sends it.
+3. Caller is a dev (`isDeveloper = true`) **or** the env has `AI_STUB_NON_DEV = "true"` — defense in depth.
+
+`buildStubResponse` returns `provider = "stub"`, content `[stub]`, and zero usage. The dispatcher reuses `shouldStubAi` to stamp `x-ai-stubbed: true` on the outgoing response so smoke tests can positively assert the stub fired; `isStubbedResponse` lets handlers detect it (used by `template_moderation` and `blueprint-description`, which would otherwise fail to parse `[stub]`).
+
+## Cost and token tracking
+
+`trackTokenUsage` fires on **any** successful call (primary or failover) with non-zero tokens. It increments `usage.input_tokens` / `usage.output_tokens` (per-period throughput analytics) and `f_user_financials.ai_cost_micros` (per-period USD cost accumulator). Both are recorded **for dev accounts too** — dev bypass is a quota exception, not a diagnostics-or-cost exception. It is fire-and-forget: a failed RPC never affects the response.
+
+Cost is priced against `response.model`, so a Gemini failover is costed at Gemini rates. `computeCallCostUsd` (`functions/_shared/ai/pricing.ts`) is cache-aware: cache-creation tokens bill at `CACHE_CREATION_MULTIPLIER` = 1.25× and cache-read tokens at `CACHE_READ_MULTIPLIER` = 0.10× the input rate. `usdToMicros` converts to integer micro-USD (BIGINT) so month-long accumulation has no floating-point drift. Embedding cost uses `EMBEDDING_PRICING` (`embed-v4.0` = 0.12, `embed-multilingual-v3.0` = 0.10 per Mtok) via `computeEmbeddingCostUsd`. `pricing.ts` is a runtime mirror of `evals/config.py` and `claude/business/cost-analysis.py` — when a published rate changes, update all three.
+
+Provider error codes (`functions/_shared/errors.ts`): `all_providers_failed` (infra, 503), `ai_call_failed` (infra, 502), `provider_rate_limited` (infra, 429), `anthropic_key_missing` (developer, 500).
+
+## Where to go next
+
+- [Operation Registry](/rollingrecord/backend/ai-engine/operations-registry) — how handlers reach the client.
+- [Content Moderation](/rollingrecord/backend/ai-engine/moderation) — the embedding provider in use.
+- [Financials](/rollingrecord/backend/billing/financials) — where `ai_cost_micros` accumulates.
+
+Related: [usage table](/rollingrecord/backend/database/usage-table) · [Semantic search](/rollingrecord/backend/storage/semantic-search) · [Env & secrets](/rollingrecord/backend/operations/env-and-secrets) · [Dev bypass scope](/rollingrecord/backend/gates/dev-bypass-scope).

@@ -1,15 +1,96 @@
 ---
 title: "Support-Ops Operations"
-description: "The catalog of read-only and mutating admin operations."
+description: "The full registry of 27 support-ops operations — read-only diagnostics and dry-run-guarded mutating actions — with their permissions and behavior."
 ---
 
-The support-ops registry exposes a set of read-only diagnostics and dry-run-guarded mutating operations.
+The `OPERATIONS` registry (`functions/support-ops/operations/registry.ts`) exposes 27 operations: 8 mutating ones that enforce the dry-run → commit flow, and 19 read-only ones that skip it. Each is an `OperationDef` with a snake_case wire `name`, an `isReadOnly` flag, a `requiredPermission`, a `validateParams` validator, and a `handler`. Callers send the wire name in the request body's `operation` field.
 
-## What this covers
+## Full registry
 
-- Read ops: whoami, search-users, lookup-user-by-email, get-user-overview/-state/-timeline/-audit/-credits/-credit-ledger/-rate-limits/-transcribe-history, get-admin-audit, get-abuse-top-offenders, get-storage-drift, get-tombstone-report, get-clerk-metadata.
-- Mutating ops: grant-manual-credit, freeze-user-account, set-account-password, delete-user-account, clear-app-lock-pin, reset-extraction, reset-transcription, restore-tombstones, validate-recovery-code, link-audit-ticket; operations/registry.ts + handler.ts (OperationError).
+| Operation (wire name) | Kind | Required permission | Purpose |
+| --- | --- | --- | --- |
+| `set_account_password` | Mutating | `can_set_account_password` | Force-set a Clerk password (provided or 24-char generated) |
+| `freeze_user_account` | Mutating | `can_freeze_account` | Toggle `frozen_at` / `frozen_reason` (freeze + unfreeze) |
+| `grant_manual_credit` | Mutating | `can_grant_credits` | Adjust the manual `user_credits` row for one resource (ceiling-checked) |
+| `restore_tombstones` | Mutating | `can_restore_tombstones` | Restore one sync group's tombstones within the grace window |
+| `clear_app_lock_pin` | Mutating | `can_set_account_password` | Null the `user_crypto` PIN verifier for a fresh App Lock PIN |
+| `reset_extraction` | Mutating | `can_reset_extraction` | Delete a stuck `extraction_jobs` row (runner + client self-heal) |
+| `reset_transcription` | Mutating | `can_reset_extraction` | Cancel a stuck transcription (terminal state) to free the slot |
+| `delete_user_account` | Mutating | `can_delete_user` | Irreversible full `wipeUser()`; `confirm_email` server-checked |
+| `lookup_user_by_email` | Read | `can_lookup_user` | Exact email → `auth_user_id` identity card (Clerk API) |
+| `search_users` | Read | `can_lookup_user` | Fuzzy multi-candidate email search |
+| `get_user_overview` | Read | `can_view_user_data` | Summary card: identity, tier, storage, data counts |
+| `get_user_state` | Read | `can_read_user_state` | Technical dump: sync prefs, storage, usage, crypto presence |
+| `get_clerk_metadata` | Read | `can_read_user_state` | Clerk record + public/private/unsafe metadata |
+| `user_rate_limits` | Read | `can_read_user_state` | Currently-active `rate_limit_counters` |
+| `get_admin_audit` | Read | `can_read_audit` | Recent `l_admin_audit` (meta-audit) |
+| `get_user_audit` | Read | `can_read_user_audit` | Per-user `l_admin_audit` + abuse events merged |
+| `link_audit_ticket` | Read (metadata write, no preview) | `can_read_user_audit` | Attach a `ticket_ref` to a past audit row |
+| `get_abuse_top_offenders` | Read | `can_triage_abuse` | Cross-customer `SUM(weight)` offenders leaderboard |
+| `get_user_transcribe_history` | Read | `can_read_user_audit` | `h_transcribe_history` with billed ms / credits |
+| `get_user_credit_ledger` | Read | `can_read_user_audit` | Chronological credit events (grants + `l_credit_log`) |
+| `get_user_credits` | Read | `can_view_user_data` | Current manual / bundle / total balances |
+| `get_user_timeline` | Read | `can_read_user_audit` | Merged N-hour cross-source feed |
+| `get_tombstone_report` | Read | `can_view_user_data` | Restorable-row counts per sync group |
+| `get_storage_drift` | Read | `can_read_audit` | `l_storage_drift` entries (detect-only) |
+| `verify_support_token` | Read (marks `consumed_at`) | `can_validate_codes` | Verify a 6-digit code; `reason` + `token_state` axes |
+| `validate_recovery_code` | Read (multi-use) | `can_validate_codes` | Verify a 16-digit code vs an argon2id hash |
+| `whoami` | Read | null (any admin row) | Caller's own permissions + `allowed_operations` |
 
-<Note>
-Scaffold generated from the codebase map — expand with full detail, examples, and specifics.
-</Note>
+## Mutating operations
+
+Each mutating op runs a dry-run preview (no writes) before a `preview_id`-gated commit. See [dry-run & audit](/rollingrecord/backend/support-ops/dry-run-and-audit).
+
+- **`set_account_password`** (`operations/set-account-password.ts`) — force-sets a Clerk password via `updateClerkUserPassword`. Uses a provided password (min 12 chars) or a 24-char server-generated one returned ONLY in the commit response (never in the dry-run preview, and scrubbed from the audit row). Super-admin target-protected. A weak or breached password surfaces as the typed `password_rejected` carrying `clerk_code` + `detail`.
+- **`freeze_user_account`** (`operations/freeze-user-account.ts`) — toggles `canonical_users.frozen_at` + `frozen_reason` via a `frozen` boolean. `reason` is required on freeze, optional on unfreeze. Self-freeze is refused unconditionally (it would lock the admin out of support-ops), and only a super-admin may freeze another super-admin.
+- **`grant_manual_credit`** (`operations/grant-manual-credit.ts`) — adjusts ONLY the `manual` row of `user_credits` for one resource (wire field `credit_type` ∈ `transcription_ms` / `ai_queries` / `extraction_ms`). Positive amounts grant, negative revoke (clamp-to-zero). Per-grant caps apply (360M ms / 10k queries) plus an account credit ceiling (`credit_ceiling_exceeded`). Bundle credits are never touched — those are authored exclusively by the RevenueCat webhook.
+- **`restore_tombstones`** (`operations/restore-tombstones.ts`) — restores all tombstoned (`deleted_at IS NOT NULL`) rows in one sync group within `cloud_tombstone_grace_days`. For the recordings group it storage-quota-checks under a row lock (`quota_insufficient`) before mutating. The UPDATEs run inside the SQL function `support_ops_restore_tombstones` for transactional atomicity; the whole group is restored (the server is encryption-blind and cannot pick a single recording).
+- **`clear_app_lock_pin`** (`operations/clear-app-lock-pin.ts`) — nulls BOTH `pin_verifier_ct` and `pin_verifier_iv` on the `user_crypto` row together, per the paired-NULL rule and the DB CHECK, so the user can enrol a fresh App Lock PIN. It does NOT touch `dek_ct` / `dek_iv` / `kek_version` — cloud audio stays decryptable (RR-492).
+- **`reset_extraction`** (`operations/reset-extraction.ts`) — deletes the user's one stuck `extraction_jobs` row; the extract-runner and the client each self-heal to their "job is gone" terminal paths.
+- **`reset_transcription`** (`operations/reset-transcription.ts`) — cancels a stuck transcription by moving the active job row to the terminal `cancelled` state (`cancelled`, not `failed` — an operator's intentional stop is an outcome, not an error; it does NOT delete the row — a deleted row makes the client spin) and nulls `assemblyai_transcript_id` so a late webhook can't commit the metered reservation. Frees the single-flight-per-user slot with no charge.
+- **`delete_user_account`** (`operations/delete-user-account.ts`) — irreversible full erasure via the shared `wipeUser()` (all `c_*` rows, storage buckets, usage, credits, `canonical_users`, the RevenueCat customer, and the Clerk user). Requires a server-side `confirm_email` match (case/whitespace-insensitive, the real address never echoed). Blocks self-delete (`user_delete_self`), unknown user (`user_delete_not_found`), an active subscription (`user_delete_active_subscription`), and super-admin targets. This is NOT a tombstone — `restore_tombstones` cannot undo it. See [delete-user](/rollingrecord/backend/accounts/delete-user).
+
+## Identity lookup
+
+- **`lookup_user_by_email`** (`operations/lookup-user-by-email.ts`) — resolves an EXACT email to an `auth_user_id` identity card via the Clerk Backend API (the old `auth.users` RPC is dead for Clerk users).
+- **`search_users`** (`operations/search-users.ts`) — the fuzzy multi-candidate counterpart for a partial or misremembered address; returns candidates rather than a single exact answer.
+
+## User snapshots
+
+- **`get_user_overview`** — summary card: identity, tier, storage headline, data counts.
+- **`get_user_state`** — deeper technical dump: sync prefs, per-group storage, usage counters, `user_crypto` presence, pending support token + ledger rows.
+- **`get_clerk_metadata`** — the Clerk record plus its public / private / unsafe metadata namespaces.
+- **`user_rate_limits`** (`operations/get-user-rate-limits.ts`) — only currently-active `rate_limit_counters` (windows not yet elapsed), joining `rate_limit_config.window_sec` at runtime so it always reflects the live window. Note the wire name drops the `get_` prefix that every other op carries.
+- **`get_user_credits`** — current manual / bundle / total balances as a plain read (previously only obtainable from `grant_manual_credit`'s dry-run, which required intent to grant).
+- **`get_tombstone_report`** — restorable-row counts per sync group (settings excluded); pairs with `restore_tombstones`.
+
+## Forensic feeds
+
+- **`get_admin_audit`** (`operations/get-admin-audit.ts`) — recent `l_admin_audit`, filterable — the meta-audit of what operators have done.
+- **`get_user_audit`** — per-user `l_admin_audit` + `l_user_abuse_event` merged by time.
+- **`get_user_timeline`** — merges `h_transcribe_history` + `h_ai_engine_sessions` + `l_admin_audit` + `l_user_abuse_event` + `l_credit_log` (credit events, discriminated by the `source` column) over an N-hour window.
+- **`get_user_transcribe_history`** — reads `h_transcribe_history` with `billed_ms` / credits.
+- **`get_user_credit_ledger`** — merges admin grants and `l_credit_log` chronologically.
+- **`get_abuse_top_offenders`** (`operations/get-abuse-top-offenders.ts`) — the cross-customer `SUM(weight)` leaderboard; gated behind its own higher Trust-and-Safety permission (`can_triage_abuse`).
+- **`get_storage_drift`** (`operations/get-storage-drift.ts`) — lists `l_storage_drift` entries, detect-only (the former `resolve_storage_drift` op was removed).
+
+## Code validation
+
+- **`verify_support_token`** (`operations/verify-support-token/index.ts`) — verifies the target user's 6-digit support code from `support_tokens` and marks `consumed_at` on a match. That consume is internal bookkeeping, not a user-visible state change, which is why it is `isReadOnly: true` and skips dry-run. The response carries two orthogonal axes: `reason` (`verified` / `mismatch` / `already_consumed` / `expired` / `no_active_code`) and `token_state` (`active` / `consumed` / `expired` / `none`), so an operator can tell a typo apart from a fraud signal (a code supplied by someone who has no active token to give).
+- **`validate_recovery_code`** (`operations/validate-recovery-code.ts`) — verifies a 16-digit recovery code against the argon2id hash on the target's `canonical_users` row. Multi-use by design — validation consumes nothing, so it is read-only with no preview. The dispatcher's 60/hr rate limit plus the argon2id cost make brute force against the ~53-bit space infeasible (RR-315). See [recovery code](/rollingrecord/backend/accounts/recovery-code).
+
+## Metadata write and introspection
+
+- **`link_audit_ticket`** (`operations/link-audit-ticket.ts`) — read-only in the dispatcher's sense (no preview) but performs a LIGHT metadata write: it sets `ticket_ref` on a past `l_admin_audit` row, after which the dispatcher writes its own `link_audit_ticket` audit row.
+- **`whoami`** (`operations/whoami.ts`) — the ONLY op with `requiredPermission: null`; any `admin_permissions` row suffices, but a non-admin is still rejected. It returns the caller's effective permissions (a super-admin reads back all-true) plus `allowed_operations` computed live from the registry, so a client never restates the permission → operation map.
+
+## The user-facing counterpart
+
+`verify_support_token` checks a code minted by a separate, user-facing Edge Function. `generate-support-token` (`functions/generate-support-token/index.ts`) is JWT + `Bucket.SupportTokenGenerate` (20/hr) gated. It returns an existing active token when one exists, else mints a cryptographically-random, rejection-sampled 6-digit code (`TOKEN_TTL_MS` = 60 min) and UPSERTs it on `auth_user_id` into `support_tokens`. It is display-only — no email delivery. See [support token](/rollingrecord/backend/accounts/support-token).
+
+## Where to go next
+
+- [Dispatcher gate chain](/rollingrecord/backend/support-ops/dispatcher) — how a request is admitted and routed to these ops.
+- [Admin permissions](/rollingrecord/backend/support-ops/permissions) — the permission column each op declares and the super-admin bypass.
+- [Dry-run & audit](/rollingrecord/backend/support-ops/dry-run-and-audit) — the safety flow every mutating op runs.
+- [Credits & bundles](/rollingrecord/backend/billing/credits-and-bundles) — the balances `grant_manual_credit` and `get_user_credits` operate on.

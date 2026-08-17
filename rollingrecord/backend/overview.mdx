@@ -1,0 +1,80 @@
+---
+title: "Backend Overview"
+description: "The Supabase backend at a glance — the Edge Functions, the shared gate chain, the encrypted data plane, and the external services behind RollingRecord."
+---
+
+RollingRecord's backend is one self-contained monorepo part (`supabase/`) combining Supabase Postgres, Deno/TypeScript Edge Functions, and Storage. Every user-facing server operation — AI, sync, transcription, extraction, billing, identity — runs as an Edge Function behind a single fixed admission chain, and every byte of user content is stored encrypted so that deleting one row erases a user completely.
+
+## The backend as one part
+
+The whole backend lives under `supabase/` and is built to be extracted into its own repository later with a mechanical `git filter-repo` — no cross-part surgery. It is three Supabase primitives plus a small set of external providers:
+
+| Piece | What it is |
+| --- | --- |
+| **Postgres** | 114 append-only migrations under `supabase/migrations/` define every table, RLS policy, index, `pg_cron` job, and trigger. Edge Functions reach it with the service-role client (RLS-bypassing); the anon key gets nothing. |
+| **Edge Functions** | 31 Deno/TypeScript functions under `supabase/functions/`. Shared logic lives in `supabase/functions/_shared/` (gates, crypto, billing, sync transforms, AI providers, …). |
+| **Storage** | Encrypted audio and brand assets in buckets keyed by `auth_user_id` as the first path segment, so a user's objects enumerate and delete cleanly. |
+
+External services the functions call out to: **Anthropic** and **Gemini** (LLM), **AssemblyAI** (transcription), **Cohere** (embeddings), **Brevo** (transactional email), **Clerk** (auth / JWT + Svix webhooks), **RevenueCat** (entitlements), and **Supabase Vault** (the key-encryption key). Firebase **App Check** fronts every request.
+
+## Runtime surfaces
+
+The 31 Edge Functions group into a handful of planes. Each domain below has its own section:
+
+<CardGroup cols={2}>
+  <Card title="Edge Functions & Gates" icon="server" href="/rollingrecord/backend/edge-functions/overview">
+    Every function routes through `runGates()` in a fixed admission order — method, App Check, version floor, auth, entitlement, rate limit.
+  </Card>
+  <Card title="AI Engine" icon="wand-magic-sparkles" href="/rollingrecord/backend/ai-engine/operations-registry">
+    The `ai-engine` proxy: KB-query agent loop, synthesis, keywords, moderation, provider/model selection, and the server-owned prompts.
+  </Card>
+  <Card title="Sync Engine" icon="cloud-arrow-up" href="/rollingrecord/backend/sync/overview">
+    `sync-push` / `sync-pull` / `sync-reserve` / `sync-audio` / `sync-reconcile` — the encrypted cross-device replication protocol.
+  </Card>
+  <Card title="Extraction" icon="list-check" href="/rollingrecord/backend/extraction/architecture">
+    The async plane: `extract-submit` enqueues, `extract-runner` drains, `extract-results` returns structured insights.
+  </Card>
+  <Card title="Transcription" icon="microphone-lines" href="/rollingrecord/backend/transcription/pipeline">
+    AssemblyAI jobs, the `assemblyai-webhook` callback, and the `transcribe-drain` sweeper, metered per second.
+  </Card>
+  <Card title="Storage & Keys" icon="lock" href="/rollingrecord/backend/storage/envelope-encryption">
+    Envelope encryption (KEK in Vault, per-recording DEKs), the audio bucket, and the storage janitors.
+  </Card>
+  <Card title="Database" icon="database" href="/rollingrecord/backend/database/high-risk-tables">
+    Table + column conventions, high-risk tables, RLS, the `l_*` / `h_*` / `f_*` prefixes, and the cron sweepers.
+  </Card>
+  <Card title="Accounts & Identity" icon="user" href="/rollingrecord/backend/accounts/account-otp">
+    Email OTP, recovery codes, App-Lock PIN, identity resolution, anti-abuse, and GDPR account deletion.
+  </Card>
+  <Card title="Billing" icon="credit-card" href="/rollingrecord/backend/billing/entitlements">
+    RevenueCat entitlements, grace windows, manual credits and bundles, and per-user financials.
+  </Card>
+  <Card title="Support Ops" icon="headset" href="/rollingrecord/backend/support-ops/dispatcher">
+    The `support-ops` dispatcher, its operations catalog, permission model, and dry-run + audit trail.
+  </Card>
+  <Card title="Architecture" icon="sitemap" href="/rollingrecord/backend/architecture/overview">
+    The cross-cutting design: the config split, the deletion cascade, and the single-identity model.
+  </Card>
+  <Card title="Operations" icon="gear" href="/rollingrecord/backend/operations/error-registry">
+    `config.toml`, env + secrets, the error-code registry, the privacy posture, and the test strategy.
+  </Card>
+</CardGroup>
+
+## Cross-cutting guarantees
+
+A few invariants hold across every function and table, and they are the reason the backend is safe to extend:
+
+- **One admission chain.** Every Edge Function expresses its guards declaratively as `runGates(req, config)` (`functions/_shared/gates/`). The dispatcher runs them in a fixed order so a mistake like "rate-limit before auth" is structurally impossible. See [The gate chain](/rollingrecord/backend/gates/run-gates).
+- **Delete one row, erase the user.** Every user-data table carries `auth_user_id` with a foreign key `ON DELETE CASCADE` to `canonical_users`; every Storage object is namespaced under the user id. The `delete-user` function is the authoritative wipe list for the few tables that can't use the FK. See [The deletion cascade](/rollingrecord/backend/architecture/deletion-cascade).
+- **Encrypted at rest.** Audio is sealed with per-recording data-encryption keys wrapped by a Vault-held key-encryption key; the server never holds plaintext audio. See [Envelope encryption](/rollingrecord/backend/storage/envelope-encryption).
+- **Config has one home.** Server-authoritative knobs (token ceilings, model allowlist, usage caps) live in the `server_config` table; rate limits live in `rate_limit_config`. See [The config split](/rollingrecord/backend/architecture/config-split).
+- **Calendar-month usage.** Every monthly cap resets on the first of the month at 00:00 UTC, keyed `YYYY-MM` — one global cron, never a per-user rolling window. See [The usage table](/rollingrecord/backend/database/usage-table).
+- **Errors go through a registry.** Every `error` string a function returns comes from the canonical registry in `functions/_shared/errors.ts`, mirrored to the client. See [The error registry](/rollingrecord/backend/operations/error-registry).
+
+## Where to go next
+
+- [Architecture](/rollingrecord/backend/architecture/overview) — the design principles that shape everything else.
+- [Edge Functions overview](/rollingrecord/backend/edge-functions/overview) — the full function catalog and the shared handler shape.
+- [The gate chain](/rollingrecord/backend/gates/run-gates) — how admission is enforced, in order, for every request.
+- [High-risk tables](/rollingrecord/backend/database/high-risk-tables) — the rows whose loss has no recovery path, and the rules that protect them.
+- [Operations](/rollingrecord/backend/operations/env-and-secrets) — how the backend is configured, secured, and tested.

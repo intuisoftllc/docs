@@ -1,15 +1,77 @@
 ---
 title: "Sync Engine Overview"
-description: "The cloud-sync model — replicated c_* tables, client-side encryption, and the endpoint flow."
+description: "Map of the cloud-sync subsystem: seven Edge Functions, the 14-entity encrypted c_* registry, the six sync-preference groups, per-file envelope crypto, and the tombstone / grace-window lifecycle."
 ---
 
-Cross-device sync replicates a set of client-encrypted c_* tables under a last-writer-wins model across a small set of endpoints.
+Cross-device sync replicates a paying user's recordings, contexts, categories, schedules, chat threads, and settings across their devices as client-encrypted rows on Supabase. Seven Edge Functions carry the traffic; every one of them consults a single registry, `ENTITY_REGISTRY` in `functions/_shared/sync/entities.ts`, to decide what crosses the wire and in what shape.
 
-## What this covers
+## The seven Edge Functions
 
-- c_* replicated tables (c_recordings, c_transcripts, c_contexts, c_context_cards, c_search_messages, c_settings, junctions); client-side encryption (ciphertext columns) with a per-user DEK; LWW conflict model.
-- Endpoints: sync-reserve to sync-push to sync-pull to sync-reconcile, plus sync-audio, sync-group-exclude, user-sync-preferences.
+Every endpoint runs the same fixed admission chain via `runGates` (`functions/_shared/gates/index.ts`) and requires at least one of `Entitlement.ProCloud` / `Entitlement.ProCloudAi` — sync is a paid feature. The `developer` RC entitlement cascades into that set, so dev accounts pass entitlement and skip rate limits.
 
-<Note>
-Scaffold generated from the codebase map — expand with full detail, examples, and specifics.
-</Note>
+| Endpoint | Role | Direction |
+| --- | --- | --- |
+| `sync-reserve` | Stateless signed-URL issuer: mint a per-file DEK, wrap it under the KEK, sign an upload URL; writes zero rows | write setup |
+| `sync-push` | Batched upsert + tombstone with per-op outcomes (`accepted` / `server_wins` / `rejected`) and LWW | write |
+| `sync-pull` | Paginated two-phase delta pull keyed on an opaque `(updated_at, id, syncedAt)` cursor | read |
+| `sync-audio` | `download` (unwrap DEK + signed GET URL) and `delete` (sanctioned rolling-demote blob removal) | read + blob delete |
+| `sync-reconcile` | Drift handshake: a cheap `counts` op, a paginated `ids` op on mismatch | read / audit |
+| `sync-group-exclude` | Bulk cloud exclude / restore of a whole group via RPC, with a storage-cap pre-check | write (bulk) |
+| `user-sync-preferences` | GET / PATCH the six per-group sync toggles | config |
+
+## The entity registry
+
+`ENTITY_REGISTRY` is the source of truth for which physical `c_*` tables and columns replicate. It declares 14 `WireEntity` names across 12 non-junction tables plus 2 junction tables. Clients only ever see the wire names — the `c_` prefix and raw SQL identifiers never cross the wire.
+
+| Wire entity | Table | Notes |
+| --- | --- | --- |
+| `recording` | `c_recordings` | carries the cloud-backup crypto columns (`dek_ct`, `audio_iv`, `dek_iv`, `kek_version`, `storage_path`) |
+| `recording_session` | `c_recording_sessions` | rolling-session parent |
+| `transcript` | `c_transcripts` | PK is `recording_id`, exposed on the wire as `id` |
+| `recording_note` | `c_recording_notes` | timestamped notes |
+| `context` | `c_contexts` | |
+| `context_card` | `c_context_cards` | PK is `context_id`, exposed as `id` |
+| `action_item` | `c_action_items` | |
+| `context_recording` | `c_context_recordings` | composite-PK junction |
+| `context_session` | `c_context_sessions` | composite-PK junction |
+| `category` | `c_categories` | |
+| `scheduled_recording` | `c_scheduled_recordings` | |
+| `search_thread` | `c_search_threads` | |
+| `search_message` | `c_search_messages` | |
+| `settings` | `c_settings` | one row per user, `UNIQUE(auth_user_id)` |
+
+Every user-content column is an encrypted `<field>_ct` / `<field>_iv` byte pair — the server stores ciphertext and IVs, never plaintext. See [Sync Shared Modules](/rollingrecord/backend/sync/shared-transforms) for the transform and validation layer.
+
+## Sync groups
+
+Six preference toggles on `user_sync_preferences` gate whole groups of entities. `SyncGroup` and the group → entity mapping live in `functions/_shared/sync/groups.ts`, derived live from the registry.
+
+| Group | Preference column | Entities (wire names) |
+| --- | --- | --- |
+| recordings | `sync_recordings` | `recording`, `recording_session`, `transcript`, `recording_note` |
+| contexts | `sync_contexts` | `context`, `context_card`, `action_item`, `context_recording`, `context_session` |
+| categories | `sync_categories` | `category` |
+| schedules | `sync_schedules` | `scheduled_recording` |
+| threads | `sync_threads` | `search_thread`, `search_message` |
+| settings | `sync_settings` | `settings` |
+
+## Per-file envelope encryption
+
+Encryption uses a per-FILE DEK, not a per-user one. Each `c_recordings` row carries its own Data Encryption Key: `sync-reserve` generates a fresh 32-byte DEK, wraps it under the current KEK from Vault (`generateDek` / `wrapDek` in `functions/_shared/crypto/envelope.ts`), and hands back the plaintext DEK once so the client can encrypt the audio. `sync-audio` `download` reverses the wrap with `unwrapDek` against the row's recorded `kek_version`, so KEK rotations never break old rows. The KEK is the only shared root of trust; every DEK below it protects exactly one audio file, so a leaked DEK exposes one recording rather than the whole library.
+
+## Write and read paths
+
+Three write paths exist in `sync-push`. A tombstone op (`deleted_at` set) is an UPDATE-only path that never inserts — a 0-row match still returns `accepted` so the client can drain the outbox entry. The default no-`known_updated_at` op is an UPSERT that treats the client's row as authoritative for the columns it sends (single-device metadata flows: rename, favorite, post-merge duration). The `known_updated_at` op is a last-writer-wins UPDATE gated on `updated_at <= known` — the multi-device / audio-commit path where a stale writer loses to `server_wins`. Reads flow through `sync-pull`, which fans out one delta SELECT per enabled entity, merge-sorts globally, and paginates via the opaque cursor.
+
+## Tombstones and the grace window
+
+A delete is a soft-delete tombstone — an UPDATE that sets `deleted_at`, never a raw `DELETE` on `c_recordings`. The encrypted blob is deliberately kept for `server_config.cloud_tombstone_grace_days` (30 by default) so a restore stays playable; the orphan-blob sweeper reaps it only after the window closes. `sync-pull` returns `resync_required` when a client's cursor predates that window, since deletes it never saw may already have been GC'd.
+
+## Where to go next
+
+- [sync-push](/rollingrecord/backend/sync/push) — the batched write endpoint: per-op outcomes, FK reordering, blob re-validation, and the three write paths.
+- [sync-pull](/rollingrecord/backend/sync/pull) — the paginated two-phase delta read: cursor, page caps, remaining count, and the resync path.
+- [sync-reserve & sync-audio](/rollingrecord/backend/sync/reserve-and-audio) — signed-URL issuance for encrypted uploads and the download / delete companion.
+- [sync-reconcile & sync-group-exclude](/rollingrecord/backend/sync/reconcile-and-groups) — the drift handshake and bulk cloud exclude / restore.
+- [user-sync-preferences](/rollingrecord/backend/sync/preferences) — the GET / PATCH endpoint over the six per-group toggles.
+- [Sync Shared Modules](/rollingrecord/backend/sync/shared-transforms) — the registry, wire↔DB transform, opaque cursor, and protocol constants every endpoint reuses.

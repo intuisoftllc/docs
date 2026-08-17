@@ -1,15 +1,37 @@
 ---
 title: "sync-reconcile & sync-group-exclude"
-description: "The drift-detection handshake and the bulk group exclude/restore endpoint."
+description: "The counts-then-ids drift-detection handshake and the bulk cloud exclude / restore endpoint with its storage-cap pre-check."
 ---
 
-sync-reconcile detects client/server drift with a cheap counts-then-ids handshake; sync-group-exclude does bulk cloud exclude/restore.
+`sync-reconcile` catches divergence between a client's local mirror and the server cheaply, then hands the client the id list it needs to repair. `sync-group-exclude` is the whole-group escape hatch for taking a group out of the cloud and putting it back. Both are separate from the per-row `sync-push` / `sync-pull` protocol because they are inherently set-wide operations.
 
-## What this covers
+## sync-reconcile — the drift handshake
 
-- sync-reconcile: counts (cheap, frequent) vs ids (paginated, on mismatch) drift handshake; the client fixes drift.
-- sync-group-exclude: bulk exclude/restore group ops via RPC with a cap pre-check (storage_cap_would_be_exceeded); revive_would_exceed_quota.
+`sync-reconcile` (`functions/sync-reconcile/index.ts`) exposes two operations, discriminated by `parseRequest`. Fixing the actual drift is the client's job (a cursor reset for "server has, local doesn't"; a local hard-delete for "local has, server doesn't"). Both ops apply the client's synced-set predicate: `deleted_at IS NULL AND cloud_excluded_at IS NULL AND auth_user_id = caller` — tombstones and opt-out rows are not counted.
 
-<Note>
-Scaffold generated from the codebase map — expand with full detail, examples, and specifics.
-</Note>
+| operation | Request | Response |
+| --- | --- | --- |
+| `counts` | `{ operation: "counts", groups: [ ] }` | `{ entities: { wire: { count, max_updated_at } }, server_time }` |
+| `ids` | `{ operation: "ids", entities: [ ], cursor? }` | `{ entities: { wire: { ids: [ ], next_cursor } }, server_time }` |
+
+`runCounts` returns a per-entity `count: 'exact'` head query plus a separate `max(updated_at)` over the synced-set predicate — the cheap op the client runs frequently (debounced foregrounding + a 4h period). `runIds` only fires on a count mismatch: a per-entity paginated id list ordered by the id column, `LIMIT RECONCILE_IDS_PAGE_SIZE + 1` where `RECONCILE_IDS_PAGE_SIZE = 5000`; overflow sets `next_cursor` to the last id. `singleIdColumn` returns the entity's wire-`id` db column, or `null` for composite-PK junctions — so `ids` does NOT support `context_recording` or `context_session`, which have no single id column and are reconciled implicitly via parent-row resync.
+
+## sync-group-exclude — bulk exclude and restore
+
+`sync-group-exclude` (`functions/sync-group-exclude/index.ts`) does whole-group operations through two SECURITY DEFINER RPCs. `isValidGroup` guards `body.group` against `ALL_SYNC_GROUPS`; `restore` additionally accepts `null` / undefined for a blanket undo.
+
+| operation | group | Result |
+| --- | --- | --- |
+| `exclude` | required (a specific group) | `bulk_cloud_exclude_group` stamps `cloud_excluded_at` → `{ excluded_count, group, excluded_at }` |
+| `restore` | optional (`null` = all groups) | `bulk_cloud_exclude_restore`, all-or-nothing with a cap pre-check → `{ restored_count, restored_bytes, group }` OR 409 `storage_cap_would_be_exceeded` |
+
+`exclude` captures `NOW()` server-side and calls `bulk_cloud_exclude_group` with `{ p_auth_user_id, p_group, p_excluded_at }`. `restore` calls `bulk_cloud_exclude_restore` with `{ p_auth_user_id, p_group }` (a `null` group means undo across all groups). The RPC returns either a success payload or an error payload, both as JSONB; the handler detects the over-cap case by probing for `obj.error === "storage_cap_would_be_exceeded"` and returns it as a 409 with `{ current_used_bytes, restore_bytes, cap_bytes, overage_bytes }`.
+
+Neither op requires the group's sync toggle to be ON — `exclude` is often part of toggling a group OFF, and `restore` naturally precedes re-enabling. Both share the `sync_push` rate-limit bucket, since they sit in the same cost envelope as row pushes.
+
+## Related pages
+
+- [Sync Engine Overview](/rollingrecord/backend/sync/overview) — the subsystem map and the six sync groups.
+- [sync-pull](/rollingrecord/backend/sync/pull) — the cursor reset a client uses to repair "server has, local doesn't" drift.
+- [user-sync-preferences](/rollingrecord/backend/sync/preferences) — the toggle a group-exclude typically accompanies.
+- [Sync Shared Modules](/rollingrecord/backend/sync/shared-transforms) — the registry these ops walk to resolve entities and id columns.

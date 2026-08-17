@@ -1,15 +1,85 @@
 ---
 title: "sync-push"
-description: "The batched upsert + tombstone endpoint and its per-operation outcome model."
+description: "The batched upsert + tombstone write endpoint: per-op outcome array, topological FK reordering, blob HEAD + size re-validation, running quota, and the three LWW write paths."
 ---
 
-sync-push applies batched upserts and tombstones, returning a per-operation outcome array rather than failing the whole batch.
+`POST /sync-push` (`functions/sync-push/index.ts`) takes a batch of write ops and returns a per-op outcome array — it is deliberately NOT all-or-nothing. A well-formed batch with one bad op still commits the other nine; only structural abuse of the envelope fails the whole request.
 
-## What this covers
+## Request and response shape
 
-- Batched upserts + tombstones with a per-op outcome array (accepted/server_wins/rejected); top-level 400 only for structural abuse; tombstones reordered before upserts.
-- Per-op codes: sync_disabled_for_group, blob_missing, size_mismatch (over 1% goes to l_user_abuse_event), batch_too_large, fk_violation; a sanctioned c_recordings DELETE (tombstone) path.
+The body is `{ ops: [ { entity, known_updated_at?, row } ] }`. A tombstone is just an op whose `row` carries a non-null `deleted_at` — there is no separate delete verb. `parsePushRequest` (`functions/sync-push/request.ts`) validates only the outer skeleton; per-field validation is delegated to `wireRowToDb`.
 
-<Note>
-Scaffold generated from the codebase map — expand with full detail, examples, and specifics.
-</Note>
+```json
+{
+  "status": "ok",
+  "server_time": "2026-04-22T15:10:00.000Z",
+  "results": [
+    { "index": 0, "outcome": "accepted",    "entity": "recording", "row": { } },
+    { "index": 1, "outcome": "server_wins", "entity": "category",  "row": { } },
+    { "index": 2, "outcome": "rejected",    "entity": "recording",
+      "code": "sync_disabled_for_group", "group": "recordings" }
+  ]
+}
+```
+
+`buildOkResponse` (`functions/sync-push/response.ts`) sorts `results` back to submission order by `index`, so the client correlates each outcome to its outbound queue entry even though the server executes them reordered. `PushOpInput` is `{ entity: string; knownUpdatedAt: string | null; row: Record<string, unknown> }`.
+
+## Per-op outcomes
+
+`processPushOp` (`functions/sync-push/push-ops.ts`) returns one `OpResult` per op — a discriminated union of accepted / server_wins / rejected.
+
+| Outcome | When | Returned row |
+| --- | --- | --- |
+| `accepted` | Insert / update / tombstone applied (a tombstone matching 0 rows is also accepted — the row was already gone) | new server-side row |
+| `server_wins` | LWW lost (`updated_at` in the DB is newer than `known`) OR a non-PK `UNIQUE` collision resolved to the existing row (`c_settings`) | current server-side row |
+| `rejected` | Validation / preference / blob / quota / FK / ownership failure | no row; carries `code` (plus `field` or `group`) |
+
+## The per-op pipeline
+
+Each op runs the same sequence: entity resolve (`entityByWire`) → preference check (`groupForEntity` against the loaded toggles) → wire→db transform (`wireRowToDb`) → blob HEAD + size re-check → quota pre-check → one of three writes.
+
+1. **Tombstone** (`deleted_at` set) — UPDATE-only. The wire row carries just `{ id, deleted_at }`, so an INSERT would violate every `NOT NULL` column; UPDATE matches the real semantics ("mark it deleted if it exists"). Zero rows matched means the row never reached the server — accepted anyway so the client drains its outbox. The blob is kept, not deleted, for the recovery window.
+2. **UPSERT** (no `known_updated_at`) — insert if new, update if exists; the client's row is authoritative for the columns it sends. Columns it omits are preserved.
+3. **LWW UPDATE** (`known_updated_at` set) — `UPDATE ... WHERE updated_at <= known`. Zero rows affected → SELECT the current row and return `server_wins`; one row affected → `accepted`. This is the multi-device / audio-commit path.
+
+### Two special resolution branches on the UPSERT path
+
+- **Tombstone resurrection.** A non-tombstone upsert asserts the row exists now, so it forces `deleted_at = null` on write. Without this, re-adding a junction/transcript row that reuses a deterministic PK would leave the row undead — the next pull reads the stale tombstone and deletes it again every cycle.
+- **Non-PK UNIQUE collision.** A PG `23505` on a `UNIQUE` constraint other than the PK (today `c_settings UNIQUE(auth_user_id)`) resolves to `server_wins` via `fetchSoleRowForUser`, so a reinstall adopts the existing settings row and its id instead of clobbering it.
+
+### Cross-user IDOR guard
+
+Because the upsert's `onConflict` targets the bare PK (not scoped to `auth_user_id`), an ownership pre-check probes for an existing row under a different owner and rejects it as `not_found` — the same opaque outcome the LWW path returns for a cross-user PK. The tombstone and LWW-UPDATE branches carry `.eq("auth_user_id", authUserId)` directly.
+
+## Execution ordering
+
+`reorderForExecution` (`functions/sync-push/index.ts`) splits ops into tombstones-first, then sorts topologically by FK depth using `ENTITY_DEPTH`: within tombstones, children before parents (depth descending); within upserts, parents before children (depth ascending). This is the fix for the 2026-05-05 FK-violation incident, where a batch of `[message, message, thread]` — exactly what the client outbox produces — rejected the messages because the thread was not yet written. Unknown entities default to `UNKNOWN_ENTITY_DEPTH = 99` (a safe leaf). The original submission `index` is preserved for response re-sorting.
+
+## Blob validation and running quota
+
+When an upsert row carries a `storage_path`, `blobMetadata` does a HEAD-equivalent `storage.from('audio-storage').list` to confirm the client's signed-URL PUT completed and to read the real object size. If the claimed `file_size_bytes` is more than 1% off the actual size, the op is rejected `size_mismatch` and an `l_user_abuse_event` (`SizeMismatch`) is logged; otherwise the server overwrites `file_size_bytes` with what it measured. `estimateIncomingBytes` sums bytea-column lengths plus `file_size_bytes` and checks it against a `RunningQuota` (`{ remainingBytes, quotaBytes, usedBytes }`) that is decremented in place per accepted op — so a batch cannot split a large write past the cap. `syncQuotaCap` (`functions/_shared/db/storage-quota.ts`) fire-and-forget persists the resolved cap so the `enforce_recordings_quota` DB trigger can reject atomically too; `isQuotaExceededError` maps that trigger's `P0001` / `backup_quota_exceeded` error back to the same wire code as the pre-check.
+
+## Rejection codes
+
+| code | HTTP | Meaning |
+| --- | --- | --- |
+| `sync_disabled_for_group` | 409 | the op's group toggle is OFF on `user_sync_preferences` (carries `group`) |
+| `blob_missing` | 409 | `storage_path` declared but no object found there (the PUT never completed) |
+| `size_mismatch` | 409 | claimed `file_size_bytes` is more than 1% off the actual Storage size |
+| `backup_quota_exceeded` | 409 | upsert would exceed the tier storage cap (pre-check or `enforce_recordings_quota` trigger) |
+| `fk_violation` | 409 | PG `23503` — child references a parent not yet written; retriable next cycle |
+| `not_found` | 404 | cross-user PK (IDOR guard on the upsert path) OR an LWW UPDATE matched no owned row |
+| `validation_failed` | 400 | unknown or mistyped field (carries `field`); also top-level for a bad envelope |
+| `batch_too_large` | 413 | more than 500 ops or a body over 5 MB (top-level; fails the whole request) |
+| `database_error` | 500 | unexpected DB failure or the op threw |
+| `invalid_body` | 400 | non-JSON or non-object body (top-level) |
+
+Top-level 400s / 413s fire only for structural abuse (`invalid_body`, `validation_failed` on the envelope, `batch_too_large` from `SYNC_PUSH_MAX_BATCH_OPS = 500` / `SYNC_PUSH_MAX_BATCH_BYTES = 5 MB`). Everything else is a per-op outcome inside `results`.
+
+## Related pages
+
+- [Sync Engine Overview](/rollingrecord/backend/sync/overview) — where sync-push sits in the subsystem.
+- [sync-pull](/rollingrecord/backend/sync/pull) — how accepted rows come back on the read side.
+- [sync-reserve & sync-audio](/rollingrecord/backend/sync/reserve-and-audio) — the upload that precedes an audio-commit push.
+- [Sync Shared Modules](/rollingrecord/backend/sync/shared-transforms) — `wireRowToDb`, the registry, and validation.
+- [user-sync-preferences](/rollingrecord/backend/sync/preferences) — the toggle that drives `sync_disabled_for_group`.

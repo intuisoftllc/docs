@@ -1,15 +1,80 @@
 ---
 title: "Error-Code Registry & Kotlin Mirror"
-description: "The single source of truth for error codes and its Kotlin mirror."
+description: "The single TypeScript registry of every Edge Function error code, its Kotlin enum mirror, and the on-demand doc generator."
 ---
 
-Every error code comes from one registry, mirrored on the Kotlin side and regenerated into human-readable docs.
+`supabase/functions/_shared/errors.ts` is the single source of truth for every `error` string any Edge Function returns to the client. No function may inline an error string — the constant is the contract, enforced by a `CLAUDE.md` HARD RULE. A Kotlin enum mirrors the registry one-to-one, a drift test holds them in parity, and a Python script regenerates a human-readable table on demand.
 
-## What this covers
+## The registry: three category objects
 
-- _shared/errors.ts is the single source of truth (USER_ERRORS / INFRA_ERRORS / DEV_ERRORS, def(), AppError, ALL_ERROR_CODES, errorCategory); no inline literals; jwt.ts is the discriminated-union exception.
-- The Kotlin mirror AiEngineErrorCode.kt (identical code set, same commit); supabase/scripts/gen_error_docs.py regenerates docs/error-codes.md.
+Codes are built by a compact `def(code, category, httpStatus, description)` factory into three exported objects, then spread into one combined `AppError`. The `category` field — not which object a code sits in — is what drives client presentation.
+
+| Object (`_shared/errors.ts`) | Category meaning | Client treatment |
+|---|---|---|
+| `USER_ERRORS` | `user` | friendly UI message, maps to a typed `AiEngineResult` variant |
+| `INFRA_ERRORS` | `infra` | generic "service unavailable, retry" — the client backs off |
+| `DEV_ERRORS` | `developer` | never shown; logged to Crashlytics as "something went wrong" |
+
+Representative codes per category:
+
+| category | Examples |
+|---|---|
+| `user` | `cap_reached`, `subscription_required`, `moderation_failed`, `step_up_required`, `backup_quota_exceeded`, `semantic_search_disabled` |
+| `infra` | `all_providers_failed`, `rate_limited`, `provider_rate_limited`, `database_error`, `fk_violation`, `embedding_failed` |
+| `developer` | `invalid_jwt`, `handler_threw`, `missing_operation`, `model_not_allowed`, `extraction_undecryptable`, `admin_hmac_mismatch` |
 
 <Note>
-Scaffold generated from the codebase map — expand with full detail, examples, and specifics.
+Object and category are not identical. `batch_too_large`, `size_mismatch`, and `recovery_code_invalid_operation` are physically defined inside `USER_ERRORS` but carry category `"developer"`. Both the Kotlin mirror and the doc generator bucket by the `category` field, so these three appear under Developer errors — don't assume the enclosing object equals the category.
 </Note>
+
+## Combined surface and lookup
+
+Three helpers close the registry:
+
+| Symbol (`_shared/errors.ts`) | Role |
+|---|---|
+| `AppError` | `{ ...USER_ERRORS, ...INFRA_ERRORS, ...DEV_ERRORS }`; call sites reference `AppError.X.code` / `AppError.X.httpStatus` |
+| `ALL_ERROR_CODES` | `ReadonlySet<string>` of every code, for smoke-test drift checks; its size must equal `Object.keys(AppError).length` |
+| `errorCategory(code)` | resolves a code back to its `ErrorCategory`, or `null` for an unknown code |
+
+Because the three objects are spread into one, a duplicate `code` string across groups would silently shadow. `tests/_shared/errors_test.ts` pins against exactly that: no duplicate codes, `ALL_ERROR_CODES.size == AppError` key count, snake_case codes, `httpStatus` in the 4xx/5xx range, non-empty descriptions, and valid categories.
+
+## The Kotlin mirror
+
+The client mirrors the registry as `enum class AiEngineErrorCode(val code: String, val category: Category)` with a nested `enum class Category { USER, DEVELOPER, INFRA }` and a `fromCode()` lookup. The name is historical — despite the `AiEngine` prefix it covers every Edge Function's codes, not just `ai-engine`.
+
+<Warning>
+The Kotlin mirror's real path is `app/agentcore/src/main/kotlin/com/intuisoftllc/rollingrecord/data/remote/aiengine/AiEngineErrorCode.kt` — inside the pure-JVM `agentcore` module. The `errors.ts` header comment cites a wildcard `app/.../data/remote/aiengine/AiEngineErrorCode.kt` path; only the `CLAUDE.md` rule cites the outdated `app/app/.../AiEngineErrorCode.kt` module path. Use the `agentcore` path.
+</Warning>
+
+`AiEngineErrorCodeDriftTest` parses the TypeScript registry at test runtime and asserts exact **bidirectional** parity between the enum and `errors.ts`. Adding a code on only one side fails the build — the fix is to add it on both, never to `@Ignore` the test.
+
+## Registry → mirror → docs pipeline
+
+| Artifact | File | Role |
+|---|---|---|
+| TypeScript registry (source of truth) | `functions/_shared/errors.ts` | `USER` / `INFRA` / `DEV_ERRORS` + `AppError` + `ALL_ERROR_CODES` + `errorCategory` |
+| Kotlin mirror | `app/agentcore/.../aiengine/AiEngineErrorCode.kt` | 1:1 enum, category-tagged, `fromCode()` |
+| Drift guard | `AiEngineErrorCodeDriftTest` | parses the TS at runtime, asserts bidirectional parity |
+| Unit tests | `tests/_shared/errors_test.ts` | no-duplicates + well-formedness |
+| Generated doc | `docs/error-codes.md` (via `scripts/gen_error_docs.py`) | human-readable, regenerated on demand |
+
+`supabase/scripts/gen_error_docs.py` reads `errors.ts`, matches each `CONST: def("code", "category", STATUS, "desc")` with a `DOTALL` regex (`ENTRY_RE`) that also collapses TypeScript `"a" + "b"` string concatenation, and writes `docs/error-codes.md` with a per-category count summary plus one table per category sorted by code. Run it from the repo root:
+
+```bash
+python supabase/scripts/gen_error_docs.py
+```
+
+<Warning>
+`docs/error-codes.md` is a **point-in-time snapshot regenerated on demand, not in CI** — it drifts. The current checked-in copy is out of sync: its summary claims 152 codes and it lists a whole family of `bundle_*` purchase codes (`bundle_already_credited`, `bundle_no_grant_found`, `bundle_rc_transaction_*`, …) that exist in **neither** the current `errors.ts` nor the Kotlin mirror. Treat `errors.ts` as authoritative and regenerate the markdown after any code change.
+</Warning>
+
+## The single exception to "no inline literals"
+
+`functions/_shared/gates/jwt.ts` returns a `VerifyBearerResult` discriminated union with narrow string-literal `error` types (`"missing_bearer_token"`, `"invalid_jwt"`) so consumers can exhaustively pattern-match. Those literals must match the registry codes exactly and are renamed in the same commit as any registry rename. Any new helper needing this pattern gets the same treatment: literal in the type, matching registry entry, paired updates.
+
+## Where to go next
+
+- [Function Deployment (config.toml)](/rollingrecord/backend/operations/config-toml) — the functions that emit these codes.
+- [Environment Variables & Secrets](/rollingrecord/backend/operations/env-and-secrets) — the secrets whose absence raises the `*_key_missing` codes.
+- [Testing Strategy](/rollingrecord/backend/operations/testing) — where `errors_test.ts` fits in the two-layer test model.

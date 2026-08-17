@@ -1,15 +1,58 @@
 ---
 title: "High-Risk Tables Registry"
-description: "The registry of tables where losing a row destroys user data with no recovery path."
+description: "The tables where losing a single row destroys user data with no engineering recovery path, and the protections around them."
 ---
 
-A small registry marks the tables whose loss is unrecoverable, with strict protections around them.
+Two tables are **high-risk**: losing a row (or nulling its crypto columns while the Storage blob survives) makes the corresponding ciphertext permanently un-decryptable. The authoritative registry is `supabase/docs/high-risk-tables.md`; CLAUDE.md requires reading it before any migration, `DELETE`/`TRUNCATE`/`DROP`, or RLS/FK/crypto-column change touching these tables.
 
-## What this covers
+## What makes a table high-risk
 
-- Criteria (no engineering recovery path); registry entries c_recordings (crypto columns dek_ct/audio_iv/dek_iv/kek_version/storage_path) and user_crypto (per-user DEK).
-- Protections: no raw DELETE outside sanctioned callers, no TRUNCATE/DROP, PITR + daily off-platform backup, plus watched-but-not-high-risk tables (canonical_users, lifetime_entitlements).
+A table earns the label when all three hold, per `supabase/docs/high-risk-tables.md`:
 
-<Note>
-Scaffold generated from the codebase map — expand with full detail, examples, and specifics.
-</Note>
+| Criterion | Meaning |
+| --- | --- |
+| No engineering recovery | No forward-fix migration, no rebuild from other tables, no regenerate-from-source |
+| External-backup dependent | Restoration depends on PITR (inside its window) or a daily dump that may not exist |
+| Blast radius | "All of a user's data of some class" or worse |
+
+## The registry
+
+| Table | What it holds | Why catastrophic | Recovery path |
+| --- | --- | --- | --- |
+| `c_recordings` crypto columns | `dek_ct` / `audio_iv` / `dek_iv` / `kek_version` / `storage_path` per recording | The `audio-storage` blob is random bytes without the row's wrapped DEK | PITR (14-day window); outside it, re-upload from device-local audio |
+| `user_crypto` | per-user `dek_ct` / `dek_iv` / `kek_version` | The one DEK decrypts every text ciphertext column across all `c_*` tables | PITR only; outside it the user's cloud text corpus is gone (audio survives via its own per-recording DEKs) |
+
+### `c_recordings` cryptographic columns
+
+Every recording row carries a cloud-backup crypto column-set: `dek_ct` (the wrapped per-recording DEK), `audio_iv`, `dek_iv`, `kek_version`, and `storage_path` (`supabase/migrations/20260508000000_baseline.sql`). These are NULL together for a local-only recording and non-NULL together for a cloud-backed one. The ciphertext audio file in the `audio-storage` bucket is meaningless without the row's `dek_ct` + `audio_iv` + `dek_iv` + `kek_version` — even with Storage and Vault access combined, the per-file wrapped DEK is gone. The primary key is `id`; `fk_c_recordings_user` references `canonical_users(auth_user_id)` with `ON DELETE CASCADE`. Pre-RR-304 this metadata lived on a separate `audio_backups` table; RR-304 merged it onto `c_recordings` and the blast radius moved with it. See [c_recordings integrity](/rollingrecord/backend/database/c-recordings-integrity).
+
+### `user_crypto`
+
+One row per user, holding `dek_ct` + `dek_iv` + `kek_version` (all `NOT NULL`, with `CHECK (kek_version > 0)`). That single DEK encrypts every text ciphertext column across every synced table — `c_recordings.name_ct`, `c_transcripts.text_ct`, `c_contexts.description_ct`, `c_context_cards.sections_ct`, `c_search_messages.content_ct`, and the rest. Lose the row and the user's entire text corpus becomes unrecoverable bytes. Its protections are all shipped, not pending: `fk_user_crypto_user` FK + CASCADE, RLS enabled with no policies, and it is listed in `delete-user`'s `TABLES_TO_WIPE` (`supabase/functions/_shared/users/wipe.ts`). The RR-320 rename (`wrapped_dek` → `dek_ct`, `iv` → `dek_iv`) has already landed.
+
+## Watched, but not high-risk
+
+| Table | Why it's watched | Why it's recoverable |
+| --- | --- | --- |
+| `canonical_users` | Losing one row CASCADEs away that user's whole dataset | That cascade is the *designed* account-deletion behavior; mass loss recovers from the auth provider + PITR |
+| `lifetime_entitlements` | Loss means founders / admin grants must be re-claimed | Reconstructable from RevenueCat + Play/App Store receipts; RC is the enforcement layer, this is an intent ledger |
+
+## Protections in force
+
+- **HARD RULE — `c_recordings` Cryptographic-Column Integrity** (CLAUDE.md): no raw `DELETE` outside sanctioned callers, no crypto-column nulling on rows whose Storage object still exists, no `TRUNCATE`, no `DROP TABLE`.
+- **FK + CASCADE** to `canonical_users` on both tables, so account deletion is clean.
+- **Belt-and-suspenders wipe**: `wipeUser()` lists both `user_crypto` and `c_recordings` in `TABLES_TO_WIPE`, and `audio-storage` / `embedding-storage` / `transcribe-inbox` in `BUCKETS_TO_WIPE` — Storage objects never CASCADE, so the bucket wipe is what removes the ciphertext blobs.
+- **PITR** on production Supabase, 14-day retention (RR-287). A daily off-platform encrypted backup is noted in the registry as pending — not yet a guaranteed second copy.
+- **`subscription_lapse_cleanup`**: 30 days after `subscription_lapsed_at`, this daily sweeper deletes the user's `audio-storage` objects and tombstones every `c_*` row — `canonical_users`, `user_crypto`, and the audit logs deliberately survive.
+
+## Adding a new high-risk table
+
+Per the registry's update procedure: add a registry entry with blast radius and recovery path, confirm PITR + daily-backup coverage, add a HARD RULE in CLAUDE.md mirroring the `c_recordings` pattern, and wire it into `delete-user`'s `TABLES_TO_WIPE` if it doesn't CASCADE.
+
+## Related pages
+
+- [c_recordings integrity](/rollingrecord/backend/database/c-recordings-integrity) — the sanctioned DELETE callers and the TRUNCATE/DROP ban
+- [Column spine & encrypted pairs](/rollingrecord/backend/database/column-conventions) — the `_ct` / `_iv` crypto-column convention
+- [Scheduled pg_cron sweepers](/rollingrecord/backend/database/cron-sweepers) — the jobs that touch crypto columns
+- [RLS & service-role model](/rollingrecord/backend/database/rls-and-service-role) — why these tables are reachable only through Edge Functions
+- [Migration discipline](/rollingrecord/backend/database/migrations-discipline) — the destructive-migration rules that guard them

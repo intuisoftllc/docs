@@ -1,15 +1,73 @@
 ---
-title: "f_user_financials & Cost Accounting"
-description: "The per-user financial-state table and how AI and storage cost are recorded in micro-USD."
+title: "Per-User Financials"
+description: "f_user_financials — the per-(user, month) financial-state table in micro-USD: revenue in, AI and transcription cost, a trigger-maintained storage estimate, and cost recorded even for developer accounts."
 ---
 
-Per-user cost is recorded in integer micro-USD on f_user_financials, tracked for every account including developers.
+`f_user_financials` is the per-user, per-month financial ledger — revenue in, AI and transcription cost out, and a storage-cost snapshot. It is the first table to use the `f_*` prefix (sensitive, mutable financial **state** — not append-only history like `l_*` / `h_*`). It is created in `migrations/20260527100000_create_f_user_financials.sql`.
 
-## What this covers
+## Table shape
 
-- Per-(user, period) financial state in micro-USD (BIGINT, no floats); ai_cost_micros (LLM via client.ts + transcription via assemblyai-webhook) and storage_cost_estimate_micros (a trigger from user_storage_usage times rates).
-- The f_* convention rules; recorded for dev accounts (cost visibility is not a dev exception).
+The table is keyed per-`(user, month)`: PK `(auth_user_id, period)` where `period` is `YYYY-MM` UTC, mirroring the `usage` table so cost and consumption join cleanly per-period. A new month's first write implicitly creates the row (no rollover cron), quiet months get no row, and past rows stay queryable as a cost history. It has an FK + `ON DELETE CASCADE` to `canonical_users`, so it is GDPR-covered by the cascade — it is also belt-and-suspenders listed in `TABLES_TO_WIPE` (`_shared/users/wipe.ts`). All money is integer micro-USD (BIGINT, `>= 0` CHECKs); divide by 1e6 for dollars.
 
-<Note>
-Scaffold generated from the codebase map — expand with full detail, examples, and specifics.
-</Note>
+| Column | Type | Role | Written by |
+| --- | --- | --- | --- |
+| `auth_user_id` | TEXT | PK part 1 / cascade hook | — |
+| `period` | TEXT (`YYYY-MM` UTC) | PK part 2 | implicit on first write in month |
+| `updated_at` | TIMESTAMPTZ | lifecycle | every write |
+| `revenue_micros` | BIGINT `>= 0` | real paid inflow (accumulator) | `revenuecat-webhook` (bundles + recurring renewals) |
+| `ai_cost_micros` | BIGINT `>= 0` | LLM + transcription cost (accumulator) | `_shared/ai/client.ts` + `assemblyai-webhook`, via `increment_financial_counter` |
+| `storage_cost_estimate_micros` | BIGINT `>= 0` | monthly storage-cost SNAPSHOT (not accumulated) | `user_storage_usage` triggers + re-stamped by `increment_financial_counter` |
+
+## revenue_micros
+
+`revenue_micros` captures **real** paid inflows only. It is written by two `revenuecat-webhook` handlers — `handleRecurringSubRevenue` (fresh `INITIAL_PURCHASE` / `RENEWAL`) and `handleNonSubscriptionPurchase` (bundle purchases with `outcome === 'credited'`) — both calling `incrementFinancialColumn(user, 'revenue_micros', usdToMicros(event.price))`, each gated so RC retries never double-count. Free, promotional, and dev grants never write here, so revenue stays an honest figure for margin analysis. (The migration's column comment predates the shipped code and lists recurring renewals as "future"; recurring revenue is written today.)
+
+## ai_cost_micros
+
+`ai_cost_micros` accumulates two cost streams through the same RPC:
+
+- **LLM cost** — `trackTokenUsage` in `_shared/ai/client.ts` fires on every successful primary-or-failover AI call. It increments `usage.input_tokens` / `usage.output_tokens` (analytics, not a gated quota) and writes `usdToMicros(computeCallCostUsd(model, usage))` via `incrementFinancialColumn`. `computeCallCostUsd` (`_shared/ai/pricing.ts`) is model-aware and prompt-cache-aware.
+- **Transcription cost** — `assemblyai-webhook` writes on a completed transcript with a persisted reservation and `billedDurationMs > 0`: `computeTranscriptionCostUsd({durationMs, medicalMode, diarize})` → `incrementFinancialColumn(authUserId, 'ai_cost_micros', usdToMicros(costUsd))`.
+
+Both paths are fire-and-forget — a failed RPC is logged, never propagated to the caller. `incrementFinancialColumn` (`_shared/db/usage-counters.ts`) is a thin wrapper over the `increment_financial_counter` RPC with no UPSERT fallback, since the RPC self-inserts.
+
+## The storage estimate
+
+`storage_cost_estimate_micros` is a **snapshot**, not an accumulator — it holds the value at the last write to that period's row. `compute_storage_cost_micros(p_auth_user_id)` (a STABLE plpgsql function) centralizes the formula for both write sites:
+
+```
+(recordings_bytes + trashed_bytes) × s3_rate
+  + (contexts + categories + schedules + threads + settings + templates bytes) × pg_rate
+  ÷ 1073741824
+```
+
+Rates come from two private `server_config` rows seeded in the same migration: `storage_cost_s3_micros_per_gb_month = 21000` ($0.021/GB/mo, S3-backed audio) and `storage_cost_pg_micros_per_gb_month = 125000` ($0.125/GB/mo, Postgres). `pending_delete_bytes` is excluded, and a user with no `user_storage_usage` row returns 0.
+
+Two mechanisms keep the snapshot fresh:
+
+- **Byte-change triggers** on `user_storage_usage` — `maintain_f_user_financials_storage_cost` recomputes and UPSERTs into the CURRENT-period row. The INSERT trigger always fires; the UPDATE trigger has a `WHEN` clause that only fires when a byte column actually changed (it skips `updated_at`-only, quota-only, and `pending_delete`-only writes).
+- **Every `increment_financial_counter` call** re-stamps the snapshot as a side effect, so any AI-cost or revenue increment in a period also refreshes that period's storage cost.
+
+## The write allowlist
+
+`increment_financial_counter(p_auth_user_id, p_column, p_amount)` derives the current period internally and does an `INSERT … ON CONFLICT DO UPDATE` that adds `p_amount` to the target column **and** re-stamps `storage_cost_estimate_micros`. It guards `p_column` against an explicit allowlist and RAISEs otherwise; `p_amount = 0` is a no-op.
+
+| Column | Increment-writable via RPC? |
+| --- | --- |
+| `ai_cost_micros` | yes |
+| `revenue_micros` | yes |
+| `storage_cost_estimate_micros` | no — trigger-maintained from bytes, auto-stamped as a side effect |
+
+The doc comment on `incrementFinancialColumn` still says the allowlist is "currently just `ai_cost_micros`"; that comment is stale relative to the RPC body, which allows both `ai_cost_micros` and `revenue_micros`.
+
+## Cost is recorded for developer accounts
+
+Cost and revenue are recorded for developer accounts too. Dev bypass is a **quota** exception, not a cost-visibility exception: `ai_cost_micros`, `revenue_micros`, and the `usage` token analytics (`input_tokens` / `output_tokens`) are all written for devs. Only the ENFORCED quota counters (`ai_queries`, `transcription_ms`, `extraction_ms`, …) and the usage cap **check** are dev-skipped in the gate chain — a dev's real spend and token throughput are useful, harmless data. This matches the Developer Bypass Scope rule; see [Dev bypass scope](/rollingrecord/backend/gates/dev-bypass-scope).
+
+## Related pages
+
+- [RevenueCat integration](/rollingrecord/backend/billing/revenuecat) — the sole source of `revenue_micros`.
+- [Credits & bundles](/rollingrecord/backend/billing/credits-and-bundles) — the credit ledger sibling.
+- [Entitlement taxonomy](/rollingrecord/backend/billing/entitlements) — tiers and the developer entitlement.
+- [Transcription metering & cost](/rollingrecord/backend/transcription/metering-and-cost) and [AI providers & models](/rollingrecord/backend/ai-engine/providers-and-models).
+- [usage table](/rollingrecord/backend/database/usage-table) and [table naming conventions](/rollingrecord/backend/database/table-naming-conventions).

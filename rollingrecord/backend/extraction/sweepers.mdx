@@ -1,14 +1,75 @@
 ---
 title: "Extraction Sweepers & Cron"
-description: "The scheduled jobs that tick, requeue, and expire extraction jobs."
+description: "The scheduled jobs that tick the runner, requeue stalled jobs, finalize stale cancels, and reap terminal extraction rows."
 ---
 
-A set of cron sweepers keeps the extraction plane healthy — ticking the runner, requeuing stalled jobs, and expiring old ones.
+Three `pg_cron` schedules keep the extraction plane healthy: one drives the runner as a fallback to the inline kick, one reaps stalled and stale-cancelled jobs, and one reaps terminal rows the client never acked. The short-retention `h_extraction_charge` ledger is swept separately by the shared support-history sweeper.
 
-## What this covers
+## Cron schedules
 
-- extract-runner-tick cron (~60s fallback), sweep_extraction_heartbeats (E4 requeue up to extraction_max_attempts), sweep_extraction_jobs_ttl, sweep_stale_cancel_requested.
+| Cron job | Schedule | Runs | Purpose |
+| --- | --- | --- | --- |
+| `extract-runner-tick` | `* * * * *` (every minute) | POST `extract-runner` (Vault `extract_runner_secret`) | Fallback drain + resume dropped re-kicks. |
+| `sweep_extraction_heartbeats` | `* * * * *` (every minute) | `sweep_extraction_heartbeats()` | Finalize stale cancels, fail exhausted, requeue stalled `RUNNING` jobs. |
+| `sweep_extraction_jobs_ttl` | `20 * * * *` (hourly at :20) | `sweep_extraction_jobs_ttl()` | Reap terminal rows older than 48h the client never acked. |
+| `prune_h_tables` (shared) | short-retention sweeper | `prune_h_tables()` | Reap `h_extraction_charge` past 90 days, alongside the other `h_*` tables. |
+
+## extract-runner-tick
+
+The every-minute cron POSTs `extract-runner` with an empty body — no hint — so the runner claims the oldest eligible job (`migrations/20260721020000_extract_runner_dedicated_secret.sql`). It reads Vault `extract_runner_url` and `extract_runner_secret`; if either is missing it `RAISE NOTICE`s and returns, so a half-provisioned environment degrades to "jobs wait for the inline kick" rather than a broken tick. It authenticates with the **dedicated** `extract_runner_secret` (→ `EXTRACT_RUNNER_SECRET`), not the service-role key — the original `20260720180000` cron used `service_role_key` and was rescheduled by RR-503 for least privilege. This is the runner side of the requeue loop: a `QUEUED` job requeued by the heartbeat sweeper is re-promoted by `claim_extraction_job` on a later tick.
+
+## sweep_extraction_heartbeats
+
+A `RUNNING` job refreshes `heartbeat_at` on every chunk, so a live job is never stale. The sweeper's cutoff is `3 × extraction_runner_interval_sec` (default `3 × 60 = 180s`); a job must miss ~3 runner cycles before it is presumed dead. The latest body (`migrations/20260723150000_sweep_stale_cancel_requested.sql`) runs three ordered steps.
+
+| Step | Matches | Action |
+| --- | --- | --- |
+| Step 0 (RR-added) | `CANCEL_REQUESTED` AND (`heartbeat_at` NULL OR stale) | → `CANCELLED` — the owning tick never returned; unwedges the single-flight slot. |
+| Step 1 | `RUNNING` AND stale AND `attempt_count + 1 >= extraction_max_attempts` | → `FAILED`, `error_code = extraction_failed`. |
+| Step 2 | `RUNNING` AND stale AND `attempt_count + 1 < extraction_max_attempts` | → `QUEUED`, `attempt_count++`, `heartbeat_at` cleared. |
+
+Step 0 runs first so a cancelled job can never be picked up by the Step 2 requeue. Fail-before-requeue plus the complementary predicates guarantee a job on its last life is never requeued past the cap. With `extraction_max_attempts = 4`, a job survives 3 stalls (`attempt_count` 0, 1, 2 requeue) and `FAILED`s on the 4th. The function is `SECURITY DEFINER` and idempotent; the original two-step version was `migrations/20260720170000_extraction_sweepers.sql`.
 
 <Note>
-Scaffold generated from the codebase map — expand with full detail, examples, and specifics.
+There is no separate `sweep_stale_cancel_requested` function or cron. The stale-`CANCEL_REQUESTED` finalization is Step 0 added *inside* `sweep_extraction_heartbeats()` — the migration file name is the only place that string appears, and it `CREATE OR REPLACE`s the existing function without scheduling anything new. The common case is handled instantly at request time by `extract-results` (`cancelTargetStatus` finalizes a dead-but-`RUNNING` row); this sweeper covers the residual race where the tick dies right after the request.
 </Note>
+
+## sweep_extraction_jobs_ttl
+
+The hourly `:20` reaper is now a **pure row-TTL reaper** (`migrations/20260721000000_extraction_payload_in_db.sql`). It DELETEs `extraction_jobs` rows in `DONE` / `FAILED` / `CANCELLED` / `ACKED` whose `updated_at` is older than `extraction_job_ttl_hours` (default 48h), using `FOR UPDATE SKIP LOCKED` so it never blocks a concurrent ack or cancel. The `CASCADE` FK reaps each job's `extraction_job_items` transcripts with the row. This is a backstop only — a normal ack deletes the row immediately, so the TTL reaper catches within 48–49h just the terminal jobs a client never came back to ack.
+
+The original E4 revision of this sweeper (`20260720170000`) also ran `DELETE FROM storage.objects` against the private `job-plane` bucket before deleting the row. RR-503 (`20260721000000`) removed that storage delete — along with the unused `auth_user_id` selection and the `storage` `search_path` entry — when it moved the payload into encrypted row columns, so the sweeper has been a pure row reaper ever since. The later `20260801000000` migration only re-asserts that cleanup; the `job-plane` bucket has since been deleted, and the extraction pipeline touches no Storage bucket at all. See [Storage janitors](/rollingrecord/backend/storage/janitors) and [Cron sweepers](/rollingrecord/backend/database/cron-sweepers).
+
+## h_extraction_charge retention
+
+The idempotency ledger `h_extraction_charge` is **not** swept by any extraction-specific sweeper. As a short-retention `h_*` table it is reaped by the shared `prune_h_tables()` (`migrations/20260624000000_extraction_minutes_metering.sql`), which deletes rows where `charged_at < now() - support_history_retention_days` (default 90 days), alongside `h_transcribe_history` and `h_ai_engine_sessions`. See [Table naming conventions](/rollingrecord/backend/database/table-naming-conventions).
+
+## Sweeper config knobs
+
+The knobs the sweepers and the claim RPC read are seeded in `migrations/20260720160000_extraction_jobs_foundation.sql`.
+
+| Key | Default | Controls |
+| --- | --- | --- |
+| `extraction_max_attempts` | 4 | Total attempts before a stalled job goes `FAILED` (survives 3 stalls). |
+| `extraction_runner_interval_sec` | 60 | Runner cadence; drives the `3×` stale window (= 180s). |
+| `extraction_job_ttl_hours` | 48 | Terminal-row TTL before the reaper deletes it. |
+| `extraction_max_concurrent_jobs` | 25 | Global `RUNNING` ceiling enforced in `claim_extraction_job`. |
+
+## Who removes an extraction_jobs row
+
+There are four sanctioned paths that delete a job row; everything else is forbidden from touching it.
+
+| Path | Trigger | Timing |
+| --- | --- | --- |
+| `extract-results` ack | Client applied the results | Immediate row DELETE (the whole cleanup) |
+| `sweep_extraction_jobs_ttl` | Terminal job never acked | Backstop, within 48–49h |
+| support-ops `reset_extraction` | Support agent unsticks a job | Manual, on demand |
+| `delete-user` CASCADE | Account deletion | FK CASCADE reaps jobs + items |
+
+The manual `reset_extraction` support path (`migrations/20260723130000_admin_can_reset_extraction.sql`) deletes a user's stuck `extraction_jobs` row so the runner and client both fall back to their "job is gone" terminal paths. It is gated by `admin_permissions.can_reset_extraction` (default FALSE, granted per least privilege); `is_super_admin = TRUE` bypasses the flag. See [Support-ops operations catalog](/rollingrecord/backend/support-ops/operations-catalog) and [delete-user](/rollingrecord/backend/accounts/delete-user).
+
+## Where to go next
+
+- [Async extraction architecture](/rollingrecord/backend/extraction/architecture) — the plane and job lifecycle.
+- [extract-runner tick engine](/rollingrecord/backend/extraction/runner) — the tick these sweepers backstop.
+- [Extraction metering & caps](/rollingrecord/backend/extraction/billing-and-caps) — the `h_extraction_charge` ledger this page sweeps.

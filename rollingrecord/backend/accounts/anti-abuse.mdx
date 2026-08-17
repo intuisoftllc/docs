@@ -1,14 +1,81 @@
 ---
 title: "Anti-Abuse & Re-signup Carryover"
-description: "How abuse counters survive account deletion and re-signup within a period."
+description: "How abuse-signal events are logged and weighted, how usage counters survive deletion and carry forward on same-email re-signup, and the account-freeze soft-block."
 ---
 
-Anti-abuse counters are snapshotted at deletion and carried forward on same-email re-signup, feeding a top-offenders view.
+Three cooperating anti-abuse primitives sit behind the account surface: an append-only behavioral-signal log, a deletion-to-resignup usage carryover that stops delete-then-re-register from resetting monthly caps, and the account-freeze gate that turns a flagged account away before it can spend quota.
 
-## What this covers
+## Abuse-event log
 
-- l_deleted_identity counter snapshots carried forward on same-email re-signup within a period (_shared/users/deleted-identity-history.ts, USAGE_COUNTER_COLUMNS); l_user_abuse_event + abuse-log.ts + the top-offenders query.
+`l_user_abuse_event` is an append-only log written fire-and-forget by `logAbuseEvent()` in `functions/_shared/users/abuse-log.ts` on "should-have-known-better" server failures. Callers invoke it without `await` and attach a `.catch(...)`, so a log-write failure never cascades into a user-visible error — the system would rather lose a signal row than deny a legitimate request. Each row carries a severity `weight`, plus `source_ip` (`cf-connecting-ip` / `x-forwarded-for`), `user_agent`, `app_version`, and `device_hash` for fingerprint attribution.
+
+The table has **no FK** to `canonical_users` and `auth_user_id` is nullable (pre-signup events). As a long-retention `l_*` forensics log (3-year retention, swept by `prune_log_tables`) it is deliberately **not** in `delete-user`'s `TABLES_TO_WIPE` — the log survives user deletion so top-offenders and dispute forensics still have the signal months later.
+
+| Column | Type | Notes |
+| --- | --- | --- |
+| `id` | `uuid` | `gen_random_uuid()` |
+| `auth_user_id` | `text` (nullable) | NULL for pre-signup events |
+| `event_type` | `text NOT NULL` | free-form, no CHECK |
+| `weight` | `integer NOT NULL DEFAULT 1` | severity |
+| `details_json` | `jsonb` | event payload |
+| `source_ip` / `user_agent` / `app_version` | `text` | extracted from the Request |
+| `device_hash` | `text` | per-device fingerprint (RR-340) |
+| `created_at` | `timestamptz NOT NULL DEFAULT now()` | |
+
+### Event types and weights
+
+`AbuseEventType` and `DEFAULT_WEIGHTS` centralize the known slugs. The `event_type` column is free-form TEXT, so a new slug needs no migration — the constant set just keeps callers honest.
+
+| Constant | Slug | Default weight |
+| --- | --- | --- |
+| `SizeMismatch` | `size_mismatch` | 5 |
+| `InvalidSizeBytes` | `invalid_size_bytes` | 3 |
+| `JwtInvalid` | `jwt_invalid` | 2 |
+| `AppCheckFailed` | `app_check_failed` | 3 |
+| `AdminHmacMismatch` | `admin_hmac_mismatch` | 10 |
+| `AdminSecretMismatch` | `admin_secret_mismatch` | 10 |
+| `AdminPermissionDenied` | `admin_permission_denied` | 1 |
+| `RateLimitHit` | `rate_limit_hit` | 1 |
+| `NearLimitApproach` | `near_limit_approach` | 2 |
+
+### Admin reads
+
+Two helpers back support-ops operations, both gated by `can_read_user_audit`:
+
+- `getUserAbuseSignals()` — recent events for one user, newest first (limit default 50, cap 500, optional `since`).
+- `getAbuseTopOffenders()` — ranks callers by `SUM(weight)` DESC over a window (default 24h). The aggregation runs in **application code** (an in-memory group-by over a 20k-row scan cap), not a SQL RPC or view, to keep the surface additive. It returns `totalWeight`, `eventCount`, `distinctTypes`, and `lastSeenAt`.
+
+## Re-signup carryover
+
+`l_deleted_identity` snapshots a deleted user's current-period usage counters so a returning user can't wipe their monthly caps by deleting and re-registering. It is keyed by `(email_hash, period)` — a salted `HMAC(email)` plus the `YYYY-MM` period, **not** `auth_user_id`, because a re-signup gets a net-new `auth_user_id`. `functions/_shared/users/deleted-identity-history.ts` owns both sides of the protocol.
+
+| Step | Caller | Effect |
+| --- | --- | --- |
+| delete | `delete-user` (`wipeUser` step) | `snapshotUsageForDeletion()` reads the current-period `usage` row and inserts counters into `l_deleted_identity` before `usage` is hard-deleted |
+| re-signup | `resolve-identity` | `carryForwardOnResignup()` MAX-merges the counters into the new user's `usage` row, then deletes the history row |
+| no match | `resolve-identity` | `no_history` — the normal fresh-signup path |
+
+Both writes take the MAX of any existing and incoming values (`upsertWithMax()` on a snapshot PK conflict, `Math.max` per column on carryover) so anti-abuse always keeps the worst-case cap usage. `carryForwardOnResignup()` returns `no_history`, `carried_forward`, or `failed`; the snapshot is best-effort and never blocks deletion.
+
+`USAGE_COUNTER_COLUMNS` is the authoritative runtime list of columns that participate: `transcription_ms`, `ai_queries`, `syntheses`, `deep_reasoning_syntheses`, `keywords_count`, `context_summary_count`, `thread_naming_count`, `template_moderation_count`, `save_user_template_count`, `list_user_templates_count`, and `delete_user_template_count`. Any new usage counter must be added both here and to the `l_deleted_identity` schema, or it silently drops out of the snapshot/carryover.
+
+## Account-freeze gate
+
+`runAccountFrozenGate()` (`functions/_shared/gates/account-frozen.ts`, RR-310) is a generic soft-block checked on every JWT-authenticated Edge Function. It reads `canonical_users.frozen_at` / `frozen_reason` **after** JWT and **before** the rate-limit step, so a frozen account's rejections cost no quota. A non-null `frozen_at` returns `403 account_frozen` with the `reason` in the body.
+
+- **Fails open** — a DB read error or a missing row admits the request rather than locking every user out on a transient glitch.
+- **No bypass** — there is no `skipFrozenCheck` option and no admin / super-admin exemption; freeze that could self-lift is not freeze.
+- **Not abuse-logged** — a frozen account being turned away is the freeze working, not a signal worth recording.
+
+`frozen_at` (`TIMESTAMPTZ`) and `frozen_reason` (`TEXT`) live on `canonical_users`, with a partial index `idx_canonical_users_frozen WHERE frozen_at IS NOT NULL`. They are set and cleared by the support-ops `freeze_user_account` / unfreeze operations. See [Account-Freeze Gate](/rollingrecord/backend/gates/account-frozen) for the full gate semantics.
 
 <Note>
-Scaffold generated from the codebase map — expand with full detail, examples, and specifics.
+The `account_frozen_attempt` abuse event was **retired**. `runAccountFrozenGate` no longer logs frozen rejections, `AbuseEventType` no longer has the member, and `migrations/20260812000000_drop_account_frozen_attempt_events.sql` purged the already-logged rows — high-volume, low-signal bloat that skewed the top-offenders aggregate.
 </Note>
+
+## Related
+
+- [Account-Freeze Gate](/rollingrecord/backend/gates/account-frozen) — the freeze soft-block in the gate chain.
+- [delete-user](/rollingrecord/backend/accounts/delete-user) and [resolve-identity](/rollingrecord/backend/edge-functions/resolve-identity) — the two sides of the carryover protocol.
+- [Operations catalog](/rollingrecord/backend/support-ops/operations-catalog) and [permissions](/rollingrecord/backend/support-ops/permissions) — the admin reads gated by `can_read_user_audit`.
+- [Usage table](/rollingrecord/backend/database/usage-table) and [table-naming conventions](/rollingrecord/backend/database/table-naming-conventions).

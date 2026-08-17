@@ -1,16 +1,112 @@
 ---
 title: "Server vs Client Configuration"
-description: "Where each config value lives — Supabase server_config vs Firebase Remote Config — and why there is no duplication."
+description: "The three config stores — server_config, rate_limit_config, and Firebase Remote Config — where each value lives, and why nothing is duplicated."
 ---
 
-Every config value lives in exactly one place; the server is always authoritative and local defaults are cold-start fallbacks only.
+Every backend knob has exactly one home. Server-enforced values live in Supabase (`server_config`, or the dedicated `rate_limit_config`); client-only values live in Firebase Remote Config. No value is intentionally duplicated across stores, and the Kotlin `DEFAULT_*` constants are cold-start fallbacks only — when the server has a value, the server wins.
 
-## What this covers
+## The three stores
 
-- The server_config table is server-authoritative (token ceilings, model allowlist, monthly caps, kill switches, provider chains); rate_limit_config is the one dedicated exception table (bucket to max + window + enabled). Firebase Remote Config holds client-only knobs.
-- Rule: every config value lives in exactly one place — no intentional duplication; DEFAULT_* Kotlin constants are cold-start fallbacks only, the server always wins.
-- The server-config Edge Function serves only WHERE public = true rows to the client; server-only knobs never reach client network traffic.
+The split is three-way, not two-way. Rate limits earn their own table because their shape (bucket → max + window + enabled) is structured enough to benefit from dedicated columns.
+
+| Store | Authority | Holds | Read by | Tuned via |
+| --- | --- | --- | --- | --- |
+| `server_config` (Supabase table) | Server | token ceilings, model names + allowlists, monthly caps, feature flags, page sizes, kill switches | Edge Functions via `getServiceClient()` (service role); client via the `server-config` endpoint (`public=true` rows only) | Supabase dashboard / migration |
+| `rate_limit_config` (Supabase table) | Server | per-bucket `max_requests` + `window_sec` + `enabled` | `checkRateLimit()` → `getBucketConfig()` | Supabase dashboard / migration |
+| Firebase Remote Config | Client-only | client-loop limits, on-device similarity thresholds, UI toggles | Android `ClientConfigManager` → `ClientConfig` | Firebase console |
+
+Both Supabase tables are `RLS ENABLED` with zero policies. That is the default-safe state for this architecture: Edge Functions read through `getServiceClient()` (`functions/_shared/db/client.ts`), the service-role client that bypasses RLS, while a direct anon-key read from a decompiled APK gets nothing.
+
+## `server_config`
+
+Defined in `migrations/20260508000000_baseline.sql`. A flat key/value table with a visibility flag.
+
+| Column | Type | Notes |
+| --- | --- | --- |
+| `public` | `boolean NOT NULL DEFAULT true` | the `server-config` endpoint returns only `public=true` rows — server-only knobs must set `public=false` explicitly |
+| `key` | `text NOT NULL` | the config key |
+| `value` | `text NOT NULL` | always TEXT; the client parses per key |
+| `description` | `text` | why the default was chosen |
+
+<Warning>
+`public` **defaults to `true`** — the inverse of what most readers assume. A newly inserted row is client-visible unless the migration sets `public=false`. Any server-only ceiling, model choice, or runaway cap must carry `public=false` or it leaks into client network traffic.
+</Warning>
+
+The client half is fetched by the `server-config` Edge Function (`functions/server-config/index.ts`): a public `GET` gated only on HTTP method and App Check. It selects `key,value` where `public=true` and returns a flat `Record<string, string>` — server-only knobs (`public=false`) never leave the server. Values are always strings because the column is TEXT; the client parses each per key. The one gate opt-out is `skipAppVersion` — this is the bootstrap endpoint that serves the version floor itself, so gating it on that floor would be a chicken-and-egg.
+
+Representative keys seeded across migrations (values are illustrative — they change over time):
+
+| Key | Example value |
+| --- | --- |
+| `embedding_model` | `embed-v4.0` |
+| `embedding_dims` | `1024` |
+| `embedding_model_allowlist` | `["embed-v4.0","embed-multilingual-v3.0"]` |
+| `kb_chat_max_output_tokens` | `4200` |
+| `kb_chat_max_total_chars` | `300000` |
+| `sync_pull_page_size` | `100` |
+| `cloud_ai_extraction_minutes_per_month` | `1800` |
+| `extraction_chunk_tokens` | `8000` |
+| `template_semantic_prefilter_threshold` | `0.72` |
+| `semantic_search_enabled` | `true` |
+| `scan_index_candidates` | `50` |
+
+The Kotlin mirror is `ServerConfig` (`app/agentcore/src/main/kotlin/com/intuisoftllc/rollingrecord/config/ServerConfig.kt`) — typed accessors plus `DEFAULT_*` cold-start fallbacks, populated from the endpoint's public rows. It moved into the `agentcore` module so the eval agent loop can read it too.
+
+## `rate_limit_config`
+
+The one dedicated exception store, also defined in `migrations/20260508000000_baseline.sql`. One row per bucket, keyed by `bucket_key` — which matches the `Bucket` enum's wire string (`functions/_shared/gates/types.ts`).
+
+| Column | Type | Notes |
+| --- | --- | --- |
+| `bucket_key` | `text NOT NULL` | matches the `Bucket` enum wire string |
+| `max_requests` | `integer NOT NULL` | `CHECK (> 0)` |
+| `window_sec` | `integer NOT NULL` | `CHECK (> 0)` |
+| `enabled` | `boolean NOT NULL DEFAULT true` | `false` = kill-switch: admit without counting |
+| `description` | `text` | what the bucket protects |
+| `updated_at` | `timestamptz NOT NULL DEFAULT now()` | last edit |
+
+Its table comment records the history: it *"Replaces the `rate_limit_<bucket>_{max,window_sec}` rows that used to live in `server_config`."* The knobs were pulled out of `server_config` precisely so a structured shape could replace a family of loosely-related string rows.
+
+Reads go through `getBucketConfig()` in `functions/_shared/gates/rate-limit.ts`, cached per warm isolate. When the row is missing or the table read fails, it falls back to `BUCKET_DEFAULTS` — a code-side record with an entry for every `Bucket` member. Several fallbacks are deliberately set to **half** the live ceiling so a missing-row fallback always errs *below* the real ceiling, never above:
+
+| Bucket | Live ceiling | `BUCKET_DEFAULTS` fallback |
+| --- | --- | --- |
+| `SyncPull` | 550/hr | 275/hr |
+| `Search` | 600/hr | 300/hr |
+| `Indexing` | 300/hr | 150/hr |
+| `EmbeddingCache` | 600/hr | 300/hr |
+
+`checkRateLimit()` reads the config, then calls the atomic `check_and_increment_rate_limit` RPC, which upserts `rate_limit_counters` and returns `{allowed, current_count, window_start_sec, near_limit_crossed}` — the first three fields are defined in `migrations/20260508000000_baseline.sql`, and the fourth (`near_limit_crossed`) was added later by `migrations/20260601000000_rate_limit_near_limit_flag.sql`. Windows anchor to the first request after a reset, not clock-hour boundaries. Two short-circuits skip the counter entirely: `isDeveloper=true` (dev bypass) and `enabled=false` (kill switch). On RPC error it fails **closed** — a `500 database_error` rather than fail-open melting every user's limits at once; only the over-limit reject returns `429 rate_limited`. `rate_limit_counters` is written only by that RPC and has no FK to `canonical_users` (see [the deletion cascade](/rollingrecord/backend/architecture/deletion-cascade)).
+
+Adding a bucket is a same-commit trio: the enum member in `Bucket`, the `BUCKET_DEFAULTS` entry, and a seeded `rate_limit_config` row. See [rate limiting](/rollingrecord/backend/gates/rate-limiting) for the gate wiring.
+
+## Firebase Remote Config
+
+The client-only store. `ClientConfigManager` (`app/app/src/main/java/com/intuisoftllc/rollingrecord/config/ClientConfigManager.kt`) fetches once per session and applies `buildValuesMap()` into the in-memory `ClientConfig` (`app/agentcore/.../config/ClientConfig.kt`). Release fetch interval is one hour; debug fetches every launch. If the fetch fails, the in-app `ClientConfig` defaults stay in effect — the app always works without a successful fetch.
+
+The keys it carries are all client-behavior only — none is server-enforced:
+
+| Key | Kind | Controls |
+| --- | --- | --- |
+| `kb_chat_max_history_pairs` | int | conversation-history window fed to the agent loop |
+| `ai_chat_max_transcript_snippets` | int | transcript snippets attached to a chat turn |
+| `reconcile_periodic_interval_hours` | int | background drift-reconcile cadence |
+| `reconcile_foreground_debounce_minutes` | int | foreground reconcile debounce |
+| `semantic_search_result_cap` | int | on-device search result ceiling |
+| `semantic_snippet_chunk_count` | int | chunks per semantic snippet |
+| `topic_search_threshold` | double | on-device similarity threshold |
+| `section_semantic_threshold` | double | on-device section-match threshold |
+| `semantic_search_margin` | double | search score margin |
+| `template_moderation_enabled` | boolean | client-side moderation toggle |
 
 <Note>
-Scaffold generated from the codebase map — expand with full detail, examples, and specifics.
+`ClientConfig` + `ClientConfigManager` are the current Android class names. Older references to `RemoteConfig.kt` / `FirebaseRemoteConfigManager` are stale, and `ServerConfig.kt` now lives in `app/agentcore`, not `app/app`.
 </Note>
+
+## Why no duplication
+
+Classifying a new value is a single question: does the Edge Function or the server need to enforce it (a cost, quota, kill switch, or allowlist)? If yes, it is Supabase-only. If it is purely client display, client behavior, A/B testing, or on-device code, it is Firebase-only. Never both by default — a duplicated value must be justified explicitly (e.g. an A/B test needing both instant Firebase propagation and server enforcement).
+
+The reason the split has teeth: the Kotlin `DEFAULT_*` constants only apply on first-ever launch before any fetch completes, or when the cache is missing. Once the server has a value, it overrides the local default unconditionally. Silently editing a `DEFAULT_*` constant to fix a tuning problem does nothing for existing installs — the live dial is the Supabase or Firebase console, not the code.
+
+Related: [config tables](/rollingrecord/backend/database/config-tables) · [the `server-config` endpoint](/rollingrecord/backend/edge-functions/server-config) · [RLS and the service role](/rollingrecord/backend/database/rls-and-service-role) · [env and secrets](/rollingrecord/backend/operations/env-and-secrets) · [architecture overview](/rollingrecord/backend/architecture/overview).

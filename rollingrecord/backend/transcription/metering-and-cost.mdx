@@ -1,14 +1,67 @@
 ---
 title: "Transcription Metering & Cost"
-description: "How transcription minutes are metered and how cost is recorded."
+description: "How transcription minutes meter against tier caps in transcription_ms, how AssemblyAI cost is priced into f_user_financials.ai_cost_micros, and why dev accounts record cost but skip quota."
 ---
 
-Transcription is metered in measured milliseconds against minute-based tier caps, and cost is recorded to the financials table.
+Transcription is metered in **server-measured milliseconds** (`usage.transcription_ms`), not a call count. The metered op is reserved at `transcribe_submit` but only committed — and only priced — in the `assemblyai-webhook` when the transcript completes, so failed, errored, and no-speech transcripts consume no quota and cost nothing.
 
-## What this covers
+## The metered unit
 
-- transcription_ms counter (actual measured ms, not a count); tier caps in minutes converted to ms at read time; cost (base + diarize + medical add-ons) to f_user_financials.ai_cost_micros via incrementFinancialColumn; h_transcribe_history.
+`METERED_OP_TYPES.TRANSCRIPTION_MS` (`functions/_shared/db/metered-ops.ts`) maps the `transcription_ms` usage column to the `transcription_ms` credit resource at `unitsPerCredit: 1` — the credit balance is stored in the same ms unit as the counter, so there is no conversion at consumption time. The reserved and committed amount is the **billed** duration: for Medical Mode the measured ms is first inflated by `applyUsageMultiplier` (`functions/_shared/usage/multiplier.ts`) using `medical_mode_usage_multiplier` (cold-start fallback `1.35`) **before** the cap check, so the gate, the persisted reservation, and the eventual increment all agree. A non-medical request uses multiplier 1 — billed equals actual.
+
+## Tier caps
+
+`resolveTranscriptionCapMs` (`functions/_shared/db/usage-counters.ts`) resolves the monthly base cap in ms from the caller's effective entitlements. It returns 0 for any set lacking `TIER.PRO_CLOUD`; among cloud-eligible tiers `PRO_CLOUD_AI` wins. `server_config` stores caps in minutes (admin readability, finer allocations); the helper multiplies by `60_000` and compares against `usage.transcription_ms` (a `BIGINT`).
+
+| Tier | `server_config` key | Fallback default |
+| --- | --- | --- |
+| Pro+Cloud | `pro_cloud_transcription_minutes_per_month` | 480 min (8 hr) |
+| Cloud+AI | `cloud_ai_transcription_minutes_per_month` | 1200 min (20 hr) |
+| Free / Pro | (none) | 0 — no cloud budget (local engines only) |
 
 <Note>
-Scaffold generated from the codebase map — expand with full detail, examples, and specifics.
+`migrations/20260527130000_transcription_hrs_to_minutes.sql` renamed and rescaled these keys from `*_hrs_per_month` to `*_minutes_per_month` (value × 60) so caps can be expressed in whole minutes.
 </Note>
+
+## Reserve at submit, commit at the webhook
+
+The reservation and the commit are deliberately split across the async boundary:
+
+1. **Reserve (`transcribe_submit`).** `reserveMeteredOp` captures a snapshot — pre-usage, base cap, and credit balance — and either admits the op or returns `cap_reached`. Nothing is written to `usage` yet. The snapshot, the billed `opCostMs`, and the `medicalMode` / `diarize` add-on flags are persisted onto `transcribe_jobs.meter_reservation` (a `PersistedMeterReservation` JSONB).
+2. **Commit (`assemblyai-webhook`).** On successful completion the webhook calls `commitMeteredOp(reservation)`, which increments `usage.transcription_ms` by `reservation.opCostMs` — the exact amount the cap admitted, never AssemblyAI's `audio_duration` echo (used only as a fallback when the reservation is missing on a legacy in-flight row).
+
+Threading the snapshot through the reservation (rather than re-reading usage at commit time) keeps the overage math correct under concurrent ops. See [Pipeline](/rollingrecord/backend/transcription/pipeline) for where each call sits.
+
+## Credits and overage
+
+`capRemaining` is the pure budget helper: `remaining = max(0, baseCap − usage) + max(0, credits)`, and the effective cap the client renders is `used + remaining`. When an op lands past the base cap, `commitMeteredOp` calls `chargeOverage` (`functions/_shared/db/user-credits.ts`), which drains the above-cap slice from `user_credits.transcription_ms_balance` — bundle row first, manual row second. The ms charged surface as `h_transcribe_history.credits_charged_ms`. See [Credits & bundles](/rollingrecord/backend/billing/credits-and-bundles).
+
+## AssemblyAI cost accounting
+
+Separately from quota, `computeTranscriptionCostUsd` (`functions/_shared/transcribe/pricing.ts`) prices the AssemblyAI dollar cost from the billed duration and the persisted add-on flags. Rates are **per minute** — `cost = (durationMs / 60000) × (base + diarize? + medical?)` — and the result is converted to micro-USD via `usdToMicros` and added to `f_user_financials.ai_cost_micros` through `incrementFinancialColumn` (the `increment_financial_counter` RPC, allowlisted to `ai_cost_micros`), alongside LLM token cost.
+
+| Component | USD / min | Constant |
+| --- | --- | --- |
+| Universal-2 base | 0.0025 | `ASSEMBLYAI_BASE_PER_MIN` |
+| Speaker labels (diarize) add-on | 0.00033 | `ASSEMBLYAI_DIARIZE_PER_MIN` |
+| Medical (`domain=medical-v1`) add-on | 0.0025 (0.15/hr) | `ASSEMBLYAI_MEDICAL_MODE_PER_MIN` |
+
+These constants are a runtime mirror of the `ASSEMBLYAI_*` values in `claude/business/cost-analysis.py` and must be kept in lockstep with the published AssemblyAI rates. See [Financials](/rollingrecord/backend/billing/financials).
+
+## Developer bypass
+
+Per the Developer Bypass Scope HARD RULE, dev bypass is a **quota** exception, not a cost-visibility exception. `f_user_financials.ai_cost_micros` is recorded for every caller including developers; only the enforced quota counter and credit charges are skipped.
+
+| Concern | Dev account behavior |
+| --- | --- |
+| `usage.transcription_ms` increment | Skipped (`commitMeteredOp` short-circuits) |
+| Base-cap / at-ceiling check | Bypassed (`reserveMeteredOp` returns a zero no-op reservation) |
+| `user_credits` overage charge | Skipped (charged credits 0) |
+| `f_user_financials.ai_cost_micros` | **Recorded** — a dev's real spend is useful, harmless data |
+| Structural validation (duration, size, body) | Enforced — never skipped |
+
+See [Dev-bypass scope](/rollingrecord/backend/gates/dev-bypass-scope).
+
+## Support-history record
+
+A transcription op writes exactly one `h_transcribe_history` row at its end, but through two different writers. In-band paths (the webhook's completed / errored / no-speech outcomes) call `recordTranscribeHistory` (`functions/_shared/db/support-history.ts`), whose insert covers `status`, `duration_ms`, `billed_ms`, `credits_charged_ms`, `assemblyai_transcript_id`, `error_message`, and `started_at` — but **not** `error_code`. The `error_code` column is written only by the drain's `writeTranscribeHistoryFailure` (`functions/_shared/transcribe/queue.ts`), a separate direct insert that records 429-exhausted and other permanent submit failures; those failures never route through `recordTranscribeHistory`. `billed_ms` and `credits_charged_ms` are 0 on any failure or no-speech outcome — only successful transcriptions consume quota, matching the metering-fairness rule. `h_transcribe_history` is an append-only 90-day support-history table (FK + `CASCADE`, RLS); see [Usage table](/rollingrecord/backend/database/usage-table) for the sibling counter store.

@@ -1,15 +1,64 @@
 ---
-title: "Built-in Extraction Blueprints"
-description: "The server-owned extraction template prompts and the append-only ID rule that protects old clients."
+title: "Built-in Blueprints"
+description: "The server-owned extraction blueprint registry, its append-only numeric IDs, and the pre-launch ID-swap history."
 ---
 
-Twelve server-owned extraction prompts ship inside ai-engine, addressed by permanently-append-only numeric IDs.
+Built-in extraction blueprints are server-owned prompts shipped inside `ai-engine`, addressed by stable numeric IDs. `BUILTIN_BLUEPRINTS` (`functions/ai-engine/blueprints/builtin/index.ts`) is the single source of truth — an array of `BuiltInBlueprint` ordered by ID, with each blueprint's prompt living in its own file for isolated editing.
 
-## What this covers
+## The registry
 
-- 12 server-owned prompts under blueprints/builtin/ (voice-memo, general-notes, interview, lecture-notes, sprint-standup, one-on-one, sales-call, brainstorming, coaching, medical-appointment, developer, etc.); the BUILTIN_TEMPLATES registry index.ts is the single source of truth.
-- HARD RULE: built-in IDs are append-only / permanently burned; deprecation is via serve-old or a 410 template_retired.
+`BUILTIN_BLUEPRINTS` holds **eleven** active blueprints occupying IDs 1 and 3–12. `BUILTIN_BLUEPRINT_MAP` is a `Map<number, BuiltInBlueprint>` built from it for fast lookup, and `getDefaultBlueprint()` returns the `isDefault` blueprint (ID 1, General Notes).
 
-<Note>
-Scaffold generated from the codebase map — expand with full detail, examples, and specifics.
-</Note>
+Each entry is a `BuiltInBlueprint`:
+
+| field | type | meaning |
+| --- | --- | --- |
+| `id` | number | stable numeric ID — append-only, never reused |
+| `name` | string | display name |
+| `description` | string | picker-card subtitle |
+| `isDefault` | boolean | the default blueprint for new contexts |
+| `isMultiSpeaker` | boolean | designed for multi-speaker recordings |
+| `status` | `"active"` \| `"deprecated"` | deprecated blueprints still serve but aren't offered to new clients |
+| `systemPrompt` | string | full prompt with `TOOL_INSTRUCTIONS` already appended |
+
+`withToolInstructions` appends `TOOL_INSTRUCTIONS` (= `TOOL_SPEC_ONLY` + `CONTENT_BOUNDARY`, imported from `prompts/extract.ts`) to each blueprint's role/instruction body, so the blueprint files don't import prompt infrastructure themselves. Each of the eleven prompts lives in its own file (`general-notes.ts`, `sales-call.ts`, `developer.ts`, `one-on-one.ts`, `voice-memo.ts`, `sprint-standup.ts`, `brainstorming.ts`, `coaching.ts`, `lecture-notes.ts`, `medical-appointment.ts`, `interview.ts`).
+
+| id | name | isDefault | isMultiSpeaker | status |
+| --- | --- | --- | --- | --- |
+| 1 | General Notes | true | false | active |
+| 3 | Sales Call | false | true | active |
+| 4 | Developer | false | true | active |
+| 5 | 1:1 Meeting | false | true | active |
+| 6 | Personal Voice Memo | false | false | active |
+| 7 | Sprint / Standup | false | true | active |
+| 8 | Brainstorming Session | false | true | active |
+| 9 | Coaching Session | false | true | active |
+| 10 | Lecture Notes | false | false | active |
+| 11 | Medical Appointment | false | false | active |
+| 12 | Interview | false | true | active |
+
+## Append-only IDs
+
+IDs are append-only: once a blueprint ships to production, its ID is permanently burned. Prompt revisions to the same blueprint keep the same ID (that is the whole point of server-owned prompts — old clients that send the ID get the updated behavior on their next extraction). A semantic replacement gets a new ID, and the old ID is marked deprecated rather than reused. The only retirement mechanism present in code today is the `status` field; no blueprint is currently `deprecated`, and there is no runtime `410 template_retired` path in this registry (that is CLAUDE.md policy, enforced elsewhere if needed).
+
+The registry header notes the codebase is still **pre-launch**: IDs may be renumbered freely until RR-46 Phase 7b ships clients against the production `ai-engine`, at which point the append-only rule takes effect unconditionally.
+
+## Pre-launch ID history
+
+ID 2 was retired pre-launch (its blueprint was consolidated into General Notes), so it has no registry entry — that is why the IDs run 1 and 3–12 for eleven blueprints. Several IDs were swapped from an earlier blueprint before any client shipped against them; reusing those IDs was permitted only because no client was running against the old blueprints at swap time.
+
+| id | original (dropped pre-launch) | current |
+| --- | --- | --- |
+| 2 | consolidated into General Notes | retired — no entry |
+| 3 | Architecture Decision | Sales Call |
+| 5 | Commitment Tracker | 1:1 Meeting |
+| 6 | Ambiguity Surface | Personal Voice Memo |
+| 8 | Requirements Extractor | Brainstorming Session |
+| 9 | Incident / Post-mortem | Coaching Session |
+
+## Where to go next
+
+- [Custom Blueprints](/rollingrecord/backend/ai-engine/user-blueprints) — user-authored blueprints stored per-user.
+- [Server-Side Prompts & Safety Sandwich](/rollingrecord/backend/ai-engine/prompts-and-safety) — the `TOOL_INSTRUCTIONS` these blueprints bake in.
+
+Related: [Extraction architecture](/rollingrecord/backend/extraction/architecture).

@@ -1,15 +1,72 @@
 ---
-title: "KB Chat (kb_query)"
-description: "The knowledge-base chat operation, its round-budget model, and the client/server split of its tooling."
+title: "KB Chat"
+description: "The kb_query agentic loop: a server-derived round budget, DB-backed session tokens, first-round-only ai_queries metering, and the client/server tool split."
 ---
 
-kb_query powers the conversational chat, metering one query per turn under a handler-owned round budget while the client owns the tool definitions.
+`kb_query` (`functions/ai-engine/operations/kb-query.ts`) is the KB-chat entry point — a `handler_owned` operation gated on `PRO_CLOUD_AI` and the `kb_chat_enabled` feature flag. The client sends conversation messages, tool definitions, and client-owned prompt fragments; the server owns the system prompt, model selection, and round counting. Because it is `handler_owned`, the dispatcher skips the generic cap and counter — the handler does all metering itself.
 
-## What this covers
+## Inputs-only contract
 
-- Handler-owned round-budget model: session tokens, max_rounds_exceeded, first-round-only ai_queries increment (continuation rounds free); kb-query-caps.ts.
-- The client owns the 14 kb_query tool definitions (navigation IP is client-side); the server owns the behavioral system prompt (prompts/kb-query.ts, app-knowledge.ts).
+`KbQueryHandler.validateInput` requires `messages` (an array) and `is_final` (a boolean); `medical_mode`, `max_history_pairs`, and `history_truncated` are type-checked when present. The full `KbQueryInput` also carries client-owned pieces the server passes through: `tools` (tool definitions), `tool_instructions`, `scope_block`, `fallback_system_prompt`, plus `question`, `had_write_op`, `user_timezone`, and a dev-only `eval_system_suffix`.
 
-<Note>
-Scaffold generated from the codebase map — expand with full detail, examples, and specifics.
-</Note>
+Crucially, the client does **not** send `round_number` or `max_rounds`. Both are derived server-side from the session row and `server_config` (RR-194) — a lying client that forges those fields cannot stretch or bypass the round budget.
+
+## Round budget derivation
+
+Round counting is DB-backed via `query_sessions` (`functions/_shared/db/query-sessions.ts`). The token is a server-issued UUID returned in the `X-Query-Session-Token` header on a query's first round; the client echoes it on every continuation round. `createQuerySession` inserts a row (`round_count = 1`, `expires_at` = now + `SESSION_TTL_MS`, 10 minutes). `consumeQuerySessionRound` validates the incoming token and atomically bumps `round_count`, returning a tagged `ConsumeResult`.
+
+The ceiling is read **inside** `consumeQuerySessionRound` from `server_config.kb_chat_max_tool_rounds` (`DEFAULT_MAX_TOOL_ROUNDS = 5`) — callers must not pass it in. The enforced ceiling is `max_tool_rounds + 1`: the extra slot is reserved for the final no-tools answer round that runs after the client's tool loop exhausts, so a client that uses its whole tool budget doesn't trip `over_rounds` on the final step. The round is consumed **before** any provider call, so failover to a secondary provider never resets or bypasses the limit.
+
+| Header / token state | Result |
+| --- | --- |
+| No token | Round 1 — cap reserved + committed, new token minted |
+| Valid continuation token | `ok` — round consumed, `maxRounds` returned, token echoed |
+| Expired token | `410 session_expired` |
+| Token at/over ceiling (`over_rounds`) | `429 max_rounds_exceeded` with `round_count` / `max_rounds` |
+| Consume threw | `502 session_check_failed` |
+| Unknown token + `is_final = false` | Falls through to new-session creation (cap still fires, new token minted — no bypass) |
+
+An unknown token with `is_final = true` fell through to new-session creation but is not a special bypass — the first round mints a fresh token, reserves the cap, and increments the counter, so a one-shot `is_final` query (used by the client's `expandQuery` / `hydeSearch` paths) cannot skip quota.
+
+## Metering: one charge per new query
+
+`ai_queries` is metered only on the **first round** of a new query — continuation tool rounds are free. Cap + credit drain is unified through `reserveMeteredOp` / `commitMeteredOp` (`functions/_shared/db/metered-ops.ts`) with `METERED_OP_TYPES.AI_QUERIES`. The first round reserves against `getInt('ai_queries_per_month', 150)` at `opCost` 1; on AI success `commitMeteredOp` fires. On continuation rounds `reservation` stays `null`, so the commit short-circuits.
+
+A cap denial returns `cap_reached` (429) with `base_cap`, `credit_balance`, and the normalized `used`/`cap` fields. Note that the **round budget itself is always enforced, even for dev accounts** — it is a structural mechanism exercised end-to-end during testing, not a quota.
+
+## Prompt assembly and caching
+
+The server owns the behavioral system prompt (`buildKbQuerySystemPrompt`, `functions/ai-engine/prompts/kb-query.ts`) with four placeholders: `{APP_KNOWLEDGE}` and `{MEDICAL_MODE_ADDENDUM}` (server-injected) and `{TOOL_USAGE_INSTRUCTIONS}` and `{SCOPE_BLOCK}` (client-injected). On `is_final` rounds it instead uses the client's `fallback_system_prompt` or `FALLBACK_SYSTEM_PROMPT_READ`.
+
+RR-430 split the prompt so **prompt caching** can hit across rounds: the static system prefix and the tool list carry a 1-hour `cache_control` marker, while the dynamic per-round content moves into an uncached `systemSuffix`. That suffix carries the round-budget status (`buildRoundBudgetSuffix`, server-derived so a client can't fake "round 3 of 99") and, on the production path, the user-identity block (`buildUserIdentityBlock`) built from a server-side Clerk fetch (`getClerkUser` / `getDisplayName` / `getPrimaryEmail`), sanitized name + email local-part + timezone. Keeping identity in the uncached suffix means per-user names don't bust the shared cache. Any identity-fetch error silently omits the block.
+
+`buildAppKnowledge` (`functions/ai-engine/prompts/app-knowledge.ts`) bakes a CONVERSATION MEMORY WINDOW from `max_history_pairs` + `history_truncated` so the assistant can honestly explain rolled-off turns only when asked. `KB_QUERY_MEDICAL_MODE_ADDENDUM` is injected into the cacheable prefix when `medical_mode` is true — the unconditional no-medical-advice guard is already in the base prompt.
+
+## Tools and hallucination correction
+
+Tool definitions are **client-owned** — the server passes `input.tools` straight through to the provider and hardcodes no tool count (the actual set lives in the Android client's `KnowledgeBaseAdvisor.kt`). Tools are omitted on `is_final` rounds; otherwise `toolChoice` is `"auto"`.
+
+RR-431 adds one-shot tool-name hallucination correction (`functions/_shared/ai/tool-validation.ts`): `findHallucinatedToolCalls` detects `tool_use` blocks naming tools that aren't in the `tools` array, and the handler retries **once** with `buildHallucinationCorrectionSuffix` appended to the uncached suffix, offering "did you mean" suggestions. The retry is capped at 1; a persistent hallucination surfaces to the client's tool dispatcher. If the retry call itself fails, the original response is surfaced.
+
+## Input-size safety net
+
+RR-199 input caps live in `kb-query-caps.ts` (pure, unit-tested). `applyInputSizeCaps` performs pairing-aware eviction of the oldest whole turns — a `tool_use` message and its matching `tool_result` are evicted together, never orphaned — plus last-resort in-place text truncation. Ceilings come from `server_config`: `kb_chat_max_message_count` (default 80) and `kb_chat_max_total_chars` (default 200,000). The former per-message char cap was removed because it dropped whole `tool_use`/`tool_result` messages and produced Anthropic 400s. When truncation fires, the handler sets the `x-kb-truncated` response header.
+
+Output is capped at `kb_chat_max_output_tokens` (default 540). A whitespace-only first-round message short-circuits to a canned reply with no cap consumed and no token minted, avoiding an Anthropic 400 on empty content.
+
+## Response and session history
+
+`kb_query`'s `execute` returns `status: "ok"` with a structured JSON payload — `content` blocks, `stop_reason`, `model`, `provider`, and `usage` (including `cache_creation_input_tokens` / `cache_read_input_tokens` so cost accounting sees the full input picture). It does **not** stream: Supabase Edge Functions don't stream, so only the final agent-loop response reaches the client; per-round intermediate text is internal.
+
+`recordAiEngineSession` (`functions/_shared/db/support-history.ts`) writes an `h_ai_engine_sessions` row at every terminal exit — `is_final` success, natural end (`stop_reason != "tool_use"`), `cap_reached`, `rounds_exhausted`, or an upstream error. Non-terminal continuation rounds skip the write.
+
+Round-budget and provider error codes (`functions/_shared/errors.ts`): `max_rounds_exceeded` (user, 429), `session_expired` (user, 410), `session_check_failed` (developer, 502), `cap_reached` (user, 429), `all_providers_failed` (infra, 503), `provider_rate_limited` (infra, 429), `ai_call_failed` (infra, 502).
+
+## Where to go next
+
+- [Operation Registry](/rollingrecord/backend/ai-engine/operations-registry) — how `kb_query` is dispatched.
+- [Providers, Models & Pricing](/rollingrecord/backend/ai-engine/providers-and-models) — the `ANTHROPIC_GEMINI` failover chain `kb_query` uses.
+- [Server-Side Prompts & Safety Sandwich](/rollingrecord/backend/ai-engine/prompts-and-safety) — the client/server prompt split.
+- [Runaway-Protected Sub-Ops](/rollingrecord/backend/ai-engine/sub-operations) — `query_expand`, which was split out of `kb_query`.
+
+Related: [Credits & bundles](/rollingrecord/backend/billing/credits-and-bundles) · [usage table](/rollingrecord/backend/database/usage-table) · [Dev bypass scope](/rollingrecord/backend/gates/dev-bypass-scope).

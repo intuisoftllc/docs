@@ -1,14 +1,59 @@
 ---
 title: "get-user-key"
-description: "The one place a plaintext data-encryption key crosses the wire."
+description: "The single endpoint where a plaintext data-encryption key crosses the wire — unwrapped from the KEK, provisioned lazily, and audit-logged on every path."
 ---
 
-get-user-key is the single endpoint that unwraps and returns the caller's plaintext DEK, which the client holds in RAM only.
+`get-user-key` (`functions/get-user-key/index.ts`, RR-291) is a `Deno.serve` POST endpoint. It returns the caller's plaintext DEK, unwrapped from the KEK, so the client can populate its in-memory DEK cache at the start of a sync session. This is the **one place** a plaintext DEK crosses the wire; every `sync-push` / `sync-pull` operation stays in ciphertext. The client holds the DEK in RAM only, zeroes it when the session ends, and refetches on cold start.
 
-## What this covers
+## Gate chain
 
-- The ONE place a plaintext DEK crosses the wire: unwraps the caller's user_crypto DEK from the KEK, lazily provisions the row on first call; the client holds it in RAM only.
+The entry calls `runGates(req, { method: HttpMethod.Post, auth: AuthMode.Jwt })` — method + App Check + App Version + Clerk JWT. There is intentionally **no entitlement gate**: the DEK also derives the local SQLCipher DB key, so any device signing into the account must be able to fetch or provision it regardless of subscription tier.
 
-<Note>
-Scaffold generated from the codebase map — expand with full detail, examples, and specifics.
-</Note>
+Rate limiting is called **manually** in the handler — `checkRateLimit(Bucket.UserKeyGet, authUserId, isDeveloper)` — rather than via chain sugar, so a `429` rejection can also write an audit row. This endpoint is where a stolen JWT would go shopping for the DEK, so forensic visibility outranks the convenience of the sugar.
+
+## Lazy provisioning
+
+The handler `SELECT`s the `user_crypto` row (`dek_ct`, `dek_iv`, `kek_version`, plus the App Lock `pin_verifier_ct` / `pin_verifier_iv` / `pin_settings` / `pin_updated_at`). If no row exists, it provisions one inline:
+
+1. `generateDek()` → a fresh 32-byte DEK.
+2. `wrapDek(dek)` → `{ wrappedDek, ivDek, kekVersion }` under the KEK (the plaintext DEK buffer is zeroed in a `finally`).
+3. `INSERT` `{ auth_user_id, dek_ct, dek_iv, kek_version }`.
+4. On a `23505` unique-violation (a concurrent request won the race), re-`SELECT` and use the row the other request wrote — whichever landed first is authoritative.
+
+Because provisioning is folded in, a client just calls `get-user-key` on first sync; there is no separate init endpoint to orchestrate first (RR-295 consolidated the former dedicated `init-user-key` into this one). The crypto columns are `dek_ct` / `dek_iv` / `kek_version` — RR-320 renamed the originals `wrapped_dek` → `dek_ct` and `iv` → `dek_iv`, following the `<field>_ct` / `<field>_iv` convention.
+
+The envelope primitives live in `functions/_shared/crypto/envelope.ts` (`generateDek`, `wrapDek`, `unwrapDek`, `zeroDek`); the BYTEA ⇄ `Uint8Array` ⇄ base64 helpers in `functions/_shared/crypto/encoding.ts` (`pgByteaToBytes`, `bytesToPgBytea`, `bytesToBase64`).
+
+## Response
+
+`GetResponse` returns the DEK plus the KEK version and the synced App Lock PIN fields (RR-492), so a device fetching its key learns the synced verifier in a single round-trip:
+
+| Field | Type | Meaning |
+| --- | --- | --- |
+| `dek` | base64 string | Plaintext DEK; base64-decodes to 32 bytes for AES-256 |
+| `kek_version` | number | KEK generation that wrapped the DEK |
+| `pin_verifier_ct` | base64 string \| null | App Lock PIN verifier ciphertext |
+| `pin_verifier_iv` | base64 string \| null | IV paired with `pin_verifier_ct` (null iff that is null) |
+| `pin_settings` | `{ auto_lock_ms? }` \| null | Synced non-encrypted App Lock settings |
+| `pin_updated_at` | epoch millis \| null | Server last-write-wins marker; null on legacy rows |
+
+After serialization the server calls `zeroDek(dek)` as buffer hygiene.
+
+## Audit logging
+
+`logUserKeyAccess` (`functions/_shared/crypto/user-key-audit.ts`) writes a forensic row to `l_user_key_access` on **every** path — this side effect is the reason rate-limit is called manually:
+
+| Path | `operation` | `result` |
+| --- | --- | --- |
+| Row already existed, unwrapped OK | `get` | `success` |
+| Row provisioned this call (or lost the insert race) | `init` | `success` |
+| Rate-limit `429` | `get` | `rate_limited` |
+| `user_crypto` select / insert / unwrap error | `get` | `db_error` |
+
+The `init` vs `get` distinction is driven by `wasProvisioned` (whether the INSERT branch ran); failures always log as `get`.
+
+## Related pages
+
+- [Edge Function catalog](/rollingrecord/backend/edge-functions/overview) — the shared `runGates()` chain.
+- [get-user-usage](/rollingrecord/backend/edge-functions/get-user-usage) — the other per-user read the client makes at session start.
+- [resolve-identity](/rollingrecord/backend/edge-functions/resolve-identity) — the launch-time `canonical_users` upsert this endpoint's `ensureCanonicalUserRow` also guarantees.

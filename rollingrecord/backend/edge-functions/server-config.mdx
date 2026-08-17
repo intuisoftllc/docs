@@ -1,14 +1,31 @@
 ---
 title: "server-config"
-description: "The public config bootstrap endpoint the Android client reads at startup."
+description: "The public config bootstrap endpoint the Android client reads at cold start — App Check only, no JWT, returning only client-safe rows."
 ---
 
-server-config is the public bootstrap endpoint that returns only client-safe config rows, with no JWT required.
+`server-config` (`functions/server-config/index.ts`) is a `Deno.serve` GET endpoint. The Android `SupabaseConfigManager` fetches it once per cold start, caches the result in DataStore, and exposes typed accessors. It returns only the client-facing rows of the `server_config` table as a flat `Record<string, string>`.
 
-## What this covers
+## Gate chain
 
-- Public config bootstrap (App Check only, no JWT, skipAppVersion opt-out); returns WHERE public = true rows as flat Record&lt;string,string&gt;; cached in Android DataStore.
+The entry calls `runGates(req, { method: HttpMethod.Get, auth: AuthMode.None, skipAppVersion: true })`. App Check gates it, but there is no JWT — this is public config, so `NoAuthGateConfig` (`functions/_shared/gates/types.ts`) applies and there is no user identity.
 
-<Note>
-Scaffold generated from the codebase map — expand with full detail, examples, and specifics.
-</Note>
+| Gate | Applied? | Reason |
+| --- | --- | --- |
+| HTTP method GET | yes | read-only endpoint |
+| App Check | yes | proves a genuine app install (requires `FIREBASE_PROJECT_NUMBER`) |
+| App Version floor | **no** (`skipAppVersion` opt-out) | the floor value lives in this very table — chicken-and-egg |
+| JWT / entitlement | **no** (`AuthMode.None`) | public config, no user identity |
+| Rate limit | **no** | `AuthMode.None` has no rate-limit subject; `runGates` throws at startup if one is declared |
+
+The `skipAppVersion` opt-out carries a required `// OPT-OUT:` comment. The reason is structural: the App Version gate reads `min_supported_app_version_code` from `server_config` — the same table this endpoint serves — so blocking an old client here would prevent it from ever learning about the raised floor. Firebase Remote Config is the fast-path notifier of floor changes anyway.
+
+## The public filter
+
+Every `server_config` row carries a `public` boolean. The handler selects `key, value WHERE public = true` and returns `Object.fromEntries(...)`. Server-enforcement knobs — rate-limit ceilings, model selection, runaway caps, truncation limits — carry `public = false` and never leave the server. Exposing or hiding a value is data-driven: flip the `public` column, no code change or redeploy.
+
+Values are always strings (matching the TEXT column type); the client parses each by key. Error responses are `405 method_not_allowed`, `401 invalid_app_check`, `500 server_misconfiguration` (missing `FIREBASE_PROJECT_NUMBER`), and `500 database_error` (the `server_config` select failed).
+
+## Related pages
+
+- [Edge Function catalog](/rollingrecord/backend/edge-functions/overview) — the shared `runGates()` chain and auth modes.
+- [get-user-usage](/rollingrecord/backend/edge-functions/get-user-usage) — the per-user read that complements this per-install config bootstrap.

@@ -1,16 +1,119 @@
 ---
 title: "Operation Registry"
-description: "How ai-engine operations are registered and resolved, and the full operation list."
+description: "How ai-engine operations are registered, validated, and dispatched through one typed-handler registry behind the runGates admission chain."
 ---
 
-Each ai-engine operation is an OperationHandler in a central registry resolved by findHandler(); extraction is deliberately not here (it's async).
+`ai-engine` is a single `POST` Edge Function (`functions/ai-engine/index.ts`). One `Deno.serve` handler runs the outer admission chain, looks the request body's `operation` string up in a static registry, and dispatches to a typed handler. There is no legacy `switch` — as of RR-46 Phase 6b every operation is an `OperationHandler`.
 
-## What this covers
+## Request lifecycle
 
-- operations/index.ts OPERATIONS map + findHandler(); the OperationHandler contract (validateInput, execute, capCategory, usageColumn, capKey, requiredEntitlement, featureFlag).
-- Real ops: kb_query, synthesis, transcribe_submit/transcribe_fetch/transcribe_upload_init, sub-ops (keywords, context_summary, thread_naming, template_moderation, query_expand), user-blueprint ops (save/list/delete_user_blueprint).
-- Note: there is no synchronous extract op — extraction is fully async (see the Extraction section).
+`Deno.serve` calls `runGates(req, { method: HttpMethod.Post, auth: AuthMode.Jwt })` first. Note it passes **no** `rateLimit` chain-sugar: the rate limit runs later, inside `dispatchOperation`, so the `x-developer-bypass` / `x-ai-stubbed` response headers survive alongside it. After the gates resolve `authUserId`, `activeEntitlements`, and `isDeveloper`, the handler parses the JSON body, resolves the operation, and hands off to `dispatchOperation`.
 
-<Note>
-Scaffold generated from the codebase map — expand with full detail, examples, and specifics.
-</Note>
+| Step | What happens | Failure |
+| --- | --- | --- |
+| Admission gates | `runGates` — method, App Check, App Version floor, JWT, entitlement fetch | gate's own response |
+| Parse body | `await req.json()` | `invalid_body` (400) |
+| Read operation | `body.operation` must be a string | `missing_operation` (400) with `valid` |
+| Lookup handler | `findHandler(operation)` in `OPERATIONS` | `invalid_operation` (400) with `valid` |
+| Dispatch | `dispatchOperation(handler, ...)` | per-op (below) |
+
+`missing_operation`, `invalid_operation`, `invalid_body`, and `handler_threw` are the dispatch-level codes from `AppError` (`functions/_shared/errors.ts`) — all `developer`-category. The two operation-lookup errors echo `OPERATION_NAMES` (every registered key) back to the caller as `valid`.
+
+## The registry
+
+`OPERATIONS` (`functions/ai-engine/operations/index.ts`) is a `Record<string, OperationHandler>` — the single dispatch path. Each handler is instantiated once at module load. `findHandler(op)` returns `OPERATIONS[op] ?? null`; `OPERATION_NAMES` is `Object.keys(OPERATIONS)`.
+
+Thirteen handlers are registered. Extraction is **deliberately absent**: it is fully async (`extract-submit` → `extract-runner` → `extract-results`), and `extract_preflight` was deleted outright.
+
+| operation | handler | entitlement | capCategory | usageColumn | capKey | featureFlag |
+| --- | --- | --- | --- | --- | --- | --- |
+| `kb_query` | `KbQueryHandler` | `PRO_CLOUD_AI` | `handler_owned` | `ai_queries` | `ai_queries_per_month` | `kb_chat_enabled` |
+| `synthesis` | `SynthesisHandler` | `PRO_CLOUD_AI` | `handler_owned` | `syntheses` | `syntheses_per_month` | — |
+| `transcribe_submit` | `TranscribeSubmitHandler` | `PRO_CLOUD` | `handler_owned` | `transcription_ms` | `cloud_ai_transcription_minutes_per_month` | — |
+| `transcribe_fetch` | `TranscribeFetchHandler` | `PRO_CLOUD` | `handler_owned` | (none) | — | — |
+| `transcribe_upload_init` | `TranscribeUploadInitHandler` | `PRO_CLOUD` | `handler_owned` | `transcription_ms` | `cloud_ai_transcription_minutes_per_month` | — |
+| `keywords` | `KeywordsHandler` | `PRO_CLOUD_AI` | `runaway_protection` | `keywords_count` | `keywords_runaway_cap_multiplier` | — |
+| `context_summary` | `ContextSummaryHandler` | `PRO_CLOUD_AI` | `runaway_protection` | `context_summary_count` | `context_summary_runaway_cap_multiplier` | — |
+| `thread_naming` | `ThreadNamingHandler` | `PRO_CLOUD_AI` | `runaway_protection` | `thread_naming_count` | `thread_naming_runaway_cap_multiplier` | — |
+| `template_moderation` | `TemplateModerationHandler` | `PRO_CLOUD_AI` | `runaway_protection` | `template_moderation_count` | `template_moderation_runaway_cap` | — |
+| `query_expand` | `QueryExpandHandler` | `PRO_CLOUD_AI` | `runaway_protection` | `query_expand_count` | `query_expand_runaway_cap` | — |
+| `save_user_blueprint` | `SaveUserBlueprintHandler` | `PRO_CLOUD_AI` | `runaway_protection` | `save_user_template_count` | `save_user_template_runaway_cap` | — |
+| `list_user_blueprints` | `ListUserBlueprintsHandler` | `PRO_CLOUD_AI` | `runaway_protection` | `list_user_templates_count` | `list_user_templates_runaway_cap` | — |
+| `delete_user_blueprint` | `DeleteUserBlueprintHandler` | `PRO_CLOUD_AI` | `runaway_protection` | `delete_user_template_count` | `delete_user_template_runaway_cap` | — |
+
+The files `save-user-template.ts`, `list-user-templates.ts`, and `delete-user-template.ts` still exist but are one-line re-export stubs from the template→blueprint rename (e.g. `export { SaveUserBlueprintHandler as SaveUserTemplateHandler }`). They are not separately registered. The `..._template...` cap and usage-column names are legacy from the same rename.
+
+## The handler contract
+
+`OperationHandler` (`functions/ai-engine/operations/handler.ts`) is a pure data + function bundle. Handlers carry no per-request state.
+
+| Field | Meaning |
+| --- | --- |
+| `name` | Matches the `operation` string in the request body |
+| `requiredEntitlement` | `TierKey` (from `_shared/billing/entitlements.ts`) or `'none'` |
+| `capCategory` | `'user_facing'` \| `'runaway_protection'` \| `'handler_owned'` |
+| `capKey` | `server_config` key holding the cap (or the multiplier key) |
+| `parentCapKey` | Parent cap for `runaway_protection`, else `null` |
+| `usageColumn` | `usage`-table column incremented on success |
+| `featureFlag` | Optional `server_config` boolean kill-switch, else `null` |
+| `validateInput(input)` | Returns an error-code string to reject with `400`, or `null` |
+| `execute(ctx)` | Runs the operation, returns a `HandlerResult` |
+
+`HandlerContext` carries `authUserId`, `isDeveloper`, `rawBody`, the opaque `input`, and `requestHeaders` (so handlers can read op-specific headers like `X-Query-Session-Token` without the dispatcher knowing about them).
+
+`HandlerResult` is a discriminated union the dispatcher maps to HTTP:
+
+| status | HTTP | Notes |
+| --- | --- | --- |
+| `ok` | 200 | `{ payload, responseHeaders? }` |
+| `ok_passthrough` | upstream | Handler-built `Response` returned with merged headers |
+| `validation_failed` | 400 | `{ error, details? }` |
+| `forbidden` | 403 | `{ error }` |
+| `not_found` | 404 | `{ error }` |
+| `limit_reached` | 429 | `{ error, details? }` |
+| `upstream_failed` | 502 (default) | `{ error, httpStatus? }` |
+| `input_too_large` | 422 | `{ error }` |
+
+## The cap categories
+
+Cap category decides who enforces the monthly quota:
+
+- **`user_facing`** — the dispatcher reads the cap from `capKey`, compares it to the usage column, rejects with `cap_reached` (429), and increments by 1 on success.
+- **`runaway_protection`** — same flow, but a hit returns the `runaway_protection` code instead, and the effective cap is `parent_cap × multiplier` when a `parentCapKey` is set. A hit is a Crashlytics signal, not a user-facing error.
+- **`handler_owned`** — the dispatcher skips the cap check **and** the counter increment entirely. The handler does both inside `execute()` because it needs unit conversion (transcribe), non-unit increments (`kb_query` counts only new queries, not continuation rounds), or multi-column budgeting (synthesis).
+
+`computeEffectiveCap` implements the generic path: `getInt(parentCapKey, 0) * getInt(capKey, 4)` when a parent is set, otherwise `getInt(capKey, 100)`. Missing `server_config` rows fall back to those defaults so a deploy-ordering glitch can't take an operation offline.
+
+## dispatchOperation gate order
+
+`dispatchOperation` runs the per-op policy after the outer `runGates` chain. Its order is fixed:
+
+| # | Gate | Reject | Dev-skipped? |
+| --- | --- | --- | --- |
+| 3 | `handler.validateInput(input)` | `400` with the returned code | no |
+| — | Stamp `x-developer-bypass` + `x-ai-stubbed` headers | — | no |
+| 4 | Per-op entitlement — `requiredEntitlement` in the effective set | `subscription_required` (403) | yes (dev cascade satisfies it) |
+| 4.5 | Feature kill-switch — `getBool(featureFlag)` | `feature_disabled` (403) with `feature` | no (global kill-switch) |
+| — | `ensureCanonicalUserRow` (idempotent FK upsert) | non-fatal | no |
+| 5 | Cap check — `computeEffectiveCap` vs `readUsageColumn` | `cap_reached` / `runaway_protection` (429) | yes (and `handler_owned` self-manage) |
+| 6 | `checkRateLimit(Bucket.AiEngine, authUserId, isDeveloper)` | rate-limit response | yes |
+| 7 | `handler.execute(ctx)` in `try/catch` | `handler_threw` (500) on throw | no |
+| 8 | `incrementUsageColumn(authUserId, usageColumn)` on `ok` | non-fatal | yes (and `handler_owned`) |
+
+The feature kill-switch runs **after** entitlement so a tier-ineligible caller sees the clearer `subscription_required` rather than a vague `feature_disabled`. It fires even for dev accounts — the intent is a global kill-switch, not a quota. Today only `kb_query` declares a `featureFlag` (`kb_chat_enabled`).
+
+## One global rate-limit bucket
+
+`ai-engine` calls `checkRateLimit(Bucket.AiEngine, authUserId, isDeveloper)` inside `dispatchOperation` rather than via `runGates` chain-sugar. A single fixed-window `Bucket.AiEngine` counter spans **every** operation for a user. The goal is crash-loop / runaway-client protection, not per-operation budgeting — the monthly caps already handle that. Dev callers short-circuit the check. Doing it inside the dispatcher (not the outer chain) is what preserves the per-op observability headers.
+
+`currentPeriod()` returns the `YYYY-MM` UTC period key stamped into cap-error payloads. `ensureCanonicalUserRow` upserts the `canonical_users` row (`ignoreDuplicates`) so FK child inserts (`transcribe_jobs`, `user_blueprints`) can't fail on a first-launch race; it is non-fatal.
+
+## Where to go next
+
+- [KB Chat](/rollingrecord/backend/ai-engine/kb-query) — the `kb_query` agent loop, round budget, and session tokens.
+- [Synthesis](/rollingrecord/backend/ai-engine/synthesis) — two-column deep-reasoning budgeting.
+- [Runaway-Protected Sub-Ops](/rollingrecord/backend/ai-engine/sub-operations) — keywords, context summary, thread naming, query expand.
+- [Custom Blueprints](/rollingrecord/backend/ai-engine/user-blueprints) — the save / list / delete blueprint operations.
+- [Providers, Models & Pricing](/rollingrecord/backend/ai-engine/providers-and-models) — the failover client and cost tracking.
+
+Related: [runGates](/rollingrecord/backend/gates/run-gates) · [JWT auth](/rollingrecord/backend/gates/jwt-auth) · [Rate limiting](/rollingrecord/backend/gates/rate-limiting) · [Dev bypass scope](/rollingrecord/backend/gates/dev-bypass-scope) · [Error registry](/rollingrecord/backend/operations/error-registry) · [usage table](/rollingrecord/backend/database/usage-table).

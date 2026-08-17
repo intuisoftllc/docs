@@ -1,15 +1,83 @@
 ---
-title: "Credits, Bundles & Ceilings"
-description: "The credit ledger, bundle purchases/refunds, and the all-or-nothing credit ceiling."
+title: "Credits & Bundles"
+description: "The two-row-per-user credit balance model, the unified append-only ledger, tier-aware bundle grants and refunds, drain order, and the all-or-nothing credit ceiling."
 ---
 
-Manual credits and purchased bundles top up usage, guarded by a ledger and an integrity ceiling.
+Credits are bonus resource beyond a user's monthly cap. They live in `user_credits` — at most two rows per user — with every grant, refund, and consumption event also written to the unified `l_credit_log` ledger. All of this is implemented in `_shared/db/user-credits.ts` and `_shared/db/credit-ceiling.ts`.
 
-## What this covers
+## The balance model
 
-- manual_credits (admin grants, no-FK so it is in TABLES_TO_WIPE), the l_credit_consumption ledger, bundle purchases (creditBundle/refundBundle); credit_ceiling_exceeded all-or-nothing integrity ceiling (applies to admin grants); _shared/db/user-credits.ts, credit-ceiling.ts.
-- grant_manual_credit validation codes (amount_not_integer, amount_out_of_range, invalid_credit_type).
+`user_credits` (defined in `migrations/20260508000000_baseline.sql`, renamed from `manual_credits`) is keyed on `(auth_user_id, credit_type)` where `credit_type` ∈ `{manual, bundle}` — so a user has at most one `manual` row and one `bundle` row. Each row carries three per-resource balances: `transcription_ms_balance` and `extraction_ms_balance` (both **BIGINT** since the widen migration) plus `ai_queries_balance` (int4). CHECK constraints keep every balance `>= 0`, and the table has **no FK** to `canonical_users`.
 
-<Note>
-Scaffold generated from the codebase map — expand with full detail, examples, and specifics.
-</Note>
+`ResourceType` is `'transcription_ms' | 'ai_queries' | 'extraction_ms'`; `RESOURCE_COLUMNS` maps each to its balance column. Reads come through `getCreditRowBalances` (one row), `getCreditBalance` (one resource), and `getAllCreditBalances` (both rows plus a per-resource `total` — `manual + bundle`, the figure `get-user-usage` shows). Missing rows read as zeros.
+
+| Credit type | Written by | Helper |
+| --- | --- | --- |
+| `manual` | support-ops admin grants | `adjustManualCreditBalance` (hardcoded to the manual row) |
+| `bundle` | RC `NON_SUBSCRIPTION_PURCHASE` webhook + support-op recovery | `creditBundle` (keyed on `purchase_token`) |
+
+`adjustManualCreditBalance` is hardcoded to `credit_type = 'manual'` and never touches the bundle row — the "support staff edit manual, not bundle" integrity boundary is enforced at the data layer. It clamps at zero (`clampedToZero`), writes an `l_credit_log` audit row with `source = 'support_op_manual'` and `consumed_by = 'admin:<id>'`, and returns an `AdjustResult` of `{previousBalance, newBalance, appliedDelta, clampedToZero}`.
+
+## The unified ledger
+
+`l_credit_log` is the append-only ledger for every credit event: manual grants/revokes, bundle grants, consumption, and refunds. Columns include `auth_user_id`, `id` (uuid PK), `resource_type` (nullable), `amount` (legacy per-resource, nullable), `consumed_by`, `reason`, `created_at`, `credit_type`, `source`, `purchase_token`, `sku`, the three delta columns `transcription_ms_delta` / `ai_queries_delta` / `extraction_ms_delta`, and `refund_of_token`. It too has **no FK** to `canonical_users`.
+
+| CHECK / index | Constraint |
+| --- | --- |
+| `credit_type` CHECK | ∈ `{manual, bundle}` |
+| `source` CHECK | ∈ `{rc_webhook, support_op_recovery, support_op_manual, consumption, rc_refund}` |
+| partial UNIQUE on `purchase_token` (WHERE NOT NULL) | authoritative duplicate-purchase guard |
+| partial UNIQUE on `refund_of_token` (WHERE `source = 'rc_refund'`) | double-clawback guard |
+
+The reconciliation invariant is `SUM(deltas) GROUP BY (auth_user_id, credit_type)` equals the live `user_credits` balances within the retention window. `l_credit_log` was renamed from `l_credit_consumption` when it absorbed grants and refunds.
+
+## Bundle grants and refunds
+
+`creditBundle` is shared by the webhook and the support-op recovery path (`source` ∈ `{rc_webhook, support_op_recovery}`). Step 1 INSERTs the `l_credit_log` row keyed on `purchase_token`; a `23505` unique violation means the other path already credited, so it returns `outcome: 'already_credited'` as a no-op. Step 2 UPSERTs the bundle row's balances. Tier-aware grant amounts are the caller's responsibility — the webhook reads the buyer's tier at webhook time and passes minutes-only for Pro+Cloud, full grants for Cloud+AI.
+
+`refundBundle` (`source` ∈ `{rc_refund, support_op_refund}`) looks up the grant by `purchase_token`, computes per-resource clawback **clamped at the current balance** (the user keeps whatever they consumed before the refund), INSERTs a negative-delta row keyed on `refund_of_token`, and decrements the bundle row. Its `outcome` is `refunded`, `already_refunded`, or `no_grant_found`. Bundle SKU definitions live in `bundle_config` (`sku` PK, `minutes_granted`, `queries_granted`, `extraction_minutes_granted`, `active` soft-disable, `price_usd` reference-only — Google Play is the authoritative price).
+
+## Drain order
+
+Consumption drains **bundle first, then manual**, so paid credit is spent before support gratuities. `chargeOverage` is the per-op entry point after a successful metered call: it computes the overage crossing `baseCap`, floors it to whole credits, and calls `drainCredits`.
+
+| Step | Row | Behavior |
+| --- | --- | --- |
+| 1 | `bundle` | drain first, clamp at 0 |
+| 2 | `manual` | drain the remainder, clamp at 0 |
+| ledger | `l_credit_log` | one `consumption` row (negative delta, `consumed_by = 'system'`) per row touched, via `writeConsumptionLog` |
+
+Draining is best-effort — the user already got their operation, so a failed balance write is logged, not thrown.
+
+## The credit ceiling
+
+Admin manual-credit grants to the two time-denominated resources are bounded by a per-account ceiling in `_shared/db/credit-ceiling.ts`. `getCreditCeilingMs()` reads `server_config.max_credit_balance_minutes` (fallback `CREDIT_CEILING_MINUTES_DEFAULT` = 60000 minutes = 1000 hours) and multiplies by 60000 to get milliseconds. `CEILINGED_RESOURCES` is `[transcription_ms, extraction_ms]` — `ai_queries` is a small count and is **not** ceilinged. `wouldExceedCreditCeiling(current, delta, ceiling)` is pure; only positive deltas can exceed.
+
+The ceiling is **all-or-nothing**: a manual grant that would push the resource total (manual + bundle) past the limit is rejected outright rather than partially applied, so no paid time is silently lost — an admin cannot top a user already at 998h up past the 1000h limit. Enforcement lives ONLY on the admin manual-grant path — the ceiling helpers are called from `grant-manual-credit.ts` and nowhere else. `creditBundle()` and the webhook's `handleNonSubscriptionPurchase()` never call them, so a bundle **purchase** is not ceiling-checked and can legitimately push the balance past the limit. `CreditCeilingExceededError` carries `{resource, limitMs, currentBalanceMs, projectedMs}`; its message is prefixed `credit_ceiling_exceeded:` so any layer reading only `.message` can classify it, and the dispatcher maps it to the `credit_ceiling_exceeded` (409) registry code. It is **not** dev-bypassable — an integrity limit, not a quota.
+
+## Admin grant validation
+
+The support-ops `grant_manual_credit` op (`support-ops/operations/grant-manual-credit.ts`) validates its `amount` input paranoidly before any DB access. `MAX_ADJUSTMENT_BY_TYPE` bounds a single grant: `transcription_ms` and `extraction_ms` at 360,000,000 ms (100 hours), `ai_queries` at 10,000.
+
+| Code | HTTP | Meaning |
+| --- | --- | --- |
+| `amount_not_integer` | 400 | `amount` is not a JSON integer (rejects numeric strings, floats, booleans, null) |
+| `amount_not_finite` | 400 | `amount` is NaN or ±Infinity (defense-in-depth) |
+| `amount_out_of_range` | 400 | `abs(amount)` exceeds the per-type single-grant cap |
+| `amount_zero` | 400 | `amount: 0` rejected as a no-op |
+| `invalid_credit_type` | 400 | resource key not in `{transcription_ms, ai_queries, extraction_ms}` |
+| `credit_ceiling_exceeded` | 409 | grant would push a ceilinged resource total past the max holdable balance |
+
+The `credit_type` wire field actually names the RESOURCE being adjusted (a CLI back-compat holdover), not the manual/bundle discriminator that `credit_type` means inside `user_credits`.
+
+## Deletion coverage
+
+Neither `user_credits` nor `l_credit_log` has an FK to `canonical_users`, so CASCADE never reaches them. Both are listed in `TABLES_TO_WIPE` in `_shared/users/wipe.ts` and hard-deleted explicitly for GDPR right-to-erasure. The unit note worth carrying: the time-resource balance and delta columns are in **milliseconds** and were widened int4 → BIGINT in `migrations/20260729120000_widen_credit_ms_columns_to_bigint.sql`, because the 1000-hour ceiling (3.6e9 ms) overflows int4 (~596h). The extraction resource key was renamed `extractions` → `extraction_minutes` → `extraction_ms` across two migrations.
+
+## Related pages
+
+- [RevenueCat integration](/rollingrecord/backend/billing/revenuecat) — the webhook that calls `creditBundle` / `refundBundle`.
+- [Per-user financials](/rollingrecord/backend/billing/financials) — where bundle revenue is recorded.
+- [Entitlement taxonomy](/rollingrecord/backend/billing/entitlements) — the tiers that gate credit consumption.
+- [Support-ops operations catalog](/rollingrecord/backend/support-ops/operations-catalog) and [permissions](/rollingrecord/backend/support-ops/permissions).
+- [Transcription metering](/rollingrecord/backend/transcription/metering-and-cost), [extraction billing](/rollingrecord/backend/extraction/billing-and-caps), and the [usage table](/rollingrecord/backend/database/usage-table).

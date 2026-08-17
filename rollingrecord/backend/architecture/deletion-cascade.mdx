@@ -1,16 +1,80 @@
 ---
-title: "Deletion-Cascade Guarantee (GDPR)"
-description: "How deleting one user row erases all of their data across every table and Storage file, with no orphans."
+title: "Deletion-Cascade Guarantee"
+description: "How deleting one user erases all of their data — every table via FK cascade, every no-FK straggler via the wipe list, and every Storage object via the user-id path prefix."
 ---
 
-Deleting a single canonical_users row is designed to erase all of a user's data everywhere — the core GDPR right-to-erasure invariant.
+Deleting a user must leave nothing behind: no orphaned rows in any table, no orphaned ciphertext in any Storage bucket. Two mechanisms guarantee it — foreign keys with `ON DELETE CASCADE` for FK-backed tables, and an explicit wipe list for the tables and buckets that cascade can't reach. Both live in one shared module, `wipeUser()` (`functions/_shared/users/wipe.ts`), so the three callers can never drift apart.
 
-## What this covers
+## The shared `wipeUser()` module
 
-- Design invariant: deleting one canonical_users row erases all of a user's data across every table and every Storage file, no orphans.
-- Two mechanisms: FK + ON DELETE CASCADE (default), and the delete-user TABLES_TO_WIPE list for no-FK tables (query_sessions, manual_credits).
-- The Storage path convention &#123;bucket&#125;/&#123;auth_user_id&#125;/... is what makes wipeBucketFolder cleanup possible; any new table/bucket must update delete-user in the same session.
+`wipeUser(authUserId, options)` is the single delete ladder. Its `WipeUserResult` reports per-table row counts and per-bucket status so callers can surface exactly what was removed. Best-effort steps (snapshot, RC delete, lifetime revoke, storage wipe, table wipe, Clerk delete) log and continue — a partial failure never blocks a user's right to erasure. Only the `canonical_users` delete failing is fatal: it throws `CanonicalUserDeleteFailedError` carrying the partial result.
+
+The ladder runs in a fixed order:
+
+| Step | Action |
+| --- | --- |
+| 1 | Subscription check (unless `skipSubscriptionCheck`) — an active recurring sub throws `ActiveSubscriptionError` |
+| 2 | `canonical_users` lookup — missing row returns a clean `status: "not_found"` (idempotent) |
+| 3 | Snapshot usage → `l_deleted_identity` (anti-abuse carryover, best-effort) |
+| 4 | Delete the RevenueCat customer (`deleteRcCustomer`) |
+| 5 | Revoke lifetime entitlements locally (belt-and-suspenders) |
+| 6 | Wipe Storage buckets (`BUCKETS_TO_WIPE`, `{bucket}/{auth_user_id}/`) |
+| 7 | Wipe tables (`TABLES_TO_WIPE`, by `auth_user_id`) |
+| 8 | Hard-delete `usage` (after step 3 read it) |
+| 9 | Delete the `canonical_users` row (fires the remaining `ON DELETE CASCADE`s) |
+| 10 | Delete the Clerk user (`deleteClerkUser`) — frees the email for reuse; a 404 counts as success |
+
+The final auth-row deletion targets the **Clerk** user, not Supabase Auth — the goal is "this user is no longer in Clerk," so an already-gone 404 is success. See [the identity model](/rollingrecord/backend/architecture/identity-model) for why Clerk owns identity.
+
+## Mechanism 1 — FK cascade
+
+Twenty-six user-data tables reference `canonical_users(auth_user_id)` with `ON DELETE CASCADE` in the baseline schema (`migrations/20260508000000_baseline.sql`); later migrations add more — `transcription_queue`, `f_user_financials`, `h_extraction_charge`, `account_otp`, the extraction-jobs tables, `embedding_bundle_catalog`, and a storage-drift table — so the current FK-backed count is past 30. When step 9 deletes the `canonical_users` row, those cascades fire and take the child rows with it. The baseline FK-backed set spans `admin_permissions`, `support_tokens`, `user_crypto`, `l_user_key_access`, `l_entitlement_events`, `h_ai_engine_sessions`, `h_transcribe_history`, `transcribe_jobs`, `transcribe_results`, `user_blueprints` (the renamed `user_extraction_templates`), `user_storage_usage`, `user_sync_preferences`, and all 14 `c_*` sync tables. Note that `transcription_queue` and `f_user_financials` are both FK-backed **and** listed in `TABLES_TO_WIPE` (belt-and-suspenders plus per-table counts) — being in the wipe list does not mean a table lacks an FK.
+
+`auth_user_id TEXT NOT NULL` with an FK + `ON DELETE CASCADE` is required on every user-data table — it is what makes deleting one `canonical_users` row erase the user everywhere.
+
+## Mechanism 2 — the explicit wipe list
+
+`TABLES_TO_WIPE` in `wipeUser()` deletes each listed table by `auth_user_id` via `wipeTable()` (a `DELETE ... WHERE auth_user_id = ?` with `count: 'exact'`). It serves two roles. For FK-backed tables it is belt-and-suspenders plus a source of per-table counts in the response — those rows would also fall to the step-9 cascade. For the handful of tables with **no** FK to `canonical_users`, the explicit wipe is the *only* thing that removes them:
+
+| Table | Why no FK to `canonical_users` |
+| --- | --- |
+| `query_sessions` | ephemeral; often written before the caller's `canonical_users` row exists |
+| `user_credits` | bundle credits / admin gratuities survive deletion races (financial) |
+| `l_credit_log` | credit-consumption audit survives deletion races |
+| `usage` | anti-abuse counters float independent of the user lifecycle; wiped separately at step 8, *after* the snapshot reads it |
+
+Because `wipeTable()` keys off the single `auth_user_id` column, cleaning up a no-FK table is just appending its name to the list. `user_storage_usage` is deliberately **last** in the list: the `maintain_storage_*` triggers on the `c_*` deletes recreate its row, so wiping it earlier would orphan a zeroed counter next to live rows.
 
 <Note>
-Scaffold generated from the codebase map — expand with full detail, examples, and specifics.
+The wipe list lives in the shared `functions/_shared/users/wipe.ts`, not in `delete-user`. The `delete-user` Edge Function only runs gates and step-ups, then delegates to `wipeUser()`. Adding a new user-data table or bucket requires updating this shared module in the same session.
 </Note>
+
+## Storage objects never cascade
+
+A row delete does nothing to Storage. Every user file therefore lives under a `{bucket}/{auth_user_id}/` prefix, and `BUCKETS_TO_WIPE` enumerates and removes it:
+
+| Bucket | Contents |
+| --- | --- |
+| `transcribe-inbox` | transcribe source audio |
+| `audio-storage` | envelope-encrypted cloud audio blobs (renamed from `audio-backups`, RR-304) |
+| `embedding-storage` | encrypted embedding-bundle blobs |
+
+`wipeBucketFolder()` wipes every object under `{bucket}/{authUserId}/` at any depth. `collectStorageObjectPaths()` walks recursively and paginated (`STORAGE_LIST_PAGE_SIZE = 1000`, `STORAGE_MAX_DEPTH = 8`), collecting object paths before deleting so mid-walk removals can't shift the listing offsets; `remove()` then runs in batches (`STORAGE_REMOVE_BATCH_SIZE = 500`). It returns `ok` only when enumeration was complete *and* every batch was removed — a partial enumeration returns `failed` rather than a false clean-wipe. Losing an `audio-storage` object's owning `c_recordings` crypto columns makes the ciphertext permanently un-decryptable, so this bucket wipe is the only thing that removes those blobs. See [`c_recordings` integrity](/rollingrecord/backend/database/c-recordings-integrity).
+
+## Anti-abuse snapshot before the wipe
+
+Step 3 snapshots the user's `usage` counters into `l_deleted_identity`, keyed by `email_hash + period`, via `snapshotUsageForDeletion()` (`functions/_shared/users/deleted-identity-history.ts`). If the same email re-signs up in the same calendar month, `carryForwardOnResignup()` restores those counters onto the new account — closing the delete-and-resignup cap-reset hole. This is why `usage` is deleted separately at step 8, after the snapshot has read it.
+
+## The three callers
+
+One ladder, three entry points:
+
+| Caller | Trigger / differences |
+| --- | --- |
+| `delete-user` Edge Function | user-facing self-delete; enforces the active-sub block + email-OTP step-up + `delete_user` rate limit, then delegates to `wipeUser()` |
+| `clerk-webhook` (`user.deleted`) | account removed outside the app (Clerk dashboard / Account Portal / admin API); Svix-signed; calls `wipeUser(..., { skipSubscriptionCheck: true })` with no email supplied |
+| `support-ops` `delete_user_account` | admin-initiated wipe |
+
+The user-facing `delete-user` (`functions/delete-user/index.ts`) runs `runGates()` (POST + App Check + App Version + JWT), then a 409 `active_subscription` block for active recurring subs, the `DeleteUser` rate limit (2/hr, dev-bypassed), an optional `check_only` preflight, and an email-OTP step-up (`consumeOtpTicket`, purpose `account_deletion` → 403 `step_up_required`) before the destructive call. `handleUserDeleted()` in `clerk-webhook` is the auto-deletion path for accounts removed outside the app; a 404 from `deleteClerkUser` is treated as success, and because `wipeUser` is idempotent a 500 simply lets Svix retry.
+
+Related: [the `delete-user` endpoint](/rollingrecord/backend/accounts/delete-user) · [webhooks](/rollingrecord/backend/edge-functions/webhooks) · [high-risk tables](/rollingrecord/backend/database/high-risk-tables) · [Storage buckets](/rollingrecord/backend/storage/buckets) · [support-ops catalog](/rollingrecord/backend/support-ops/operations-catalog) · [the identity model](/rollingrecord/backend/architecture/identity-model).

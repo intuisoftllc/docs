@@ -1,14 +1,47 @@
 ---
 title: "analytics"
-description: "The server-to-server ingest endpoint for the Python eval harness."
+description: "The content-free, server-to-server ingest endpoint the Python eval harness calls to upsert eval-run metadata into l_eval_run."
 ---
 
-analytics is a content-free, server-to-server ingest endpoint used by the Python eval harness to record run metadata.
+`analytics` (`functions/analytics/index.ts`) is a `Deno.serve` POST dispatcher authenticated by a shared secret. v1 ships exactly one operation — `log_eval_run` — which upserts a single row into `l_eval_run` keyed on `run_id`. It records only run metadata (counts, cost, git SHA), never customer content, per the "No Use of Customer Data" rule.
 
-## What this covers
+## Gate chain
 
-- Server-to-server ingest (ANALYTICS_INGEST_SECRET) for the Python eval harness; v1 op log_eval_run upserts l_eval_run; content-free (no customer data) per the privacy HARD RULE.
+The entry calls `runGates(req, { method: Post, skipAppCheck: true, skipAppVersion: true, auth: AuthMode.WebhookSecret, secretEnvVar: "ANALYTICS_INGEST_SECRET" })`. Both App Check and App Version are opted out because the caller is the Python eval harness on a dev machine, not the mobile app — it sends neither header. The harness authenticates with `Authorization: Bearer <ANALYTICS_INGEST_SECRET>`.
+
+After the chain, the body is parsed as `AnalyticsBody` (`{ operation: string, input: unknown }`):
+
+| Condition | Response |
+| --- | --- |
+| Body isn't valid JSON | `INVALID_BODY` |
+| `operation` missing / not a string | `MISSING_OPERATION` |
+| `operation` unknown | `INVALID_OPERATION` (echoes `operation`) |
+| Handler throws | `HANDLER_THREW` |
+
+There is deliberately no shared body schema across operations — the analytics surface is heterogeneous, and each future op owns its own input validation.
+
+## `log_eval_run`
+
+`handleLogEvalRun` upserts into `l_eval_run` with `onConflict: "run_id"`. The harness calls it at run start, periodically as cases complete, and at run end, so a crashed harness still leaves an interrogable trail. Input is validated by `validateLogEvalRunInput` (`functions/analytics/validation.ts`), which returns a typed `LogEvalRunInput` or an error string that the dispatcher maps to `VALIDATION_FAILED` with a `detail`.
+
+Only fields the caller actually provided are written, so a partial "progress" upsert never clobbers previously-recorded counts:
+
+| Field group | Written by function? | Notes |
+| --- | --- | --- |
+| `run_id` / `status` / `scope` / `dry_run` | always | core upsert key + state |
+| `started_at` / `finished_at` / `git_sha` / `git_branch` / `notes` | only if provided | passthrough — absent keys skipped |
+| `cases_run` / `cases_passed` / `cases_failed` / `cases_uncertain` / `cases_skipped` / `cases_flaked` | only if provided | count columns |
+| `production_*` / `judge_*` (calls, input/output tokens, `cost_usd`) | only if provided | model + cost telemetry |
+| `pass_rate` | never | DB `GENERATED` column, derived from the counts |
+| `total_cost_usd` | never | DB-side generated column |
+
+On a successful upsert it returns `{ ok: true, run_id }` (200); a DB failure returns `DATABASE_ERROR`.
 
 <Note>
-Scaffold generated from the codebase map — expand with full detail, examples, and specifics.
+An earlier design exposed a `judge_inference` operation that proxied Anthropic calls to keep the API key server-side. It was walked back — the harness now calls Anthropic directly via `evals/_anthropic.py` — so v1 has exactly one operation.
 </Note>
+
+## Related pages
+
+- [Edge Function catalog](/rollingrecord/backend/edge-functions/overview) — the shared `runGates()` chain and webhook-secret auth mode.
+- [Inbound webhooks](/rollingrecord/backend/edge-functions/webhooks) — the other webhook-secret functions.

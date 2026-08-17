@@ -1,15 +1,58 @@
 ---
 title: "Column Spine & Encrypted Pairs"
-description: "The consistent column ordering and the encrypted _ct / _iv column pair convention."
+description: "The consistent user-data column ordering and the paired ciphertext + IV convention for encrypted fields."
 ---
 
-User-data tables share a consistent column spine, and every encrypted field is stored as a paired ciphertext + IV column.
+Every user-data table lays its columns out in the same order — a "spine" that puts identity first, lifecycle metadata next, domain columns after, and encrypted content last. Encrypted fields are always stored as a `<field>_ct` + `<field>_iv` pair, both suffixed so they sort together.
 
-## What this covers
+## The column spine
 
-- User-data table spine: auth_user_id first, then PK, sync/audit metadata, created_at, domain columns, encrypted pairs at the end.
-- Encrypted column pairs &lt;field&gt;_ct (BYTEA AES-256-GCM ciphertext incl. tag) + &lt;field&gt;_iv (12-byte IV), paired NOT NULL semantics + optional CHECK; the RR-320 rename convention.
+Reading any row top-to-bottom then gives identity, then row id, then lifecycle, then content — the same shape in `psql \d`, the Table Editor, and the JSON PostgREST returns.
 
-<Note>
-Scaffold generated from the codebase map — expand with full detail, examples, and specifics.
-</Note>
+| Slot | Column(s) |
+| --- | --- |
+| 1 | `auth_user_id` — always first, the cascade hook |
+| 2 | Primary key: `id` (surrogate UUID) OR remaining composite-PK parts (`period`, `recording_id`, `context_id`, …) |
+| 3 | Sync / audit metadata: `updated_at`, `version`, `deleted_at` |
+| 4 | `created_at` (when separate) |
+| 5 | Domain columns, ordered by importance |
+| 6 | Encrypted pairs at the END: `<field>_ct` then `<field>_iv` |
+
+On `c_*` tables the trailing `cloud_excluded_at` domain column sits after the encrypted pairs in practice. The lifecycle half of the spine is maintained by `maintain_sync_metadata` (`supabase/migrations/20260508000000_baseline.sql`), a `BEFORE UPDATE` trigger on every sync table that sets `updated_at := now()` and `version := OLD.version + 1`.
+
+## The encrypted-pair convention
+
+Every encrypted field on a user-data or crypto-metadata table is two columns, both suffixes coming **after** the field name so the pair sorts together alphabetically — never `iv_name`.
+
+| Suffix | Type | Contents |
+| --- | --- | --- |
+| `<field>_ct` | `BYTEA` | AES-256-GCM ciphertext, including the 16-byte GCM auth tag |
+| `<field>_iv` | `BYTEA` | The 12-byte random IV used for that encryption |
+
+`c_settings` documents the canonical spec in its column comments: `settings_ct` is "AES-GCM ciphertext ... (includes 16-byte auth tag)" and `settings_iv` is the "12-byte IV". A `CHECK ((name_ct IS NULL) = (name_iv IS NULL))` is encouraged for new tables so the pair can never be half-written.
+
+## NOT NULL semantics
+
+If the underlying field is required on the client, both `_ct` and `_iv` are `NOT NULL`; if optional, both are nullable and the client writes them together (non-NULL to both, or NULL to both).
+
+| Table | Pairs | Semantics |
+| --- | --- | --- |
+| `c_action_items` | `text_ct`/`text_iv` (required); `owner_ct`/`owner_iv`, `deadline_text_ct`/`deadline_text_iv` (optional) | Required pair `NOT NULL`; optional pairs nullable, written together |
+| `c_context_cards` | `sections_ct`/`_iv`, `keywords_ct`/`_iv`, `context_summary_ct`/`_iv`, `digest_ct`/`_iv` | Four optional pairs, clustered at the table end (appended, never interleaved) |
+| `c_search_messages` | `content_ct`/`content_iv`, `sources_json_ct`/`sources_json_iv` | All `NOT NULL` |
+| `c_settings` | `settings_ct`/`settings_iv` | `NOT NULL`; the reference spec of the convention |
+
+## Crypto-metadata pairs
+
+The convention also covers the wrapped-DEK columns on crypto-metadata tables. `user_crypto` carries `dek_ct`/`dek_iv` (`NOT NULL`), and `c_recordings` carries `dek_ct`/`audio_iv`/`dek_iv` plus `storage_path`/`kek_version`. Both were renamed to the `_ct` / `_iv` form in RR-320 (`wrapped_dek` → `dek_ct`, `iv`/`iv_dek` → `dek_iv`, `iv_audio` → `audio_iv`) — a shipped rename confirmed by the `COMMENT ON COLUMN` entries in the baseline. The convention is now universal; there is no grandfathering.
+
+## Reordering existing tables
+
+Postgres has no `ALTER COLUMN POSITION`, so a migration whose only purpose is reordering is never written — the required full table round-trip is pure operational risk. The spine is instead applied to new tables at creation, and fixed opportunistically inside a migration that already rebuilds the table for another reason (a column split, a type change, a FK restructure).
+
+## Related pages
+
+- [c_recordings integrity](/rollingrecord/backend/database/c-recordings-integrity) — the crypto column-set in detail
+- [High-risk tables registry](/rollingrecord/backend/database/high-risk-tables) — why the wrapped-DEK columns are protected
+- [Table naming conventions](/rollingrecord/backend/database/table-naming-conventions) — the prefixes these tables carry
+- [RLS & service-role model](/rollingrecord/backend/database/rls-and-service-role)

@@ -1,14 +1,77 @@
 ---
 title: "Admin Permissions & Super-Admin"
-description: "The per-operation admin permission model and super-admin protections."
+description: "The per-operation admin permission model on admin_permissions, the is_super_admin bypass, and super-admin target protection."
 ---
 
-Each admin op checks a per-operation permission against admin_permissions, with super-admins bypassing per-op checks but protected from lower-tier destructive ops.
+Every support-ops operation declares an `AdminPermissionKey` (or `null`). The dispatcher fetches the caller's `admin_permissions` row once per request via `getAdminPermissions` and evaluates each op's `requiredPermission` with the pure `hasAdminPermission(row, key)`. A caller with no row is not an admin and is rejected — there is no developer-account bypass anywhere in support-ops.
 
-## What this covers
+## The permission primitives
 
-- Per-op AdminPermissionKey against admin_permissions (one SELECT per request); is_super_admin + a dev auto-pass; super-admin-guard.ts protects super-admins from lower-tier destructive ops (super_admin_protected); admin_permission_denied.
+`functions/_shared/admin/permissions.ts` is the single source of truth. It splits into a fetch and a pure check so the DB read count stays at exactly one per request regardless of how many checks a handler runs.
 
-<Note>
-Scaffold generated from the codebase map — expand with full detail, examples, and specifics.
-</Note>
+| Symbol | I/O | Behavior |
+| --- | --- | --- |
+| `AdminPermissionKey` | none | Compile-time union of the 14 gating columns — a per-op typo fails at registry-load |
+| `AdminPermissionsRow` | none | Full row shape: `auth_user_id`, the 14 booleans, `is_super_admin`, `granted_at`, `granted_by`, `notes` |
+| `getAdminPermissions` | one SELECT (`maybeSingle`) | Returns the full row, or `null` when no row exists; throws on DB error (a 500, not a denial) |
+| `hasAdminPermission` | pure | `false` when row is null; `true` when `row.is_super_admin`; else `row[permission] === true` |
+
+`hasAdminPermission` is the whole bypass logic: `is_super_admin` is the only escape hatch. In the dispatcher, the gate resolves as `permitted = op.requiredPermission === null ? (permissionsRow !== null) : hasAdminPermission(permissionsRow, op.requiredPermission)`. On `false` it fires `logAbuseEvent(AdminPermissionDenied)` and returns `admin_permission_denied` (403) — logged to `l_user_abuse_event`, never to `l_admin_audit`. The `null` branch still requires a non-null row, so `whoami` is not an anonymous door into the endpoint.
+
+## No developer bypass
+
+Elsewhere in the backend the RC `developer` entitlement cascades to the top tier and grants unlimited quota. It grants **zero** support-ops access. `admin_permissions` is a separate, manually-seeded table, and a `developer` entitlement creates no row in it. Admin authority and product entitlement are deliberately disjoint — see [dev bypass scope](/rollingrecord/backend/gates/dev-bypass-scope).
+
+## Permission column to operation mapping
+
+Several columns gate more than one operation; `can_modify_accounts` currently gates none (it is reserved). There are 14 gating columns.
+
+| AdminPermissionKey | Operations gated |
+| --- | --- |
+| `can_lookup_user` | `lookup_user_by_email`, `search_users` |
+| `can_view_user_data` | `get_user_overview`, `get_user_credits`, `get_tombstone_report` |
+| `can_read_user_state` | `get_user_state`, `get_clerk_metadata`, `user_rate_limits` |
+| `can_read_audit` | `get_admin_audit`, `get_storage_drift` |
+| `can_read_user_audit` | `get_user_audit`, `get_user_timeline`, `get_user_transcribe_history`, `get_user_credit_ledger`, `link_audit_ticket` |
+| `can_triage_abuse` | `get_abuse_top_offenders` |
+| `can_validate_codes` | `verify_support_token`, `validate_recovery_code` |
+| `can_set_account_password` | `set_account_password`, `clear_app_lock_pin` |
+| `can_freeze_account` | `freeze_user_account` |
+| `can_grant_credits` | `grant_manual_credit` |
+| `can_restore_tombstones` | `restore_tombstones` |
+| `can_reset_extraction` | `reset_extraction`, `reset_transcription` |
+| `can_delete_user` | `delete_user_account` |
+| `can_modify_accounts` | (reserved — gates no live op today) |
+| null (any admin row) | `whoami` |
+| `is_super_admin` | bypasses every per-op check, is a redaction-bypass signal, and is the only tier that may target another super-admin |
+
+## The dual role of `is_super_admin`
+
+`is_super_admin = TRUE` serves two purposes. First, it satisfies every `hasAdminPermission()` check regardless of the per-op column. Second, it is a redaction-bypass signal that the response-shaping layer reads directly off `row.is_super_admin` (not through `hasAdminPermission()`) to skip field-level redaction on DTOs. Because the row is exposed in full, handlers that need the caller's privilege level read `ctx.adminPermissions.is_super_admin` rather than issuing a second DB round-trip.
+
+## Super-admin target protection
+
+A second, orthogonal rule protects super-admin TARGETS. `assertMayTargetAdmin` (`functions/_shared/admin/super-admin-guard.ts`) refuses a destructive op aimed at a super-admin unless the caller is one too — otherwise a single compromised regular-admin credential could lock out, erase, or hijack the entire super-admin layer with no one left above to undo it.
+
+The guard short-circuits with no DB read when the caller is a super-admin; otherwise `targetIsSuperAdmin` does one indexed PK lookup of `admin_permissions.is_super_admin` for the target (a missing row — an ordinary customer — returns false). A blocked call throws `OperationError(super_admin_protected, 403, { operation, target_auth_user_id })`. This is the single source of the protected-target rule: `freeze_user_account`, `delete_user_account`, and `set_account_password` all call it, so the protected set cannot drift between ops.
+
+## The `admin_permissions` table
+
+Defined in `migrations/20260508000000_baseline.sql`. PK `auth_user_id`; FK `fk_admin_permissions_user` → `canonical_users(auth_user_id) ON DELETE CASCADE`; RLS enabled (service-role only). Rows are seeded manually via the Supabase SQL console for the bootstrap admin. It is excluded from `delete-user`'s `TABLES_TO_WIPE` — it is an administrative fixture, not user data. `whoami`'s `PERMISSION_KEYS` array holds the explicit 14-key ordering the op reports, so adding a column is a deliberate decision and bookkeeping fields (`granted_by`, `notes`) never leak into the permission map; it reports the EFFECTIVE permission, so a super-admin reads back all-true.
+
+## Column history
+
+| Change | Migration | Effect |
+| --- | --- | --- |
+| Rename `can_verify_support_token` → `can_validate_codes` | `20260525230200_admin_permissions_rename_to_can_validate_codes.sql` | Generalized to gate all code-validation ops (support token + recovery code) |
+| Add `can_modify_accounts` | `20260518010000_admin_permissions_can_modify_accounts.sql` | Reserved for account-level mutations; default FALSE |
+| Drop `can_migrate_account` (+ `account_migrations` table) | `20260723160000_drop_account_migration.sql` | Account-migration feature removed post-Clerk |
+| Add `can_reset_extraction` | `20260723130000_admin_can_reset_extraction.sql` | Gates `reset_extraction` + `reset_transcription`; default FALSE |
+| Add `can_triage_abuse` | `20260812010000_add_can_triage_abuse_permission.sql` | Higher Trust-and-Safety bar for the cross-customer offenders view |
+
+## Where to go next
+
+- [Operations catalog](/rollingrecord/backend/support-ops/operations-catalog) — every op and the permission it declares.
+- [Dispatcher gate chain](/rollingrecord/backend/support-ops/dispatcher) — where the permission gate sits in the admission pipeline.
+- [Dry-run & audit](/rollingrecord/backend/support-ops/dry-run-and-audit) — how permission denials differ from audited operations.
+- [RLS & service role](/rollingrecord/backend/database/rls-and-service-role) — why direct anon-key access to `admin_permissions` gets nothing.

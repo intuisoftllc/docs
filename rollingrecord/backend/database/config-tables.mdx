@@ -1,14 +1,81 @@
 ---
 title: "server_config & rate_limit_config"
-description: "The two server-authoritative config tables and how they're read."
+description: "The two server-authoritative config tables, their schemas, the seed-row pattern, and how Edge Functions read them."
 ---
 
-server_config holds all server-authoritative knobs; rate_limit_config is a dedicated table for structured per-bucket limits.
+Server-authoritative config lives in two tables. `server_config` is a flat key/value store read through typed accessors; `rate_limit_config` is a dedicated structured table — one row per rate-limit bucket — read through `checkRateLimit()`. Both are reached only by the service-role client, and both are seeded idempotently from migrations.
 
-## What this covers
+## `server_config`
 
-- server_config (public flag, typed accessors getInt/getBool via _shared/db/server-config.ts, provider chains, model allowlist, kill switches); rate_limit_config (bucket_key/max_requests/window_sec/enabled).
+A flat key/value/description table with a `public` flag. Public rows are readable by the client for display; the value is always stored as `TEXT` and parsed by the reader.
 
-<Note>
-Scaffold generated from the codebase map — expand with full detail, examples, and specifics.
-</Note>
+| Column | Type | Purpose |
+| --- | --- | --- |
+| `public` | `BOOLEAN DEFAULT true` | Whether the client may read this row for display |
+| `key` | `TEXT` (PK) | The config key |
+| `value` | `TEXT` | Stored as text, parsed by the reader |
+| `description` | `TEXT` | What it controls and why the default was chosen |
+
+RLS is enabled with no policies. Edge Functions read it through `getServerConfigMap()` and four typed getters in `supabase/functions/_shared/db/server-config.ts`:
+
+| Accessor | Parse | Use |
+| --- | --- | --- |
+| `getInt(key, fallback)` | `parseInt` | Integer ceilings, caps |
+| `getNumber(key, fallback)` | `parseFloat` | Fractional values (e.g. usage multipliers) |
+| `getBool(key, fallback)` | `raw === "true"` | Feature flags, kill switches |
+| `getString(key, fallback)` | raw | Model names, string config |
+
+`getServerConfigMap()` fetches the whole table once and caches it for 5 minutes per warm instance, failing loud (throwing) on a DB error so a config read can't silently return stale zeros. As of RR-164, `server_config` no longer exposes an enforced `allowed_models` allowlist — `getAllowedModels()` was removed and each operation reads its own model key directly (e.g. `extraction_model`, `kb_query_model`).
+
+## `rate_limit_config`
+
+The one exception to "server-authoritative values live in `server_config`" — rate limits have a structured shape (bucket → max + window + kill-switch) that earns its own table.
+
+| Column | Type | Purpose |
+| --- | --- | --- |
+| `bucket_key` | `TEXT` (PK) | Matches the `Bucket` enum wire string |
+| `max_requests` | `INT` | Ceiling per window (`CHECK > 0`) |
+| `window_sec` | `INT` | Window length in seconds (`CHECK > 0`) |
+| `enabled` | `BOOLEAN DEFAULT true` | Kill-switch — `false` admits without counting |
+| `description` | `TEXT` | What the bucket protects and why the ceiling was chosen |
+| `updated_at` | `TIMESTAMPTZ` | Last edit |
+
+Read through `getBucketConfig()` in `supabase/functions/_shared/gates/rate-limit.ts`, which caches the row per warm instance and falls back to `BUCKET_DEFAULTS` on a missing row or DB error. `checkRateLimit()` dev-bypasses, honors the `enabled` kill-switch, then calls the atomic RPC; a normal rejection returns a minimal 429 `rate_limited` body of only `{error, bucket, reset_at_sec}`, while an RPC failure (or a no-row result) fails **closed** with a `500` `database_error` body of `{error, bucket}`. The registry of valid `bucket_key` strings is the `Bucket` enum in `supabase/functions/_shared/gates/types.ts`; each member needs both a `BUCKET_DEFAULTS` entry and a seeded `rate_limit_config` row in the same commit.
+
+### Representative buckets
+
+`BUCKET_DEFAULTS` is the fallback ceiling. For a few buckets the code fallback is deliberately held at half the live ceiling so a missing-row fallback always errs *below* the real limit.
+
+| `bucket_key` | max | window_sec | Note |
+| --- | --- | --- | --- |
+| `ai_engine` | 60 | 3600 | All ai-engine ops |
+| `sync_pull` | 275 | 3600 | Live ceiling 550; fallback held at half |
+| `sync_push` | 240 | 3600 | Batched `c_*` writes |
+| `search` | 300 | 3600 | Live ceiling 600; fallback held at half |
+| `delete_user` | 2 | 3600 | Account deletion |
+| `account_otp_send` | 20 | 3600 | Forgot-PIN email code |
+| `account_otp_verify` | 30 | 3600 | OTP verify |
+| `sync_download_grace` | 100 | 86400 | Lapsed-subscription download grace |
+
+## `rate_limit_counters`
+
+The per-`(user, bucket)` fixed-window counter table: `auth_user_id`, `bucket_key`, `window_start_sec` (`BIGINT`), `count` (`INT`), PK `(auth_user_id, bucket_key)`. It has no FK to `canonical_users` and is written **only** by `check_and_increment_rate_limit()`. That RPC (`p_auth_user_id`, `p_bucket_key`, `p_max`, `p_window_sec`, `p_weight` default 1) atomically increments and returns `allowed`, `current_count`, and `window_start_sec` — windows anchor to the first request after a reset, not to clock-hour boundaries, and a weighted increment that would cross the cap is rejected as a whole.
+
+## Seed-row pattern
+
+Config rows land in migrations with idempotent inserts so a migration re-runs cleanly on a reset preview DB. `rate_limit_config` seeds use `INSERT ... ON CONFLICT (bucket_key) DO NOTHING` (e.g. `supabase/migrations/20260703150000_account_otp_rate_limits.sql`); `server_config` seeds use `ON CONFLICT (key) DO NOTHING` or `DO UPDATE` (e.g. `supabase/migrations/20260703170000_raise_storage_quotas.sql`, which stamps the authoritative storage caps). Live ceilings are edited in the dashboard; the code fallbacks stay at or below the live value by design. `server_config` also feeds derived logic — `supabase/migrations/20260527100000_create_f_user_financials.sql` seeds `storage_cost_s3_micros_per_gb_month` (21000) and `storage_cost_pg_micros_per_gb_month` (125000), read by `compute_storage_cost_micros`.
+
+## Config tables at a glance
+
+| Table | Shape | Read by | PK |
+| --- | --- | --- | --- |
+| `server_config` | `public` / `key` / `value` / `description` (value is `TEXT`) | `getInt`/`getNumber`/`getBool`/`getString` over `getServerConfigMap` (5-min cache) | `key` |
+| `rate_limit_config` | `bucket_key` / `max_requests` / `window_sec` / `enabled` / `description` | `checkRateLimit` → `getBucketConfig` | `bucket_key` |
+| `rate_limit_counters` | `auth_user_id` / `bucket_key` / `window_start_sec` / `count` | `check_and_increment_rate_limit()` RPC only | `(auth_user_id, bucket_key)` |
+
+## Related pages
+
+- [usage table & metered counters](/rollingrecord/backend/database/usage-table)
+- [RLS & service-role model](/rollingrecord/backend/database/rls-and-service-role)
+- [Migration discipline](/rollingrecord/backend/database/migrations-discipline)
+- [Table naming conventions](/rollingrecord/backend/database/table-naming-conventions)

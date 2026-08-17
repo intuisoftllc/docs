@@ -1,14 +1,73 @@
 ---
 title: "sync-pull"
-description: "The paginated delta-pull endpoint and its cursor model."
+description: "The paginated two-phase delta-pull endpoint: opaque (updated_at, id, syncedAt) cursor, per-entity fan-out, phase-1 tag select + phase-2 hydrate for fat entities, row + byte page caps, remaining count, bundled preferences, and the resync path."
 ---
 
-sync-pull returns a paginated delta of changes since a cursor, split across request, query, and response modules.
+`POST /sync-pull` (`functions/sync-pull/index.ts`) is the read side of sync: a paginated delta query that returns every row newer than the client's cursor across the entities it asks for. The response is a discriminated union on `status` — either an `ok` page or a `resync_required` signal.
 
-## What this covers
+## Request
 
-- Paginated delta pull (cursor + groups); request.ts/pull-query.ts/response.ts split; a discriminated-union response with next_cursor/has_more; invalid_cursor; opts into grace-period read.
+The body is `{ cursor, groups }`, parsed by `parsePullRequest` (`functions/sync-pull/request.ts`). An unknown top-level field is a hard `400 validation_failed`; an unknown group NAME inside `groups` is silently dropped (forward-compat for future clients). `cursor` is optional and defaults to `""` — an empty cursor means a full resync from the oldest row. `resolveEnabledEntities` (`functions/_shared/sync/groups.ts`) intersects the requested groups with the user's enabled toggles to produce the set of `EntityDef`s to query.
 
-<Note>
-Scaffold generated from the codebase map — expand with full detail, examples, and specifics.
-</Note>
+## Response variants
+
+| Field | `PullResponseOk` | Notes |
+| --- | --- | --- |
+| `status` | `"ok"` | |
+| `server_time` | ISO 8601 | also written into every emitted cursor as its `syncedAt` |
+| `next_cursor` | opaque base64 | advance to the last processed row; on empty delta, re-stamp the same position with a fresh `syncedAt` |
+| `has_more` | boolean | true when the row-count cap OR byte cap held rows back |
+| `remaining` | number | RR-490 backlog after this page, for the "N items left" sync UI |
+| `entities` | `Partial<Record<WireEntity, Row[]>>` | keyed by WIRE name (`"recording"`), never a `c_*` identifier; empty entities omitted |
+| `sync_preferences` | six-boolean row | RR-334 preference bundle, mirrored on every pull |
+
+`buildResyncResponse` (`functions/sync-pull/response.ts`) returns `{ status: "resync_required", server_time, sync_preferences }` — it still bundles preferences so the client advances its mirror before the fresh full pull. Both builders live in `response.ts`.
+
+## The delta query
+
+`queryEntityDelta` (`functions/sync-pull/pull-query.ts`) runs one SELECT per enabled entity, in parallel:
+
+```
+WHERE auth_user_id = :user
+  AND (updated_at, id) > (:cursor_ts, :cursor_id)   -- tuple cursor, skipped on empty
+  AND updated_at < now() - interval '1 second'      -- clock-skew buffer
+ORDER BY (updated_at, id) ASC
+LIMIT pageSize + 1                                   -- peek sets has_more
+```
+
+The query uses `count: 'exact'`, so it returns the full per-entity backlog (`total`) independent of the page limit — summed across entities, that is the number the response turns into `remaining`. `primaryOrderColumn` resolves the tie-breaker db column: the wire `id` mapping (e.g. `transcript` → `recording_id`) or, for composite-PK junctions, the first uuid non-`auth_user_id` column. `cloud_excluded_at` is deliberately NOT filtered here — the exclusion event itself must propagate so other devices update their state. A dormant uuid-cast-error retry (`isUuidCastError`) exists for a hypothetical future real-uuid id column but never fires today, since every sync id column is `text`.
+
+## Two-phase fetch
+
+The pull fans out `entities × (pageSize + 1)` rows to emit at most `pageSize`, so a page of fat rows can exhaust the isolate and die with HTTP 546 `WORKER_RESOURCE_LIMIT`. The RR-491 fix splits fat entities into two phases:
+
+- **Phase 1** selects only `(id, updated_at)` (`tagColumnList`) for two-phase entities, merge-sorts the global union, and trims to the winners.
+- **Phase 2** hydrates only those winners via `fetchRowsByIds` — `SELECT <full columns> WHERE idCol IN (winners) AND auth_user_id = :user`.
+
+`isTwoPhaseEntity` marks an entity two-phase when it has a unique `id` column AND its `maxRowBytes` ceiling exceeds 64 KB — currently `transcript`, `search_message`, `context_card`, `recording_note`, and `settings`. Phase 2 is intentionally NOT filtered by the clock-skew buffer: a row edited between phases is delivered with its newer content, the cursor still advances, and the next pull re-delivers it idempotently. A winner missing from phase 2 (hard-deleted between phases) is emitted as `full: null` — omitted from the payload but still advanced past.
+
+## Page-termination caps
+
+`selectPageCandidates` applies phase-1 selection (pure, no I/O); `buildOkResponse` applies the response byte cap. Whichever cap hits first ends the page, and the first row is always admitted so the cursor can never dead-end.
+
+| Cap | Constant | File |
+| --- | --- | --- |
+| Row count | `SYNC_PULL_DEFAULT_PAGE_SIZE = 100` (max 500), tunable via `server_config.sync_pull_page_size`, clamped by `clampPullPageSize` | `functions/_shared/sync/constants.ts` |
+| Phase-2 hydration bytes | `SYNC_PULL_HYDRATION_MAX_BYTES = 64 MB` (estimated from `maxRowBytes` ceilings, decided before fetch) | `functions/_shared/sync/constants.ts` |
+| Response bytes | `SYNC_PULL_MAX_PAGE_SIZE_BYTES = 5 MB` (measured JSON) | `functions/_shared/sync/constants.ts` |
+| Clock-skew buffer | `CLOCK_SKEW_BUFFER_SEC = 1` (exclude rows within 1s of `now()`) | `functions/_shared/sync/constants.ts` |
+
+## The cursor and resync
+
+The cursor is a `v=2` `CursorData` — `{ ts, id, syncedAt }` (`functions/_shared/sync/cursor.ts`). A legacy `v=1` cursor (no `syncedAt`) still parses and forces exactly one resync, after which the client holds a `v=2` cursor. Expiry is measured by `isCursorExpired` from `syncedAt` (when the client last synced), NOT from `ts` (the age of its newest row) — the RR-489 fix so a caught-up but dormant account is not stuck in a perpetual resync loop. When the freshness stamp is older than `cloud_tombstone_grace_days` minus a 1-hour buffer, the endpoint returns `resync_required`, since deletes the client never saw may already have been GC'd.
+
+## Gate chain specifics
+
+`sync-pull` is a READ, so it opts into `allowGracePeriodRead: true` with `rateLimit: { bucket: SyncPull, gracePeriodBucket: SyncDownloadGrace }`. A lapsed cloud subscriber inside their 30-day grace window can still pull (on the smaller grace bucket); a pro-only-lapsed user cannot, because `pro` is not in the entitlement array.
+
+## Related pages
+
+- [Sync Engine Overview](/rollingrecord/backend/sync/overview) — the subsystem map.
+- [sync-push](/rollingrecord/backend/sync/push) — the write side and LWW cursor round-trip.
+- [Sync Shared Modules](/rollingrecord/backend/sync/shared-transforms) — the cursor, registry, and `dbRowToWire` projection.
+- [sync-reconcile & sync-group-exclude](/rollingrecord/backend/sync/reconcile-and-groups) — drift detection when a pull and the local mirror disagree.

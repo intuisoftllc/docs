@@ -1,15 +1,65 @@
 ---
 title: "Scheduled pg_cron Sweepers"
-description: "The scheduled jobs that prune, reconcile, and reap across the database."
+description: "The pg_cron jobs that prune logs, counters, tombstones, trash, and orphaned Storage blobs."
 ---
 
-A set of pg_cron jobs sweeps logs, counters, queues, and orphaned blobs, calling Edge Functions when they need secrets.
+Database housekeeping runs as a fleet of `pg_cron` jobs, staggered mostly across the 03:00–04:30 UTC window. In-DB pruning is done by `SECURITY DEFINER` SQL functions; jobs that need Storage-API access or Edge-function secrets `POST` an Edge Function via `net.http_post`, pulling the URL and bearer from Vault. Each job is registered re-runnably (unschedule-if-exists, then `cron.schedule`).
 
-## What this covers
+## Two execution shapes
 
-- The real jobs: prune_log_tables/prune_h_tables, prune_rate_limit_counters, prune_account_otp, prune_transcription_queue, prune_demoted_rolling, cloud_excluded_content_cleanup, reconcile_pending_delete_counters, c_recordings_audit_blobs, c_recordings_reconcile_no_blob_path, transcribe-inbox-cleanup, extract-runner-tick, sweep_extraction_heartbeats, sweep_extraction_jobs_ttl, storage_orphan_lister.
-- Cron calls Edge Functions via net.http_post with Vault-stored secrets (SQL cannot read Edge env).
+| Shape | How it runs | Examples |
+| --- | --- | --- |
+| In-DB SQL function | `cron.schedule('job', '<cron>', 'SELECT public.fn();')` | `prune_tombstones`, `prune_log_tables`, `purge_expired_trash` |
+| Edge Function via `net.http_post` | POSTs a URL + bearer read from Vault; `RAISE NOTICE`-skips until those Vault rows exist (SQL cannot read Edge env vars) | `storage_orphan_lister`, `extract-runner-tick` |
 
-<Note>
-Scaffold generated from the codebase map — expand with full detail, examples, and specifics.
-</Note>
+## Retention sweepers
+
+| Function | Schedule (UTC) | What it deletes |
+| --- | --- | --- |
+| `prune_log_tables` | Sun `03:00` weekly | `l_*` rows older than `server_config.log_retention_months` (default 36) from `l_user_key_access`, `l_user_abuse_event`, `l_admin_audit`, `l_credit_log` |
+| `prune_h_tables` | Sun `04:00` weekly | `h_*` rows older than `server_config.support_history_retention_days` (default 90) from `h_transcribe_history` (by `completed_at`), `h_ai_engine_sessions` (by `ended_at`), and `h_extraction_charge` (by `charged_at`) |
+| `prune_support_tokens` | hourly | Consumed or expired `support_tokens` rows |
+| `prune_account_otp` | `:20` hourly | Consumed / expired account-OTP rows |
+
+These functions are defined in `supabase/migrations/20260508000000_baseline.sql`; their `cron.schedule` registrations live in later migrations or the dashboard, not the baseline itself.
+
+## Tombstone & trash sweepers
+
+| Function | Schedule (UTC) | Action |
+| --- | --- | --- |
+| `prune_tombstones` | `~03:15` nightly | Hard-deletes rows across the 13 `c_*` tables whose `deleted_at` is past `cloud_tombstone_grace_days` (default 30), via a `FOREACH` loop (`c_settings` is not in the array) |
+| `prune_demoted_rolling` | `03:25` nightly | Hard-deletes `c_recordings` husks where `mode='ROLLING'` and `protected_at IS NULL` and `deleted_at IS NULL` past the grace window (`supabase/migrations/20260605210100_prune_demoted_rolling_cron.sql`) |
+| `purge_expired_trash` | daily | Tombstones `c_recordings` whose `trashed_at` is past `trash_retention_days`, then tombstones orphaned `c_recording_sessions` in the same CTE transaction (sets `deleted_at`) |
+| `purge_orphan_recording_sessions` | weekly | Defense-in-depth: tombstones any `c_recording_sessions` with zero live recordings |
+
+## Storage / crypto reconcilers
+
+These null crypto or storage columns to force a client re-upload, or reap orphaned blobs. See [c_recordings integrity](/rollingrecord/backend/database/c-recordings-integrity) for the invariants they preserve.
+
+| Function / job | Schedule (UTC) | Action |
+| --- | --- | --- |
+| `audit_orphan_blobs` (job `c_recordings_audit_blobs`) | `03:00` daily | For committed rows whose `audio-storage` object is verified MISSING, nulls `storage_path` + crypto + `cloud_backup_committed_at` so the client re-uploads |
+| `reconcile_committed_no_blob_path` (job `c_recordings_reconcile_no_blob_path`) | `03:10` daily | Nulls `cloud_backup_committed_at` on rows that claim a commit but have no `storage_path` |
+| `cloud_excluded_storage_cleanup` | `~03:37` daily | Nulls `storage_path` + `dek_ct`/`dek_iv`/`audio_iv` on rows past `cloud_excluded_grace_days`; the hourly lister reaps the blob (`supabase/migrations/20260731150000_storage_janitor_cutover.sql`) |
+| `cloud_excluded_content_cleanup` | `03:40` daily | Nulls the encrypted TEXT content columns (`c_recordings.name_ct/name_iv`, `c_transcripts` text columns) on excluded rows — touches no audio-DEK columns, issues no DELETE |
+| `storage_orphan_lister` | `:23` hourly | `net.http_post` to the `storage-orphan-lister` Edge Function (Vault `storage_orphan_lister_url` + `storage_janitor_secret`); sweeps `audio-storage`, `embedding-storage`, `transcribe-inbox` in one pass |
+
+`storage_orphan_lister` consolidated two former per-sweeper crons (`audio_backup_delete_orphan_blobs` and `transcribe-inbox-cleanup`), which were unscheduled in the storage-janitor cutover. Raw `DELETE FROM storage.objects` is blocked by `protect_delete()`, so these sweepers drop a row's claim on a blob and let the lister remove the object via the Storage API.
+
+## Counter, queue & extraction jobs
+
+| Function / job | Schedule (UTC) | Action |
+| --- | --- | --- |
+| `prune_rate_limit_counters` | `04:15` daily | Drops stale `rate_limit_counters` rows |
+| `reconcile_pending_delete_counters` | `03:45` daily | Fixes pending-delete byte counters |
+| `prune_transcription_queue` | `03:50` daily | Drains finished queue rows |
+| `extract-runner-tick` | every minute | `net.http_post` to the `extract-runner` Edge Function via a dedicated Vault secret (`supabase/migrations/20260721020000_extract_runner_dedicated_secret.sql`) |
+| `sweep_extraction_heartbeats` | every minute | Requeues extraction jobs with a stale heartbeat |
+| `sweep_extraction_jobs_ttl` | `:20` hourly | Drops extraction jobs past their TTL (`supabase/migrations/20260720170000_extraction_sweepers.sql`) |
+
+## Related pages
+
+- [c_recordings integrity](/rollingrecord/backend/database/c-recordings-integrity) — the sanctioned-caller status of these sweepers
+- [Table naming conventions](/rollingrecord/backend/database/table-naming-conventions) — the `l_*` / `h_*` retention classes swept here
+- [usage table & metered counters](/rollingrecord/backend/database/usage-table)
+- [RLS & service-role model](/rollingrecord/backend/database/rls-and-service-role)

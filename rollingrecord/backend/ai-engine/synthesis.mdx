@@ -1,14 +1,47 @@
 ---
-title: "Synthesis & Deep Reasoning"
-description: "The multi-column-budgeted synthesis operation and its soft deep-reasoning downgrade."
+title: "Synthesis"
+description: "The handler_owned synthesis operation: a hard syntheses cap plus a soft deep-reasoning-to-Haiku downgrade across two usage columns."
 ---
 
-Synthesis budgets across multiple usage columns and softly downgrades deep reasoning to Haiku on cap rather than rejecting.
+`synthesis` (`functions/ai-engine/operations/synthesis.ts`) distills a completed context's accumulated sections and tasks into a permanent knowledge digest, generated once when a context transitions to COMPLETED. It is `handler_owned` and gated on `PRO_CLOUD_AI`. The client sends only the data; the server owns the prompt, model selection, and `max_tokens`.
 
-## What this covers
+## Input contract
 
-- Multi-column budgeting (syntheses + deep_reasoning_syntheses); deep reasoning is soft — it downgrades to Haiku on cap rather than rejecting; prompts/synthesis.ts.
+`validateInput` requires three fields, all present or the request is rejected with a `developer` error:
 
-<Note>
-Scaffold generated from the codebase map — expand with full detail, examples, and specifics.
-</Note>
+| field | type | missing → error |
+| --- | --- | --- |
+| `sections_json` | string (JSON-encoded sections) | `missing_sections_json` (400) |
+| `tasks_json` | string (JSON-encoded tasks) | `missing_tasks_json` (400) |
+| `use_deep_reasoning` | boolean | `missing_use_deep_reasoning` (400) |
+
+`buildUserMessage` parses both JSON strings and renders an `EXTRACTED SECTIONS` block followed by a `TASKS` block (pending, then completed), sliced to `synthesis_max_input_tokens × CHARS_PER_TOKEN` (`CHARS_PER_TOKEN = 3`). It mirrors the client's `ContextSynthesisWorker.buildUserMessage()`. If both sections and tasks are empty the message is blank and the handler returns `{ digest: null }` with **no provider call**, logged as a completed session.
+
+## Two-column budgeting
+
+Because it is `handler_owned`, the handler runs its own cap logic against two `usage` columns:
+
+| counter | config key | default | behavior on limit |
+| --- | --- | --- | --- |
+| `syntheses` | `syntheses_per_month` | 72 | **hard reject** → `cap_reached` / `limit_reached` (429) |
+| `deep_reasoning_syntheses` | `synthesis_deep_reasoning_monthly_limit` | 20 | **soft downgrade** → falls back to the standard Haiku model |
+
+The base `syntheses` cap is checked first: if `used >= cap` (non-dev), the handler returns `limit_reached` with `cap_reached` (429) and writes a `cap_reached` session row — synthesis is genuinely blocked.
+
+The deep-reasoning slot is a soft ceiling, not a rejection. When `use_deep_reasoning` is true and the user is under `synthesis_deep_reasoning_monthly_limit`, the handler selects the Sonnet model (`getOperationModel("synthesisDeepReasoning")`, default `CLAUDE_SONNET`, Gemini Pro fallback). Once that slot is exhausted it **silently downgrades** to the standard Haiku synthesis model (`getOperationModel("synthesis")`, default `CLAUDE_HAIKU`, Gemini Flash fallback) rather than rejecting. Dev accounts always get deep reasoning when they request it.
+
+## Execution and counters
+
+The handler calls the resilient client over `ProviderChains.ANTHROPIC_GEMINI`, with a `modelForProvider` that maps the Sonnet path to Gemini Pro and the Haiku path to Gemini Flash. `synthesis_max_output_tokens` (default 4096) caps the output. On success it extracts the first text block as the digest, and (non-dev only) increments `syntheses` by 1 — plus `deep_reasoning_syntheses` by 1 when the Sonnet path actually ran (`functions/_shared/db/usage-counters.ts`). The cap is read via `readUsageColumn` before the call; the period key comes from `currentPeriod()`.
+
+Every exit path writes one `h_ai_engine_sessions` row via `recordAiEngineSession` — `completed` (including the empty-input null-digest case), `cap_reached`, or `failed`. The success payload carries `digest`, `model_used`, `provider`, and token `usage`.
+
+Error codes (`functions/_shared/errors.ts`): the three `missing_*` input errors above (developer, 400); `cap_reached` (user, 429); and the shared provider failures `all_providers_failed` (503), `provider_rate_limited` (429), `ai_call_failed` (502).
+
+## Where to go next
+
+- [Operation Registry](/rollingrecord/backend/ai-engine/operations-registry) — how `synthesis` is dispatched.
+- [Providers, Models & Pricing](/rollingrecord/backend/ai-engine/providers-and-models) — the Sonnet/Haiku model + fallback selection.
+- [Server-Side Prompts & Safety Sandwich](/rollingrecord/backend/ai-engine/prompts-and-safety) — where `SYNTHESIS_SYSTEM_PROMPT` lives and why.
+
+Related: [usage table](/rollingrecord/backend/database/usage-table) · [Extraction architecture](/rollingrecord/backend/extraction/architecture).

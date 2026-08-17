@@ -1,15 +1,63 @@
 ---
 title: "Storage Janitors & Orphan Reaping"
-description: "The only sanctioned Storage-delete path and the orphan-blob discovery sweeper."
+description: "The one generic storage-janitor that is the only sanctioned delete path, the bucket-aware storage-orphan-lister and its three sweeps, and the nightly audit_orphan_blobs cron."
 ---
 
-A dumb janitor is the only sanctioned way to delete Storage objects, fed by a bucket-aware orphan-lister.
+Raw `DELETE FROM storage.objects` is blocked by Supabase's `protect_delete()` trigger, so every Storage deletion routes through `removePaths` (`functions/_shared/storage/remove.ts`). Two Edge Functions sit above it: `storage-janitor`, a dumb "delete these paths" service, and `storage-orphan-lister`, the one place that knows which blobs are orphaned. A separate nightly SQL cron, `audit_orphan_blobs`, handles the inverse — rows whose blob has gone missing.
 
-## What this covers
+## The one delete path
 
-- storage-janitor (a generic "delete these paths" with STORAGE_JANITOR_SECRET, the only sanctioned path since protect_delete() blocks raw DELETE FROM storage.objects); storage-orphan-lister (bucket-specific discovery across audio-storage/embedding-storage, 1-hour grace, tombstone-grace awareness).
-- Storage drift detection + quota alignment (_shared/db/storage-quota.ts, storage_drift_detection migration).
+`removePaths(bucket, paths)` deletes via the Storage admin API, chunked to `STORAGE_REMOVE_BATCH_SIZE` = 1000 (the `remove()` cap). It is idempotent — removing an already-gone path is a no-op — `deleted` counts paths submitted rather than objects that existed, and it throws on a hard Storage error. It is the ONE sanctioned code path for removing objects, shared by both the janitor and the orphan-lister.
+
+## storage-janitor
+
+`functions/storage-janitor/index.ts` is a generic server-to-server "delete these paths from this bucket" service holding no domain logic about *which* blobs to delete — that always lives with the caller. A `pg_cron` `net.http_post` or another Edge Function POSTs `{ bucket, paths[] }`; the janitor validates and calls `removePaths`.
+
+| Aspect | Value |
+| --- | --- |
+| Auth | `AuthMode.WebhookSecret`, secret `STORAGE_JANITOR_SECRET` |
+| Opt-outs | `skipAppCheck` + `skipAppVersion` (server-to-server callers send neither header) |
+| Validation | `parseJanitorRequest` — bucket in `ALLOWED_BUCKETS`, paths a non-empty-string array |
+| Response | `{ bucket, deleted, batches }` |
+| Errors | `invalid_body` (400), `delete_failed` (502) |
+
+`ALLOWED_BUCKETS` (`functions/storage-janitor/buckets.ts`) is exactly `['audio-storage', 'embedding-storage', 'transcribe-inbox']` — any other bucket name is rejected 400. Duplicate paths are preserved as-is since `remove()` is idempotent.
+
+## storage-orphan-lister
+
+`functions/storage-orphan-lister/index.ts` is the single discovery sweep and the ONE place with bucket-specific orphan logic. It carries the same `WebhookSecret` + `STORAGE_JANITOR_SECRET` gate and the same `skipAppCheck` / `skipAppVersion` opt-outs as the janitor. It runs **three independent sweeps** — audio, embeddings, transcribe — each wrapped in `runSweep` so one sweep's failure surfaces as `{ error }` in its section without blocking the others; the call still returns 200.
+
+Two guards bound what a sweep will touch. `collectAgedPaths` (`functions/_shared/storage/sweep.ts`) does a two-level `{folder}/{file}` walk and skips any object younger than `STALE_AGE_MS` = 1 hour, so an in-flight upload whose row hasn't committed is never mistaken for an orphan (an object with no `created_at` is treated as brand-new and kept). And every sweep honors `cloud_tombstone_grace_days` (default 30), read once per run into `restorableSince`.
+
+### Orphan definition per bucket
+
+| Bucket | Owning table | Orphan predicate | Grace / retention |
+| --- | --- | --- | --- |
+| `audio-storage` | `c_recordings` | path not claimed by a row that is live or restorable (`deleted_at IS NULL` or `>= restorableSince`) | 1-hour age skip + `cloud_tombstone_grace_days` (default 30) |
+| `embedding-storage` | `c_recordings` / `c_contexts` | owner row gone, tombstoned past grace, or `emb_bundle_hash` NULL | 1-hour age skip + 30-day tombstone grace |
+| `transcribe-inbox` | `transcribe_jobs` | blob with no job row, or a job past `expires_at` | 1-hour age skip; row reap runs unconditionally |
+
+`sweepAudio` cross-references `c_recordings.storage_path` in `DB_LOOKUP_BATCH` = 50-path batches (keeping the PostgREST `.in()` GET URL under the nginx header limit); a cloud-excluded row whose `storage_path` was nulled drops its claim and is reaped within the hour. `sweepEmbeddings` classifies paths with `parseEmbeddingPath` / `embeddingLiveKey` (`functions/storage-orphan-lister/predicates.ts`), which match `^{authUserId}/(recording|context)-{uuid}.bin$`; an unrecognized path is left in place, never deleted.
+
+### Why tombstoned rows keep their blobs
+
+`restore_tombstones` offers a 30-day recovery window, so deleting a restorable row's blob would produce a recording that exists and cannot be played. The lister, the tombstone pruner, and `restore_tombstones` all read the same `cloud_tombstone_grace_days` so the row's retention window and the blob's retention window can never disagree.
+
+### The transcribe row reap
+
+`sweepTranscribe` runs a blob sweep and a row reap that are **independent**. The blob sweep uses `transcribeBlobsToDelete(candidates, jobExpiryMap, nowMs)` — a blob with no job row, or an expired/null expiry, is deleted; an active job's blob is kept. Separately, the reap deletes **every** `transcribe_jobs` row `WHERE expires_at < now` unconditionally — even if the blob sweep threw — which is what cleans blob-less stuck-pending rows a bucket walk never encounters. Rows with a null `expires_at` are left alone.
+
+## audit_orphan_blobs — the inverse sweep
+
+The orphan-lister removes blobs with no owning row; `audit_orphan_blobs` (RR-361, `migrations/20260508000000_baseline.sql`) handles rows whose blob has vanished. This nightly `pg_cron` job (with `FOR UPDATE SKIP LOCKED`) walks `c_recordings` rows claiming a committed blob (`storage_path` and `cloud_backup_committed_at` NOT NULL, `deleted_at` NULL) past a grace cutoff, checks whether the `audio-storage` object actually exists, and for a missing blob nulls `storage_path`, `dek_ct`, `dek_iv`, `audio_iv`, `kek_version`, and `cloud_backup_committed_at`. That leaves the row in the exact "needs upload" state the client's `AudioSyncWorker` re-uploads from.
 
 <Note>
-Scaffold generated from the codebase map — expand with full detail, examples, and specifics.
+This blob-integrity audit is distinct from storage-quota drift. `audit_orphan_blobs` reconciles blob-versus-row existence; the separate `storage_drift_detection` machinery reconciles the `user_storage_usage` byte counter. They solve different problems and live in different places.
 </Note>
+
+## Related pages
+
+- [Storage Buckets](/rollingrecord/backend/storage/buckets) — the bucket allowlist and path conventions these sweeps enforce
+- [Envelope Encryption Model](/rollingrecord/backend/storage/envelope-encryption) — the crypto material `audit_orphan_blobs` nulls
+- [KEK Lifecycle & user_crypto](/rollingrecord/backend/storage/key-management) — the keys tied to a reaped blob
+- [Server-Side Embeddings](/rollingrecord/backend/storage/semantic-search) — the bundle blobs `sweepEmbeddings` reaps

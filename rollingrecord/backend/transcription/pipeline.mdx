@@ -1,15 +1,79 @@
 ---
 title: "Transcription Pipeline"
-description: "The submit/fetch transcription pipeline and server-side duration measurement."
+description: "The async webhook transcribe flow: upload_init allocates a job, submit measures + enqueues, the drain submits to AssemblyAI, the webhook persists an encrypted result, and fetch returns it."
 ---
 
-Transcription is a submit/fetch pipeline fronting AssemblyAI, with the server measuring audio duration for billing.
+Cloud transcription is a Pro+Cloud / Cloud+AI feature that fronts AssemblyAI through an asynchronous webhook flow. Four `ai-engine` operations plus one dedicated webhook Edge Function move a recording from the phone to a decrypted transcript, and no single Edge Function invocation ever waits on AssemblyAI — the completion arrives out-of-band as a webhook callback.
 
-## What this covers
+## The four operations and the webhook
 
-- The submit/fetch split: transcribe_upload_init (signed upload URL + transcribe_jobs row), transcribe_submit (submit to AssemblyAI, returns immediately), assemblyai-webhook (completion writes transcribe_results), transcribe_fetch (client polls).
-- Server-side duration measurement (_shared/transcribe/ogg-duration.ts, audio-duration.ts); unreadable_audio, audio_too_short, audio_too_large.
+The client drives the flow with three `ai-engine` calls (`transcribe_upload_init` → `transcribe_submit` → repeated `transcribe_fetch`); AssemblyAI closes it out by POSTing to `assemblyai-webhook`.
+
+| Stage | Operation / function | File | What it does |
+| --- | --- | --- | --- |
+| Upload init | `transcribe_upload_init` | `functions/ai-engine/operations/transcribe-upload-init.ts` | Allocates a `transcribe_jobs` row + a 300s signed upload URL to `transcribe-inbox`; reduced at-ceiling cap pre-check; dedups by `(auth_user_id, recording_id)` |
+| Submit | `transcribe_submit` | `functions/ai-engine/operations/transcribe-submit.ts` | Measures duration server-side, applies the medical multiplier, reserves the metered op, persists `meter_reservation`, enqueues, and runs the drain inline (Layer 1) |
+| Provider submit | `runDrain` → `submitTranscript` | `functions/_shared/transcribe/queue.ts` + `functions/_shared/transcribe/assemblyai.ts` | POSTs `/v2/transcript` with a fresh signed audio URL and the webhook callback config |
+| Callback | `assemblyai-webhook` | `functions/assemblyai-webhook/index.ts` | Fetches the transcript, encrypts it into `transcribe_results`, commits the meter + cost, records history, deletes the job row + inbox blob + AssemblyAI transcript |
+| Fetch | `transcribe_fetch` | `functions/ai-engine/operations/transcribe-fetch.ts` | Polls `transcribe_results`, decrypts, `DELETE … RETURNING`, returns completed / error / cancelled / still_processing |
 
 <Note>
-Scaffold generated from the codebase map — expand with full detail, examples, and specifics.
+`transcribe_submit` does **not** call AssemblyAI directly. RR-434 moved provider submission into the queue drain so bursts can't exhaust AssemblyAI's per-key concurrency limit — see [Queue, Drain & Concurrency](/rollingrecord/backend/transcription/queue-and-drain).
 </Note>
+
+## Upload init
+
+`TranscribeUploadInitHandler` requires `TIER.PRO_CLOUD`, is `capCategory: "handler_owned"` with `capKey` `cloud_ai_transcription_minutes_per_month` and `usageColumn` `transcription_ms`. `validateInput` type-checks only `file_extension` (required, max 8 chars) and — when present — `recording_id`; the optional `diarize` / `medical_mode` / `language_code` fields aren't validated there but are coerced with `typeof` checks in `execute()`, where anything malformed is silently dropped. Those last three are display-only metadata stored on the row from birth, never billing inputs.
+
+Because the client no longer sends its own measured duration (RR-121), the cap check here is a reduced "are you already at the ceiling?" pre-check: `reserveMeteredOp` with `opCost: 1` (uncommitted — nothing is written to `usage`). When `recording_id` is supplied, `findExistingTranscribeJob` + `inboxObjectExists` dedup against an in-flight job for the same `(auth_user_id, recording_id)`, returning the existing job with `deduplicated: true` so a second device skips its upload. The row is created via `createTranscribeJob` (`functions/_shared/transcribe/jobs.ts`) at `{auth_user_id}/{uuid}.{ext}` in the `transcribe-inbox` bucket with a `transcribe_inbox_ttl_hours` (default 24) TTL, then `createSignedUploadUrl` issues a 300s signed PUT.
+
+## Submit and duration measurement
+
+`TranscribeSubmitHandler` loads and owner-checks the job, then short-circuits idempotently: a `completed` job — or a `processing` job that already carries an `assemblyai_transcript_id` — returns success without re-measuring or re-reserving, so a client retry after a network drop proceeds straight to polling. Otherwise it runs the full pipeline (every step is idempotent):
+
+1. Issues a 3600s signed download URL for the measurement fetch only.
+2. Measures duration with `measureAudioDurationMs` (`functions/_shared/transcribe/audio-duration.ts`), which streams the audio through `npm:music-metadata@11.12.3` (`parseWebStream`, bounded memory) and returns a tagged union `ok` / `too_short` / `unreadable`. `MIN_DURATION_SECONDS` is `1.0`.
+3. Falls back to `measureOggOpusDurationMs` (`functions/_shared/transcribe/ogg-duration.ts`) for `ogg` / `opus` files that `music-metadata` parses to `duration=undefined` — Android `MediaRecorder` Opus output. It range-fetches ~512 bytes of head (pre-skip) and 128 KB of tail (last granule) and computes `(last_granule − pre_skip) / 48000`.
+4. Enforces `audio_too_large` (Content-Length vs `audio_file_size_limit_bytes`, default `1_200_000_000`), `audio_too_short`, and `unreadable_audio`.
+5. Applies the Medical Mode usage multiplier (`applyUsageMultiplier`) so the gate, the persisted reservation, and the eventual increment all agree — see [Metering & Cost](/rollingrecord/backend/transcription/metering-and-cost).
+6. Calls `reserveMeteredOp` with the billed duration (authoritative cap check), persists the `meter_reservation` and display metadata onto the job, and flips its status to `processing`.
+7. `enqueueTranscriptionJob`, then `runDrain({ targetQueueId })` inline.
+
+The response carries `transcribe_job_id`, `duration_ms`, and `assemblyai_transcript_id` when the inline drain submitted synchronously (informational only — the client polls by job id).
+
+## The webhook callback
+
+`assemblyai-webhook` is POST-only and runs `runGates` with `AuthMode.WebhookSecret` against `ASSEMBLYAI_WEBHOOK_SECRET`, opting out of App Check and App Version (server-to-server caller — see [Webhook-secret auth](/rollingrecord/backend/gates/webhook-secret)). AssemblyAI's `webhook_auth_header_name=Authorization` + `Bearer <secret>` config yields exactly the header the gate validates. The payload is `{transcript_id, status}`; the handler looks the job up by `assemblyai_transcript_id` and dispatches on status. Every path is replay-safe against AssemblyAI's retry policy: `transcribe_results` has PK `transcribe_job_id` with `ON CONFLICT DO NOTHING`, and a missing job row (already deleted by the first delivery) returns 200 `already_processed` with the result discarded.
+
+| AssemblyAI status / condition | Handler | Result written | Billed? |
+| --- | --- | --- | --- |
+| `completed` | `handleCompletedStatus` | completed `transcribe_results` (encrypted text + words) | Yes — `commitMeteredOp` + `ai_cost_micros` |
+| `error`, "no spoken audio" | `handleNoSpeech` | empty completed `transcribe_results` (text `''`) | No |
+| `error`, other reason | `handleErrorStatus` | error `transcribe_results` with `error_message` | No |
+| duplicate delivery, job row gone | (none) | none — 200 `already_processed` | No |
+
+`handleCompletedStatus` fetches the full transcript with `fetchCompletedTranscript` (which asserts `status === "completed"` so a mismatch 5xxes and AssemblyAI retries), bills off the persisted `reservation.opCostMs` (AssemblyAI's `audio_duration` echo is only a fallback), inserts the encrypted result, fire-and-forgets `deleteTranscript`, commits the meter, adds transcription cost to `f_user_financials.ai_cost_micros`, records `h_transcribe_history`, then deletes the job row + inbox blob. `handleErrorStatus` first GETs the transcript to capture the real provider reason (the transcript is deleted moments later, so this is the only chance), routes "no spoken audio" to `handleNoSpeech`, and otherwise writes an error result. On both error paths the reservation is captured-but-never-committed, so the user is not charged. `handleNoSpeech` treats AssemblyAI's auto-language-detect failure on a non-speech file as a truthful empty transcript rather than an error.
+
+## At-rest encryption of held transcripts
+
+`transcribe_results` (`functions/_shared/transcribe/results.ts`) holds the transcript only for the sub-second window between webhook write and client fetch. `insertCompletedResult` serializes `{transcript_text, words}` to JSON and encrypts it under a **fresh per-row DEK** (`generateDek` / `encryptWithDek`) wrapped by the audio-backup KEK in Vault — `transcript_ct`/`transcript_iv`, `dek_ct`/`dek_iv`, `kek_version`. This is defense-in-depth, **not** end-to-end secrecy: AssemblyAI and the Edge Function both see plaintext. See [Envelope encryption](/rollingrecord/backend/storage/envelope-encryption). `fetchAndDeleteResult` does a single `DELETE … RETURNING` filtered by `auth_user_id`, decrypts, and `zeroDek`s — so two concurrent fetches are safe (one wins the delete, the other sees `not_found`).
+
+## Fetch
+
+`TranscribeFetchHandler` has no cap, no metered op, and no usage column — fetching is free. It calls `fetchAndDeleteResult` and answers `completed` (with `transcript_text` + `words`), `error`, `cancelled` (a support-operator stop, surfaced as a clean terminal rather than a failure), `still_processing` (job exists, no result yet), or `not_found` (`transcribe_result_not_found`). For a drain-permanently-failed job it extracts a structured `error_code` from the first colon-delimited segment of `job.errorMessage` (e.g. `provider_rate_limited:max_attempts_exhausted` → `provider_rate_limited`).
+
+## Duration-measurement error codes
+
+Raised in `transcribe-submit.ts`; the registry lives in `functions/_shared/errors.ts` (see [Error registry](/rollingrecord/backend/operations/error-registry)).
+
+| Code | Category / status | Meaning |
+| --- | --- | --- |
+| `unreadable_audio` | user, 400 | Corrupt header, unsupported format, or truncated upload — even the OGG fallback couldn't parse it |
+| `audio_too_short` | user, 400 | Server-measured duration below the 1-second minimum |
+| `audio_too_large` | developer, 400 | Content-Length exceeds `audio_file_size_limit_bytes` |
+| `audio_verification_failed` | infra, 502 | Retryable catch-all for an unexpected fetch / parse / I/O failure |
+| `signed_url_failed` | developer, 500 | Storage download URL generation failed |
+
+<Warning>
+`invalid_audio_duration_seconds` still exists in the registry but is **dead code**. Since RR-121 the client stopped sending `audio_duration_seconds`; `transcribe_upload_init` never emits it and the server measures duration in `transcribe_submit` instead. The live measurement codes are the five above.
+</Warning>

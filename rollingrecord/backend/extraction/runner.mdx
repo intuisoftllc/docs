@@ -1,16 +1,80 @@
 ---
 title: "extract-runner Tick Engine"
-description: "The server-paced tick engine that claims, processes, checkpoints, and finalizes extraction jobs."
+description: "The WebhookSecret-authed tick engine that claims, chunk-processes, checkpoints, and finalizes extraction jobs by driving ExtractHandler directly."
 ---
 
-extract-runner claims one job, processes chunks within a wall-clock budget, checkpoints after each, and crash-resumes from the last durable checkpoint.
+`extract-runner` (`functions/extract-runner/index.ts`) is the heart of the async extraction plane. Each invocation atomically claims one job, processes as many chunks as fit a wall-clock budget — checkpointing after every chunk — then either yields (re-kicking itself) or finalizes to `DONE`. A crash mid-tick resumes at the last durable checkpoint with the accumulator intact.
 
-## What this covers
+## Wake paths and the dedicated secret
 
-- WebhookSecret (EXTRACT_RUNNER_SECRET); atomically CLAIMs one job, processes chunks within a ~100s wall-budget, checkpoints after every chunk, yields/re-kicks or finalizes; crash-resumes from the last durable checkpoint.
-- Imports ExtractHandler from _shared/extraction/extract-handler.ts directly (no network hop); per-recording reserve-on-chunk-0 / commit-on-last-chunk metering via extraction_run_id idempotency.
-- Two-lane errors: retryable (throw, heartbeat sweeper requeues) vs poison (extraction_undecryptable, fail immediately) — runner-classify.ts.
+The runner is woken three ways, all authenticating with the dedicated `EXTRACT_RUNNER_SECRET` webhook secret — **not** the service-role key. RR-503 rescheduled the cron off the service-role key (`migrations/20260721020000_extract_runner_dedicated_secret.sql`) for least privilege: the right to start a tick must not carry god-mode DB access.
 
-<Note>
-Scaffold generated from the codebase map — expand with full detail, examples, and specifics.
-</Note>
+| Caller | Secret source | Cadence |
+| --- | --- | --- |
+| `extract-submit` inline kick | `EXTRACT_RUNNER_SECRET` (Edge env) | On every submit (primary) |
+| `pg_cron` `extract-runner-tick` | Vault `extract_runner_secret` → Bearer | Every minute (fallback) |
+| self re-kick (`reKickSelf`) | `EXTRACT_RUNNER_SECRET` | On budget yield with work remaining |
+
+The gate config is `AuthMode.WebhookSecret` with `secretEnvVar: "EXTRACT_RUNNER_SECRET"`, plus `skipAppCheck` and `skipAppVersion` — the server-to-server callers send neither device header. The request body is optional: the inline kick and self re-kick pass `{ job_id }` as a preference hint; the cron passes an empty body and a malformed body is ignored, not an error.
+
+## Claiming one job
+
+The runner calls `claim_extraction_job(uuid, int, int)` (`migrations/20260720180000_extraction_runner_cron.sql`) once per tick. The RPC is `SECURITY DEFINER`, returns `SETOF extraction_jobs` (so the claimed row already carries every encrypted blob), and runs its whole body under `pg_advisory_xact_lock` so two overlapping ticks — an inline kick and a cron tick firing together — can never both slip a `QUEUED` job past the concurrency ceiling. It picks a job in one of three modes, in priority order.
+
+| Mode | Trigger | Concurrency cap? |
+| --- | --- | --- |
+| RESUME | a hinted job that is `RUNNING` and not stale (a budget-yield self re-kick) | No — already holds a slot |
+| PROMOTE | the oldest `QUEUED` job (prefers the hint) | Yes — only when live-`RUNNING` `< extraction_max_concurrent_jobs` |
+| RECLAIM | a stale-`RUNNING` job (crashed / timed-out) | No — same job, not a new slot |
+
+All three use `FOR UPDATE SKIP LOCKED`. A tick that claims nothing returns `{ claimed: false }`.
+
+## The per-job loop
+
+`processJob` opens the row DEK (`openRowDek` unwraps `dek_ct` under `kek_version`), loads the decrypted manifest (`loadPayload`) and the checkpointed accumulator (`loadAccumulator`), and builds a lazy transcript source (`createTranscriptSource`) that serves **one** `extraction_job_items` transcript at a time — the previous slot is released before the next fetch, so peak memory is one recording rather than the whole corpus. It then plans a flat, stable-across-ticks work-unit list from `transcript_chars` alone (`planWorkUnits`, `functions/_shared/extraction/runner-plan.ts`) — no transcript text is resident at plan time, so a 600-recording job plans as cheaply as a 1-recording one.
+
+The chunk loop runs until a `~100s TICK_BUDGET_MS` wall budget or the work runs out. Each iteration:
+
+1. Reads the row status — honors `CANCEL_REQUESTED` (writes `CANCELLED` and stops) and yields if some other tick now owns the row.
+2. At each recording boundary, runs a context-budget pre-flight (`recordingFits`, `functions/_shared/extraction/context-budget.ts`) that admits the recording only if `existing insights + its transcript` fits under the ceiling.
+3. Slices this chunk out of the one loaded recording, builds the handler input, calls `ExtractHandler.validateInput` then `.execute` directly.
+4. On success, merges the tool blocks into the immutable accumulator (`applyChunkResult`, `functions/_shared/extraction/accumulator.ts`) and **checkpoints** — sealing the accumulator and writing `state_ct`/`state_iv` + `chunks_done` + `heartbeat_at` in one atomic `UPDATE`, so state and progress can never disagree.
+
+Because `checkpoint` is a single statement, a failed write leaves the previous checkpoint intact and the tick ends retryable. `ExtractHandler.validateInput` is called before every `execute` even though the input is runner-built: the retired ai-engine dispatcher used to run it, and CLAUDE.md's Developer Bypass rule treats structural validation as non-skippable — a `validateInput` failure is terminal (`extraction_failed`), not a requeue.
+
+## HandlerResult status → runner action
+
+`ExtractHandler.execute` (`functions/_shared/extraction/extract-handler.ts`) returns a typed `HandlerResult` union the runner pattern-matches on.
+
+| `execute()` status | Runner handling |
+| --- | --- |
+| `ok` | Parse tool blocks, `applyChunkResult`, checkpoint, advance. |
+| `limit_reached` | Monthly `extraction_ms` exhausted → finalize what was already paid for (`budgetExhausted`). |
+| `input_too_large` | Skip this recording's remaining chunks (`extraction_input_too_large` or `extraction_transcript_exceeds_duration`); nothing committed. |
+| `ok_passthrough` / `upstream_failed` | Retryable (429 / provider 5xx) → throw, no terminal state; heartbeat stales → the sweeper requeues. |
+| `validation_failed` / `not_found` / `forbidden` | Deterministic non-poison → `markTerminal` `FAILED(extraction_failed)`. |
+
+When the budget is hit with work remaining and none of the terminal conditions apply, the runner calls `reKickSelf` (a fire-and-forget POST to itself) so a budget-yielded `RUNNING` job resumes on the next invocation instead of waiting for the 60s cron.
+
+## Finalize — and why no embeddings
+
+`finalize` builds the results blob (`version`, `context_id`, `recording_ids` from `processedRecordingIds`, `sections` each with `embedding: null`, `tasks`, `calibration_input_tokens`), seals it, and `markTerminal` `DONE` — writing `results_ct`/`results_iv` and nulling `payload_ct`/`payload_iv` in one `UPDATE`. Vectors are deliberately **not** produced here: every section ships with `embedding: null`, and the client's `EmbeddingReconcileWorker` owns section vectors. It keys them by the local row id (which the server cannot know for a new section) and re-embeds only sections whose source text changed — dropping the results blob roughly 95% versus shipping 1024-dim vectors as JSON.
+
+## The extraction engine
+
+`ExtractHandler` was formerly the ai-engine `extract` operation; that synchronous op is retired and the runner is now its only driver, importing and calling it directly (no network hop, no second gate chain). The handler owns:
+
+- **The safety sandwich** — `assembleSystemPrompt` (`functions/ai-engine/prompts/extract.ts`) builds the server-owned system prompt from the blueprint, its built-in flag, the incremental flag, and medical mode. It stays server-side per the AI-content-placement rule and is described only at an architecture level here.
+- **Four server-owned tool schemas** — `buildTools()` produces `saveSection`, `replaceSection`, `saveTasks`, `completeTasks` with `toolChoice: "any"`. A section carries a `category` enum `[RESOLVED, INFORMATIONAL, OPEN, NEUTRAL]` and `insights[]` with a `confidence` enum `[STRONG, TENTATIVE, HISTORICAL]` and an optional `dateRef`. These are server-side because the schema is extraction IP.
+- **Model selection**, the transcript-vs-duration ceiling, the digest hard-cap, prompt caching, and per-recording metering (reserve on chunk 0, commit on the last chunk, keyed by `extraction_run_id`) — see [Extraction metering & caps](/rollingrecord/backend/extraction/billing-and-caps).
+
+## Two error lanes
+
+`classifyRunnerError` (`functions/_shared/extraction/runner-classify.ts`) splits caught errors into two lanes with opposite handling. A `JobPoisonError` — thrown by `poisonGuard` at every deterministic decrypt / unwrap / `JSON.parse` / null-column site — is **poison**: the runner catches it and marks the job `FAILED(extraction_undecryptable)` immediately, because retrying is deterministic and would burn all four requeue ticks. Everything else is **retryable**: the runner lets it throw without a terminal write, the heartbeat goes stale, and the sweeper requeues. Defaulting the unknown case to retryable is the safe bias — at worst it burns `extraction_max_attempts` ticks rather than wrongly failing a recoverable job.
+
+## Where to go next
+
+- [Async extraction architecture](/rollingrecord/backend/extraction/architecture) — the plane, the job row, and the lifecycle states.
+- [Extraction metering & caps](/rollingrecord/backend/extraction/billing-and-caps) — how each chunk reserves and commits.
+- [Extraction sweepers & cron](/rollingrecord/backend/extraction/sweepers) — the heartbeat requeue and TTL reaper.
+- [Built-in blueprints](/rollingrecord/backend/ai-engine/builtin-blueprints) and [prompts & safety](/rollingrecord/backend/ai-engine/prompts-and-safety) — the server-owned prompt and blueprint registry.
