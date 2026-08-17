@@ -1,0 +1,15 @@
+---
+title: "Support-Ops Operations"
+description: "The catalog of read-only and mutating admin operations."
+---
+
+The support-ops registry exposes a set of read-only diagnostics and dry-run-guarded mutating operations.
+
+## What this covers
+
+- Read ops: whoami, search-users, lookup-user-by-email, get-user-overview/-state/-timeline/-audit/-credits/-credit-ledger/-rate-limits/-transcribe-history, get-admin-audit, get-abuse-top-offenders, get-storage-drift, get-tombstone-report, get-clerk-metadata.
+- Mutating ops: grant-manual-credit, freeze-user-account, set-account-password, delete-user-account, clear-app-lock-pin, reset-extraction, reset-transcription, restore-tombstones, validate-recovery-code, link-audit-ticket; operations/registry.ts + handler.ts (OperationError).
+
+<Note>
+Scaffold generated from the codebase map — expand with full detail, examples, and specifics.
+</Note>

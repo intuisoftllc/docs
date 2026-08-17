@@ -1,0 +1,16 @@
+---
+title: "Developer Bypass Scope"
+description: "Exactly what developer accounts may skip (quotas) and what they must never skip (structural validation and cost accounting)."
+---
+
+Developer bypass is a quota exception, not a validation-or-cost exception — structural checks and cost accounting always run.
+
+## What this covers
+
+- What dev bypass MAY skip: Gate 4 entitlement, Gate 5 caps + enforced quota-counter increments, Gate 6 rate limits.
+- What it MUST NEVER skip: structural validation (App Check, body parse, operation/model allowlist, transcribe duration format, kb_query round budget) AND cost accounting (f_user_financials.ai_cost_micros) + token-throughput analytics (usage.input_tokens/output_tokens).
+- The classification rule for new checks: a limit/quota is dev-skippable; structural/format/safety is unconditional.
+
+<Note>
+Scaffold generated from the codebase map — expand with full detail, examples, and specifics.
+</Note>

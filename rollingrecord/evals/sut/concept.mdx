@@ -1,0 +1,16 @@
+---
+title: "System-Under-Test Concept"
+description: "The SUT abstraction that decouples judges from how output is produced."
+---
+
+The `SystemUnderTest` ABC lets the same judges grade output regardless of which backend produced it.
+
+## What this covers
+
+- The `SystemUnderTest` ABC + `ActualOutput` shape (`evals/core/system.py`) that decouples judges from how output was produced.
+- Single-shot cases always use the HTTP client; SESSION cases route to either `SessionRunner` (python) or `KotlinSessionDriver` (kotlin) via `Runner.session_driver`.
+- `_DryRunSystem` stub used on `--dry-run` (`evals/run.py`).
+
+<Note>
+Scaffold generated from the codebase map — expand with full detail, examples, and specifics.
+</Note>

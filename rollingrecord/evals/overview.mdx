@@ -1,0 +1,16 @@
+---
+title: "Eval System Overview"
+description: "What the AI evaluation harness grades and how it is structured."
+---
+
+The eval harness evaluates the AI behavior of RollingRecord's KB-chat bot and related operations, and runs in two places that share the same case format.
+
+## What this covers
+
+- What the harness evaluates: AI behavior of the KB-chat bot (`kb_query`) plus `template_moderation`/`extract`; graded model is `claude-haiku-4-5` (`evals/config.py` `PRODUCTION_MODEL`), judged by Sonnet/Opus.
+- The two runtimes that share the same case format: the Python harness in `evals/` and the on-device Kotlin port in `app/app/src/debug/.../evalmode/`.
+- The Python→Kotlin parity direction: `--sut=kotlin` drives the LITERAL production loop via `app/agentrunner` + `app/agentcore`.
+
+<Note>
+Scaffold generated from the codebase map — expand with full detail, examples, and specifics.
+</Note>

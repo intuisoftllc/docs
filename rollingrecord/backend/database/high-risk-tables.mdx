@@ -1,0 +1,15 @@
+---
+title: "High-Risk Tables Registry"
+description: "The registry of tables where losing a row destroys user data with no recovery path."
+---
+
+A small registry marks the tables whose loss is unrecoverable, with strict protections around them.
+
+## What this covers
+
+- Criteria (no engineering recovery path); registry entries c_recordings (crypto columns dek_ct/audio_iv/dek_iv/kek_version/storage_path) and user_crypto (per-user DEK).
+- Protections: no raw DELETE outside sanctioned callers, no TRUNCATE/DROP, PITR + daily off-platform backup, plus watched-but-not-high-risk tables (canonical_users, lifetime_entitlements).
+
+<Note>
+Scaffold generated from the codebase map — expand with full detail, examples, and specifics.
+</Note>

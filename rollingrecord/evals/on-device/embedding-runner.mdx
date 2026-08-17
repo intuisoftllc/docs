@@ -1,0 +1,16 @@
+---
+title: "Embedding Threshold Eval (separate)"
+description: "A distinct debug harness for tuning semantic-search thresholds."
+---
+
+`EmbeddingEvalRunner` is a separate debug harness (not part of `evalmode`) for tuning semantic-search cosine thresholds.
+
+## What this covers
+
+- `devmode/eval/EmbeddingEvalRunner.kt` (RR-487): a distinct debug harness for tuning semantic-search cosine thresholds, NOT part of `evalmode`.
+- Replicates both production retrieval pipelines (topic via `TranscriptChunker` + server Cohere embed vs `topicSearchThreshold`; section vs `sectionSemanticThreshold`) using the labeled `assets/eval/eval_set.json`.
+- Reads no real user data; writes results only to cacheDir.
+
+<Note>
+Scaffold generated from the codebase map — expand with full detail, examples, and specifics.
+</Note>

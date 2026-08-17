@@ -1,0 +1,16 @@
+---
+title: "Deletion-Cascade Guarantee (GDPR)"
+description: "How deleting one user row erases all of their data across every table and Storage file, with no orphans."
+---
+
+Deleting a single canonical_users row is designed to erase all of a user's data everywhere — the core GDPR right-to-erasure invariant.
+
+## What this covers
+
+- Design invariant: deleting one canonical_users row erases all of a user's data across every table and every Storage file, no orphans.
+- Two mechanisms: FK + ON DELETE CASCADE (default), and the delete-user TABLES_TO_WIPE list for no-FK tables (query_sessions, manual_credits).
+- The Storage path convention &#123;bucket&#125;/&#123;auth_user_id&#125;/... is what makes wipeBucketFolder cleanup possible; any new table/bucket must update delete-user in the same session.
+
+<Note>
+Scaffold generated from the codebase map — expand with full detail, examples, and specifics.
+</Note>

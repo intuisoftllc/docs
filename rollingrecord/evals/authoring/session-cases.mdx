@@ -1,0 +1,16 @@
+---
+title: "Authoring Session Cases"
+description: "Writing multi-round session cases with mock tools and follow-ups."
+---
+
+A `session` block turns a case multi-round, driving the agent loop with mock tool results and scripted follow-ups.
+
+## What this covers
+
+- The `session` block (`max_rounds`, `max_cost_usd`, `mock_tools`, `follow_ups`) and how it turns a case multi-round.
+- Writing `mock_tools` in loose/explicit/staged forms with match operators; canonical-tool-name validation and read-vs-write default behavior.
+- `follow_ups` semantics differences between the Python runner (`after_round` honored) and the Kotlin runner/on-device (ignored).
+
+<Note>
+Scaffold generated from the codebase map — expand with full detail, examples, and specifics.
+</Note>

@@ -1,0 +1,15 @@
+---
+title: "Dev Mode Architecture"
+description: "The source-set duplication pattern and dev entry points."
+---
+
+Developer tooling is compiled only into debug builds via source-set duplication, reached through a hidden entry point.
+
+## What this covers
+
+- Source-set duplication (`src/debug` vs `src/release`) instead of `BuildConfig.DEBUG`; `DebugNavGraph`, `DebugMenuEntry`, the `DevFlags` contract.
+- Entry points: 7-tap version label → Developer Options → `DevModeScreen`.
+
+<Note>
+Scaffold generated from the codebase map — expand with full detail, examples, and specifics.
+</Note>

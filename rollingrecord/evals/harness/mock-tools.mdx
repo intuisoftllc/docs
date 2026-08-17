@@ -1,0 +1,16 @@
+---
+title: "Mock Tool Registry"
+description: "How tool calls are mocked in eval cases."
+---
+
+The mock tool registry supplies deterministic tool results to the agent loop during a session case.
+
+## What this covers
+
+- Three fixture forms in `evals/core/mock_tools.py`: loose, explicit `{match,result}` list, and staged progressive-disclosure; match operators (exact / `_contains` / `_in`).
+- `READ_ONLY_TOOL_DEFAULTS` safe-empty fallbacks vs `MockNotFound` for unmocked write tools; `MockResolution` trace records.
+- Stage advancement keyed to user turns (sticky-last clamp), driven by `advance_stage()`.
+
+<Note>
+Scaffold generated from the codebase map — expand with full detail, examples, and specifics.
+</Note>

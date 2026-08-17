@@ -1,0 +1,15 @@
+---
+title: "Column Spine & Encrypted Pairs"
+description: "The consistent column ordering and the encrypted _ct / _iv column pair convention."
+---
+
+User-data tables share a consistent column spine, and every encrypted field is stored as a paired ciphertext + IV column.
+
+## What this covers
+
+- User-data table spine: auth_user_id first, then PK, sync/audit metadata, created_at, domain columns, encrypted pairs at the end.
+- Encrypted column pairs &lt;field&gt;_ct (BYTEA AES-256-GCM ciphertext incl. tag) + &lt;field&gt;_iv (12-byte IV), paired NOT NULL semantics + optional CHECK; the RR-320 rename convention.
+
+<Note>
+Scaffold generated from the codebase map — expand with full detail, examples, and specifics.
+</Note>

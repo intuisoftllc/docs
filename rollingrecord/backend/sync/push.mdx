@@ -1,0 +1,15 @@
+---
+title: "sync-push"
+description: "The batched upsert + tombstone endpoint and its per-operation outcome model."
+---
+
+sync-push applies batched upserts and tombstones, returning a per-operation outcome array rather than failing the whole batch.
+
+## What this covers
+
+- Batched upserts + tombstones with a per-op outcome array (accepted/server_wins/rejected); top-level 400 only for structural abuse; tombstones reordered before upserts.
+- Per-op codes: sync_disabled_for_group, blob_missing, size_mismatch (over 1% goes to l_user_abuse_event), batch_too_large, fk_violation; a sanctioned c_recordings DELETE (tombstone) path.
+
+<Note>
+Scaffold generated from the codebase map — expand with full detail, examples, and specifics.
+</Note>

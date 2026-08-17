@@ -1,0 +1,16 @@
+---
+title: "Shared JVM Modules (crypto, agentcore, agentrunner)"
+description: "The pure-JVM modules shared across the app, smoketest, and evals."
+---
+
+Several pure-JVM modules are shared between the app and other parts of the monorepo so the exact same logic runs everywhere.
+
+## What this covers
+
+- `app/crypto`: pure-JVM primitives (`EnvelopeCrypto`, `TextCrypto`, `KeyDerivation`, `AppLockVerifier`, `RrBackupContainer`) shared with smoketest by source inclusion.
+- `app/agentcore`: the KB-chat agent loop (`AgentLoop`, `ToolExecutor`, `KbToolSpec`, `ClientConfig`/`ServerConfig`) shared by the app and the eval runner.
+- `app/agentrunner`: pure-JVM CLI driving the real agent loop for evals.
+
+<Note>
+Scaffold generated from the codebase map — expand with full detail, examples, and specifics.
+</Note>

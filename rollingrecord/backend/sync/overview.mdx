@@ -1,0 +1,15 @@
+---
+title: "Sync Engine Overview"
+description: "The cloud-sync model — replicated c_* tables, client-side encryption, and the endpoint flow."
+---
+
+Cross-device sync replicates a set of client-encrypted c_* tables under a last-writer-wins model across a small set of endpoints.
+
+## What this covers
+
+- c_* replicated tables (c_recordings, c_transcripts, c_contexts, c_context_cards, c_search_messages, c_settings, junctions); client-side encryption (ciphertext columns) with a per-user DEK; LWW conflict model.
+- Endpoints: sync-reserve to sync-push to sync-pull to sync-reconcile, plus sync-audio, sync-group-exclude, user-sync-preferences.
+
+<Note>
+Scaffold generated from the codebase map — expand with full detail, examples, and specifics.
+</Note>

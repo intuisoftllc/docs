@@ -1,0 +1,16 @@
+---
+title: "On-Device Judges & Suite Registry"
+description: "The Kotlin analog of the Python judges.py resolvers."
+---
+
+`SuiteRegistry` is the Kotlin analog of each suite's `judge_for_case`, wiring the same structural + LLM judge fan-out on-device.
+
+## What this covers
+
+- `suites/SuiteRegistry.kt` = the Kotlin analog of every `judges.py` `judge_for_case`, wiring all 14 suites with the standard structural-`AllOf` + `Cascade(MinConfidence(LlmJudge Sonnet), LlmJudge Opus)` fan-out.
+- The ported judge families under `judges/` (Deterministic, Fuzzy, Semantic, Llm, Faithfulness, GroundedExtraction, Retrieval, SessionJudges, Chains) and `Anthropic.kt` for direct judge calls.
+- `data/CaseLoader.kt` loading bundled `assets/evals` case JSON.
+
+<Note>
+Scaffold generated from the codebase map — expand with full detail, examples, and specifics.
+</Note>

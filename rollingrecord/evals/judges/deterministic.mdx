@@ -1,0 +1,16 @@
+---
+title: "Deterministic, Fuzzy & Semantic Judges"
+description: "The structural judge tier that runs before LLM grading."
+---
+
+Deterministic, fuzzy, and semantic judges perform cheap structural checks and sit ahead of the LLM tier in a typical chain.
+
+## What this covers
+
+- Keyword/length/body-field/list-shape/tool-call style judges (`evals/judges/deterministic.py`, `fuzzy.py`, `semantic.py`).
+- What `expected` keys each reads and when they SKIP vs decide.
+- Where they sit in a typical suite chain (structural `AllOf` before the LLM tier).
+
+<Note>
+Scaffold generated from the codebase map — expand with full detail, examples, and specifics.
+</Note>

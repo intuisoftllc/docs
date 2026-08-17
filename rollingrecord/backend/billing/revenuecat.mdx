@@ -1,0 +1,14 @@
+---
+title: "RevenueCat Integration"
+description: "How entitlements are read live and how the webhook mirrors lifetime grants."
+---
+
+RevenueCat is read live per request for recurring subscriptions, while the webhook is the authoritative writer of lifetime entitlements.
+
+## What this covers
+
+- _shared/billing/revenuecat.ts live entitlement reads; revenuecat-webhook as the authoritative lifetime_entitlements writer; recurring subs are log-only (read live per request); the developer entitlement drives dev bypass.
+
+<Note>
+Scaffold generated from the codebase map — expand with full detail, examples, and specifics.
+</Note>

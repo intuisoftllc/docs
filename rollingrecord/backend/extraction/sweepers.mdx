@@ -1,0 +1,14 @@
+---
+title: "Extraction Sweepers & Cron"
+description: "The scheduled jobs that tick, requeue, and expire extraction jobs."
+---
+
+A set of cron sweepers keeps the extraction plane healthy — ticking the runner, requeuing stalled jobs, and expiring old ones.
+
+## What this covers
+
+- extract-runner-tick cron (~60s fallback), sweep_extraction_heartbeats (E4 requeue up to extraction_max_attempts), sweep_extraction_jobs_ttl, sweep_stale_cancel_requested.
+
+<Note>
+Scaffold generated from the codebase map — expand with full detail, examples, and specifics.
+</Note>

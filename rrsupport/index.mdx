@@ -1,0 +1,17 @@
+---
+title: "RRSupport Overview"
+description: "The account-operations / support console that sits alongside the main RollingRecord app."
+---
+
+RRSupport is the account-operations and support tooling for RollingRecord. It is deliberately simpler than the main app — a thin, secured admin surface over the existing backend rather than a separate system.
+
+## What this covers
+
+- **Three components** (per `CLAUDE.md`): the `support-ops` Edge Functions, the `support_ops.py` CLI, and the admin console UI.
+- **Not a separate backend** — it shares the same Supabase project (dev/prod), the same Clerk JWT auth, the same `supabase/functions/_shared/` gate chain and DB client, and the same tables (`admin_permissions`, `l_admin_audit`, `support_tokens`).
+- **Obfuscated endpoint by design** — the dispatcher is named `support-ops`, not `admin`, to minimize URL-level discoverability.
+- **Environment split** — every operation is per-environment (dev vs prod) with distinct secrets and HMAC keys, so a dev-secret leak cannot touch prod.
+
+<Note>
+Scaffold generated from the codebase map — expand with full detail, examples, and specifics.
+</Note>

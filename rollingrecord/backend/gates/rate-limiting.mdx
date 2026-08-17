@@ -1,0 +1,16 @@
+---
+title: "Rate Limiting & Buckets"
+description: "The fixed-window rate limiter, the bucket taxonomy, and how to add a new bucket."
+---
+
+Fixed-window counters keyed on the caller enforce per-bucket velocity limits, with developers short-circuited.
+
+## What this covers
+
+- rate-limit.ts fixed-window counters keyed on authUserId, short-circuits for developers; chain-sugar (rateLimit with a bucket) vs standalone checkRateLimit() for per-op/multi-dimensional cases.
+- The Bucket enum (_shared/gates/types.ts) with real buckets: ai_engine, ai_extraction, extraction_submit, extraction_status, sync_push/sync_pull/sync_reserve/sync_reconcile, sync_audio, sync_download_grace, search, indexing, embedding_cache, support_ops, support_token_generate, recovery_code_*, account_otp_*, delete_user.
+- Adding a bucket: enum member + BUCKET_DEFAULTS fallback + rate_limit_config seed migration; abuseEventOnReject for security-sensitive buckets; counters swept by the prune_rate_limit_counters cron.
+
+<Note>
+Scaffold generated from the codebase map — expand with full detail, examples, and specifics.
+</Note>

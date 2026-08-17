@@ -1,0 +1,16 @@
+---
+title: "config.py & Environment"
+description: "Eval configuration, required environment, and model/pricing constants."
+---
+
+`EvalConfig` centralizes the harness's environment, model ids, and path constants, loaded from the repo-root `.env.local`.
+
+## What this covers
+
+- `EvalConfig` + `from_env()` required vars (Supabase dev, Clerk, Firebase App Check, analytics secret, optional `ANTHROPIC_API_KEY`); loaded from repo-root `.env.local` (`evals/config.py`).
+- Hardcoded model ids (`PRODUCTION_MODEL`/`JUDGE_MODEL`/`ARBITER_MODEL`), `MODEL_PRICING`, `DEFAULT_CONFIDENCE_THRESHOLD`, `DEFAULT_PASS_FLOOR=0.95`.
+- Path constants (`SUITES_ROOT`, `RESULTS_ROOT`) and derived URLs (`ai_engine_url`, `analytics_url`).
+
+<Note>
+Scaffold generated from the codebase map — expand with full detail, examples, and specifics.
+</Note>

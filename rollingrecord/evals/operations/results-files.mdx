@@ -1,0 +1,16 @@
+---
+title: "Result Files & Analytics"
+description: "Where per-run results are written and how analytics are recorded."
+---
+
+Each run writes a per-run results JSON and upserts an analytics row tracking the run's lifecycle.
+
+## What this covers
+
+- Per-run JSON at `evals/results/<YYYY-MM-DD>/<run_id>.json` (`Runner._safe_write_results_file`): counts, per-case verdicts, `session_trace`, cost.
+- `l_eval_run` analytics upserts via `AnalyticsClient` (`evals/analytics/client.py`, Bearer `ANALYTICS_INGEST_SECRET`); running→completed/aborted/failed lifecycle with retry on finalize.
+- On-device equivalent written by `ResultWriter` to device storage.
+
+<Note>
+Scaffold generated from the codebase map — expand with full detail, examples, and specifics.
+</Note>

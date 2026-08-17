@@ -1,0 +1,16 @@
+---
+title: "Access Gate & Safety"
+description: "The fail-closed gate that protects real user data during on-device evals."
+---
+
+`EvalAccess` is a fail-closed gate that only admits a developer test account before any run, seed, or spend.
+
+## What this covers
+
+- `access/EvalAccess.kt` fail-closed gate: signed in + `developer` RC entitlement + Clerk `+clerk_test` sub-address account required before any run/seed/spend.
+- Why the test-account marker is the load-bearing data-safety guard (seeded corpus lives in the signed-in account's real Room DB).
+- Denied reasons surfaced as the access screen.
+
+<Note>
+Scaffold generated from the codebase map — expand with full detail, examples, and specifics.
+</Note>

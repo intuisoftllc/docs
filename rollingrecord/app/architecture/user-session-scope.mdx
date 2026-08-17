@@ -1,0 +1,16 @@
+---
+title: "Per-User Session Scope"
+description: "How the session scope is rebuilt on sign-in/out to isolate accounts."
+---
+
+Every account runs in its own session scope, rebuilt on each sign-in and sign-out so no state leaks between users.
+
+## What this covers
+
+- `UserSessionManager.switchTo()` tears down and rebuilds `UserSessionScope` on every sign-in/out; `UserSessionModule` wiring.
+- The `UserScopedCache` + `userScopedCacheRegistry` pattern and owner-stamping to prevent cross-account leakage (`UsageRepository` reference impl).
+- `SessionDekHolder`, `UserScopedInject`, and `UserWorkTag` for session-scoped work tagging.
+
+<Note>
+Scaffold generated from the codebase map — expand with full detail, examples, and specifics.
+</Note>

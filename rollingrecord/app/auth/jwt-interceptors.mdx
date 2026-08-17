@@ -1,0 +1,15 @@
+---
+title: "Auth Token Injection & Refresh"
+description: "Attaching, refreshing, and reacting to auth tokens."
+---
+
+Network requests attach the Clerk JWT and refresh it on expiry, with account-freeze handling.
+
+## What this covers
+
+- `BearerJwtInterceptor` attaches the Clerk JWT; `TokenRefreshAuthenticator` refreshes on 401.
+- `AccountFreezeInterceptor` and account-freeze responses.
+
+<Note>
+Scaffold generated from the codebase map — expand with full detail, examples, and specifics.
+</Note>

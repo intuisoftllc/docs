@@ -1,0 +1,16 @@
+---
+title: "Entitlement Check, Dev Bypass & Grace Window"
+description: "How tier entitlements are resolved, the post-lapse read-grace window, and implicit developer bypass."
+---
+
+The entitlement gate resolves the caller's effective tier (with cascade), derives developer bypass, and honors a 30-day post-lapse read grace.
+
+## What this covers
+
+- entitlement.ts fetches effective entitlements (cascade applied) which also derives isDeveloper; the Entitlement enum keys (pro, pro_cloud, pro_cloud_ai); at-least-one-of match.
+- grace.ts — RR-358 30-day post-lapse read grace: admits when subscription_lapsed_at is under 30d and subscription_lapsed_tier matches the required tier; read endpoints opt in via allowGracePeriodRead, writes never do.
+- Dev bypass is implicit (the developer RC entitlement cascades to top tier + flags cap/rate-limit skip).
+
+<Note>
+Scaffold generated from the codebase map — expand with full detail, examples, and specifics.
+</Note>

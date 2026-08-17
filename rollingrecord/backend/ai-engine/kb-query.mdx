@@ -1,0 +1,15 @@
+---
+title: "KB Chat (kb_query)"
+description: "The knowledge-base chat operation, its round-budget model, and the client/server split of its tooling."
+---
+
+kb_query powers the conversational chat, metering one query per turn under a handler-owned round budget while the client owns the tool definitions.
+
+## What this covers
+
+- Handler-owned round-budget model: session tokens, max_rounds_exceeded, first-round-only ai_queries increment (continuation rounds free); kb-query-caps.ts.
+- The client owns the 14 kb_query tool definitions (navigation IP is client-side); the server owns the behavioral system prompt (prompts/kb-query.ts, app-knowledge.ts).
+
+<Note>
+Scaffold generated from the codebase map — expand with full detail, examples, and specifics.
+</Note>

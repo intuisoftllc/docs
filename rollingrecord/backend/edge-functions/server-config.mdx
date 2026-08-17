@@ -1,0 +1,14 @@
+---
+title: "server-config"
+description: "The public config bootstrap endpoint the Android client reads at startup."
+---
+
+server-config is the public bootstrap endpoint that returns only client-safe config rows, with no JWT required.
+
+## What this covers
+
+- Public config bootstrap (App Check only, no JWT, skipAppVersion opt-out); returns WHERE public = true rows as flat Record&lt;string,string&gt;; cached in Android DataStore.
+
+<Note>
+Scaffold generated from the codebase map — expand with full detail, examples, and specifics.
+</Note>

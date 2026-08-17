@@ -1,0 +1,14 @@
+---
+title: "Dry-Run Workflow & Audit"
+description: "The dry-run-then-commit safety model and the admin audit trail."
+---
+
+Mutating admin ops default to a dry-run preview that must be committed within a window, and every action is audited with secrets scrubbed.
+
+## What this covers
+
+- Dry-run-as-default for mutating ops: a preview_id + 15-min window + canonical params-hash match (validateDryRunPreview, dry_run_required/preview_expired/preview_mismatch); every action writes l_admin_audit with secrets scrubbed (redact-audit.ts); ticket_ref linking.
+
+<Note>
+Scaffold generated from the codebase map — expand with full detail, examples, and specifics.
+</Note>

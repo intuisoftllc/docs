@@ -1,0 +1,16 @@
+---
+title: "Inbound Webhooks"
+description: "The three inbound webhooks — Clerk, RevenueCat, and AssemblyAI — and what each writes."
+---
+
+Three inbound webhooks drive identity, entitlements, and transcription completion: clerk-webhook, revenuecat-webhook, and assemblyai-webhook.
+
+## What this covers
+
+- clerk-webhook: Svix-signed; user.created provisions the row; user.deleted triggers a full GDPR wipeUser().
+- revenuecat-webhook: shared-secret only (App Check + App Version opted out); authoritative writer of lifetime_entitlements; mirrors only WEBHOOK_MIRRORED_LOOKUP_KEYS; handles bundle credit grants/refunds and records transcription/LLM cost.
+- assemblyai-webhook: completion callback writes transcribe_results, commits metered ms, records cost to f_user_financials, records h_transcribe_history.
+
+<Note>
+Scaffold generated from the codebase map — expand with full detail, examples, and specifics.
+</Note>

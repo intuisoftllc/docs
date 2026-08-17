@@ -1,0 +1,17 @@
+---
+title: "Support Tokens"
+description: "User-generated 6-digit codes and how admins verify them during a support case."
+---
+
+Support tokens let a signed-in user prove account ownership to a support agent: the app mints a short-lived 6-digit code, and an admin verifies it through a read-only support-ops operation.
+
+## What this covers
+
+- **User-side generation:** `supabase/functions/generate-support-token/index.ts` (RR-313) — any signed-in user mints a 6-digit code, `TOKEN_TTL_MS = 60 * 60 * 1000` (60 min), single-use, display-only (no email). Return-existing UPSERT semantics; rate-limited by `Bucket.SupportTokenGenerate` (20/hr).
+- **App-side surface:** the code is generated from the Account Management UI — `SupportTokenBottomSheet.kt`, `SupportTokenSheetViewModel.kt`, `SupportTokenRepository.kt`, DTO `GenerateSupportTokenDto.kt` (copy-to-clipboard + countdown against `expires_at`).
+- **Admin-side verification:** the `verify_support_token` operation — `isReadOnly: true`, `requiredPermission: "can_validate_codes"`; stamps `consumed_at` on a match. Exposed via CLI `--op verify-token --user <uid> --code <6 digits>`.
+- **Two-axis diagnostics:** `token_state` (active / consumed / expired / none) × `reason` (verified / mismatch / already_consumed / expired / no_active_code) — e.g. `no_active_code` flags a code supplied for an account that never generated one.
+
+<Note>
+Scaffold generated from the codebase map — expand with full detail, examples, and specifics.
+</Note>

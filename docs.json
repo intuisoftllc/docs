@@ -1,37 +1,427 @@
 {
   "$schema": "https://mintlify.com/docs.json",
   "theme": "mint",
-  "name": "Mintlify Starter Kit",
+  "name": "RollingRecord",
   "colors": {
-    "primary": "#16A34A",
-    "light": "#07C983",
-    "dark": "#15803D"
+    "primary": "#D43C39",
+    "light": "#E0655F",
+    "dark": "#B5312E"
   },
-  "favicon": "/favicon.svg",
+  "favicon": "/favicon.png",
   "navigation": {
-    "pages": [
+    "dropdowns": [
       {
-        "group": "Getting Started",
+        "dropdown": "RollingRecord",
+        "icon": "waveform-lines",
+        "groups": [
+          {
+            "group": "Introduction",
+            "pages": [
+              "index"
+            ]
+          },
+          {
+            "group": "App",
+            "pages": [
+              {
+                "group": "Overview",
+                "pages": [
+                  "rollingrecord/app/overview"
+                ]
+              },
+              {
+                "group": "Architecture",
+                "pages": [
+                  "rollingrecord/app/architecture/app-shell",
+                  "rollingrecord/app/architecture/config-split",
+                  "rollingrecord/app/architecture/dependency-injection",
+                  "rollingrecord/app/architecture/local-database",
+                  "rollingrecord/app/architecture/shared-modules",
+                  "rollingrecord/app/architecture/ui-and-navigation",
+                  "rollingrecord/app/architecture/user-session-scope"
+                ]
+              },
+              {
+                "group": "Recording",
+                "pages": [
+                  "rollingrecord/app/recording/overview",
+                  "rollingrecord/app/recording/admission-control",
+                  "rollingrecord/app/recording/audio-formats",
+                  "rollingrecord/app/recording/import-export",
+                  "rollingrecord/app/recording/interruption-recovery",
+                  "rollingrecord/app/recording/manual-mode",
+                  "rollingrecord/app/recording/quick-settings-tiles",
+                  "rollingrecord/app/recording/recording-service",
+                  "rollingrecord/app/recording/rolling-mode",
+                  "rollingrecord/app/recording/scheduled-recordings",
+                  "rollingrecord/app/recording/segment-rotation"
+                ]
+              },
+              {
+                "group": "Playback & Editing",
+                "pages": [
+                  "rollingrecord/app/playback/overview",
+                  "rollingrecord/app/playback/continuations-merge",
+                  "rollingrecord/app/playback/notes-and-marks",
+                  "rollingrecord/app/playback/session-detail",
+                  "rollingrecord/app/playback/trim",
+                  "rollingrecord/app/playback/waveform"
+                ]
+              },
+              {
+                "group": "Transcription",
+                "pages": [
+                  "rollingrecord/app/transcription/overview",
+                  "rollingrecord/app/transcription/cloud-transcription",
+                  "rollingrecord/app/transcription/local-engine",
+                  "rollingrecord/app/transcription/transcript-ui"
+                ]
+              },
+              {
+                "group": "AI & Intelligence",
+                "pages": [
+                  "rollingrecord/app/ai/overview",
+                  "rollingrecord/app/ai/agent-loop",
+                  "rollingrecord/app/ai/ai-corrections-proposals",
+                  "rollingrecord/app/ai/content-moderation",
+                  "rollingrecord/app/ai/context-budget",
+                  "rollingrecord/app/ai/context-export",
+                  "rollingrecord/app/ai/context-extraction",
+                  "rollingrecord/app/ai/embeddings-index",
+                  "rollingrecord/app/ai/extraction-jobs",
+                  "rollingrecord/app/ai/knowledge-base-chat",
+                  "rollingrecord/app/ai/semantic-search",
+                  "rollingrecord/app/ai/synthesis",
+                  "rollingrecord/app/ai/tasks-action-items",
+                  "rollingrecord/app/ai/templates-blueprints"
+                ]
+              },
+              {
+                "group": "Sync & Cloud",
+                "pages": [
+                  "rollingrecord/app/sync/overview",
+                  "rollingrecord/app/sync/audio-sync",
+                  "rollingrecord/app/sync/cloud-prefetch-download",
+                  "rollingrecord/app/sync/outbox-engine",
+                  "rollingrecord/app/sync/reconcile-engine",
+                  "rollingrecord/app/sync/sync-preferences",
+                  "rollingrecord/app/sync/trash-and-free-up",
+                  "rollingrecord/app/sync/wire-transforms"
+                ]
+              },
+              {
+                "group": "Security & Crypto",
+                "pages": [
+                  "rollingrecord/app/security/overview",
+                  "rollingrecord/app/security/app-lock",
+                  "rollingrecord/app/security/backup-restore",
+                  "rollingrecord/app/security/database-recovery",
+                  "rollingrecord/app/security/dek-and-db-key",
+                  "rollingrecord/app/security/envelope-crypto",
+                  "rollingrecord/app/security/forgot-pin",
+                  "rollingrecord/app/security/pin-and-biometrics",
+                  "rollingrecord/app/security/recovery-codes"
+                ]
+              },
+              {
+                "group": "Monetization",
+                "pages": [
+                  "rollingrecord/app/monetization/entitlements-revenuecat",
+                  "rollingrecord/app/monetization/feature-gating",
+                  "rollingrecord/app/monetization/plans-and-subscription",
+                  "rollingrecord/app/monetization/rate-limiting",
+                  "rollingrecord/app/monetization/tiers",
+                  "rollingrecord/app/monetization/usage-metering"
+                ]
+              },
+              {
+                "group": "Auth & Identity",
+                "pages": [
+                  "rollingrecord/app/auth/account-deletion",
+                  "rollingrecord/app/auth/account-health",
+                  "rollingrecord/app/auth/account-settings",
+                  "rollingrecord/app/auth/clerk",
+                  "rollingrecord/app/auth/identity-resolution",
+                  "rollingrecord/app/auth/jwt-interceptors",
+                  "rollingrecord/app/auth/known-accounts",
+                  "rollingrecord/app/auth/login-flow",
+                  "rollingrecord/app/auth/profile"
+                ]
+              },
+              {
+                "group": "Platform",
+                "pages": [
+                  "rollingrecord/app/platform/analytics",
+                  "rollingrecord/app/platform/app-check",
+                  "rollingrecord/app/platform/logging",
+                  "rollingrecord/app/platform/networking",
+                  "rollingrecord/app/platform/notifications",
+                  "rollingrecord/app/platform/onboarding-permissions",
+                  "rollingrecord/app/platform/receivers",
+                  "rollingrecord/app/platform/settings",
+                  "rollingrecord/app/platform/storage-files",
+                  "rollingrecord/app/platform/system-monitors",
+                  "rollingrecord/app/platform/version-gate",
+                  "rollingrecord/app/platform/workmanager"
+                ]
+              },
+              {
+                "group": "Dev Mode",
+                "pages": [
+                  "rollingrecord/app/devmode/architecture",
+                  "rollingrecord/app/devmode/in-app-evals",
+                  "rollingrecord/app/devmode/tools"
+                ]
+              }
+            ]
+          },
+          {
+            "group": "Backend",
+            "pages": [
+              {
+                "group": "Architecture",
+                "pages": [
+                  "rollingrecord/backend/architecture/overview",
+                  "rollingrecord/backend/architecture/config-split",
+                  "rollingrecord/backend/architecture/deletion-cascade",
+                  "rollingrecord/backend/architecture/identity-model"
+                ]
+              },
+              {
+                "group": "Gates & Security",
+                "pages": [
+                  "rollingrecord/backend/gates/account-frozen",
+                  "rollingrecord/backend/gates/dev-bypass-scope",
+                  "rollingrecord/backend/gates/entitlement-and-grace",
+                  "rollingrecord/backend/gates/jwt-auth",
+                  "rollingrecord/backend/gates/method-appcheck-version",
+                  "rollingrecord/backend/gates/rate-limiting",
+                  "rollingrecord/backend/gates/run-gates",
+                  "rollingrecord/backend/gates/webhook-secret"
+                ]
+              },
+              {
+                "group": "Edge Functions",
+                "pages": [
+                  "rollingrecord/backend/edge-functions/overview",
+                  "rollingrecord/backend/edge-functions/ai-engine",
+                  "rollingrecord/backend/edge-functions/analytics",
+                  "rollingrecord/backend/edge-functions/get-user-key",
+                  "rollingrecord/backend/edge-functions/get-user-usage",
+                  "rollingrecord/backend/edge-functions/resolve-identity",
+                  "rollingrecord/backend/edge-functions/server-config",
+                  "rollingrecord/backend/edge-functions/webhooks"
+                ]
+              },
+              {
+                "group": "AI Engine",
+                "pages": [
+                  "rollingrecord/backend/ai-engine/builtin-blueprints",
+                  "rollingrecord/backend/ai-engine/kb-query",
+                  "rollingrecord/backend/ai-engine/moderation",
+                  "rollingrecord/backend/ai-engine/operations-registry",
+                  "rollingrecord/backend/ai-engine/prompts-and-safety",
+                  "rollingrecord/backend/ai-engine/providers-and-models",
+                  "rollingrecord/backend/ai-engine/sub-operations",
+                  "rollingrecord/backend/ai-engine/synthesis",
+                  "rollingrecord/backend/ai-engine/user-blueprints"
+                ]
+              },
+              {
+                "group": "Extraction",
+                "pages": [
+                  "rollingrecord/backend/extraction/architecture",
+                  "rollingrecord/backend/extraction/billing-and-caps",
+                  "rollingrecord/backend/extraction/runner",
+                  "rollingrecord/backend/extraction/sweepers"
+                ]
+              },
+              {
+                "group": "Sync & Cloud",
+                "pages": [
+                  "rollingrecord/backend/sync/overview",
+                  "rollingrecord/backend/sync/preferences",
+                  "rollingrecord/backend/sync/pull",
+                  "rollingrecord/backend/sync/push",
+                  "rollingrecord/backend/sync/reconcile-and-groups",
+                  "rollingrecord/backend/sync/reserve-and-audio",
+                  "rollingrecord/backend/sync/shared-transforms"
+                ]
+              },
+              {
+                "group": "Transcription",
+                "pages": [
+                  "rollingrecord/backend/transcription/metering-and-cost",
+                  "rollingrecord/backend/transcription/pipeline",
+                  "rollingrecord/backend/transcription/queue-and-drain"
+                ]
+              },
+              {
+                "group": "Database",
+                "pages": [
+                  "rollingrecord/backend/database/c-recordings-integrity",
+                  "rollingrecord/backend/database/column-conventions",
+                  "rollingrecord/backend/database/config-tables",
+                  "rollingrecord/backend/database/cron-sweepers",
+                  "rollingrecord/backend/database/high-risk-tables",
+                  "rollingrecord/backend/database/migrations-discipline",
+                  "rollingrecord/backend/database/rls-and-service-role",
+                  "rollingrecord/backend/database/table-naming-conventions",
+                  "rollingrecord/backend/database/usage-table"
+                ]
+              },
+              {
+                "group": "Storage & Encryption",
+                "pages": [
+                  "rollingrecord/backend/storage/buckets",
+                  "rollingrecord/backend/storage/envelope-encryption",
+                  "rollingrecord/backend/storage/janitors",
+                  "rollingrecord/backend/storage/key-management",
+                  "rollingrecord/backend/storage/semantic-search"
+                ]
+              },
+              {
+                "group": "Billing & Cost",
+                "pages": [
+                  "rollingrecord/backend/billing/credits-and-bundles",
+                  "rollingrecord/backend/billing/entitlements",
+                  "rollingrecord/backend/billing/financials",
+                  "rollingrecord/backend/billing/revenuecat"
+                ]
+              },
+              {
+                "group": "Accounts",
+                "pages": [
+                  "rollingrecord/backend/accounts/account-otp",
+                  "rollingrecord/backend/accounts/anti-abuse",
+                  "rollingrecord/backend/accounts/app-lock-pin",
+                  "rollingrecord/backend/accounts/delete-user",
+                  "rollingrecord/backend/accounts/recovery-code",
+                  "rollingrecord/backend/accounts/support-token"
+                ]
+              },
+              {
+                "group": "Support-Ops",
+                "pages": [
+                  "rollingrecord/backend/support-ops/dispatcher",
+                  "rollingrecord/backend/support-ops/dry-run-and-audit",
+                  "rollingrecord/backend/support-ops/operations-catalog",
+                  "rollingrecord/backend/support-ops/permissions"
+                ]
+              },
+              {
+                "group": "Operations",
+                "pages": [
+                  "rollingrecord/backend/operations/config-toml",
+                  "rollingrecord/backend/operations/env-and-secrets",
+                  "rollingrecord/backend/operations/error-registry",
+                  "rollingrecord/backend/operations/privacy-posture",
+                  "rollingrecord/backend/operations/testing"
+                ]
+              }
+            ]
+          },
+          {
+            "group": "Evals",
+            "pages": [
+              {
+                "group": "Overview",
+                "pages": [
+                  "rollingrecord/evals/overview",
+                  "rollingrecord/evals/architecture",
+                  "rollingrecord/evals/concepts"
+                ]
+              },
+              {
+                "group": "Python Harness",
+                "pages": [
+                  "rollingrecord/evals/harness/cases",
+                  "rollingrecord/evals/harness/configuration",
+                  "rollingrecord/evals/harness/cost-baseline",
+                  "rollingrecord/evals/harness/mock-tools",
+                  "rollingrecord/evals/harness/run-cli",
+                  "rollingrecord/evals/harness/runner",
+                  "rollingrecord/evals/harness/sessions",
+                  "rollingrecord/evals/harness/tool-fixtures"
+                ]
+              },
+              {
+                "group": "Judges",
+                "pages": [
+                  "rollingrecord/evals/judges/overview",
+                  "rollingrecord/evals/judges/chains",
+                  "rollingrecord/evals/judges/deterministic",
+                  "rollingrecord/evals/judges/llm",
+                  "rollingrecord/evals/judges/retrieval",
+                  "rollingrecord/evals/judges/session"
+                ]
+              },
+              {
+                "group": "SUT",
+                "pages": [
+                  "rollingrecord/evals/sut/ai-engine-http",
+                  "rollingrecord/evals/sut/auth",
+                  "rollingrecord/evals/sut/concept"
+                ]
+              },
+              {
+                "group": "Kotlin SUT",
+                "pages": [
+                  "rollingrecord/evals/kotlin-sut/agentcore",
+                  "rollingrecord/evals/kotlin-sut/agentrunner",
+                  "rollingrecord/evals/kotlin-sut/contract",
+                  "rollingrecord/evals/kotlin-sut/kb-tool-spec"
+                ]
+              },
+              {
+                "group": "On-Device Eval Mode",
+                "pages": [
+                  "rollingrecord/evals/on-device/overview",
+                  "rollingrecord/evals/on-device/access",
+                  "rollingrecord/evals/on-device/corpus",
+                  "rollingrecord/evals/on-device/embedding-runner",
+                  "rollingrecord/evals/on-device/judges-suites",
+                  "rollingrecord/evals/on-device/results-ui",
+                  "rollingrecord/evals/on-device/runner",
+                  "rollingrecord/evals/on-device/sut"
+                ]
+              },
+              {
+                "group": "Authoring",
+                "pages": [
+                  "rollingrecord/evals/authoring/judge-resolvers",
+                  "rollingrecord/evals/authoring/session-cases",
+                  "rollingrecord/evals/authoring/suite-layout",
+                  "rollingrecord/evals/authoring/suites-catalog"
+                ]
+              },
+              {
+                "group": "Operations",
+                "pages": [
+                  "rollingrecord/evals/operations/daily-analysis",
+                  "rollingrecord/evals/operations/pass-floor",
+                  "rollingrecord/evals/operations/results-files",
+                  "rollingrecord/evals/operations/running"
+                ]
+              }
+            ]
+          }
+        ]
+      },
+      {
+        "dropdown": "RRSupport",
+        "icon": "life-ring",
         "pages": [
-          "index",
-          "quickstart"
+          "rrsupport/index",
+          "rrsupport/architecture",
+          "rrsupport/cli",
+          "rrsupport/console",
+          "rrsupport/operations",
+          "rrsupport/permissions-and-audit",
+          "rrsupport/support-tokens"
         ]
       }
-    ],
-    "global": {
-      "anchors": [
-        {
-          "anchor": "Documentation",
-          "href": "https://mintlify.com/docs",
-          "icon": "book-open-cover"
-        },
-        {
-          "anchor": "Blog",
-          "href": "https://mintlify.com/blog",
-          "icon": "newspaper"
-        }
-      ]
-    }
+    ]
   },
   "logo": {
     "light": "/logo/light.svg",
@@ -41,32 +431,21 @@
     "links": [
       {
         "label": "Support",
-        "href": "mailto:hi@mintlify.com"
+        "href": "mailto:support@rollingrecord.ai"
       }
-    ],
-    "primary": {
-      "type": "button",
-      "label": "Dashboard",
-      "href": "https://app.mintlify.com"
-    }
+    ]
   },
   "contextual": {
     "options": [
       "copy",
       "view",
       "chatgpt",
-      "claude",
-      "perplexity",
-      "mcp",
-      "cursor",
-      "vscode"
+      "claude"
     ]
   },
   "footer": {
     "socials": {
-      "x": "https://x.com/mintlify",
-      "github": "https://github.com/mintlify",
-      "linkedin": "https://linkedin.com/company/mintlify"
+      "github": "https://github.com/intuisoftllc"
     }
   }
 }

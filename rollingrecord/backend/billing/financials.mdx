@@ -1,0 +1,15 @@
+---
+title: "f_user_financials & Cost Accounting"
+description: "The per-user financial-state table and how AI and storage cost are recorded in micro-USD."
+---
+
+Per-user cost is recorded in integer micro-USD on f_user_financials, tracked for every account including developers.
+
+## What this covers
+
+- Per-(user, period) financial state in micro-USD (BIGINT, no floats); ai_cost_micros (LLM via client.ts + transcription via assemblyai-webhook) and storage_cost_estimate_micros (a trigger from user_storage_usage times rates).
+- The f_* convention rules; recorded for dev accounts (cost visibility is not a dev exception).
+
+<Note>
+Scaffold generated from the codebase map — expand with full detail, examples, and specifics.
+</Note>

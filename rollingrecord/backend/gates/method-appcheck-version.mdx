@@ -1,0 +1,15 @@
+---
+title: "Method, App Check & App Version Gates"
+description: "The first three admission gates — HTTP method allowlist, Firebase App Check, and the minimum-version floor."
+---
+
+The first three gates reject a request before any auth work — wrong method, missing App Check, or an under-floor app version.
+
+## What this covers
+
+- method.ts (POST/GET/PATCH allowlist), app-check.ts (verifies X-Firebase-AppCheck with Firebase), app-version.ts (compares X-App-Version against min_supported_app_version_code).
+- The App Version floor emits client_too_old (410) with a Play Store deep-link; bootstrap/server-to-server callers opt out.
+
+<Note>
+Scaffold generated from the codebase map — expand with full detail, examples, and specifics.
+</Note>

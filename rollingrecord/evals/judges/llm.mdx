@@ -1,0 +1,16 @@
+---
+title: "LLM-as-Judge, Faithfulness & Grounded Extraction"
+description: "Rubric grading and grounding judges backed by Anthropic models."
+---
+
+The LLM judge tier grades responses against rubrics and source material, escalating from Sonnet to an Opus arbiter.
+
+## What this covers
+
+- `LlmJudge`/rubric grading via `evals/_anthropic.py` (`AnthropicMessages`), Sonnet default + Opus arbiter; SKIPs cleanly when `ANTHROPIC_API_KEY` is unset.
+- Faithfulness + grounded-extraction judges (`evals/judges/faithfulness.py`, `grounded_extraction.py`) grading against retrieved tool results / source material.
+- Confidence thresholds and demotion-to-UNCERTAIN behavior.
+
+<Note>
+Scaffold generated from the codebase map — expand with full detail, examples, and specifics.
+</Note>

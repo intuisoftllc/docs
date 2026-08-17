@@ -1,0 +1,14 @@
+---
+title: "Transcription Metering & Cost"
+description: "How transcription minutes are metered and how cost is recorded."
+---
+
+Transcription is metered in measured milliseconds against minute-based tier caps, and cost is recorded to the financials table.
+
+## What this covers
+
+- transcription_ms counter (actual measured ms, not a count); tier caps in minutes converted to ms at read time; cost (base + diarize + medical add-ons) to f_user_financials.ai_cost_micros via incrementFinancialColumn; h_transcribe_history.
+
+<Note>
+Scaffold generated from the codebase map — expand with full detail, examples, and specifics.
+</Note>

@@ -1,0 +1,16 @@
+---
+title: "Core Concepts & Glossary"
+description: "The vocabulary of the eval harness: cases, buckets, judges, verdicts."
+---
+
+The harness has a small, consistent vocabulary shared across the Python and Kotlin runtimes.
+
+## What this covers
+
+- `TestCase` (input/expected/session/bucket/is_flake), suite, `TokenBucket` (small/med/large), judge, `Verdict` (PASS/FAIL/UNCERTAIN/SKIP), baseline/regression — from `evals/core/case.py` and `evals/core/verdict.py`.
+- Single-shot vs SESSION cases (multi-round agent loop), and the `_session` trace shape every judge reads.
+- Fully-qualified id convention `<suite>.<id>` used as the baseline + results key.
+
+<Note>
+Scaffold generated from the codebase map — expand with full detail, examples, and specifics.
+</Note>

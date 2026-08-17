@@ -1,0 +1,16 @@
+---
+title: "Runner: Orchestration & Concurrency"
+description: "How the runner orchestrates cases, judges, and concurrency."
+---
+
+`Runner` drives each case through the SUT and judge, manages bounded concurrency, and finalizes analytics and results.
+
+## What this covers
+
+- Lifecycle in `evals/core/runner.py`: open analytics row → per-case SUT call + judge → periodic upsert → finalize + write results JSON.
+- Fixed `DEFAULT_WORKERS=4` (the `--workers` override was removed because 8 overloaded ai-engine); sequential path for single-case runs; `ThreadPoolExecutor` parallel path with input-order re-sort.
+- Quota-cascade abort (`_detect_quota_error` on `rate_limited`/`cap_reached`, excluding `provider_rate_limited`), unfilled-stub `<<REPLACE_ME` skip, and stale-mock-tool-name guard.
+
+<Note>
+Scaffold generated from the codebase map — expand with full detail, examples, and specifics.
+</Note>

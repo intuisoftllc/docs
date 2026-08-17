@@ -1,0 +1,17 @@
+---
+title: "support_ops.py — Admin CLI"
+description: "The command-line tool that drives every support-ops operation with HMAC signing and dry-run safety."
+---
+
+`support_ops.py` is the unified admin CLI that consumes every registered support-ops operation, handling HMAC signing, the admin secret, JWT auth, and the dry-run→commit flow.
+
+## What this covers
+
+- **Purpose & entry point:** `supabase/scripts/admin/support_ops.py` (RR-317) — one CLI over every support-ops operation, handling HMAC signing, the `X-Admin-Secret` header, JWT auth, and dry-run→commit.
+- **The load-bearing `--env dev|prod` flag:** REQUIRED on every invocation with no default (enforced in `build_parser()`); selects the Supabase URL + admin secret + per-env HMAC key so a prod-signed request can't hit dev and vice-versa. Exactly one of `--op`, `--login`, or `--logout` per call.
+- **Authentication:** `--login` / `--logout` use Clerk FAPI's native-client password flow, caching credentials at `~/.rr-admin/credentials_{dev|prod}.json`; because Clerk session JWTs live ~60s, `_mint_fresh_jwt()` uses the long-lived client token to mint a fresh session token per op. Signing is `sign_body()` = HMAC-SHA256 of `timestamp + "." + body`.
+- **Command surface + guardrails:** read ops (`lookup-user`, `overview`, `state`, `admin-audit`, `timeline`, …) and mutating ops (`set-password`, `clear-pin`, `reset-extraction`, `freeze-account`/`unfreeze-account`, `grant-credits`, `grant-bundle`/`refund-bundle`, `resolve-storage-drift`) that print a dry-run preview and require typing `yes`. Required env vars: `SUPABASE_URL_{ENV}`, `SUPABASE_ANON_KEY_{ENV}`, `ADMIN_OPS_SECRET_{ENV}`, `ADMIN_OPS_HMAC_KEY_{ENV}`, `CLERK_DOMAIN_{ENV}`.
+
+<Note>
+Scaffold generated from the codebase map — expand with full detail, examples, and specifics.
+</Note>

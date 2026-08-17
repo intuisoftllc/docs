@@ -1,0 +1,15 @@
+---
+title: "Queue, Drain & Concurrency"
+description: "The transcription queue, the two-layer drain, and provider concurrency control."
+---
+
+A queue plus a two-layer drain keeps transcription within provider concurrency limits and backs off on 429s.
+
+## What this covers
+
+- transcription_queue + transcribe-drain (Layer 1 inline runDrain(), Layer 2 Deno.cron every minute for overflow/backoff); concurrent-job ceiling + 429 exponential backoff.
+- _shared/transcribe/ — queue.ts, jobs.ts, assemblyai.ts, results.ts, pricing.ts; medical-mode queue + usage multiplier.
+
+<Note>
+Scaffold generated from the codebase map — expand with full detail, examples, and specifics.
+</Note>

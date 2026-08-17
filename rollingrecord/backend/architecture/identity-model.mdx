@@ -1,0 +1,16 @@
+---
+title: "Identity & the canonical_users Hub"
+description: "The single platform-agnostic identity column and the cascade hub every user-data table hangs off."
+---
+
+Every user is identified by one column, auth_user_id, and every user-data table cascades off the canonical_users hub.
+
+## What this covers
+
+- Single platform-agnostic identity: auth_user_id TEXT (the Clerk/Supabase Auth sub claim); migration history collapsed the old triple (canonical_user_id/rc_customer_id/auth_user_id) into one column, but the TABLE stays canonical_users.
+- canonical_users is the cascade hub — every user-data table FKs to it ON DELETE CASCADE; deleting one row wipes the user everywhere.
+- The row is provisioned idempotently by resolve-identity (on app launch) and clerk-webhook (user.created), with a belt-and-suspenders ensureCanonicalUserRow() upsert inside ai-engine.
+
+<Note>
+Scaffold generated from the codebase map — expand with full detail, examples, and specifics.
+</Note>

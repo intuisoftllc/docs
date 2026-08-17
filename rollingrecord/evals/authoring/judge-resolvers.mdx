@@ -1,0 +1,16 @@
+---
+title: "Writing judges.py"
+description: "The per-case judge resolver convention each suite implements."
+---
+
+Each suite's `judges.py` exports a `judge_for_case` resolver that returns the composed judge chain for a given case.
+
+## What this covers
+
+- The `judge_for_case(case, *, anthropic)` convention and returning a composed chain; reading `expected.judge_chain`/tags for per-case variation.
+- Combining structural judges (`AllOf`) with the LLM tier; how absent `ANTHROPIC_API_KEY`/rubric degrades to structural-only.
+- Keeping Python `judges.py` and the Kotlin `SuiteRegistry` in step.
+
+<Note>
+Scaffold generated from the codebase map — expand with full detail, examples, and specifics.
+</Note>

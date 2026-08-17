@@ -1,0 +1,16 @@
+---
+title: "Running Evals"
+description: "Standard workflows for running the harness, and the cost/safety reality."
+---
+
+Common workflows range from a cheap dry-run cost preview to a full pre-release run across both the Python and Kotlin SUTs.
+
+## What this covers
+
+- Standard workflows from the `run.py` docstring: `--dry-run` cost preview, `--bucket=small` cheap iteration, single `--case`, full `--all` pre-release; Kotlin path via `--build-runner`/`--sut=kotlin`.
+- Cost & safety reality: every non-dry run makes live dev ai-engine + Anthropic judge calls and requires the eval user's `developer` RC entitlement (quota-abort otherwise); fixed 4 workers (raising it fabricates failures).
+- Rebuild `:agentrunner` after any `:agentcore`/`:agentrunner` change so `--sut=kotlin` drives the latest loop.
+
+<Note>
+Scaffold generated from the codebase map — expand with full detail, examples, and specifics.
+</Note>

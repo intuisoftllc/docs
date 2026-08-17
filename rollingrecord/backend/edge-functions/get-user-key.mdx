@@ -1,0 +1,14 @@
+---
+title: "get-user-key"
+description: "The one place a plaintext data-encryption key crosses the wire."
+---
+
+get-user-key is the single endpoint that unwraps and returns the caller's plaintext DEK, which the client holds in RAM only.
+
+## What this covers
+
+- The ONE place a plaintext DEK crosses the wire: unwraps the caller's user_crypto DEK from the KEK, lazily provisions the row on first call; the client holds it in RAM only.
+
+<Note>
+Scaffold generated from the codebase map — expand with full detail, examples, and specifics.
+</Note>

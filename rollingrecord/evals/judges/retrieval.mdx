@@ -1,0 +1,16 @@
+---
+title: "Retrieval Judges"
+description: "Recall, MRR, and precision judges over retrieved chunks."
+---
+
+Retrieval judges score how well the agent's tool results retrieved the expected source chunks.
+
+## What this covers
+
+- Recall@k / MRR / Precision@k (`evals/judges/retrieval.py`) computed from `_session.all_tool_results` chunk identifiers vs `expected.gold_chunk_ids`.
+- How mock tool results feed chunk-id parsing.
+- Suites that use them (e.g. `rag_real_content`).
+
+<Note>
+Scaffold generated from the codebase map — expand with full detail, examples, and specifics.
+</Note>

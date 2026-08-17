@@ -1,0 +1,16 @@
+---
+title: "Client vs Server Configuration"
+description: "The split between Firebase client config and Supabase server config."
+---
+
+Configuration is split so every value lives in exactly one place: client-only knobs in Firebase, server-authoritative knobs in Supabase.
+
+## What this covers
+
+- `ClientConfig` (agentcore) fetched from Firebase Remote Config via `ClientConfigManager`: model preferences, client-loop limits, similarity thresholds.
+- `ServerConfig` (agentcore) fetched from Supabase `server_config` via `ServerConfigManager` + `ServerConfigDataSource`: token ceilings, usage caps, model allowlist.
+- The "every value lives in exactly one place" rule and `DEFAULT_*` cold-start fallbacks.
+
+<Note>
+Scaffold generated from the codebase map — expand with full detail, examples, and specifics.
+</Note>

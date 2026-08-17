@@ -1,0 +1,15 @@
+---
+title: "ai-engine"
+description: "The POST proxy for every synchronous AI operation, with per-op validation, caps, and rate limiting."
+---
+
+ai-engine is the single POST proxy fronting every synchronous AI operation, dispatching by operation after the shared gate chain.
+
+## What this covers
+
+- POST proxy for every synchronous AI operation; outer runGates (method/App Check/JWT/entitlement fetch), then dispatchOperation() runs per-op validation, per-op entitlement, feature kill-switch, cap check, ai_engine rate limit, execute, counter increment.
+- Cap categories user_facing / runaway_protection / handler_owned; computeEffectiveCap() (parent x multiplier); x-developer-bypass + x-ai-stubbed response headers for the smoke harness.
+
+<Note>
+Scaffold generated from the codebase map — expand with full detail, examples, and specifics.
+</Note>

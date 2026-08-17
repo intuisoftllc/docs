@@ -1,0 +1,15 @@
+---
+title: "Extraction Metering & Caps"
+description: "Millisecond-based extraction metering, caps, and the anti-forgery transcript ceiling."
+---
+
+Extraction is metered in true audio milliseconds against tier-resolved caps and credits, with several structural guards.
+
+## What this covers
+
+- Millisecond-based extraction_ms metering (tier-resolved + credits); extraction_budget_exhausted, extraction_input_too_large, extraction_context_full, extraction_transcript_exceeds_duration (anti-forgery ~600 tok/min ceiling).
+- _shared/extraction/ modules: billing.ts, caps.ts, context-budget.ts, accumulator.ts, messages.ts, job-status.ts, job-crypto.ts.
+
+<Note>
+Scaffold generated from the codebase map — expand with full detail, examples, and specifics.
+</Note>

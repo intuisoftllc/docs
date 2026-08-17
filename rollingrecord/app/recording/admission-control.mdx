@@ -1,0 +1,15 @@
+---
+title: "Recording Admission & Concurrency"
+description: "How recording start requests are admitted, queued, and de-conflicted."
+---
+
+A small admission layer decides when a recording may start and prevents microphone and playback contention.
+
+## What this covers
+
+- `RecordingGatekeeper`, `RecordingAdmissionBus`, `RecordStartRequest`, and `BlockingOp` for admitting/queuing start requests.
+- `BusyGuard` mutual exclusion and `PlaybackCoordinator` to avoid mic/playback contention.
+
+<Note>
+Scaffold generated from the codebase map — expand with full detail, examples, and specifics.
+</Note>

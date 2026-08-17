@@ -1,0 +1,16 @@
+---
+title: "Data Encryption Key & DB Key Lifecycle"
+description: "The DEK model, DB key management, and KEK rotation."
+---
+
+A per-user data encryption key (DEK) protects content and derives the database key, exchanged securely and rotated over time.
+
+## What this covers
+
+- `DekKeyStore`, `SessionDekHolder`, `DatabaseKeyManager`; `DatabaseKeyTransition` / `DatabaseKeyTransitionDecision` KEK rotation.
+- Remote wrapped-DEK exchange: `UserKeyApi` / `UserKeyApiClient`, `GetUserKeyResponse`.
+- DEK-unavailable handling: `V2DekUnavailableScreen`.
+
+<Note>
+Scaffold generated from the codebase map — expand with full detail, examples, and specifics.
+</Note>

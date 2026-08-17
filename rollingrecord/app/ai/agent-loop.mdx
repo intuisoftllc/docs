@@ -1,0 +1,16 @@
+---
+title: "Agent Loop & Tool Contract"
+description: "The shared agent loop, tool spec, and round budget."
+---
+
+KB chat runs on a shared agent loop with a client-owned tool contract and a server round budget — the same loop the eval runner drives.
+
+## What this covers
+
+- agentcore `AgentLoop`, `ToolExecutor`, `KbToolSpec` / `KbToolNames`, `KbQuerySessionManager` round-budget.
+- The `AiEnginePort` abstraction implemented by the app (Retrofit/Room) and by mocks in agentrunner.
+- Turn tracing/analytics (`TurnTrace`, `AgentAnalytics`) and message assembly.
+
+<Note>
+Scaffold generated from the codebase map — expand with full detail, examples, and specifics.
+</Note>

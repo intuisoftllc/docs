@@ -1,0 +1,16 @@
+---
+title: "Token Minting & Auth"
+description: "How the harness mints App Check and Clerk tokens for the dev backend."
+---
+
+The harness mints Firebase App Check and Clerk bearer tokens for a dedicated eval user with the `developer` entitlement.
+
+## What this covers
+
+- `mint_tokens`/`EvalTokens` (`evals/ai_engine/auth.py`): Firebase App Check debug-token exchange + Clerk Backend-API/FAPI bearer flow; 60s bearer TTL with `force_fresh_bearer_jwt()` re-mint.
+- The dedicated eval test user (distinct from smoketest) and the `developer` RC entitlement requirement that bypasses caps/rate limits.
+- Parity with the Kotlin `SmokeTokenMinter` failure modes.
+
+<Note>
+Scaffold generated from the codebase map — expand with full detail, examples, and specifics.
+</Note>

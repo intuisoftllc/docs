@@ -1,0 +1,16 @@
+---
+title: "Fixture Seeding & Corpus"
+description: "How on-device eval cases seed and tear down real Room data safely."
+---
+
+`FixtureSeeder` plants real Room rows for a case, runs it, and tears them down — always behind the access gate so real data is never touched.
+
+## What this covers
+
+- `corpus/FixtureSeeder.kt` seeds REAL Room rows (recordings with real Opus files, fabricated transcripts auto-indexed into `transcript_fts`, contexts + membership); prefixed ids for exact teardown.
+- `SeededCorpus`/`CorpusStrategy` (`core/CorpusStrategy.kt`): seed→run→teardown per case, Skip vs Ready; no-op for non-seeded cases.
+- Safety: only runs behind `EvalAccess`; a run can never touch real user data.
+
+<Note>
+Scaffold generated from the codebase map — expand with full detail, examples, and specifics.
+</Note>

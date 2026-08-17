@@ -1,0 +1,16 @@
+---
+title: "Suite & Case File Layout"
+description: "The on-disk contract for suites, buckets, and case JSON."
+---
+
+Suites follow a fixed directory contract, with cases stored as JSON arrays grouped by cost bucket.
+
+## What this covers
+
+- Directory contract: `suites/<name>/{small,med,large}/*_{n}.json` (JSON arrays), plus `judges.py`, `README.md`, optional `baseline.json` (`evals/core/case.py` loader).
+- Case JSON schema (`id`/`input`/`expected`/`tags`/`notes`/`session`/`is_flake`) and bucket cost tiers.
+- The `input` shape for `kb_query` (`operation` + `input.input.messages`).
+
+<Note>
+Scaffold generated from the codebase map — expand with full detail, examples, and specifics.
+</Note>

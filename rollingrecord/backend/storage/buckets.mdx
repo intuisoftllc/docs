@@ -1,0 +1,15 @@
+---
+title: "Storage Buckets"
+description: "The Storage buckets, their contents, and the user-scoped path convention."
+---
+
+A few Storage buckets hold encrypted audio, embedding bundles, and public brand assets, all under a user-scoped path convention.
+
+## What this covers
+
+- audio-storage (encrypted .enc audio blobs at &#123;uid&#125;/&#123;rid&#125;.enc), embedding-storage (embedding bundle cache), brand-assets (public, migration 20260816120000); the retired job-plane bucket (extraction moved to DB columns).
+- The path convention &#123;bucket&#125;/&#123;auth_user_id&#125;/... and its role in deletion cleanup.
+
+<Note>
+Scaffold generated from the codebase map — expand with full detail, examples, and specifics.
+</Note>

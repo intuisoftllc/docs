@@ -1,0 +1,16 @@
+---
+title: "Cost Ledger, Baselines & Regressions"
+description: "Cost tracking, baseline diffing, and flake handling."
+---
+
+The harness tracks spend per run and diffs each result against a per-suite baseline to detect regressions.
+
+## What this covers
+
+- `CostLedger`/`AnthropicUsage` (`evals/core/cost.py`) splitting production vs judge spend, cache-token pricing, and where per-round session cost is recorded.
+- Baseline diffing in `Runner._baseline_diff` (`suites/<suite>/baseline.json`): `new`/`unchanged`/`regression`/`fix`/`changed`; regressions always break the build.
+- Flake handling: `is_flake` routes FAIL/UNCERTAIN to `cases_flaked`, excluded from exit-code and regression signal.
+
+<Note>
+Scaffold generated from the codebase map — expand with full detail, examples, and specifics.
+</Note>

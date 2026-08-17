@@ -1,0 +1,14 @@
+---
+title: "delete-user (GDPR Erasure)"
+description: "The account-deletion function, its guards, and the wipe ladder."
+---
+
+delete-user runs the full GDPR erasure ladder behind subscription, rate-limit, and step-up-OTP guards, idempotently.
+
+## What this covers
+
+- Delegates to _shared/users/wipe.ts wipeUser() ladder; gates (active-subscription block active_subscription, a tight delete_user rate limit, a step-up OTP ticket account_deletion); check_only preflight; snapshot + TABLES_TO_WIPE + bucket wipe + RC customer delete + Auth teardown; idempotent.
+
+<Note>
+Scaffold generated from the codebase map — expand with full detail, examples, and specifics.
+</Note>

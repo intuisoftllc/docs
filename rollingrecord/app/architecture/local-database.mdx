@@ -1,0 +1,16 @@
+---
+title: "Room Database & SQLCipher"
+description: "The encrypted per-user Room database and migration discipline."
+---
+
+Local data lives in a per-user Room database encrypted at rest with SQLCipher.
+
+## What this covers
+
+- `AppDatabase`, the full DAO set (`RecordingDao`, `ContextDao`, `TranscriptDao`, `SyncOutboxDao`, `EmbeddingDao`, etc.) and entities under `data/local/db/entity`.
+- Encrypted-at-rest via SQLCipher keyed by `DatabaseKeyManager`; the database is per-user.
+- Migration discipline: `data/local/db/migrations`, `allMigrations` in `DatabaseModule`, and the index-name rules (see the migration HARD RULE in `CLAUDE.md`).
+
+<Note>
+Scaffold generated from the codebase map — expand with full detail, examples, and specifics.
+</Note>

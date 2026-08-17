@@ -1,0 +1,15 @@
+---
+title: "JWT Auth Gate"
+description: "How Clerk session tokens are verified and turned into an auth_user_id."
+---
+
+The JWT gate verifies the Clerk-issued RS256 session token against Clerk's JWKS and extracts the caller's identity.
+
+## What this covers
+
+- jwt.ts verifies RS256 Clerk session tokens against Clerk's JWKS, extracts authUserId from sub; the single exception to the error-registry rule — returns typed VerifyBearerResult literals (missing_bearer_token, invalid_jwt) that must match registry codes.
+- All functions set verify_jwt = false in config.toml so Supabase's built-in check doesn't reject the Clerk token before runGates runs.
+
+<Note>
+Scaffold generated from the codebase map — expand with full detail, examples, and specifics.
+</Note>

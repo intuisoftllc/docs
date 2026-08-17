@@ -1,0 +1,16 @@
+---
+title: "Dashboard, Results & Upload"
+description: "The on-device eval dashboard, result files, and Upload-to-PC."
+---
+
+The on-device dashboard shows live progress and writes per-run result JSON that can be pulled or uploaded to a PC.
+
+## What this covers
+
+- `ui/` dashboard + overlays (`EvalDashboardScreen`, `EvalConsoleOverlay`, `EvalResultsOverlay`, `EvalCaseDetailSheet`, `EvalViewModel`).
+- `results/ResultWriter.kt` writing per-run device JSON (adb-pullable, analog of the Python `results/<date>/<uuid>.json`) + `EvalResultStore`; optional "Upload to PC" via `EvalConfig.uploadUrl` (`serve_apk.py`).
+- `EvalRunState` model driving live progress/counts.
+
+<Note>
+Scaffold generated from the codebase map — expand with full detail, examples, and specifics.
+</Note>

@@ -1,0 +1,16 @@
+---
+title: "Audio Formats & Encoders"
+description: "The recorder abstraction, formats, quality knobs, and WAV recovery."
+---
+
+Recording is backed by an encoder abstraction that supports AAC, Opus, and WAV, with configurable quality and WAV corruption resilience.
+
+## What this covers
+
+- `AudioRecorder` abstraction with `AacRecorder` and `WavRecorder` implementations; `AudioFormat` model (AAC / Auto / Opus / WAV).
+- Recording-quality knobs: Voice/Hi-Fi mode, bitrate (64–320 kbps), sample rate — via `AudioConfigHandler` and `FormatHandler`.
+- WAV corruption resilience via `WavHeaderRecovery`.
+
+<Note>
+Scaffold generated from the codebase map — expand with full detail, examples, and specifics.
+</Note>

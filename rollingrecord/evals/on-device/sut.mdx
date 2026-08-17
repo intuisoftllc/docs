@@ -1,0 +1,16 @@
+---
+title: "OnDeviceSystemUnderTest"
+description: "The on-device SUT that runs the literal production ask() path."
+---
+
+`OnDeviceSystemUnderTest` runs the real production `ask()` path against real Room data and the live backend for the signed-in test account.
+
+## What this covers
+
+- `systemundertest/OnDeviceSystemUnderTest.kt`: runs the LITERAL production `ContextCardRepository.ask()` path (real loop, real Room, live ai-engine, signed-in identity).
+- `_session` reconstruction from `DevChatTraceCapture` so session judges run on-device; follow-ups as successive turns on one threadId; per-case synthetic identity/timezone/`history_truncated`.
+- Supported ops: `kb_query` end-to-end; `template_moderation` via `AiEngineClient`; `extract` returns an honest unsupported error (server-side tool calls not observable).
+
+<Note>
+Scaffold generated from the codebase map — expand with full detail, examples, and specifics.
+</Note>

@@ -1,0 +1,16 @@
+---
+title: "Session Runner (multi-round loop)"
+description: "The simulated multi-round chatbot loop for SESSION cases."
+---
+
+`SessionRunner` simulates a multi-round conversation with the agent, threading session tokens and producing the canonical `_session` trace.
+
+## What this covers
+
+- `SessionRunner` in `evals/core/session.py`: the simulated chatbot loop, `X-Query-Session-Token` threading across rounds, `is_final` fallback round, `follow_ups` injection with per-turn stage advance.
+- Terminal reasons (`end_turn`, `max_rounds_exceeded`, `harness_round_cap`, `harness_cost_cap`, `mock_not_found`, `transport_error`, `upstream_error`) and the `HARNESS_MAX_ROUNDS_DEFAULT`/`DEFAULT_MAX_COST_USD` safety nets vs the server's authoritative round cap.
+- `SessionTrace` + `_synthesize_output` producing the canonical `_session` body block (rounds, all_tool_calls, all_tool_results) that both SUTs must emit.
+
+<Note>
+Scaffold generated from the codebase map — expand with full detail, examples, and specifics.
+</Note>

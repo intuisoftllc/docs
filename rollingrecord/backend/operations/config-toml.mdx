@@ -1,0 +1,14 @@
+---
+title: "Function Deployment (config.toml)"
+description: "How functions are configured for deployment and scheduling across branches."
+---
+
+config.toml configures every function to run its own Clerk-JWT check and defines cron scheduling, kept in parity across branches.
+
+## What this covers
+
+- All functions run verify_jwt = false (their own Clerk-JWT check via runGates); rationale comments; Deno.cron vs pg_cron scheduling; branch parity (dev + production).
+
+<Note>
+Scaffold generated from the codebase map — expand with full detail, examples, and specifics.
+</Note>

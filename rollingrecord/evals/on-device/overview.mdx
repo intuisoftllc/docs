@@ -1,0 +1,16 @@
+---
+title: "On-Device Eval Mode"
+description: "The on-device Kotlin port of the eval harness in the debug build."
+---
+
+`evalmode` is an on-device port of the harness that runs bundled cases inside the debug build, reached through Dev Mode.
+
+## What this covers
+
+- The `evalmode` package under `app/app/src/debug/` — an on-device port of the harness bundling cases in `assets/evals/`, reached via the Dev Mode → EvalMode route (`devmode/DebugNavGraph.kt` → `EvalDashboardScreen`).
+- Composition root `EvalComponent.kt` wiring access/SUT/corpus/caseLoader/suiteRegistry/resultWriter with no Koin module change.
+- `EvalConfig.kt` mirroring `evals/config.py` (models, pricing, `MAX_CONCURRENCY=4`, pass floor) and BuildConfig-sourced judge key/upload URL.
+
+<Note>
+Scaffold generated from the codebase map — expand with full detail, examples, and specifics.
+</Note>

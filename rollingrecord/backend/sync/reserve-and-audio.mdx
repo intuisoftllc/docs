@@ -1,0 +1,15 @@
+---
+title: "sync-reserve & sync-audio"
+description: "The signed-URL issuer for encrypted audio uploads and the download/delete companion."
+---
+
+sync-reserve mints and wraps a per-file key and signs an upload URL; sync-audio handles encrypted download and sanctioned deletes.
+
+## What this covers
+
+- sync-reserve: a stateless signed-URL issuer — mints a DEK, wraps it under the KEK, signs an upload URL at audio-storage/&#123;uid&#125;/&#123;rid&#125;.enc, writes zero rows; backup_quota_exceeded.
+- sync-audio: download (unwrap DEK + signed GET) and delete (the sanctioned orphaned-blob removal on rolling demote); grace-window download throttling via sync_download_grace.
+
+<Note>
+Scaffold generated from the codebase map — expand with full detail, examples, and specifics.
+</Note>

@@ -1,0 +1,16 @@
+---
+title: "run.py CLI & Flags"
+description: "The command-line entry point to the Python eval harness."
+---
+
+`run.py` is the entry point for the Python harness, with flags for scoping, dry-runs, and choosing the system-under-test.
+
+## What this covers
+
+- Every flag from `evals/run.py` `_parse_args`: `--all`, `--suite`, `--bucket`, `--case`, `--dry-run`, `--scope`, `--show-pass`, `--pass-floor`, `--build-runner`, `--sut={python,kotlin}`, `--repeat N`.
+- Mutually-exclusive scope group (`--all` vs `--suite`), `--case` cross-suite discovery, and `--build-runner` build-only shortcut (forces `--sut=kotlin`).
+- Summary printing + exit-code policy (`_print_summary`) and repeat-mode reliability badges (`_print_repeat_summary`: reliable/flaky/broken).
+
+<Note>
+Scaffold generated from the codebase map — expand with full detail, examples, and specifics.
+</Note>

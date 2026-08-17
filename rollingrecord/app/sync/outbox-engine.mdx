@@ -1,0 +1,15 @@
+---
+title: "Sync Outbox & Enqueue"
+description: "How local writes are enqueued for sync."
+---
+
+Every local write is enqueued into an outbox that drives the push side of sync.
+
+## What this covers
+
+- `SyncOutboxRepository` / `SyncOutboxDao` / `SyncOutboxEntity`; `SyncEnqueuer` and `SyncEnqueueRecovery`.
+- Per-entity enqueue on writes and `UserWorkTag` scoping.
+
+<Note>
+Scaffold generated from the codebase map — expand with full detail, examples, and specifics.
+</Note>

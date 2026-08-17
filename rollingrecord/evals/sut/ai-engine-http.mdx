@@ -1,0 +1,16 @@
+---
+title: "Live Dev Backend Client"
+description: "The HTTP client that calls the live dev ai-engine Edge Function."
+---
+
+`AiEngineHttp` is the Python SUT that posts eval requests to the live dev `ai-engine` Edge Function and normalizes the response.
+
+## What this covers
+
+- `AiEngineHttp` (`evals/ai_engine/client.py`) POSTing to the dev `ai-engine` Edge Function; required headers (`apikey`, `X-Firebase-AppCheck`, `Authorization`, `X-App-Version=999999`).
+- Response normalization into `ActualOutput` (text/tool_calls/model/usage), client-side token estimation for post-processed ops, and `provider_rate_limited` retry backoff.
+- Canonical-tool injection (`_inject_canonical_tools`) for bare `kb_query` cases.
+
+<Note>
+Scaffold generated from the codebase map — expand with full detail, examples, and specifics.
+</Note>

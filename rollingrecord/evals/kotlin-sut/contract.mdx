@@ -1,0 +1,16 @@
+---
+title: "--sut=kotlin & KotlinSessionDriver"
+description: "The frozen JSON contract that drives the Kotlin agent runner."
+---
+
+`KotlinSessionDriver` runs SESSION cases through the real Kotlin agent loop via a frozen JSON stdin/stdout contract.
+
+## What this covers
+
+- `KotlinSessionDriver` (`evals/ai_engine/kotlin_runner.py`): the frozen JSON stdin envelope (`case`/`auth`/`config`) → subprocess → `_session` trace on stdout.
+- `build_runner()` (`:agentrunner:installDist`) and `find_runner_command()` (`$EVAL_KOTLIN_RUNNER` or the installDist launcher); `DEFAULT_SERVER_CONFIG`/`DEFAULT_CLIENT_CONFIG` dials.
+- Deliberate fidelity differences vs the Python SessionRunner (production turn-opener, raw-text tool results, `after_round` ignored); transport-failure mapping.
+
+<Note>
+Scaffold generated from the codebase map — expand with full detail, examples, and specifics.
+</Note>

@@ -1,0 +1,14 @@
+---
+title: "sync-pull"
+description: "The paginated delta-pull endpoint and its cursor model."
+---
+
+sync-pull returns a paginated delta of changes since a cursor, split across request, query, and response modules.
+
+## What this covers
+
+- Paginated delta pull (cursor + groups); request.ts/pull-query.ts/response.ts split; a discriminated-union response with next_cursor/has_more; invalid_cursor; opts into grace-period read.
+
+<Note>
+Scaffold generated from the codebase map — expand with full detail, examples, and specifics.
+</Note>

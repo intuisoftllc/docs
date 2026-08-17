@@ -1,0 +1,15 @@
+---
+title: "Background Work (WorkManager)"
+description: "The WorkManager worker inventory and session scoping."
+---
+
+Long-running work runs through WorkManager, with every worker session-scoped to the signed-in user.
+
+## What this covers
+
+- Full worker inventory: `TranscriptionWorker`, `ContextExtractionWorker`, `ContextSynthesisWorker`, `MergeWorker`, `WaveformExtractionWorker`, `EmbeddingReconcileWorker`, the Sync / AudioSync / CloudPrefetch workers, and the scheduled-recording workers.
+- `WorkerModule` wiring and `UserWorkTag` session scoping.
+
+<Note>
+Scaffold generated from the codebase map — expand with full detail, examples, and specifics.
+</Note>

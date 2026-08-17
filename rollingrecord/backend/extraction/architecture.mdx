@@ -1,0 +1,15 @@
+---
+title: "Async Extraction Architecture"
+description: "The three-function async extraction plane and where its encrypted payload lives."
+---
+
+Extraction is fully asynchronous across three functions, with all job state stored as encrypted columns rather than a Storage bucket.
+
+## What this covers
+
+- Three functions: extract-submit (client submit + reserve-only headroom check), extract-runner (server-paced tick), extract-results (fetch/ack/status/cancel); single-flight enforced by a partial unique index (extraction_already_running).
+- Payload/accumulator/results live as encrypted columns on extraction_jobs (payload_ct, state_ct, results_ct under one per-job DEK in dek_ct) — the former job-plane Storage bucket was removed (RR-503).
+
+<Note>
+Scaffold generated from the codebase map — expand with full detail, examples, and specifics.
+</Note>

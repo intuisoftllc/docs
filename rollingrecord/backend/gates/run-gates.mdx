@@ -1,0 +1,16 @@
+---
+title: "The runGates() Admission Chain"
+description: "The single declarative admission chain every Edge Function routes through, in a fixed non-reorderable order."
+---
+
+Every Edge Function admits requests through one declarative runGates() call with a fixed, non-reorderable gate order.
+
+## What this covers
+
+- Single declarative entry point in _shared/gates/index.ts; fixed, non-reorderable order: method to App Check to App Version to JWT to entitlement fetch to entitlement check to account-freeze to rate-limit sugar.
+- The GateConfig union (JwtGateConfig / WebhookSecretGateConfig / NoAuthGateConfig) drives a type-narrowed ResolvedContext (reading authUserId on a webhook handler is a compile error).
+- Opt-outs (skipAppCheck, skipAppVersion) require a // OPT-OUT: reason comment; current opt-outs include server-config and revenuecat-webhook.
+
+<Note>
+Scaffold generated from the codebase map — expand with full detail, examples, and specifics.
+</Note>

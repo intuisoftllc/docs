@@ -1,0 +1,16 @@
+---
+title: "extract-runner Tick Engine"
+description: "The server-paced tick engine that claims, processes, checkpoints, and finalizes extraction jobs."
+---
+
+extract-runner claims one job, processes chunks within a wall-clock budget, checkpoints after each, and crash-resumes from the last durable checkpoint.
+
+## What this covers
+
+- WebhookSecret (EXTRACT_RUNNER_SECRET); atomically CLAIMs one job, processes chunks within a ~100s wall-budget, checkpoints after every chunk, yields/re-kicks or finalizes; crash-resumes from the last durable checkpoint.
+- Imports ExtractHandler from _shared/extraction/extract-handler.ts directly (no network hop); per-recording reserve-on-chunk-0 / commit-on-last-chunk metering via extraction_run_id idempotency.
+- Two-lane errors: retryable (throw, heartbeat sweeper requeues) vs poison (extraction_undecryptable, fail immediately) — runner-classify.ts.
+
+<Note>
+Scaffold generated from the codebase map — expand with full detail, examples, and specifics.
+</Note>

@@ -1,0 +1,16 @@
+---
+title: "agentrunner CLI (Main.kt)"
+description: "The pure-JVM CLI that runs the real agent loop for --sut=kotlin."
+---
+
+`agentrunner` reads one case envelope, runs the real `AgentLoop`, and emits the `_session` trace — the binary that `--sut=kotlin` drives.
+
+## What this covers
+
+- `app/agentrunner/src/main/kotlin/.../Main.kt`: reads one case envelope, runs `AgentLoop` once per user turn with a fresh `KbQuerySessionManager`, emits the `_session` + `turns` JSON; exit-code rules.
+- `parseSeededConversation` (user/assistant pairs → history + trailing question), follow-up ordering, per-turn stage advance, config application through real `ServerConfig`/`ClientConfig`.
+- Supporting classes: `HttpAiEnginePort`, `RecordingAiEnginePort`, `RunnerMockRegistry`, `RunnerToolExecutor`, and `AgentLog`→stderr diagnostics.
+
+<Note>
+Scaffold generated from the codebase map — expand with full detail, examples, and specifics.
+</Note>

@@ -1,0 +1,14 @@
+---
+title: "Admin Permissions & Super-Admin"
+description: "The per-operation admin permission model and super-admin protections."
+---
+
+Each admin op checks a per-operation permission against admin_permissions, with super-admins bypassing per-op checks but protected from lower-tier destructive ops.
+
+## What this covers
+
+- Per-op AdminPermissionKey against admin_permissions (one SELECT per request); is_super_admin + a dev auto-pass; super-admin-guard.ts protects super-admins from lower-tier destructive ops (super_admin_protected); admin_permission_denied.
+
+<Note>
+Scaffold generated from the codebase map — expand with full detail, examples, and specifics.
+</Note>

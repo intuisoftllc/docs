@@ -1,0 +1,16 @@
+---
+title: "Architecture & Data Flow"
+description: "The end-to-end path a case takes through the eval harness."
+---
+
+An eval case flows from `run.py` through the runner and a system-under-test into the judge chain, producing a verdict, results JSON, and analytics.
+
+## What this covers
+
+- End-to-end path: `run.py` → `Runner` → `SystemUnderTest`/`SessionRunner` → judge chain → `Verdict` → results JSON + `l_eval_run` analytics.
+- The three SUT backends behind one `SystemUnderTest` ABC (`evals/core/system.py`): `AiEngineHttp` (Python), `KotlinSessionDriver` (`--sut=kotlin`), and on-device `OnDeviceSystemUnderTest`.
+- Where fidelity is deliberately imperfect vs production (documented in `evals/core/session.py` and `evals/ai_engine/kotlin_runner.py` headers).
+
+<Note>
+Scaffold generated from the codebase map — expand with full detail, examples, and specifics.
+</Note>

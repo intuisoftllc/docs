@@ -1,0 +1,15 @@
+---
+title: "Scheduled pg_cron Sweepers"
+description: "The scheduled jobs that prune, reconcile, and reap across the database."
+---
+
+A set of pg_cron jobs sweeps logs, counters, queues, and orphaned blobs, calling Edge Functions when they need secrets.
+
+## What this covers
+
+- The real jobs: prune_log_tables/prune_h_tables, prune_rate_limit_counters, prune_account_otp, prune_transcription_queue, prune_demoted_rolling, cloud_excluded_content_cleanup, reconcile_pending_delete_counters, c_recordings_audit_blobs, c_recordings_reconcile_no_blob_path, transcribe-inbox-cleanup, extract-runner-tick, sweep_extraction_heartbeats, sweep_extraction_jobs_ttl, storage_orphan_lister.
+- Cron calls Edge Functions via net.http_post with Vault-stored secrets (SQL cannot read Edge env).
+
+<Note>
+Scaffold generated from the codebase map — expand with full detail, examples, and specifics.
+</Note>

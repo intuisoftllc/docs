@@ -1,0 +1,15 @@
+---
+title: "Storage Janitors & Orphan Reaping"
+description: "The only sanctioned Storage-delete path and the orphan-blob discovery sweeper."
+---
+
+A dumb janitor is the only sanctioned way to delete Storage objects, fed by a bucket-aware orphan-lister.
+
+## What this covers
+
+- storage-janitor (a generic "delete these paths" with STORAGE_JANITOR_SECRET, the only sanctioned path since protect_delete() blocks raw DELETE FROM storage.objects); storage-orphan-lister (bucket-specific discovery across audio-storage/embedding-storage, 1-hour grace, tombstone-grace awareness).
+- Storage drift detection + quota alignment (_shared/db/storage-quota.ts, storage_drift_detection migration).
+
+<Note>
+Scaffold generated from the codebase map — expand with full detail, examples, and specifics.
+</Note>

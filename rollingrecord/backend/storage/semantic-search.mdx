@@ -1,0 +1,15 @@
+---
+title: "Server-Side Embeddings"
+description: "The search and indexing endpoints that back semantic search, and the embedding bundle cache."
+---
+
+Server-side embeddings power semantic search — a stateless query embedder, a batch indexer, and a bundle cache plane.
+
+## What this covers
+
+- search (embeds a single query, holds no vectors, returns a 1024-dim vector), indexing (batch document-chunk embeddings, up to 96/call), the embedding bundle cache plane (get_bundles/put_bundle, embedding_cache bucket + bundle_too_large).
+- Cohere provider (_shared/ai/providers/embeddings/cohere.ts), exact billed tokens to f_user_financials; semantic_search_disabled kill switch; Pro+Cloud entitlement.
+
+<Note>
+Scaffold generated from the codebase map — expand with full detail, examples, and specifics.
+</Note>

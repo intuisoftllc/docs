@@ -1,0 +1,14 @@
+---
+title: "server_config & rate_limit_config"
+description: "The two server-authoritative config tables and how they're read."
+---
+
+server_config holds all server-authoritative knobs; rate_limit_config is a dedicated table for structured per-bucket limits.
+
+## What this covers
+
+- server_config (public flag, typed accessors getInt/getBool via _shared/db/server-config.ts, provider chains, model allowlist, kill switches); rate_limit_config (bucket_key/max_requests/window_sec/enabled).
+
+<Note>
+Scaffold generated from the codebase map — expand with full detail, examples, and specifics.
+</Note>

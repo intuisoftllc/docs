@@ -1,0 +1,16 @@
+---
+title: "Application Shell & Entry Points"
+description: "The Application class, single-Activity host, and cold-start responsibilities."
+---
+
+The app boots through a single Application class and a single-Activity host that own startup, entry points, and the app-lock overlay.
+
+## What this covers
+
+- `App.kt` Application class (Koin startup, Clerk/Firebase init) and the single-Activity host `MainActivity.kt`.
+- `AuthCallbackActivity.kt` for OAuth / deep-link callbacks; share-intent admission in `MainActivity.handleShareIntent` (`ACTION_SEND` / `ACTION_SEND_MULTIPLE`, gated to Pro).
+- Cold-start responsibilities: config-fetch kickoff, version gate, and app-lock overlay hosting.
+
+<Note>
+Scaffold generated from the codebase map — expand with full detail, examples, and specifics.
+</Note>

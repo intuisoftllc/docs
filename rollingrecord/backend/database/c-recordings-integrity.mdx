@@ -1,0 +1,14 @@
+---
+title: "c_recordings Cryptographic-Column Integrity"
+description: "The four sanctioned delete callers and the permanent ban on TRUNCATE/DROP for c_recordings."
+---
+
+The crypto columns on c_recordings make audio decryptable, so deletes are limited to four callers and TRUNCATE/DROP is permanently banned.
+
+## What this covers
+
+- The four sanctioned DELETE callers (delete-user, sync-push tombstone, sync-audio delete, pg_cron sweepers); TRUNCATE/DROP is permanently banned (overriding the destructive-migration escape hatch); expand-migrate-contract if restructuring is ever needed.
+
+<Note>
+Scaffold generated from the codebase map — expand with full detail, examples, and specifics.
+</Note>

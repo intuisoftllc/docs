@@ -1,0 +1,15 @@
+---
+title: "Error-Code Registry & Kotlin Mirror"
+description: "The single source of truth for error codes and its Kotlin mirror."
+---
+
+Every error code comes from one registry, mirrored on the Kotlin side and regenerated into human-readable docs.
+
+## What this covers
+
+- _shared/errors.ts is the single source of truth (USER_ERRORS / INFRA_ERRORS / DEV_ERRORS, def(), AppError, ALL_ERROR_CODES, errorCategory); no inline literals; jwt.ts is the discriminated-union exception.
+- The Kotlin mirror AiEngineErrorCode.kt (identical code set, same commit); supabase/scripts/gen_error_docs.py regenerates docs/error-codes.md.
+
+<Note>
+Scaffold generated from the codebase map — expand with full detail, examples, and specifics.
+</Note>

@@ -1,0 +1,17 @@
+---
+title: "Operation Catalog"
+description: "How support-ops operations are registered, plus the read-only and mutating op inventory."
+---
+
+Support-ops exposes a registry of individually-declared operations — each with its own permission requirement, validation, and read-only vs. mutating classification.
+
+## What this covers
+
+- **How operations are registered:** each is an `OperationDef` (`operations/handler.ts`) declaring `name`, `isReadOnly`, `requiredPermission`, `validateParams`, and `handler`; all are collected in `operations/registry.ts` and resolved by `findOperation(body.operation)`.
+- **Read-only diagnostics:** `lookup_user_by_email`, `search_users`, `get_user_overview`, `get_user_state`, `get_clerk_metadata`, `get_user_rate_limits`, `get_admin_audit`, `get_user_audit`, `get_abuse_top_offenders`, `get_user_transcribe_history`, `get_user_credit_ledger`, `get_user_credits`, `get_user_timeline`, `get_tombstone_report`, `get_storage_drift`, `whoami`.
+- **Mutating ops (dry-run → commit):** `set_account_password`, `freeze_user_account`, `grant_manual_credit`, `restore_tombstones`, `clear_app_lock_pin`, `reset_extraction`, `reset_transcription`, and the irreversible `delete_user_account` (guarded by server-side email confirmation); hybrids `verify_support_token` / `validate_recovery_code`; light metadata write `link_audit_ticket`.
+- **Error contract:** handlers throw `OperationError(code, httpStatus, extra)` for clean coded rejections (e.g. `credit_ceiling_exceeded`), otherwise collapse to a generic `handler_threw` 500.
+
+<Note>
+Scaffold generated from the codebase map — expand with full detail, examples, and specifics. (Cross-check the authoritative op list against the deployed dispatcher — the CLI and registry drifted slightly in the mapped repo state.)
+</Note>

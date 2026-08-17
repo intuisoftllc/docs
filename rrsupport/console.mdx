@@ -1,0 +1,17 @@
+---
+title: "Admin Console UI"
+description: "The human-facing front end over support-ops — lives in a separate repository."
+---
+
+The admin console is the third RRSupport component: a human-facing front end over the same `support-ops` dispatcher the CLI drives. Its source is **not** in this monorepo, so this page is a placeholder until the separate repo is available.
+
+## What this covers
+
+- **Purpose within RRSupport:** the third named component (per `CLAUDE.md`) — a human-facing front end over the same `support-ops` dispatcher the CLI drives.
+- **Status: not present in this monorepo.** No web frontend exists here (no `admin/`, `console/`, or `web/` directory, no `package.json`/`next.config`/`vite.config`). This page can only be written from the separate RRSupport repo.
+- **Evidence it exists elsewhere:** the `whoami` op is explicitly designed for a client to "hide what it cannot run," and `reset-transcription` references "the console" showing job state — both imply a UI consumer built against this backend.
+- **What to document once the other repo is available:** how the console signs requests (mirroring the CLI's `X-Admin-Secret` + HMAC + Clerk JWT), which operations it surfaces, and its dry-run→commit UX.
+
+<Note>
+Placeholder — the console app lives in a separate repository. Fill this in from that repo (framework, hosting, auth wiring, screen inventory).
+</Note>

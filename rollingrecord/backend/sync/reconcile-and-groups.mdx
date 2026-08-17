@@ -1,0 +1,15 @@
+---
+title: "sync-reconcile & sync-group-exclude"
+description: "The drift-detection handshake and the bulk group exclude/restore endpoint."
+---
+
+sync-reconcile detects client/server drift with a cheap counts-then-ids handshake; sync-group-exclude does bulk cloud exclude/restore.
+
+## What this covers
+
+- sync-reconcile: counts (cheap, frequent) vs ids (paginated, on mismatch) drift handshake; the client fixes drift.
+- sync-group-exclude: bulk exclude/restore group ops via RPC with a cap pre-check (storage_cap_would_be_exceeded); revive_would_exceed_quota.
+
+<Note>
+Scaffold generated from the codebase map — expand with full detail, examples, and specifics.
+</Note>

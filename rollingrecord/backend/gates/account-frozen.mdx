@@ -1,0 +1,15 @@
+---
+title: "Account-Freeze Gate"
+description: "The gate that blocks frozen accounts before they consume any quota."
+---
+
+A frozen account is rejected before the rate-limit gate so the rejection consumes no quota, and every attempt is logged.
+
+## What this covers
+
+- account-frozen.ts fires BEFORE rate limit so frozen-account rejections consume no quota; reads canonical_users.frozen_at/frozen_reason, returns account_frozen (403), writes one l_user_abuse_event row per attempt.
+- Applies to dev accounts too (a safety primitive, not a quota); set/cleared by the support-ops freeze_user_account op.
+
+<Note>
+Scaffold generated from the codebase map — expand with full detail, examples, and specifics.
+</Note>

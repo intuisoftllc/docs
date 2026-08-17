@@ -1,0 +1,16 @@
+---
+title: "On-Device Runner"
+description: "The Kotlin runner that drives cases with bounded parallelism on-device."
+---
+
+The on-device `Runner` executes the access→corpus→SUT→judge→record pipeline with bounded parallelism and live dashboard state.
+
+## What this covers
+
+- `core/Runner.kt`: `access.check → corpus.prepare → SUT.call → judge → record` with `Semaphore`-bounded parallelism, live `EvalRunState` for the dashboard, and resume-after-OS-kill support.
+- Seeded runs force serial execution to avoid cross-case DB contamination; cost priced into `CostLedger` for agent + judge.
+- Verbose per-case console logging (question, tools, answer, verdict) and `CaseStatus` mapping (flake → FLAKED).
+
+<Note>
+Scaffold generated from the codebase map — expand with full detail, examples, and specifics.
+</Note>

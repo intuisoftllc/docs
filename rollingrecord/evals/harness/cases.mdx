@@ -1,0 +1,16 @@
+---
+title: "Cases, Suites & Loading"
+description: "The TestCase model and how suites and cases are loaded from disk."
+---
+
+Cases are JSON records grouped into suites and buckets, loaded and validated by the harness.
+
+## What this covers
+
+- `TestCase` dataclass fields and `load_suite_cases` directory walk (`suites/<suite>/<bucket>/*_{n}.json`, each file a JSON array) in `evals/core/case.py`.
+- Required fields (`id`/`input`/`expected`), duplicate-id detection, `tags`, `notes`, `is_flake`, and the optional `session` spec schema.
+- How the `--bucket` and `--case` filters resolve.
+
+<Note>
+Scaffold generated from the codebase map — expand with full detail, examples, and specifics.
+</Note>

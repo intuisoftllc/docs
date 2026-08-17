@@ -1,0 +1,16 @@
+---
+title: "Chain Primitives"
+description: "Composing judges with Cascade, AllOf, AnyOf, Majority, MinConfidence."
+---
+
+Chain primitives compose individual judges into a decision pipeline, ordering cheap deterministic checks before expensive LLM grading.
+
+## What this covers
+
+- `Cascade`, `AllOf`, `AnyOf`, `Majority`, `MinConfidence` composition semantics and the PASS/FAIL/UNCERTAIN/SKIP truth table (`evals/judges/chains.py`).
+- Cost = sum of children that ran; cheap-deterministic-first, expensive-LLM-last ordering; `MinConfidence` as the escalation knob.
+- How child verdicts nest into `details.children` (rendered by the runner's verdict tree).
+
+<Note>
+Scaffold generated from the codebase map — expand with full detail, examples, and specifics.
+</Note>

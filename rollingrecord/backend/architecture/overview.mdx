@@ -1,0 +1,16 @@
+---
+title: "Backend Overview"
+description: "The Supabase backend at a glance — Edge Functions, storage, and the external services behind RollingRecord."
+---
+
+RollingRecord's backend is one self-contained monorepo part (supabase/) combining Supabase Postgres, Deno/TypeScript Edge Functions, and Storage.
+
+## What this covers
+
+- The backend is one monorepo "part" (supabase/) designed for a future clean git filter-repo split; components are Supabase Postgres + Edge Functions (Deno/TypeScript) + Storage, fronted by Firebase App Check and paid via RevenueCat.
+- The real runtime pieces: the ai-engine proxy, the sync engine (sync-push/sync-pull/sync-reserve/sync-audio/sync-reconcile), the async extraction plane (extract-submit/extract-runner/extract-results), transcription (transcribe-* ops + assemblyai-webhook + transcribe-drain), and identity/webhooks (resolve-identity, clerk-webhook, revenuecat-webhook).
+- External services: Anthropic + Gemini (LLM), AssemblyAI (transcription), Cohere (embeddings), Brevo (transactional email), Clerk (auth/JWT + Svix webhooks), RevenueCat (entitlements), Supabase Vault (KEK).
+
+<Note>
+Scaffold generated from the codebase map — expand with full detail, examples, and specifics.
+</Note>

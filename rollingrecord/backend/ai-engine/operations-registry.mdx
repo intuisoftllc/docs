@@ -1,0 +1,16 @@
+---
+title: "Operation Registry"
+description: "How ai-engine operations are registered and resolved, and the full operation list."
+---
+
+Each ai-engine operation is an OperationHandler in a central registry resolved by findHandler(); extraction is deliberately not here (it's async).
+
+## What this covers
+
+- operations/index.ts OPERATIONS map + findHandler(); the OperationHandler contract (validateInput, execute, capCategory, usageColumn, capKey, requiredEntitlement, featureFlag).
+- Real ops: kb_query, synthesis, transcribe_submit/transcribe_fetch/transcribe_upload_init, sub-ops (keywords, context_summary, thread_naming, template_moderation, query_expand), user-blueprint ops (save/list/delete_user_blueprint).
+- Note: there is no synchronous extract op — extraction is fully async (see the Extraction section).
+
+<Note>
+Scaffold generated from the codebase map — expand with full detail, examples, and specifics.
+</Note>

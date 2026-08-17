@@ -1,0 +1,15 @@
+---
+title: "Table Naming l_ / h_ / f_ / c_"
+description: "The prefix conventions that encode a table's retention and purpose."
+---
+
+Table-name prefixes encode purpose and retention — long-retention logs, short-retention history, financial state, and cloud-synced tables.
+
+## What this covers
+
+- l_* long-retention audit/compliance/financial-event logs (l_user_key_access, l_admin_audit, l_user_abuse_event, l_deleted_identity, l_credit_consumption, l_entitlement_events), swept by prune_log_tables().
+- h_* short-retention support history (h_transcribe_history, h_ai_engine_sessions), swept by prune_h_tables(); f_* financial state (f_user_financials); c_* cloud-synced tables.
+
+<Note>
+Scaffold generated from the codebase map — expand with full detail, examples, and specifics.
+</Note>

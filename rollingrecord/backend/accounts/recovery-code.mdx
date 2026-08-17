@@ -1,0 +1,14 @@
+---
+title: "Recovery Codes"
+description: "The two-op recovery-code design and its one-shot-per-account rule."
+---
+
+Recovery codes use a generate-then-acknowledge design, hashed once per account with argon2id.
+
+## What this covers
+
+- The recovery-code two-op design (generate is idempotent to recovery_code_pending, acknowledge stores an argon2id hash in canonical_users.recovery_code_hash); one-shot per account (recovery_code_already_exists); legacy recovery-code-generate; the support-ops Tier-3 regenerate escape hatch.
+
+<Note>
+Scaffold generated from the codebase map — expand with full detail, examples, and specifics.
+</Note>

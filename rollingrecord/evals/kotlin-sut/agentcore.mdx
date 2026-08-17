@@ -1,0 +1,16 @@
+---
+title: "agentcore Shared Agent Loop"
+description: "The KB-chat agent loop shared by the app and the eval runner."
+---
+
+`agentcore` holds the `AgentLoop` extracted verbatim from the app, so evals drive the exact production loop.
+
+## What this covers
+
+- `AgentLoop.kt` (`app/agentcore`): the KB-chat tool loop extracted verbatim from `KnowledgeBaseAdvisor`, driving both the Android app and the eval runner; round budget from `ServerConfig.kbChatMaxToolRounds` + fallback final round.
+- `AgentTurnRequest`/`AgentTurnOutcome`, the full `AiEngineResult`→user-string mapping, `hadWriteOp`, and response sanitization.
+- What the loop does NOT own (pre-flight, tool dispatch behind `ToolExecutor`, analytics) plus wire models under `data/remote/aiengine/model`.
+
+<Note>
+Scaffold generated from the codebase map — expand with full detail, examples, and specifics.
+</Note>

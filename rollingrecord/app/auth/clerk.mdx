@@ -1,0 +1,15 @@
+---
+title: "Authentication (Clerk)"
+description: "How the app authenticates through the Clerk SDK."
+---
+
+All authentication routes through a repository that wraps the Clerk SDK, which issues the JWTs the backend consumes.
+
+## What this covers
+
+- `AuthRepository` wraps the Clerk SDK (all auth routes through it); `Clerk.userFlow` session state and `Session.fetchToken()` JWTs.
+- `AuthUserStore` session persistence and `AuthCallbackActivity` for SSO callbacks.
+
+<Note>
+Scaffold generated from the codebase map — expand with full detail, examples, and specifics.
+</Note>

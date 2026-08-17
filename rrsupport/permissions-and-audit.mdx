@@ -1,0 +1,17 @@
+---
+title: "Permissions & Audit Log"
+description: "The per-operation admin permission model and the l_admin_audit trail."
+---
+
+Every admin gets a per-operation permission set, and every action is recorded to an append-only audit log — the two mechanisms that keep support-ops accountable.
+
+## What this covers
+
+- **Permission model:** `supabase/functions/_shared/admin/permissions.ts` — per-op boolean columns on the `admin_permissions` table, typed by the `AdminPermissionKey` enum (`can_delete_user`, `can_validate_codes`, `can_set_account_password`, `can_view_user_data`, `can_freeze_account`, `can_grant_credits`, `can_restore_tombstones`, `can_reset_extraction`, …).
+- **Evaluation:** the dispatcher fetches the row once per request via `getAdminPermissions()`, then each op checks `hasAdminPermission(row, key)`; `is_super_admin = true` bypasses every per-op check. Denials go to `l_user_abuse_event`, not the audit log.
+- **Self-introspection:** the `whoami` op is the only one with `requiredPermission: null` — it returns the caller's own grants so a UI client can hide operations it can't run.
+- **Audit trail:** every mutating/dry-run/commit writes to `l_admin_audit` (operation_type, execution_state, admin identity/IP/UA, target, redacted params/result, `preview_id`, optional `ticket_ref`); read ops store `result_json = null`. Queryable via `--op admin-audit` / `--op user-audit`.
+
+<Note>
+Scaffold generated from the codebase map — expand with full detail, examples, and specifics.
+</Note>

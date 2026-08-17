@@ -1,0 +1,16 @@
+---
+title: "Scheduled Recordings"
+description: "Time-based recordings via AlarmManager and WorkManager."
+---
+
+Scheduled recordings start and stop themselves at planned times using AlarmManager and WorkManager, re-arming across reboots.
+
+## What this covers
+
+- `ScheduledRecording` model + `RepeatMode`, `ScheduleLogic`, `ScheduledRecordingRepository`, `ScheduleEnqueuer`.
+- AlarmManager path: `ScheduleAlarmReceiver`, `ScheduledRecordingStartWorker`/`StopWorker`, `PreStartNotificationWorker`; re-arm on boot via `BootReceiver`.
+- Schedule UI: `V2ScheduleScreen` / `V2AddScheduleScreen` / `V2ScheduleViewModel`.
+
+<Note>
+Scaffold generated from the codebase map — expand with full detail, examples, and specifics.
+</Note>

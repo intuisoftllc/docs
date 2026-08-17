@@ -1,0 +1,16 @@
+---
+title: "Judge Framework"
+description: "The Judge contract and per-case resolution."
+---
+
+Judges turn a case's actual output into a verdict; each suite resolves the right judge (or chain) per case.
+
+## What this covers
+
+- `Judge` ABC + `JudgeContext` + single `evaluate()→Verdict` contract (`evals/judges/base.py`); why cost is bundled into the verdict.
+- Per-case resolution: each suite exports `judge_for_case(case, *, anthropic)` (`run.py` `_load_judge_resolver`), dispatched across suites in `--all` runs.
+- The judge file inventory in `evals/judges/` (deterministic, fuzzy, semantic, llm, external_llm, faithfulness, grounded_extraction, retrieval, session_judges).
+
+<Note>
+Scaffold generated from the codebase map — expand with full detail, examples, and specifics.
+</Note>

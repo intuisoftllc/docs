@@ -1,0 +1,16 @@
+---
+title: "Interruption Handling & Recovery"
+description: "How calls, audio-focus loss, and kills are handled during recording."
+---
+
+Recording survives interruptions gracefully — pausing on calls, auto-recovering from audio-focus loss, and reporting recovery after a kill.
+
+## What this covers
+
+- `CallStateHandler` pauses on phone calls (manual resume); audio-focus loss and mic contention auto-recover rather than pausing.
+- `RecordingInterruptedState` + `V2RecordingInterruptedSheet` surfacing the outcome to the user.
+- The "Block calls while recording" setting.
+
+<Note>
+Scaffold generated from the codebase map — expand with full detail, examples, and specifics.
+</Note>

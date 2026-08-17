@@ -1,0 +1,17 @@
+---
+title: "The support-ops Dispatcher"
+description: "The single admin Edge Function, its three-layer gate chain, and the dry-run safety model."
+---
+
+Every RRSupport operation goes through one admin dispatcher Edge Function that runs its own layered authentication and a dry-run→commit safety model before touching anything.
+
+## What this covers
+
+- **Single admin dispatcher** at `supabase/functions/support-ops/index.ts`; `verify_jwt = false` in `supabase/config.toml` — it runs its own Clerk JWT check via `runGates` instead of Supabase's built-in.
+- **Three-layer gate chain, all required:** (1) `runGates()` JWT auth (App Check opted out, App Version floor kept), (2) `verifyAdminSecret()` checking the `X-Admin-Secret` / `ADMIN_OPS_SECRET` env var, (3) `verifyAdminHmac()` HMAC-SHA256 over `X-Timestamp + "." + body` with `ADMIN_OPS_HMAC_KEY` and a 60-second replay window (`_shared/admin/secret.ts`, `_shared/admin/hmac.ts`).
+- **Dry-run→commit for mutating ops:** default `dry_run: true` returns a `preview_id`; committing requires `dry_run: false` + matching `preview_id`, validated by `validateDryRunPreview()` (15-min window, same admin, same op, canonical-JSON params hash). Read-only ops (`isReadOnly: true`) skip it.
+- **Auditing + rate limiting:** every admitted request writes an `l_admin_audit` row (via `redactAuditJson()` to scrub secrets) and is gated by `checkRateLimit(Bucket.SupportOps, ...)`; gate/permission denials route to `l_user_abuse_event` instead.
+
+<Note>
+Scaffold generated from the codebase map — expand with full detail, examples, and specifics.
+</Note>

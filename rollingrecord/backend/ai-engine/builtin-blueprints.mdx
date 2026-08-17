@@ -1,0 +1,15 @@
+---
+title: "Built-in Extraction Blueprints"
+description: "The server-owned extraction template prompts and the append-only ID rule that protects old clients."
+---
+
+Twelve server-owned extraction prompts ship inside ai-engine, addressed by permanently-append-only numeric IDs.
+
+## What this covers
+
+- 12 server-owned prompts under blueprints/builtin/ (voice-memo, general-notes, interview, lecture-notes, sprint-standup, one-on-one, sales-call, brainstorming, coaching, medical-appointment, developer, etc.); the BUILTIN_TEMPLATES registry index.ts is the single source of truth.
+- HARD RULE: built-in IDs are append-only / permanently burned; deprecation is via serve-old or a 410 template_retired.
+
+<Note>
+Scaffold generated from the codebase map — expand with full detail, examples, and specifics.
+</Note>

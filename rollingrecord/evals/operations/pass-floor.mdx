@@ -1,0 +1,16 @@
+---
+title: "Pass Floor, Flakes & Exit Codes"
+description: "How the harness decides pass/fail and sets its exit code."
+---
+
+The exit-code policy combines the pass floor, regression detection, and flake accounting to decide whether a run succeeds.
+
+## What this covers
+
+- Exit-code policy in `run.py` `_print_summary`: 0 (rate ≥ floor, no regressions), 1 (below floor OR any regression), 2 (run aborted/failed); default floor `0.95` in `config.py`.
+- Flake accounting (`is_flake` excluded from denominator + exit code) and `--repeat` reliability badges (reliable ≥95% / flaky 50–94% / broken <50%).
+- Regression always breaks the build regardless of floor.
+
+<Note>
+Scaffold generated from the codebase map — expand with full detail, examples, and specifics.
+</Note>

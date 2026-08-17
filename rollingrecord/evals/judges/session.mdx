@@ -1,0 +1,16 @@
+---
+title: "Session-Aware Judges"
+description: "Judges that grade the multi-round trace, not just the final answer."
+---
+
+Session-aware judges read the `_session` trace to assert on which tools were called, in what order, and within what round budget.
+
+## What this covers
+
+- `MustCallToolJudge`, `MustNotCallToolJudge`, `RoundBudgetJudge`, `ToolCallSequenceJudge` (`evals/judges/session_judges.py`) reading `_session.all_tool_calls`/`terminal_reason`.
+- The `expected` keys they consume (`must_call_tools`, `must_not_call_tools`, `round_budget`, `tool_call_sequence`) and their opt-in SKIP behavior.
+- Why the multi-round trace (not just the final answer) is what these grade.
+
+<Note>
+Scaffold generated from the codebase map — expand with full detail, examples, and specifics.
+</Note>

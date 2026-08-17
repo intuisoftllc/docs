@@ -1,0 +1,14 @@
+---
+title: "App Lock PIN (set-user-pin)"
+description: "How the App Lock PIN verifier is stored server-side so it syncs across devices."
+---
+
+set-user-pin writes a DEK-encrypted PIN verifier to user_crypto so App Lock syncs across devices while the server stays zero-knowledge.
+
+## What this covers
+
+- Writes/clears the DEK-encrypted PIN verifier (pin_verifier_ct/_iv) on user_crypto so App Lock syncs across devices; the server is zero-knowledge on the PIN; clearing requires an app_lock_pin_reset OTP ticket, setting does not.
+
+<Note>
+Scaffold generated from the codebase map — expand with full detail, examples, and specifics.
+</Note>

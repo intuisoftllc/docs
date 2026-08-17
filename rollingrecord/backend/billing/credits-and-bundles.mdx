@@ -1,0 +1,15 @@
+---
+title: "Credits, Bundles & Ceilings"
+description: "The credit ledger, bundle purchases/refunds, and the all-or-nothing credit ceiling."
+---
+
+Manual credits and purchased bundles top up usage, guarded by a ledger and an integrity ceiling.
+
+## What this covers
+
+- manual_credits (admin grants, no-FK so it is in TABLES_TO_WIPE), the l_credit_consumption ledger, bundle purchases (creditBundle/refundBundle); credit_ceiling_exceeded all-or-nothing integrity ceiling (applies to admin grants); _shared/db/user-credits.ts, credit-ceiling.ts.
+- grant_manual_credit validation codes (amount_not_integer, amount_out_of_range, invalid_credit_type).
+
+<Note>
+Scaffold generated from the codebase map — expand with full detail, examples, and specifics.
+</Note>

@@ -1,0 +1,15 @@
+---
+title: "Testing Strategy"
+description: "The two testing layers — Deno pure-logic unit tests and the gate-chain smoke suite."
+---
+
+Pure logic is unit-tested with Deno mirroring the source layout, while the smoke suite drives the real Edge Function gate chain.
+
+## What this covers
+
+- Deno pure-logic unit tests mirror the source layout under supabase/tests/ (deno task test) — cost math, sync transforms, validators, registries, extraction/transcribe/billing/crypto helpers.
+- Smoke tests (smoketest/) must drive the real Edge Function gate chain (service-role only for preconditioning/assertion reads); no raw DELETE / crypto-column nulling on c_recordings.
+
+<Note>
+Scaffold generated from the codebase map — expand with full detail, examples, and specifics.
+</Note>

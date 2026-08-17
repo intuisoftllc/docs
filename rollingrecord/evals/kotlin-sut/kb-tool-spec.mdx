@@ -1,0 +1,16 @@
+---
+title: "KbToolSpec (client-owned tools)"
+description: "The single source of truth for the client-owned KB tool definitions."
+---
+
+`KbToolSpec` is the single source of truth for the KB tool definitions and usage instructions the AI sees — client-owned by design.
+
+## What this covers
+
+- `KbToolSpec.kt` (`app/agentcore/.../data/repository`): single source of truth for tool DEFINITIONS + usage instructions the AI sees; client-owned per the AI-Content-Placement HARD RULE.
+- How `KbToolSpec.definitions()`/`usageInstructions()` feed both `agentrunner` and the snapshot that generates `evals/fixtures/kb_query_tools.json`.
+- The full production tool catalog (search/list/transcript/propose/write tools) referenced by mock-tool and session judges.
+
+<Note>
+Scaffold generated from the codebase map — expand with full detail, examples, and specifics.
+</Note>

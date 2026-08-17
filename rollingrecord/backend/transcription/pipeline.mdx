@@ -1,0 +1,15 @@
+---
+title: "Transcription Pipeline"
+description: "The submit/fetch transcription pipeline and server-side duration measurement."
+---
+
+Transcription is a submit/fetch pipeline fronting AssemblyAI, with the server measuring audio duration for billing.
+
+## What this covers
+
+- The submit/fetch split: transcribe_upload_init (signed upload URL + transcribe_jobs row), transcribe_submit (submit to AssemblyAI, returns immediately), assemblyai-webhook (completion writes transcribe_results), transcribe_fetch (client polls).
+- Server-side duration measurement (_shared/transcribe/ogg-duration.ts, audio-duration.ts); unreadable_audio, audio_too_short, audio_too_large.
+
+<Note>
+Scaffold generated from the codebase map — expand with full detail, examples, and specifics.
+</Note>

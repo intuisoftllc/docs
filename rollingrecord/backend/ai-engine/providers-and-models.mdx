@@ -1,0 +1,16 @@
+---
+title: "Provider Chain, Models & Pricing"
+description: "Config-driven provider failover, the model allowlist, and token cost tracking."
+---
+
+Per-operation provider chains, an enforced model allowlist, and per-token cost tracking are all driven from server_config for redeploy-free changes.
+
+## What this covers
+
+- _shared/ai/provider-chain.ts reads per-op provider chains from server_config (e.g. extract_provider_chain) for redeploy-free failover; providers under _shared/ai/providers/ (anthropic, gemini); all_providers_failed/provider_rate_limited.
+- models.ts allowlist enforcement (model_not_allowed, dev cannot bypass), operation-models.ts per-op selection, pricing.ts + client.ts cost tracking via trackTokenUsage to f_user_financials.ai_cost_micros.
+- AI stubbing gate (shouldStubAi) for smoke tests.
+
+<Note>
+Scaffold generated from the codebase map — expand with full detail, examples, and specifics.
+</Note>

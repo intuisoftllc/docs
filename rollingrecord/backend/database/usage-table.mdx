@@ -1,0 +1,15 @@
+---
+title: "usage Table & Metered Counters"
+description: "The per-(user, period) counter table, calendar-month reset, and the add-a-counter checklist."
+---
+
+The usage table holds one row per user per calendar month, resetting on the first of the month UTC with no cron.
+
+## What this covers
+
+- One row per (auth_user_id, period = YYYY-MM UTC); calendar-month reset (never rolling, no cron); the full counter inventory (ai_queries, syntheses, transcription_ms, deep_reasoning_syntheses, runaway *_count, items_indexed, token analytics).
+- Adding a counter: the 10-step checklist (migration + server_config cap + USAGE_COUNTER_COLUMNS + get-user-usage + UserUsageCaps + handler registration + Android mirror + smoke test).
+
+<Note>
+Scaffold generated from the codebase map — expand with full detail, examples, and specifics.
+</Note>

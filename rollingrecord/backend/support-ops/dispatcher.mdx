@@ -1,0 +1,15 @@
+---
+title: "support-ops 3-Layer Gate Chain"
+description: "The admin dispatcher and its three stacked authentication layers."
+---
+
+support-ops is an obfuscated admin endpoint guarded by JWT, an admin secret, and an HMAC signature with a replay window.
+
+## What this covers
+
+- An obfuscated admin endpoint; Layer 1 runGates (JWT, App Check opted out for the CLI), Layer 2 X-Admin-Secret (ADMIN_OPS_SECRET), Layer 3 X-Signature HMAC-SHA256 over timestamp.body (ADMIN_OPS_HMAC_KEY, 60s replay window); _shared/admin/secret.ts, hmac.ts.
+- Rate limit after structural admission (never bypassed even for dev); gate rejections go to l_user_abuse_event, not l_admin_audit.
+
+<Note>
+Scaffold generated from the codebase map — expand with full detail, examples, and specifics.
+</Note>

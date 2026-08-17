@@ -1,0 +1,14 @@
+---
+title: "KEK Lifecycle & user_crypto"
+description: "The key-encryption-key lifecycle and the per-user text DEK."
+---
+
+The master KEK lives in Vault with a documented lifecycle, while each user has a text DEK on user_crypto for synced content.
+
+## What this covers
+
+- docs/encryption/02-key-management.md: KEK in Vault, bootstrap migration, cold-backup step, rotation, kek_version; the per-user text DEK on user_crypto (one DEK encrypts all synced text columns); get-user-key provisioning.
+
+<Note>
+Scaffold generated from the codebase map — expand with full detail, examples, and specifics.
+</Note>

@@ -1,0 +1,16 @@
+---
+title: "Server vs Client Configuration"
+description: "Where each config value lives — Supabase server_config vs Firebase Remote Config — and why there is no duplication."
+---
+
+Every config value lives in exactly one place; the server is always authoritative and local defaults are cold-start fallbacks only.
+
+## What this covers
+
+- The server_config table is server-authoritative (token ceilings, model allowlist, monthly caps, kill switches, provider chains); rate_limit_config is the one dedicated exception table (bucket to max + window + enabled). Firebase Remote Config holds client-only knobs.
+- Rule: every config value lives in exactly one place — no intentional duplication; DEFAULT_* Kotlin constants are cold-start fallbacks only, the server always wins.
+- The server-config Edge Function serves only WHERE public = true rows to the client; server-only knobs never reach client network traffic.
+
+<Note>
+Scaffold generated from the codebase map — expand with full detail, examples, and specifics.
+</Note>

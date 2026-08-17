@@ -1,0 +1,15 @@
+---
+title: "Envelope Encryption Model"
+description: "The KEK/DEK envelope model that protects audio, and its deliberate non-E2EE tradeoffs."
+---
+
+Audio is protected by envelope encryption — a Vault master key wrapping per-file keys — with the plaintext key existing only in RAM.
+
+## What this covers
+
+- The plain-English KEK (Vault master) / DEK (per-file) / wrapped DEK / IV design from docs/encryption/01-overview.md; three-system defense-in-depth (Storage + Postgres + Vault); the explicitly-not-E2EE tradeoffs.
+- Client-side streaming AES-256-GCM on upload/download; the plaintext DEK exists in RAM only.
+
+<Note>
+Scaffold generated from the codebase map — expand with full detail, examples, and specifics.
+</Note>

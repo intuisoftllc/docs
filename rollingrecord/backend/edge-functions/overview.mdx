@@ -1,0 +1,15 @@
+---
+title: "Edge Function Catalog & Conventions"
+description: "The full list of Edge Functions and the scaffolding conventions every one follows."
+---
+
+Every Edge Function scaffolds with runGates() plus a config object, never inline gate logic, and many use a single-dispatcher pattern.
+
+## What this covers
+
+- Full list from config.toml (all verify_jwt = false), grouped by purpose; every function scaffolds with runGates() + config, never inline gate logic (Schema HARD RULE 4).
+- Dispatcher pattern (single obfuscated endpoint + operation field) used by ai-engine, support-ops, analytics, sync-audio, sync-reconcile to avoid one-secret-per-function deploys.
+
+<Note>
+Scaffold generated from the codebase map — expand with full detail, examples, and specifics.
+</Note>

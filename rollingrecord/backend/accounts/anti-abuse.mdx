@@ -1,0 +1,14 @@
+---
+title: "Anti-Abuse & Re-signup Carryover"
+description: "How abuse counters survive account deletion and re-signup within a period."
+---
+
+Anti-abuse counters are snapshotted at deletion and carried forward on same-email re-signup, feeding a top-offenders view.
+
+## What this covers
+
+- l_deleted_identity counter snapshots carried forward on same-email re-signup within a period (_shared/users/deleted-identity-history.ts, USAGE_COUNTER_COLUMNS); l_user_abuse_event + abuse-log.ts + the top-offenders query.
+
+<Note>
+Scaffold generated from the codebase map — expand with full detail, examples, and specifics.
+</Note>

@@ -1,0 +1,14 @@
+---
+title: "resolve-identity"
+description: "The launch-time function that provisions the canonical_users row and carries anti-abuse counters forward."
+---
+
+Called every app launch, resolve-identity upserts the caller's canonical_users row and carries forward anti-abuse snapshots on re-signup.
+
+## What this covers
+
+- Called every launch: upserts canonical_users, carries forward anti-abuse counter snapshots from l_deleted_identity on same-email re-signup within the period; computes lifetime status.
+
+<Note>
+Scaffold generated from the codebase map — expand with full detail, examples, and specifics.
+</Note>

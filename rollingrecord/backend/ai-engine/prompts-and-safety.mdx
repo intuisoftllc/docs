@@ -1,0 +1,15 @@
+---
+title: "Server-Side Prompts & Safety Sandwich"
+description: "Why AI-facing prompts and the extraction tool schemas live server-side, and how the safety sandwich wraps them."
+---
+
+Behavioral prompts and the proprietary extraction tool schemas live server-side, wrapped by the safety sandwich, per the AI content-placement rule.
+
+## What this covers
+
+- The server-side placement rule (reputation/behavioral/hotfix/IP goes server); prompts under prompts/ (extract.ts safety sandwich TOOL_SPEC_ONLY / CONTENT_BOUNDARY / INCREMENTAL_ADDENDUM, medical-mode.ts, template-moderation.ts).
+- The 4 extraction tool schemas (saveSection/replaceSection/saveTasks/completeTasks) are server-side IP; kb_query tools stay client-side.
+
+<Note>
+Scaffold generated from the codebase map — expand with full detail, examples, and specifics.
+</Note>
