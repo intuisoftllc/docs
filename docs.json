@@ -153,6 +153,7 @@
                 "pages": [
                   "rollingrecord/app/platform/analytics",
                   "rollingrecord/app/platform/app-check",
+                  "rollingrecord/app/platform/bug-reports",
                   "rollingrecord/app/platform/logging",
                   "rollingrecord/app/platform/networking",
                   "rollingrecord/app/platform/notifications",
@@ -169,7 +170,6 @@
                 "group": "Dev Mode",
                 "pages": [
                   "rollingrecord/app/devmode/architecture",
-                  "rollingrecord/app/devmode/in-app-evals",
                   "rollingrecord/app/devmode/tools"
                 ]
               }
@@ -194,6 +194,7 @@
                   "rollingrecord/backend/gates/account-frozen",
                   "rollingrecord/backend/gates/dev-bypass-scope",
                   "rollingrecord/backend/gates/entitlement-and-grace",
+                  "rollingrecord/backend/gates/health-probes",
                   "rollingrecord/backend/gates/jwt-auth",
                   "rollingrecord/backend/gates/method-appcheck-version",
                   "rollingrecord/backend/gates/rate-limiting",
@@ -207,8 +208,10 @@
                   "rollingrecord/backend/edge-functions/overview",
                   "rollingrecord/backend/edge-functions/ai-engine",
                   "rollingrecord/backend/edge-functions/analytics",
+                  "rollingrecord/backend/edge-functions/bug-report",
                   "rollingrecord/backend/edge-functions/get-user-key",
                   "rollingrecord/backend/edge-functions/get-user-usage",
+                  "rollingrecord/backend/edge-functions/notifications",
                   "rollingrecord/backend/edge-functions/resolve-identity",
                   "rollingrecord/backend/edge-functions/server-config",
                   "rollingrecord/backend/edge-functions/webhooks"
@@ -304,6 +307,7 @@
               {
                 "group": "Support-Ops",
                 "pages": [
+                  "rollingrecord/backend/support-ops/bug-triage",
                   "rollingrecord/backend/support-ops/dispatcher",
                   "rollingrecord/backend/support-ops/dry-run-and-audit",
                   "rollingrecord/backend/support-ops/operations-catalog",
@@ -372,19 +376,6 @@
                   "rollingrecord/evals/kotlin-sut/agentrunner",
                   "rollingrecord/evals/kotlin-sut/contract",
                   "rollingrecord/evals/kotlin-sut/kb-tool-spec"
-                ]
-              },
-              {
-                "group": "On-Device Eval Mode",
-                "pages": [
-                  "rollingrecord/evals/on-device/overview",
-                  "rollingrecord/evals/on-device/access",
-                  "rollingrecord/evals/on-device/corpus",
-                  "rollingrecord/evals/on-device/embedding-runner",
-                  "rollingrecord/evals/on-device/judges-suites",
-                  "rollingrecord/evals/on-device/results-ui",
-                  "rollingrecord/evals/on-device/runner",
-                  "rollingrecord/evals/on-device/sut"
                 ]
               },
               {

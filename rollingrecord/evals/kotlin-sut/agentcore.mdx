@@ -7,7 +7,7 @@ description: "AgentLoop and its seams — the KB-chat tool loop extracted verbat
 
 ## What the loop owns — and does not
 
-`AgentLoop.run(request)` owns the round mechanics: per-round `KbQueryInput` construction, the `start`/`continueQuery` session calls, the full `AiEngineResult` → error-string mapping, token accounting, `tool_use` filtering and `tool_result` message assembly, the exhausted-rounds fallback round, and crash containment.
+`AgentLoop.run(request)` owns the round mechanics: per-round `KbQueryInput` construction, the `start`/`continueQuery` session calls, the full `AiEngineResult` → error-string mapping, token accounting, `tool_use` filtering and `tool_result` message assembly (including the per-block `is_error` flag), the exhausted-rounds fallback round, and crash containment.
 
 It deliberately does NOT own pre-flight (FTS orientation, scope resolution, scope-block construction, capability gates), tool-handler logic (behind the `ToolExecutor` seam), proposal/source accumulation (executor state), or the turn-lifecycle trace and end-of-turn analytics (the caller's). The caller does all pre-flight and hands the finished inputs in; the loop never reaches back into app state.
 
@@ -38,9 +38,11 @@ The terminal result is a sealed class with token totals, round count, and the wr
 
 ## The round loop
 
-`maxRounds` is read from `ServerConfig.kbChatMaxToolRounds`. The loop `repeat(maxRounds)` times, each iteration building an inputs-only `KbQueryInput` with `isFinal = false` — the server owns the prompt, tools, model, round number, and round budget; the client only signals "this is a tool round." Round 1 calls `sessionManager.start(kbInput)`; every later round calls `sessionManager.continueQuery(kbInput)`, threading the server-issued `x-query-session-token`.
+`maxRounds` is read from `ServerConfig.kbChatMaxToolRounds`, and each round's `maxHistoryPairs` from `ServerConfig.kbChatMaxHistoryPairs` (both are server config — the loop reads them from `ServerConfig`, not the removed `ClientConfig`). The loop `repeat(maxRounds)` times, each iteration building an inputs-only `KbQueryInput` with `isFinal = false` — the server owns the prompt, tools, model, round number, and round budget; the client only signals "this is a tool round." Round 1 calls `sessionManager.start(kbInput)`; every later round calls `sessionManager.continueQuery(kbInput)`, threading the server-issued `x-query-session-token`.
 
 A round is done when `response.stopReason == "end_turn"` or there are no `tool_use` blocks. Text is only read when Claude has explicitly finished — text blocks that appear alongside `tool_use` blocks are internal monologue and must never reach the user. When not done, the assistant's full content is appended to the message list, each `tool_use` is dispatched through `ToolExecutor.execute(...)` (ORing `isWriteOp` into the sticky `hadWriteOp`), and the results are appended as a `tool_result` user message.
+
+Each `tool_result` block also carries `is_error: true` when the executed `ToolResult.isError` is set (`if (executed.isError) put("is_error", true)`); the key is OMITTED on success, so every existing result keeps its exact wire shape. Until this existed a task created and a task refused reached the model as byte-identical envelopes, distinguishable only by reading the content string, so the model skimmed past refusals and reported writes that never happened as success. Only genuine failures set the flag — a `NO_DATA` refusal or an empty search is a successful call with nothing in it, not an error.
 
 When all tool rounds are exhausted, the loop pushes a terminal user message and makes one final `is_final = true` round with a client-owned fallback prompt (`FALLBACK_PROMPT_WRITE` when a write occurred, else `FALLBACK_PROMPT_READ`) and no tools, so the model cannot emit XML stubs. The session budget reserves one slot beyond `max_tool_rounds` for this final step. These fallback prompts live in the loop per the AI-Content-Placement HARD RULE (Rule 3, atomic with loop code).
 
@@ -65,7 +67,7 @@ Every failure class maps to an exact user-facing message inside `run()`. The thr
 | `Upstream` | AI service is temporarily unavailable. Please try again in a moment. |
 | `Network` | Rethrown so `runCatching` wraps it as an error outcome. |
 
-`CancellationException` always propagates out of `run()`; every other throwable is caught by the outer `runCatching`, logged via `AgentLog`, counted as a `loop_crash` analytics event, and returned as `AgentTurnOutcome.Error`. `sanitizeResponseText()` strips any leaked function-call XML (`<function_calls>`, `<invoke>`, `<parameter>`) and internal identifiers (`contextId=…`, `recordingId=…`, `insightIndex=…`, `[internal-only:…]`) before the answer is returned.
+`CancellationException` always propagates out of `run()`; every other throwable is caught by the outer `runCatching`, logged via `AgentLog` with `save = true` (a loop crash is the one place a tool round can die outright — persisting it makes the crash visible in an uploaded log rather than looking identical to the model simply declining to call a tool), counted as a `loop_crash` analytics event, and returned as `AgentTurnOutcome.Error`. `sanitizeResponseText(text, tools)` scrubs the final answer before it is returned: it strips leaked function-call XML (`<function_calls>`, `<invoke>`, `<parameter>`) and internal identifiers (`contextId=…`, `recordingId=…`, `insightIndex=…`, `[internal-only:…]`), and — as a Level-1 backstop for the server prompt's "never name an internal tool" rule — replaces any internal tool NAME with the literal `a lookup`. That tool-name pass builds a word-anchored, case-sensitive, longest-first alternation regex from THIS turn's tool list (`tools.map { it.name }`), so a new tool is covered automatically and camelCase names like `addNote` never collide with ordinary prose; it is a no-op when `tools` is empty.
 
 ## The seams
 
@@ -74,7 +76,7 @@ The loop reaches the outside world through three interfaces, each bound differen
 | Seam | Contract | App binding | Runner binding |
 | --- | --- | --- | --- |
 | `AiEnginePort` | `fun interface` — `suspend kbQuery(input, sessionToken)` → `AiEngineResult<AiPassthroughResponse>` | `AiEngineClient::kbQuery` (Retrofit + App Check/JWT interceptors) | `HttpAiEnginePort` (plain HTTP + harness tokens) |
-| `ToolExecutor` | `fun interface` — `suspend execute(ToolCall)` → `ToolResult(text, isWriteOp)` | Per-turn dispatcher in `KnowledgeBaseAdvisor` (DAO reads, write callbacks, per-turn caps) | `RunnerToolExecutor` (mock fixtures) |
+| `ToolExecutor` | `fun interface` — `suspend execute(ToolCall)` → `ToolResult(text, isWriteOp, isError)` (`isError` defaults `false`) | Per-turn dispatcher in `KnowledgeBaseAdvisor` (DAO reads, write callbacks, per-turn caps) | `RunnerToolExecutor` (mock fixtures) |
 | `KbQuerySessionManager` | Holds one in-progress `kb_query`; `start()` mints the token, `continueQuery()` reuses it | Same class, one per user question | Same class, fresh per turn |
 
 `ToolCall` keeps `name` NULLABLE on purpose — the wire model's `AiContentBlock.name` is nullable and the dispatcher's `else` branch historically rendered a null name as the literal `Unknown tool: null`; executors apply `name ?: "unknown"` themselves. `AgentMessageAssembly.buildInitialMessages(...)` lives in `:agentcore` too, so the app and the runner assemble BYTE-IDENTICAL turn openings — drift there would mean evals test a different prompt shape than production sends.

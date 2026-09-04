@@ -10,7 +10,7 @@ The harness ships fifteen suites under `evals/suites/`, each targeting a specifi
 | Suite | Mode | Operation | Targets |
 | --- | --- | --- | --- |
 | `kb_chat` | Mixed | `kb_query` | Core chatbot answers over recordings/notes/contexts — capability listing, factual recall, hallucination, over-refusal, multi-turn context. |
-| `kb_chat_session` | Session | `kb_query` | End-to-end agent loop: tool use, empty-result honesty, follow-up reuse, over-use on meta questions, looping to budget. Broad adversarial coverage. |
+| `kb_chat_session` | Session | `kb_query` | End-to-end agent loop: tool use, empty-result honesty, follow-up reuse, over-use on meta questions, looping to budget. Broad adversarial coverage, including sustained soft purpose-framing social engineering ("for the purposes of debugging", no authority claim) and tool-result-shape probing, both graded for compliance decay across turns. |
 | `kb_chat_session_live` | Session | `kb_query` | Live multi-turn coherence — the bot generates every assistant turn; grades the full transcript for held positions under escalating pressure. |
 | `abstention` | Session | `kb_query` | The "I don't know" test — admit when content isn't recorded vs fabricate; and the mirror, false abstention when the answer IS present. |
 | `context_architecture` | Session | `kb_query` | Organization advice — when to propose a context, split a mega-context, resolve time references, attribute speakers, flag contradictions and staleness, hold scope. |
@@ -20,8 +20,8 @@ The harness ships fifteen suites under `evals/suites/`, each targeting a specifi
 | `source_attribution` | Session | `kb_query` | Multi-source attribution correctness and tool discipline (e.g. a removal case must not draft a proposal). |
 | `response_variety` | Session | `kb_query` | Varied phrasing when holding a position — catch broken-record verbatim repetition across rephrasings. |
 | `rag_real_content` | Session | `kb_query` | Real-content RAG — answer only from retrieved chunks of real source material; anti-freestyle refusal; retrieval scoring. |
-| `tool_correctness` | Session | `kb_query` | Per-tool routing — right tool picked, sensible args, correct result interpretation, graceful error/empty recovery. |
-| `security` | Session | `kb_query` | Adversarial safety — prompt injection, system-prompt leakage, persona adoption, data exfiltration, scope escalation. |
+| `tool_correctness` | Session | `kb_query` | Per-tool routing — right tool picked, sensible args, correct result interpretation, graceful error/empty recovery. Includes the `createTask` `NO_DATA` (never-extracted context) vs `write_failed` (Completed/Archived context) refusal paths, and degraded no-tools-history recovery — the model must still CALL `createTask` despite a history of unearned confirmations, keep the internal no-tools marker invisible, not backfill unrequested tasks, and report refusals honestly. |
+| `security` | Session | `kb_query` | Adversarial safety — prompt injection, system-prompt leakage, persona adoption, data exfiltration, scope escalation, plus deployment/architecture-location leakage ("server side" / "not on your device") and result-shape / field-inventory leakage. |
 | `template_moderation` | Single-shot | `template_moderation` | The safety gate that vets user-authored extraction templates — reject jailbreaks/injection, approve legit templates. |
 | `extract_template` | Single-shot | `extract` | Per-template extraction quality (sections + tasks). **Parked — see below.** |
 

@@ -1,0 +1,110 @@
+---
+title: "Bug Reports"
+description: "The two-step Submit-a-bug flow, its area taxonomy, and the client that files a report then best-effort uploads a merged log bundle to a signed Storage URL."
+---
+
+"Submit a bug" is a two-step V2 compose flow reached from Help & Support. It is free on every tier by design — the only abuse control is a server-side rate limit, not a paywall — and it is ordered so the report is safe the instant it is filed: the report row is written server-side **before** any log uploads, so a success means the typed report survives even if the later log upload fails. The client is a thin stack — `V2BugReportScreen` over `V2BugReportViewModel`, a Retrofit `BugReportApi`, a `BugReportApiClient` that files then uploads, and a `BugReportLogBundler` that merges the on-device logs into one hashed file.
+
+## Free on every tier
+
+A bug report is how the app learns it is broken, and the free tier is where sign-in, permission, and onboarding failures concentrate — so filing one is not metered by tier (see the Help & Support block in `app/app/src/main/java/com/intuisoftllc/rollingrecord/data/models/UserTier.kt`). Abuse is bounded instead by the `Bucket.BugReport` rate limit in `supabase/functions/_shared/gates/rate-limit.ts`: `max: 10, windowSec: 3600` — ten submissions per hour. Because the ceiling is the *only* control, it is the one thing standing in for entitlement gating.
+
+## Entry point
+
+`V2HelpSupportScreen` (`app/app/src/main/java/com/intuisoftllc/rollingrecord/ui/v2/screens/helpsupport/V2HelpSupportScreen.kt`) now renders **two** `V2SettingsSection` groups, `20dp` apart (matching `V2AppSettingsScreen`), rather than one "Account Security" card. The split moved the analytics/privacy control out of the list of ways to reach a human, which is the one row there that is not a support option.
+
+| Section | String key | Rows |
+| --- | --- | --- |
+| User Data & Privacy | `help_support_section_privacy` | Privacy (analytics opt-out) |
+| Get Help | `help_support_section_help` | Get support code, Contact Support, **Submit a bug** |
+
+The new row uses the `ic_bug` drawable, the string `bug_report_entry` ("Submit a bug"), and an `onSubmitBug` callback the host wires to navigate into `V2BugReportScreen`. It sits alongside Contact Support as its structured sibling: same diagnostics, but it files a filterable row instead of an email thread so reports can be triaged by area.
+
+## The screen
+
+`V2BugReportScreen` (`app/app/src/main/java/com/intuisoftllc/rollingrecord/ui/v2/screens/bugreport/V2BugReportScreen.kt`) is assembled from existing V2 pieces rather than new ones. The current step is **derived** from the area (`onStepTwo = area != null`), not tracked separately, so there is one source of truth for "which step am I on" and back cannot desync it. Three private composables render the three states:
+
+| Composable | Role |
+| --- | --- |
+| `PickAreaStep` | Step 1 — a `V2SettingsCard` of `V2SettingsNavRow` items, one per `BugArea` entry, under the standard `LibraryDetailHeader` bar |
+| `DescribeStep` | Step 2 — a fixed-height `240dp` `OutlinedTextField` styled like `V2TaskFormSheet`, an "Attach app logs" `V2SettingsToggleRow`, and the reset flow's `PrimaryButton` |
+| `SentStep` | Terminal `ic_bug` icon + Done; its `BackHandler` routes to `onDone` |
+
+The description field's height (`DESCRIPTION_FIELD_HEIGHT = 240.dp`) is fixed on purpose: a weighted height collapsed the field the moment the keyboard claimed the space, so long text scrolls inside the field and the page scrolls to reach the toggle underneath.
+
+Submitting opens a `ConfirmActionSheet` (`ui/v2/components/ConfirmActionSheet.kt`) rather than sending straight away — the report is one-way (no edit, no recall once filed), so the last thing the user sees is the area icon and label it will be filed under plus a two-line excerpt (`bodyMaxLines = 2`) of their own words. On step 2 the `BackHandler` returns to the area list instead of leaving the flow and keeps the typed description intact, so changing your mind about the area costs nothing.
+
+## Bug areas
+
+`BugArea` (in `app/app/src/main/java/com/intuisoftllc/rollingrecord/ui/v2/screens/bugreport/V2BugReportViewModel.kt`) is the nine-way area taxonomy. Each entry carries a `wire` value, a `labelRes`, and an `iconRes`:
+
+| Enum | `wire` | Label string | Icon |
+| --- | --- | --- | --- |
+| `RECORDING` | `recording` | `bug_report_area_recording` | `ic_mic` |
+| `PLAYBACK` | `playback` | `bug_report_area_playback` | `ic_play` |
+| `LIBRARY` | `library` | `bug_report_area_library` | `ic_library` |
+| `TRANSCRIPTION` | `transcription` | `bug_report_area_transcription` | `ic_wave` |
+| `CONTEXTS_AI` | `contexts_ai` | `bug_report_area_contexts_ai` | `ic_brain` |
+| `CLOUD_SYNC` | `cloud_sync` | `bug_report_area_cloud_sync` | `ic_cloud` |
+| `ACCOUNT_BILLING` | `account_billing` | `bug_report_area_account_billing` | `ic_profile` |
+| `APP_LOCK` | `app_lock` | `bug_report_area_app_lock` | `ic_app_security` |
+| `OTHER` | `other` | `bug_report_area_other` | `ic_info` |
+
+The `wire` values are the contract with the server and **must** match `BUG_AREAS` in `supabase/functions/_shared/bugreport/sanitize.ts`. Adding an entry is safe in either order — the server normalizes anything it doesn't recognize to `other` rather than rejecting, so a client that ships ahead of a deploy still files successfully. Renaming an existing `wire` value is **not** safe: reports from installed clients would silently start landing in `other`.
+
+## `V2BugReportViewModel`
+
+The ViewModel holds four state flows — `area` (`StateFlow<BugArea?>`), `description`, `attachLogs` (default `true`), and `submitState` — and derives a fifth. `submitState` is a `BugReportSubmitState`: `Idle`, `Submitting`, `Sent`, or `Error(messageRes)`.
+
+`canSubmit` is a `StateFlow<Boolean>` — a `combine` of `_area` and `_description` — deliberately **not** a plain getter. As a getter reading `_description.value` it was invisible to Compose: nothing about it was observable state, so the Submit button captured `false` on first composition and never re-enabled no matter what the user typed. It enables when `area != null` and the trimmed length is at least `MIN_DESCRIPTION_CHARS`.
+
+| Constant | Value | Meaning |
+| --- | --- | --- |
+| `MIN_DESCRIPTION_CHARS` | `10` | Client-only floor — stops a stray tap or a one-word "broken". The server still accepts anything non-empty |
+| `MAX_DESCRIPTION_CHARS` | `12_000` | Mirrors `MAX_DESCRIPTION_CHARS` in `sanitize.ts`; `onDescriptionChanged` truncates rather than rejects |
+| `TIER_LOOKUP_TIMEOUT_MS` | `1_500` | How long to wait for the tier before filing without it |
+
+`entitlementRepository` is session-scoped, so it is resolved from `userSessionManager.currentScope` on every read rather than injected once — a sign-out while the screen is open would otherwise leave the ViewModel holding a repository from a dead scope.
+
+`submit()` builds the log bundle off `Dispatchers.IO` **only when** `attachLogs` is on, resolves the tier (bounded by `TIER_LOOKUP_TIMEOUT_MS`, with an `"UNKNOWN"` fallback) **only when** diagnostics are on — no point waiting on a lookup it would discard — then maps `BugReportApiClient.Result` onto `submitState`.
+
+## Wire API
+
+`BugReportApi` (`app/app/src/main/java/com/intuisoftllc/rollingrecord/data/remote/bugreport/BugReportApi.kt`) is the Retrofit interface for the `bug-report` Edge Function. The function name is declared once as `FN_BUG_REPORT = "bug-report"`, used for the `@POST("functions/v1/" + FN_BUG_REPORT)` path and the `@EdgeTag(FN_BUG_REPORT)`. It rides the shared `aiengine` OkHttp stack (base URL + App Check + Bearer JWT + app-version interceptors), like the other reuse clients — only the path differs.
+
+`BugReportRequest` is the wire body:
+
+| Field | Wire name | Notes |
+| --- | --- | --- |
+| `area` | `area` | Chosen area's `wire` value; server normalizes unknown to `other` |
+| `description` | `description` | The user's text |
+| `clientMetadata` | `client_metadata` | `Map<String, String>` of device details; empty when diagnostics are declined |
+| `attachLogs` | `attach_logs` | Whether a log is being sent |
+| `logSha256` | `log_sha256` | Nullable digest of the bundle |
+| `logBytes` | `log_bytes` | Nullable bundle size |
+
+`BugReportResponse` returns `bug_report_id` and an optional `upload_url`. A null `upload_url` is **not** an error — it means no log is being sent (the user declined, or the server couldn't mint one), and the report is already stored by the time the response returns.
+
+## `BugReportApiClient`
+
+`BugReportApiClient` (`app/app/src/main/java/com/intuisoftllc/rollingrecord/data/remote/bugreport/BugReportApiClient.kt`) files the report, then — on success and only when a bundle exists — does a best-effort `uploadLog()`: a `PUT` of the merged log to the returned signed URL via a **separate bare `uploadClient`**. That upload never throws. The report row was written server-side before the log existed, so a log upload that fails, times out, or is killed with the app leaves a complete, readable report behind — the failure is logged (`save = true`) and swallowed rather than surfaced as a failed submission. The bundle file is deleted after the submit either way.
+
+`deviceMetadata` — `app_version_code` / `app_version_name` / `build_type` / `android_release` / `android_sdk` / `device_manufacturer` / `device_model` / `tier` / `locale` — is attached **only when** `includeDiagnostics` is the user's actual toggle choice. `includeDiagnostics` is passed separately from `logBundle` on purpose: a null bundle means "no log is being sent", which happens both when the user declined *and* when bundling simply failed, and inferring consent from a failure would silently strip a consenting user's diagnostics.
+
+`Result` is a sealed interface: `Success`, `RateLimited`, `Offline`, `Failure`. `Timeout` is grouped with `Offline` — to the person filing a report both mean "try again when the connection is better".
+
+## `BugReportLogBundler`
+
+`BugReportLogBundler` (`app/app/src/main/java/com/intuisoftllc/rollingrecord/data/remote/bugreport/BugReportLogBundler.kt`) merges `FileLogger`'s rotating segments into one `cacheDir` file, `bug-report-logs.txt`. It reads a **distinct** set of two segments — the active auth-user segment plus the `anonymous` (pre-sign-in) segment — each clearly delimited with `BEGIN`/`END` markers. The anonymous segment is included because auth and sign-in bugs are written there, and that segment is unreachable from both the in-app log viewer and the support-email export, which only ever read the current user's files. Within a segment, files are read oldest-first.
+
+The result is capped at `MAX_BUNDLE_BYTES = 8 * 1024 * 1024` (8 MiB — the destination bucket allows 25 MiB, so a legitimate upload can never be rejected for size). When the sources exceed the cap it trims from the **front** (`trimToTail`) to keep the newest tail, since a bug is reported after it happens and the tail is what describes it. `build(context)` returns a `Bundle(file, sha256, byteCount)` with a streamed SHA-256 so a multi-megabyte bundle never lands in memory whole, and it never throws — a failure returns `null`, and the caller submits without an attachment.
+
+## Wiring
+
+`BugReportApi` and `BugReportApiClient` are wired in `app/app/src/main/java/com/intuisoftllc/rollingrecord/di/NetworkModule.kt`. `BugReportApi` is created from the `named("aiengine")` Retrofit. `BugReportApiClient` is built with a **bare** `OkHttpClient` (a 2-minute `callTimeout`, no interceptors) for the signed-URL log upload, so the `PUT` does not carry `Authorization` or App Check headers — the signature is the whole authorization, and stamping the user's JWT onto a Storage host would be wrong. This is the same pattern as the `audio_signed_url` upload client.
+
+## Related pages
+
+- [Diagnostic Logging](/rollingrecord/app/platform/logging) — the `FileLogger` segments and the `save = true` no-user-content rule the bundle relies on.
+- [Networking & Edge API Layer](/rollingrecord/app/platform/networking) — the shared `aiengine` interceptor stack `BugReportApi` rides.
+- [Settings Surface](/rollingrecord/app/platform/settings) — the Help & Support screen the flow launches from.

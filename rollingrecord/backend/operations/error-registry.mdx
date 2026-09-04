@@ -19,9 +19,9 @@ Representative codes per category:
 
 | category | Examples |
 |---|---|
-| `user` | `cap_reached`, `subscription_required`, `moderation_failed`, `step_up_required`, `backup_quota_exceeded`, `semantic_search_disabled` |
+| `user` | `cap_reached`, `subscription_required`, `moderation_failed`, `step_up_required`, `backup_quota_exceeded`, `semantic_search_disabled`, `admin_grant_budget_exceeded` |
 | `infra` | `all_providers_failed`, `rate_limited`, `provider_rate_limited`, `database_error`, `fk_violation`, `embedding_failed` |
-| `developer` | `invalid_jwt`, `handler_threw`, `missing_operation`, `model_not_allowed`, `extraction_undecryptable`, `admin_hmac_mismatch` |
+| `developer` | `invalid_jwt`, `handler_threw`, `missing_operation`, `model_not_allowed`, `extraction_undecryptable`, `admin_hmac_mismatch`, `bug_report_insert_failed` |
 
 <Note>
 Object and category are not identical. `batch_too_large`, `size_mismatch`, and `recovery_code_invalid_operation` are physically defined inside `USER_ERRORS` but carry category `"developer"`. Both the Kotlin mirror and the doc generator bucket by the `category` field, so these three appear under Developer errors — don't assume the enclosing object equals the category.
@@ -47,7 +47,7 @@ The client mirrors the registry as `enum class AiEngineErrorCode(val code: Strin
 The Kotlin mirror's real path is `app/agentcore/src/main/kotlin/com/intuisoftllc/rollingrecord/data/remote/aiengine/AiEngineErrorCode.kt` — inside the pure-JVM `agentcore` module. The `errors.ts` header comment cites a wildcard `app/.../data/remote/aiengine/AiEngineErrorCode.kt` path; only the `CLAUDE.md` rule cites the outdated `app/app/.../AiEngineErrorCode.kt` module path. Use the `agentcore` path.
 </Warning>
 
-`AiEngineErrorCodeDriftTest` parses the TypeScript registry at test runtime and asserts exact **bidirectional** parity between the enum and `errors.ts`. Adding a code on only one side fails the build — the fix is to add it on both, never to `@Ignore` the test.
+`AiEngineErrorCodeDriftTest` parses the TypeScript registry at test runtime and asserts exact **bidirectional** parity between the enum and `errors.ts`. Adding a code on only one side fails the build — the fix is to add it on both, never to `@Ignore` the test. This commit added four codes on **both** sides in the same change, preserving that parity: `admin_grant_budget_exceeded` (`USER_ERRORS` / `Category.USER`, HTTP 403 — the operator's own per-rolling-30-day grant ceiling, distinct from `credit_ceiling_exceeded` which bounds what a customer may hold) and the bug-report trio `bug_report_empty_description` (400), `bug_report_description_too_long` (400), and `bug_report_insert_failed` (500), all in `DEV_ERRORS` / `Category.DEVELOPER`.
 
 ## Registry → mirror → docs pipeline
 
@@ -66,7 +66,7 @@ python supabase/scripts/gen_error_docs.py
 ```
 
 <Warning>
-`docs/error-codes.md` is a **point-in-time snapshot regenerated on demand, not in CI** — it drifts. The current checked-in copy is out of sync: its summary claims 152 codes and it lists a whole family of `bundle_*` purchase codes (`bundle_already_credited`, `bundle_no_grant_found`, `bundle_rc_transaction_*`, …) that exist in **neither** the current `errors.ts` nor the Kotlin mirror. Treat `errors.ts` as authoritative and regenerate the markdown after any code change.
+`docs/error-codes.md` is a **point-in-time snapshot regenerated on demand, not in CI** — so it can drift between regenerations. This commit regenerated it, closing most of the gap: the whole `bundle_*` purchase family (`bundle_already_credited`, `bundle_already_refunded`, `bundle_no_grant_found`, `bundle_rc_transaction_*`, `bundle_sku_unknown`) is gone from the snapshot as it already was from `errors.ts` and the Kotlin mirror, and previously-lagging codes (`password_rejected`, `super_admin_protected`, the `user_delete_*` family) that already existed in `errors.ts` were finally folded in. But the snapshot is **not** fully in sync: it reads **154** total (User-facing 52 / Infrastructure 11 / Developer 91), while `errors.ts` actually defines **156** (User-facing **54** / Infrastructure 11 / Developer 91). The two missing codes are the user-category `amount_not_integer` and `storage_cap_would_be_exceeded` — both are silently dropped by `gen_error_docs.py`, whose `ENTRY_RE` description group (`"[^"]*(?:"\s*\+\s*"[^"]*)*"`) cannot parse a description containing an escaped double-quote (`\"…\"`), which both of those definitions have. So the snapshot still trails the registry by 2 user codes until that regex is fixed. Treat `errors.ts` as authoritative and regenerate the markdown after any code change, since nothing enforces it between runs.
 </Warning>
 
 ## The single exception to "no inline literals"

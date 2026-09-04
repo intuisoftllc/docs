@@ -20,6 +20,7 @@ A from-empty start (`startCursor.isEmpty()`) is a **full pass** — the only con
 
 | Server signal | `runPull` response |
 | --- | --- |
+| `status = cloud_reset` | drop cloud-only rows (`recordingDao.getCloudOnlyIdsForCloudReset()` → `recordingRepository.deleteOrphanLocally(id)` each), run `syncEnqueueRecovery.prepareForCloudReset()`, then `settings.resetSyncCursor()`, cursor = `""`, `isFullPass = true`, clear seen ids, `continue` — **checked before `resync_required`** |
 | `status = resync_required` | `resetSyncCursor`, cursor = `""`, `isFullPass = true`, clear seen ids, continue |
 | 429 `RateLimited` | surface `rateLimitedUntilSec` (the typed `reset_at_sec`), keep the committed cursor, resume next trigger |
 | other `ApiError.Failure` | keep cursor, resume next trigger |
@@ -53,6 +54,26 @@ The third case is intentional — a non-FK exception is a real bug to surface, n
 3. the id is absent from `serverRecordingIds` — the complete set accumulated during the clean from-empty drain.
 
 New / never-pushed rows fail (1); locally-edited rows fail (2). The delete is local-only via `recordingRepository.deleteOrphanLocally(id)` and enqueues **no tombstone** (the server row is already gone). Server recording ids are canonicalized to the `rec-` prefix (`IdPrefix.formatRecording`) exactly like the apply path, so a bare-uuid server row can't read as "not on the server" and false-delete a live local row.
+
+## `cloud_reset` — rebuild cloud backup from device
+
+When `subscription_lapse_cleanup` hard-destroys a lapsed account's cloud data and the user later resubscribes, the next pull returns `status = cloud_reset` with the wipe timestamp echoed as `respBody["cloud_wiped_at"]`. Paying again is the trigger.
+
+The critical reason this status is checked **before** `resync_required`: a wiped account's cursor is *also* always expired. If `cloud_reset` fell through to the `resync_required` branch, the pull would run `reconcileOrphans` against an empty server and delete the user's **entire local library**. Handling `cloud_reset` first converts "the server forgot everything" into "nothing here has been pushed yet" — the truth — which the ordinary sync machinery already knows how to resolve by re-uploading.
+
+The branch runs three steps in a fixed order:
+
+1. **Drop cloud-only rows first** — `recordingDao.getCloudOnlyIdsForCloudReset()` → `recordingRepository.deleteOrphanLocally(id)` each. Their audio lived only in the wiped bucket, so they can neither re-upload nor download; keeping them would leave rows that can never play.
+2. **`prepareForCloudReset()`** clears the sync markers and re-enqueues every survivor. It **must complete before the cursor moves** — on failure the branch logs and `return applied + drained`, leaving the cursor intact so the server re-sends `cloud_reset` on the next pull (a retry costs one pull; continuing would cost the library).
+3. **Only then `resetSyncCursor()`**, set `cursor = ""`, `isFullPass = true`, clear the seen ids, and `continue`.
+
+Belt-and-braces: after step 2 every survivor carries a pending outbox entry, so the subsequent full-pass `reconcileOrphans` skips all of them on condition 2 (`outbox.hasPending`), and recordings additionally fail condition 1 because their `cloudBackupCommittedAt` is now null. See [Sync Outbox & Enqueue](/rollingrecord/app/sync/outbox-engine) for `prepareForCloudReset`'s internals.
+
+## Proactive junction cleanup: `RecordingRepository.deleteSession`
+
+`RecordingRepository.deleteSession(id)` now cleans up a session's `context_session` junctions before the session row goes. It enumerates them via the new `ContextSessionDao.getContextsForSession(sessionId)` query, then for each junction calls `contextSessionDao.remove(contextId, id)` **and** `syncEnqueuer.tombstoneComposite(WireEntity.CONTEXT_SESSION, contextId, id)` — as a pair — before deleting the session.
+
+`context_sessions` declares no Room `foreignKeys`, so previously every deletion of a context-linked session stranded a junction that the server rejected with `fk_violation` on every subsequent push, forever. The removal and the composite tombstone must go together: a cascade would delete the row locally but enqueue nothing, leaving the link alive in the cloud and on every other device. `getContextsForSession` mirrors `ContextRecordingDao.getContextsForRecording` and is index-backed by the existing `Index(["sessionId"])`. This is the proactive fix that pairs with the reactive `fk_violation` drain documented on [Sync Outbox & Enqueue](/rollingrecord/app/sync/outbox-engine).
 
 ## Stalled-drain detection
 

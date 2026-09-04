@@ -12,13 +12,15 @@ Both stacks are built in `di/NetworkModule.kt` against `BuildConfig.SUPABASE_URL
 | Koin name | Connect / Read / Write | Serves |
 | --- | --- | --- |
 | `supabase` | 30 / 60 / 60 s | `SupabaseApi`, `SyncApi`, `AudioSyncApi` |
-| `aiengine` | 30 / 120 / 120 s | `AiEngineApi`, `UsageApi`, `RecoveryCodeApi`, `SyncPreferencesApi`, `UserKeyApi`, `SetUserPinApi`, `AccountOtpApi`, `SearchApi`, `ExtractionJobsApi` |
+| `aiengine` | 30 / 120 / 120 s | `AiEngineApi`, `UsageApi`, `RecoveryCodeApi`, `SyncPreferencesApi`, `UserKeyApi`, `SetUserPinApi`, `AccountOtpApi`, `BugReportApi`, `SearchApi`, `ExtractionJobsApi` |
 
 The `aiengine` client uses `encodeDefaults = true` on its Retrofit `Json` converter: every request body declares `val operation: String = "<op>"` with a default, and dropping a defaulted field would strip `operation` off the wire and earn a `missing_operation` rejection.
 
 ## The `audio_signed_url` upload client
 
 A third Koin-named client, `audio_signed_url`, is **not** a Retrofit stack at all — in `di/NetworkModule.kt` it's a bare `OkHttpClient` with no `Retrofit.Builder`, no `SUPABASE_URL` base, and no interceptors. It exists only for raw `PUT` uploads of encrypted audio to Supabase Storage signed URLs, so it never hits `functions/v1`. It is deliberately un-authed — a Storage signed URL self-authenticates via its token query param, so it must not carry the user's JWT to a third-party host. Its only non-default setting is a 15-minute write timeout (`30 / 120 s / 15 min` connect/read/write) because audio uploads can be hundreds of MB on slow links.
+
+The same bare-client pattern now backs bug-report log uploads: `BugReportApiClient` is built in `di/NetworkModule.kt` with a separate bare `OkHttpClient` (a 2-minute `callTimeout`, no base URL, no interceptors) to `PUT` the merged log to a signed Storage URL, so that upload never carries the JWT or App Check headers either. See [Bug Reports](/rollingrecord/app/platform/bug-reports).
 
 `SupabaseApi` (`data/remote/SupabaseApi.kt`) declares each function name once as a companion `const` (`FN_RESOLVE_IDENTITY`, `FN_SERVER_CONFIG`, `FN_DELETE_USER`, `FN_GENERATE_SUPPORT_TOKEN`) and one method each. `AiEngineApi` (`data/remote/aiengine/AiEngineApi.kt`) is a single `ai-engine` function reached by every method with a different typed body, all returning `Response<ResponseBody>` so the client can read headers and error envelopes. Its operations are `kbQuery` (with an optional `X-Query-Session-Token` header), `synthesis`, `transcribeUploadInit`/`transcribeSubmit`/`transcribeFetch`, `keywords`, `contextSummary`, `threadNaming`, `blueprintModeration`, `queryExpand`, and the user-blueprint CRUD trio. There is no `extract` method — extraction moved to `ExtractionJobsApi` (`extract-submit` / `extract-results`).
 
@@ -32,15 +34,17 @@ Both authed clients carry the same interceptors in the same fixed order, outermo
 | 2 | `AppCheckTokenInterceptor` | `data/remote/AppCheckTokenInterceptor.kt` | `apikey` + `X-Firebase-AppCheck` |
 | 3 | `BearerJwtInterceptor` | `data/remote/aiengine/BearerJwtInterceptor.kt` | `Authorization: Bearer <Clerk JWT>` |
 | 4 | `AccountFreezeInterceptor` | `data/remote/aiengine/AccountFreezeInterceptor.kt` | Set/clear frozen from a 403 `account_frozen` / any 2xx |
-| 5 | `AppVersionHeaderInterceptor` | `data/version/AppVersionHeaderInterceptor.kt` | `X-App-Version: <versionCode>` |
-| 6 | `ClientTooOldInterceptor` | `data/version/ClientTooOldInterceptor.kt` | Flip `AppVersionGate` on a 410 `client_too_old` |
-| 7 | `HttpLoggingInterceptor` | `di/NetworkModule.kt` | `HEADERS` in debug, `NONE` in release |
+| 5 | `EntitlementRefreshInterceptor` | `data/remote/EntitlementRefreshInterceptor.kt` | Stamp `X-Entitlement-Refresh: 1` during the post-purchase window |
+| 6 | `AppVersionHeaderInterceptor` | `data/version/AppVersionHeaderInterceptor.kt` | `X-App-Version: <versionCode>` |
+| 7 | `ClientTooOldInterceptor` | `data/version/ClientTooOldInterceptor.kt` | Flip `AppVersionGate` on a 410 `client_too_old` |
+| 8 | `HttpLoggingInterceptor` | `di/NetworkModule.kt` | `HEADERS` in debug, `NONE` in release |
 | authenticator | `TokenRefreshAuthenticator` | `data/remote/aiengine/TokenRefreshAuthenticator.kt` | On 401: refresh the Clerk token and retry once |
 
 - **`AppCheckTokenInterceptor`** attaches `apikey` (`BuildConfig.SUPABASE_ANON_KEY`, the public publishable key shipped in the APK — it grants no data access on its own because RLS is enabled on every table) and a fresh Firebase App Check token. It first blocks on `AppCheckWarmup` (15 s cap) so the SDK cache is hot, then fetches the token (15 s cap). On failure it proceeds header-less — the Edge Function will 401 — and logs with `save = true`.
 - **`BearerJwtInterceptor`** awaits `AuthRepository.awaitAccessToken()` (5 s) on the OkHttp thread via `runBlocking`. The JWT is a **Clerk** session token verified server-side against Clerk's JWKS, not a Supabase Auth token.
 - **`TokenRefreshAuthenticator`** fires only on a 401 whose body is `missing_bearer_token` / `invalid_jwt` / empty, fetches a fresh Clerk token, and retries the original request once. `response.priorResponse` guards against a loop.
 - **`AccountFreezeInterceptor`** peeks (never consumes) authed responses: a 403 `account_frozen` calls `AccountHealthRepository.setFrozen(reason)`, any 2xx calls `clearFrozen()`, everything else is a no-op. It only acts on requests carrying an `Authorization` header.
+- **`EntitlementRefreshInterceptor`** stamps `X-Entitlement-Refresh: 1` while `EntitlementRefreshSignal.isPending()` — the post-purchase window — so the server skips its per-customer RevenueCat entitlement cache for that request (subject to a 20-second server-side age floor). It is a caching **hint**, never a claim: the answer still comes from RevenueCat, so it cannot grant anything the user hasn't bought. It fires on **disagreement** between the local RC tier and the server-observed tier (armed via `EntitlementRefreshSignal.onServerTierObserved`, wired in `di/NetworkModule.kt` to `UsageRepository`, which reports the server's tier from each `UserUsageSnapshot`), not only on a local purchase callback. Without it a user who just purchased is answered from a cached "no entitlements" for up to five minutes. See [Entitlements & RevenueCat](/rollingrecord/app/monetization/entitlements-revenuecat).
 - **`RateLimitInterceptor`** synthesizes a 429 (serialized from the real `RateLimitedError` envelope, so downstream can't tell it apart) when `RateLimitCoordinator` reports the target function still cooling down, and records real 429 `reset_at_sec` values for future short-circuits.
 
 ## `apiCall` and the `ApiResult` taxonomy

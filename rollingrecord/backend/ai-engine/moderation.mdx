@@ -11,7 +11,7 @@ Custom extraction blueprints are moderated by `runTemplateModeration` (`function
 
 `TemplateModerationHandler` declares `capKey = "template_moderation_runaway_cap"` (absolute, default 100 — generous for a real user), `usageColumn = "template_moderation_count"`, and no feature flag. `validateInput` requires `template_content` (a non-empty string ≤ 50,000 chars, else `missing_blueprint_content` / `blueprint_content_too_large`). The handler runs `runTemplateModeration` and returns the resulting `ModerationVerdict` — `{ result: "APPROVED" | "REJECTED", reason? }` — as its payload.
 
-There is **no** `template_moderation_enabled` `server_config` toggle: the op itself always runs (`featureFlag = null`). The two relevant knobs are `template_semantic_prefilter_enabled` (prefilter on/off) and `semantic_search_enabled` (the global embeddings kill-switch).
+There is still **no server-op kill-switch**: the op itself always runs (`featureFlag = null`), so a blueprint saved through `save_user_blueprint` is always moderated server-side. Migration `20260830120000_firebase_rc_to_server_config.sql` did fold the former Firebase RC key `template_moderation_enabled` into `server_config` — renamed to `blueprint_moderation_enabled` (`public = TRUE`, default `'true'`) because "template" is the feature's retired name — but that row does **not** gate this op. It gates the **client-side** pipeline: `BlueprintModerationService` (Android) reads `ServerConfig.blueprintModerationEnabled` and approves everything locally when it is false; the server still moderates regardless. The two knobs that affect this server op are `template_semantic_prefilter_enabled` (prefilter on/off) and `semantic_search_enabled` (the global embeddings kill-switch).
 
 ## Stage 1 — semantic prefilter (fail-open)
 
@@ -39,6 +39,9 @@ Because Haiku sometimes wraps its answer in markdown fences or preamble, `extrac
 | `template_moderation_model` | Claude Haiku | authoritative moderation model |
 | `template_moderation_max_output_tokens` | `80` | moderation output cap |
 | `template_moderation_runaway_cap` | `100` | absolute runaway cap on the op |
+| `blueprint_moderation_enabled` | `true` | **client-side only** — enables `BlueprintModerationService`'s three-layer in-app prefilter; the server op is not affected and always moderates |
+
+The `template_moderation_*` cap and model keys above were **not** renamed by the Firebase RC migration and remain live under their legacy `template_` spelling; only `blueprint_moderation_enabled` (the client toggle) carries the new name.
 
 Error codes (`functions/_shared/errors.ts`): `moderation_failed` (user, 422); `empty_moderation_response`, `moderation_no_json_found`, `invalid_moderation_shape`, `moderation_json_parse_failed` (all developer, 502); `missing_blueprint_content`, `blueprint_content_too_large` (developer, 400).
 

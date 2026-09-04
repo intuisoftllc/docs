@@ -12,9 +12,11 @@ Every support-ops operation declares an `AdminPermissionKey` (or `null`). The di
 | Symbol | I/O | Behavior |
 | --- | --- | --- |
 | `AdminPermissionKey` | none | Compile-time union of the 14 gating columns — a per-op typo fails at registry-load |
-| `AdminPermissionsRow` | none | Full row shape: `auth_user_id`, the 14 booleans, `is_super_admin`, `granted_at`, `granted_by`, `notes` |
+| `AdminPermissionsRow` | none | Full row shape: `auth_user_id`, the 14 booleans, `is_super_admin`, the three numeric ceilings `max_monthly_transcription_ms` / `max_monthly_extraction_ms` / `max_monthly_ai_queries`, `granted_at`, `granted_by`, `notes` |
 | `getAdminPermissions` | one SELECT (`maybeSingle`) | Returns the full row, or `null` when no row exists; throws on DB error (a 500, not a denial) |
 | `hasAdminPermission` | pure | `false` when row is null; `true` when `row.is_super_admin`; else `row[permission] === true` |
+
+The three `max_monthly_*` columns live on the row but are NOT `AdminPermissionKey` values — they are per-operator grant ceilings (0 = unlimited), a separate axis from the gating booleans, so the `AdminPermissionKey` union is still exactly 14 keys. They are covered in [Per-operator credit-grant ceilings](#per-operator-credit-grant-ceilings) below.
 
 `hasAdminPermission` is the whole bypass logic: `is_super_admin` is the only escape hatch. In the dispatcher, the gate resolves as `permitted = op.requiredPermission === null ? (permissionsRow !== null) : hasAdminPermission(permissionsRow, op.requiredPermission)`. On `false` it fires `logAbuseEvent(AdminPermissionDenied)` and returns `admin_permission_denied` (403) — logged to `l_user_abuse_event`, never to `l_admin_audit`. The `null` branch still requires a non-null row, so `whoami` is not an anonymous door into the endpoint.
 
@@ -29,7 +31,7 @@ Several columns gate more than one operation; `can_modify_accounts` currently ga
 | AdminPermissionKey | Operations gated |
 | --- | --- |
 | `can_lookup_user` | `lookup_user_by_email`, `search_users` |
-| `can_view_user_data` | `get_user_overview`, `get_user_credits`, `get_tombstone_report` |
+| `can_view_user_data` | `get_user_overview`, `get_user_credits`, `get_tombstone_report`, `get_bug_reports`, `set_bug_status` |
 | `can_read_user_state` | `get_user_state`, `get_clerk_metadata`, `user_rate_limits` |
 | `can_read_audit` | `get_admin_audit`, `get_storage_drift` |
 | `can_read_user_audit` | `get_user_audit`, `get_user_timeline`, `get_user_transcribe_history`, `get_user_credit_ledger`, `link_audit_ticket` |
@@ -42,7 +44,7 @@ Several columns gate more than one operation; `can_modify_accounts` currently ga
 | `can_reset_extraction` | `reset_extraction`, `reset_transcription` |
 | `can_delete_user` | `delete_user_account` |
 | `can_modify_accounts` | (reserved — gates no live op today) |
-| null (any admin row) | `whoami` |
+| null (any admin row) | `whoami`, `get_my_grant_budget` |
 | `is_super_admin` | bypasses every per-op check, is a redaction-bypass signal, and is the only tier that may target another super-admin |
 
 ## The dual role of `is_super_admin`
@@ -55,9 +57,39 @@ A second, orthogonal rule protects super-admin TARGETS. `assertMayTargetAdmin` (
 
 The guard short-circuits with no DB read when the caller is a super-admin; otherwise `targetIsSuperAdmin` does one indexed PK lookup of `admin_permissions.is_super_admin` for the target (a missing row — an ordinary customer — returns false). A blocked call throws `OperationError(super_admin_protected, 403, { operation, target_auth_user_id })`. This is the single source of the protected-target rule: `freeze_user_account`, `delete_user_account`, and `set_account_password` all call it, so the protected set cannot drift between ops.
 
+So the guard is visible before it fires: `lookup_user_by_email` and `search_users` surface the TARGET's operator role as `admin_role` (`null` | `"admin"` | `"super"`), computed by presence-is-admin — a non-null `admin_permissions` row is `"admin"`, and `is_super_admin` escalates it to `"super"`. An operator sees at a glance that a looked-up account is itself staff (and super-admin-protected) rather than discovering it only when a destructive op refuses.
+
 ## The `admin_permissions` table
 
-Defined in `migrations/20260508000000_baseline.sql`. PK `auth_user_id`; FK `fk_admin_permissions_user` → `canonical_users(auth_user_id) ON DELETE CASCADE`; RLS enabled (service-role only). Rows are seeded manually via the Supabase SQL console for the bootstrap admin. It is excluded from `delete-user`'s `TABLES_TO_WIPE` — it is an administrative fixture, not user data. `whoami`'s `PERMISSION_KEYS` array holds the explicit 14-key ordering the op reports, so adding a column is a deliberate decision and bookkeeping fields (`granted_by`, `notes`) never leak into the permission map; it reports the EFFECTIVE permission, so a super-admin reads back all-true.
+Defined in `migrations/20260508000000_baseline.sql`. PK `auth_user_id`; FK `fk_admin_permissions_user` → `canonical_users(auth_user_id) ON DELETE CASCADE`; RLS enabled (service-role only). Rows are seeded manually via the Supabase SQL console for the bootstrap admin. It is excluded from `delete-user`'s `TABLES_TO_WIPE` — it is an administrative fixture, not user data. The table also holds the three `max_monthly_*` grant-ceiling columns (see below), and `admin_credit_granted_since()` is a `SECURITY DEFINER` helper that reads `l_credit_log` to total what an operator has granted. `whoami`'s `PERMISSION_KEYS` array holds the explicit 14-key ordering the op reports — the numeric ceilings are NOT part of the permission map — so adding a gating column is a deliberate decision and bookkeeping fields (`granted_by`, `notes`) never leak into it; it reports the EFFECTIVE permission, so a super-admin reads back all-true.
+
+## Per-operator credit-grant ceilings
+
+`can_grant_credits` is a boolean: an operator either cannot grant at all, or can grant without bound. Credits cost real money, so a compromised or careless operator account can run up cost indefinitely with nothing surfacing it until the bill does. Migration `20260823120000_admin_credit_grant_budget.sql` adds three NUMERIC ceiling columns to `admin_permissions` to bound the blast radius per operator — a distinct axis from the per-op booleans. `can_grant_credits` still gates *whether* an operator may run `grant_manual_credit`; these columns bound *how much* a permitted operator may give away per rolling 30 days (`GRANT_BUDGET_WINDOW_DAYS` = 30).
+
+| Column | Type | Notes |
+| --- | --- | --- |
+| `max_monthly_transcription_ms` | bigint NOT NULL DEFAULT 0 | ms ceiling per rolling 30 days |
+| `max_monthly_extraction_ms` | bigint NOT NULL DEFAULT 0 | ms ceiling per rolling 30 days |
+| `max_monthly_ai_queries` | integer NOT NULL DEFAULT 0 | count ceiling per rolling 30 days |
+
+All three carry the `admin_permissions_max_monthly_nonneg` CHECK (each `>= 0`). 0 = unlimited, which is the default, so the migration changes no existing operator's authority until one is given a ceiling explicitly. Units match the `l_credit_log` delta columns (ms for the two durations, count for `ai_queries`) — a ceiling in minutes against a ledger in milliseconds is a conversion bug waiting to be written, so both stay in the wire unit.
+
+### The decision logic
+
+The pure function `evaluateGrantBudget` (`functions/_shared/db/admin-credit-budget.ts`) returns a `BudgetDecision` whose `reason` is one of `super_admin` | `unlimited` | `within_ceiling` | `not_a_grant` | `would_exceed`. The bypass order is deliberate:
+
+1. **Super admin bypasses** — mirroring how `is_super_admin` already bypasses every per-column check. Someone has to be able to act in an incident, and the ceiling defends against a careless or compromised OPERATOR, not against an account that can already grant itself any permission.
+2. **A ceiling of 0 = unlimited** — the default, so the feature is inert until a ceiling is set.
+3. **Revokes (`amount <= 0`) are never limited** — and, critically, never restore headroom.
+
+Landing exactly ON the ceiling is allowed (the refusal is strictly-greater: `used + requested > limit`). Spend comes from the SQL function `admin_credit_granted_since` (`SECURITY DEFINER`), which sums `GREATEST(delta, 0)` over `l_credit_log WHERE consumed_by = 'admin:' || auth_user_id AND source = 'support_op_manual'` — the positive side only, so revoking someone else's credit cannot buy back headroom, and only human grants (not webhook / recovery / refund / consumption) count. It is backed by the partial index `idx_l_credit_log_admin_grants` (`WHERE source = 'support_op_manual'`).
+
+### Enforcement point
+
+`grant_manual_credit` (`operations/grant-manual-credit.ts`, ~line 253) checks the ceiling BEFORE the dry-run branch, so an operator is refused at PREVIEW rather than discovering it on commit. It reads the ceilings straight off `ctx.adminPermissions` (no extra round trip) and only fetches spend when it can change the answer — `needsSpend = !is_super_admin && ceiling > 0`, which most grants skip. A blocked grant throws `OperationError(admin_grant_budget_exceeded, 403)` carrying `{ resource, limit, used, requested, remaining, window_days }`.
+
+The error code `admin_grant_budget_exceeded` (`functions/_shared/errors.ts`) is distinct from `credit_ceiling_exceeded`: the latter is the CUSTOMER's holding cap (how much credit an account may hold), this one is the OPERATOR's grant cap (how much a member of support may give away). The read-only [`get_my_grant_budget`](/rollingrecord/backend/support-ops/operations-catalog) op surfaces the same numbers up front so an operator plans around the ceiling instead of hitting it mid-grant.
 
 ## Column history
 
@@ -68,6 +100,7 @@ Defined in `migrations/20260508000000_baseline.sql`. PK `auth_user_id`; FK `fk_a
 | Drop `can_migrate_account` (+ `account_migrations` table) | `20260723160000_drop_account_migration.sql` | Account-migration feature removed post-Clerk |
 | Add `can_reset_extraction` | `20260723130000_admin_can_reset_extraction.sql` | Gates `reset_extraction` + `reset_transcription`; default FALSE |
 | Add `can_triage_abuse` | `20260812010000_add_can_triage_abuse_permission.sql` | Higher Trust-and-Safety bar for the cross-customer offenders view |
+| Add `max_monthly_transcription_ms` / `max_monthly_extraction_ms` / `max_monthly_ai_queries` (+ CHECK, + `admin_credit_granted_since()`) | `20260823120000_admin_credit_grant_budget.sql` | Per-operator rolling-30-day grant ceilings; default 0 = unlimited; enforced in `grant_manual_credit`, surfaced by `get_my_grant_budget` |
 
 ## Where to go next
 

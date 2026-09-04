@@ -29,10 +29,11 @@ const { authUserId, isDeveloper, isGracePeriod } = ctx
 
 ## Fixed admission order
 
-For a JWT function with every option set, the chain runs in this order. Each gate lives in its own file under `functions/_shared/gates/`.
+For a JWT function with every option set, the chain runs in this order. For functions that opt in, the chain now begins at step 0 (the health probe); a valid probe short-circuits the ENTIRE chain — before method — to a 200/503 liveness response and never reaches the handler. The example below still shows steps 1–8 for a normal JWT call. Each gate lives in its own file under `functions/_shared/gates/`.
 
 | Step | Gate | Runs when | Opt-out / skip | File |
 | --- | --- | --- | --- | --- |
+| 0 | Health probe | `config.healthCheck` set AND valid `X-Health-Probe` header | opt-in only (no `healthCheck` = disabled) | `health.ts` |
 | 1 | HTTP method | always | none (`method` required) | `method.ts` |
 | 2 | App Check | `!config.skipAppCheck` | `skipAppCheck: true` | `app-check.ts` |
 | 3 | App Version floor | `!config.skipAppVersion` | `skipAppVersion: true` | `app-version.ts` |
@@ -44,13 +45,15 @@ For a JWT function with every option set, the chain runs in this order. Each gat
 
 Step 5 runs for **every** JWT caller even when no `entitlement: [...]` is declared, because it is what derives `isDeveloper` for the dev-bypass path. Step 6 — the at-least-one-of match — is the part that only runs when a requirement is declared.
 
+The fetch honors an `X-Entitlement-Refresh: 1` cache bypass: `runGates` calls `fetchEffectiveEntitlements(authUserId, { bypassCache: req.headers.get("X-Entitlement-Refresh") === "1" })`. The app sends the header right after a purchase or restore, when a cached "no" would otherwise deny someone who has just paid. The header only chooses cache-vs-RC — RevenueCat stays the sole authority — and the RC layer throttles the bypass to roughly 3 calls/min/account, so it cannot be abused.
+
 ## Why rate-limit sits last
 
 The entitlement check (step 6) is deliberately ahead of the rate-limit step (step 8). A non-paying caller gets `403 subscription_required` on their first request rather than spending rate budget to also collect a `429`. Dev callers never reach the rate-limit step at all (chain sugar is skipped for them), so the only population that actually hits the limiter is entitled, non-developer callers — exactly the set worth rate-limiting. The account-freeze check (step 7) also precedes rate-limit so a frozen account's rejections consume no quota.
 
 ## GateConfig shapes
 
-`GateConfig` is a discriminated union of three concrete configs, all extending `GateConfigBase` (which carries the required `method` plus the `skipAppCheck` / `skipAppVersion` opt-outs). Each endpoint passes exactly one.
+`GateConfig` is a discriminated union of three concrete configs, all extending `GateConfigBase` (which carries the required `method`, the `skipAppCheck` / `skipAppVersion` opt-outs, and the optional `healthCheck?: HealthCheck` uptime opt-in — see [the health-probe door](/rollingrecord/backend/gates/health-probes)). Each endpoint passes exactly one. `gates/index.ts` also re-exports the `HealthCheck` and `HealthResult` types.
 
 | Config | `auth` | Extra fields |
 | --- | --- | --- |
@@ -79,3 +82,4 @@ The entitlement check (step 6) is deliberately ahead of the rate-limit step (ste
 - [Rate limiting & buckets](/rollingrecord/backend/gates/rate-limiting) — the bucket taxonomy and chain-sugar vs standalone wiring.
 - [Account-freeze gate](/rollingrecord/backend/gates/account-frozen) — the RR-310 soft-block.
 - [Developer bypass scope](/rollingrecord/backend/gates/dev-bypass-scope) — exactly what a dev account may and may not skip.
+- [The health-probe door](/rollingrecord/backend/gates/health-probes) — the step-0 uptime probe and its per-component checks.

@@ -10,18 +10,23 @@ Database housekeeping runs as a fleet of `pg_cron` jobs, staggered mostly across
 | Shape | How it runs | Examples |
 | --- | --- | --- |
 | In-DB SQL function | `cron.schedule('job', '<cron>', 'SELECT public.fn();')` | `prune_tombstones`, `prune_log_tables`, `purge_expired_trash` |
-| Edge Function via `net.http_post` | POSTs a URL + bearer read from Vault; `RAISE NOTICE`-skips until those Vault rows exist (SQL cannot read Edge env vars) | `storage_orphan_lister`, `extract-runner-tick` |
+| Edge Function via `net.http_post` | POSTs a URL + bearer read from Vault; `RAISE NOTICE`-skips until those Vault rows exist (SQL cannot read Edge env vars) | `storage_orphan_lister`, `extract-runner-tick`, `notify-cloud-wipe-7d` / `notify-cloud-wipe-1d` |
+
+`notify-cloud-wipe-7d` (`05:10` UTC) and `notify-cloud-wipe-1d` (`05:20` UTC), added in `supabase/migrations/20260824130000_notification_sent_log.sql`, `net.http_post` the `notifications` Edge Function with operation `cloud_wipe_warning` to warn a lapsed user before their cloud data is deleted. Both are idempotent via `l_notification_sent` (a duplicate send-claim fails `23505` and skips), run **after** `subscription_lapse_cleanup` (`04:07`) so an already-wiped user is not warned, and `RAISE NOTICE`-skip until the Vault entries `notifications_url` / `notifications_secret` exist.
 
 ## Retention sweepers
 
 | Function | Schedule (UTC) | What it deletes |
 | --- | --- | --- |
-| `prune_log_tables` | Sun `03:00` weekly | `l_*` rows older than `server_config.log_retention_months` (default 36) from `l_user_key_access`, `l_user_abuse_event`, `l_admin_audit`, `l_credit_log` |
+| `prune_log_tables` | Sun `03:00` weekly | `l_*` rows older than `server_config.log_retention_months` (default 36) from `l_user_key_access`, `l_user_abuse_event`, `l_admin_audit`, `l_credit_log`, `l_storage_drift` (by `detected_at`, added in `supabase/migrations/20260513000000_storage_drift_detection.sql`), and `l_notification_sent` (by `sent_at`, added in `supabase/migrations/20260824130000_notification_sent_log.sql`) |
 | `prune_h_tables` | Sun `04:00` weekly | `h_*` rows older than `server_config.support_history_retention_days` (default 90) from `h_transcribe_history` (by `completed_at`), `h_ai_engine_sessions` (by `ended_at`), and `h_extraction_charge` (by `charged_at`) |
+| `prune_closed_bug_reports` | nightly `03:30` | Hard-deletes `bug_reports` in a terminal status (`resolved` / `wont_fix`) whose `closed_at` is older than `server_config.bug_report_retention_days` (default 90); open and stale rows are never touched, and the `AFTER DELETE` trigger `trg_bug_reports_delete_log_object` reclaims each row's attached log in the `bug-logs` bucket (`supabase/migrations/20260817160000_bug_report_triage.sql`) |
 | `prune_support_tokens` | hourly | Consumed or expired `support_tokens` rows |
 | `prune_account_otp` | `:20` hourly | Consumed / expired account-OTP rows |
 
-These functions are defined in `supabase/migrations/20260508000000_baseline.sql`; their `cron.schedule` registrations live in later migrations or the dashboard, not the baseline itself.
+`prune_log_tables`, `prune_h_tables`, and `prune_support_tokens` are first defined in `supabase/migrations/20260508000000_baseline.sql` (the first two later re-created to sweep additional tables). `prune_closed_bug_reports` is defined in `supabase/migrations/20260817160000_bug_report_triage.sql` and `prune_account_otp` in `supabase/migrations/20260706120000_account_otp_two_phase.sql` — both post-baseline feature migrations. Their `cron.schedule` registrations live in later migrations or the dashboard, not the baseline itself.
+
+`mark_stale_bug_reports` (nightly `03:35` UTC, `supabase/migrations/20260817200000_bug_report_stale_status.sql`) rides alongside these but is an **`UPDATE`, not a delete**: it moves `bug_reports` still in status `new` and older than `server_config.bug_report_stale_days` (default 60) to status `stale`. `stale` is still open work, so it never gets a `closed_at` and `prune_closed_bug_reports()` never deletes it; `updated_at` is deliberately left untouched so a long-untouched report does not read as freshly handled.
 
 ## Tombstone & trash sweepers
 
@@ -31,6 +36,9 @@ These functions are defined in `supabase/migrations/20260508000000_baseline.sql`
 | `prune_demoted_rolling` | `03:25` nightly | Hard-deletes `c_recordings` husks where `mode='ROLLING'` and `protected_at IS NULL` and `deleted_at IS NULL` past the grace window (`supabase/migrations/20260605210100_prune_demoted_rolling_cron.sql`) |
 | `purge_expired_trash` | daily | Tombstones `c_recordings` whose `trashed_at` is past `trash_retention_days`, then tombstones orphaned `c_recording_sessions` in the same CTE transaction (sets `deleted_at`) |
 | `purge_orphan_recording_sessions` | weekly | Defense-in-depth: tombstones any `c_recording_sessions` with zero live recordings |
+| `subscription_lapse_cleanup` | daily `04:07` | For each user whose `cloud_grace_started_at` (renamed from `subscription_lapsed_at`) is older than `server_config.cloud_grace_days` (default 30): **HARD-DELETEs** all 13 `c_*` tables plus `user_blueprints`, zeroes `user_storage_usage`, clears the `cloud_grace` pair, stamps `canonical_users.cloud_wiped_at`, and `POST`s the collected audio `storage_path`s to `storage-janitor` over `pg_net`. `FOR UPDATE SKIP LOCKED`, so it never blocks a concurrent resubscribe webhook (`supabase/migrations/20260825120000_cloud_grace_window.sql`) |
+
+Unlike every other sweeper on this page, `subscription_lapse_cleanup` hard-deletes **live** rows, not already-dead ones. It deliberately does **not** tombstone: a tombstone means "the user deleted this" and would propagate to their devices and destroy the local library of someone who merely stopped paying. Returning devices instead learn of the wipe from `canonical_users.cloud_wiped_at`, which `sync-pull` surfaces as the `cloud_reset` status telling the device to re-upload. Because the blobs are handed off via `pg_net` (queued transactionally), a rollback cancels the blob delete, so a row that survives never loses its audio. See [c_recordings integrity](/rollingrecord/backend/database/c-recordings-integrity), where it is enumerated as a sanctioned hard-DELETE caller.
 
 ## Storage / crypto reconcilers
 

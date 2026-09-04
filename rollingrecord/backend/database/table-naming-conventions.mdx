@@ -3,7 +3,9 @@ title: "Table Naming Conventions"
 description: "The l_ / h_ / f_ / c_ table prefixes that encode retention class and purpose, and the sweepers behind each."
 ---
 
-A table's prefix encodes what it is and how long its rows live. Four prefixes carry meaning — `l_` (long-retention log), `h_` (short-retention history), `f_` (financial state), and `c_` (cloud-synced content) — while state, counter, config, and queue tables take no prefix. The prefixes also cluster related tables together in Supabase Studio's alphabetical list.
+A table's prefix encodes what it is and how long its rows live. Four prefixes carry meaning — `l_` (long-retention log), `h_` (short-retention history), `f_` (financial state), and `c_` (cloud-synced content) — while state, counter, config, queue, and lifecycle work-item tables take no prefix. The prefixes also cluster related tables together in Supabase Studio's alphabetical list.
+
+A table with a *lifecycle* — a row updated in place as it moves through states — is a work-item table, not an event log, and takes no prefix. `bug_reports` (`supabase/migrations/20260817120000_bug_reports.sql`) is deliberately un-prefixed for exactly this reason: a report moves `new` → `stale` → `triaged` → `in_progress` → `resolved`/`wont_fix`, which the convention groups with `transcribe_jobs`, not with the write-once `l_*` / `h_*` event rows swept on a retention clock.
 
 ## The prefixes
 
@@ -17,7 +19,7 @@ A table's prefix encodes what it is and how long its rows live. Four prefixes ca
 
 ## `l_*` — long-retention logs
 
-Append-only rows that may be referenced months or years later — compliance/legal, financial, and abuse-forensics events. Retained for `server_config.log_retention_months` (default 36). `prune_log_tables()` (`supabase/migrations/20260508000000_baseline.sql`) sweeps five of them by their timestamp columns: `l_user_key_access` (by `happened_at`); `l_user_abuse_event`, `l_admin_audit`, and `l_credit_log` (all by `created_at`); and `l_storage_drift` (by `detected_at`, added in `supabase/migrations/20260513000000_storage_drift_detection.sql`). Other `l_*` tables carry their own lifecycle and are **not** in that sweeper's body.
+Append-only rows that may be referenced months or years later — compliance/legal, financial, and abuse-forensics events. Retained for `server_config.log_retention_months` (default 36). `prune_log_tables()` (`supabase/migrations/20260508000000_baseline.sql`) sweeps six of them by their timestamp columns: `l_user_key_access` (by `happened_at`); `l_user_abuse_event`, `l_admin_audit`, and `l_credit_log` (all by `created_at`); `l_storage_drift` (by `detected_at`, added in `supabase/migrations/20260513000000_storage_drift_detection.sql`); and `l_notification_sent` (by `sent_at`, added in `supabase/migrations/20260824130000_notification_sent_log.sql`). Other `l_*` tables carry their own lifecycle and are **not** in that sweeper's body.
 
 | Table | What it records | Notes |
 | --- | --- | --- |
@@ -26,6 +28,7 @@ Append-only rows that may be referenced months or years later — compliance/leg
 | `l_admin_audit` | Support-ops actions | Write-once; no FK; deliberately excluded from `delete-user` (admin history, not user data) |
 | `l_credit_log` | Unified credit ledger | Renamed from `l_credit_consumption` (`consumed_at` → `created_at`); `UNIQUE(purchase_token)` guards duplicate purchases; in `delete-user` (no FK) |
 | `l_storage_drift` | Storage counter-drift log (RR-356) | FK + CASCADE; swept by `prune_log_tables()` (by `detected_at`) |
+| `l_notification_sent` | Send-once bookkeeping for the `notifications` Edge Function (one row per `auth_user_id` + `notification_type` + `dedupe_key`; the PK is the send-once guard — a duplicate claim fails `23505` and the loser skips) | FK + CASCADE; RLS on, no policies; swept by `prune_log_tables()` (by `sent_at`); `l_` not `h_` because the dispute it answers — "you deleted my recordings and never warned me" — can arrive months later (`supabase/migrations/20260824130000_notification_sent_log.sql`) |
 | `l_deleted_identity` | Account-deletion identity log | Keyed on salted `email_hash` + period; own retention |
 | `l_entitlement_events` | RC webhook event log | FK + CASCADE; own dedup index |
 | `l_eval_run` | AI eval-run cost log | `BIGINT` id sequence; own lifecycle |

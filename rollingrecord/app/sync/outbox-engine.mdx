@@ -49,6 +49,10 @@ Why pointers, not snapshots: a content snapshot taken at enqueue time would push
 
 ## `SyncEngine.runPush` — the drain driver
 
+<Note>
+**Tier gate before any push.** `SyncEngine.sync()` short-circuits at the very top and returns `SyncResult(pushed = 0, pulledEntities = 0)` when the tier is below `UserTier.PRO_CLOUD` — **unless** `force` is set. Every sync endpoint is `pro_cloud`-gated server-side, so below that tier a cycle is a guaranteed 403 push *and* a 403 pull; and a free user's outbox is never empty (`SyncEnqueuer` is ungated and `SyncEnqueueRecovery` re-enqueues on cold start), so `runPush`'s empty-outbox shortcut never saves the wasted round trips. The tier is read **live** per call via `entitlementRepository.currentTier.first()` (`getOrDefault(FREE)`) then `tier.atLeast(UserTier.PRO_CLOUD)`, off the new constructor input `entitlementRepository: EntitlementRepository`. `force` **fails open** — an explicit user retry spends one 403 rather than silently no-op on someone who just upgraded; automatic callers fail closed. Like the Wi-Fi-only skip, the gate does **not** stamp `lastAttemptAt` / `lastError` (no attempt was made, so no cooldown penalty and no failure UI).
+</Note>
+
 There is no dedicated "push worker" class beyond the generic `SyncWorker`; the drain logic is `SyncEngine.runPush` (`data/sync/SyncEngine.kt`). Each `runPush` call sends at most one batch; a single `sync()` drives the drain loop up to `MAX_DRAIN_ITERATIONS` (3) times, calling `runPush` once per iteration while the prior push processed `>0` rows, so one `sync()` can send up to three `sync-push` batches. `runPush`'s steps:
 
 1. **Fetch** `drainableNow(MAX_BATCH_OPS_CLIENT = 450)` — backoff-eligible rows only, capped so a 5000-row backlog doesn't load entirely into memory.
@@ -66,12 +70,23 @@ The pack loop has one critical safety invariant: a `DekUnavailableException` fro
 | `accepted` | `markProcessed` by the **sent** id | authoritative row applied via `tryApplyOrDefer` |
 | `server_wins` | `markProcessed` by the **sent** id | may return a *different* row (the `c_settings` `UNIQUE(auth_user_id)` reinstall case) — drain by the `opsIndexToEntry` id, adopt the server row |
 | `rejected`, `code = not_found` | `markProcessed`, no retry | server row hard-deleted after its tombstone was purged; local row left for the pull orphan sweep this same cycle |
+| `rejected`, `code = fk_violation` | splits on the LOCAL parent | **parent present** → transient: left with `recordRejection` + backoff, resolves on a later cycle when the parent's own push lands. **parent MISSING** → `markProcessed` (drained, no retry) plus an `AppLogger.w` (`save = true`) `runPush: FK_VIOLATION drain …` line — the entry can never be satisfied, so retrying it forever only clogs the outbox |
 | `rejected` (other) | left with `recordRejection` + backoff | `attempt_count++`, `last_rejected_code` set, `next_attempt_at = now + backoff` |
 | unknown | left unchanged | logged |
+
+The two drained rejection codes are companion constants: `CODE_NOT_FOUND = "not_found"` and `CODE_FK_VIOLATION = "fk_violation"`.
 
 ### Draining by the sent id
 
 `drainRowIdFor(responseIndex, opsIndexToEntry, echoedRowId)` (a free function in the same file) resolves which outbox key to drain by. The outbox entry is filed under the id **this client minted**; `server_wins` is precisely the outcome where the server may hand back a *different* row. On the `c_settings` reinstall path a fresh client mints a new settings id, collides with `UNIQUE(auth_user_id)`, and the server returns its stored row so the client adopts that id and content. Draining by the echoed id matched nothing, so the entry survived and re-pushed forever (`23505 → server_wins → still undrained`). Mapping index N back through `opsIndexToEntry` drains the right entry; for an ordinary `accepted` op the two ids are identical.
+
+### `missingLocalParent` — transient vs unsatisfiable FK
+
+`missingLocalParent(entity, rowId)` is what splits an `fk_violation` into "retry" and "drain forever". It decodes the composite `rowId` via `decodeCompositeRowId` and checks `existsById` on the parent and child DAOs. Only the two composite-PK junctions can have a *missing* parent: `WireEntity.CONTEXT_RECORDING` (checked against `contextDao` / `recordingDao`) and `WireEntity.CONTEXT_SESSION` (`contextDao` / `recordingSessionDao`). Every other entity returns `false`, so a foreign-key rejection on a normal entity keeps its existing retry behaviour untouched.
+
+`context_sessions` / `context_recordings` carry no Room `foreignKeys`, so a junction can outlive the parent it points at (observed 2026-08-25 on a junction whose `recording_session` had been deleted locally). The check is deliberately conservative: an unparseable entity or `rowId` answers `false` and falls through to the normal rejection + backoff path — draining a row it cannot identify is unrecoverable, so the cost of a wrong `false` is one more retry while a wrong `true` would discard a real link. It needs two new engine constructor inputs, `contextDao: ContextDao` and `recordingSessionDao: RecordingSessionDao`; `RecordingSessionDao.existsById(id)` is the new query added for it.
+
+This reactive drain has a proactive counterpart: `RecordingRepository.deleteSession` now tombstones a session's `context_session` junctions so they never strand in the first place — see [Pull & Reconciliation](/rollingrecord/app/sync/reconcile-engine).
 
 ## Backoff schedule
 
@@ -96,6 +111,16 @@ When an entry crosses `CRASHLYTICS_THRESHOLD = 10` attempts, `reportCrashlyticsF
 ## Safety net: `SyncEnqueueRecovery`
 
 `SyncEnqueueRecovery` (`data/sync/SyncEnqueueRecovery.kt`) is a **permanent** safety-net — explicitly excluded from the backfill-cleanup sweep, not a one-shot migration. `enqueueAllUnsynced()` walks all 13 synced tables (11 single-PK + 2 composite junctions; `SETTINGS` is excluded — it lives in DataStore with no `getUnsynced*` accessor) via `getUnsyncedIds()` / `getUnsyncedPairs()` (`remoteSyncedAt IS NULL`) and re-enqueues, catching any repository write that missed its enqueuer call. It is idempotent (already-synced rows are skipped; the squash index collapses duplicates) and cheap on hot start (13 indexed scans returning empty once everything is synced).
+
+### `prepareForCloudReset` — rebuild the outbox from device
+
+`prepareForCloudReset()` is the recovery pass for the `cloud_reset` rebuild-from-device flow that [`runPull`](/rollingrecord/app/sync/reconcile-engine) invokes after the server hard-destroyed a lapsed account's cloud data and the user resubscribed. It runs three steps:
+
+1. **Clears the `remoteSyncedAt` marker on all 13 synced DAOs** — `recordingDao.clearSyncMarkersForCloudReset()` plus `clearRemoteSyncedAtForCloudReset()` on the other twelve (`actionItem`, `category`, `contextCard`, `context`, `contextRecording`, `contextSession`, `note`, `recordingSession`, `scheduledRecording`, `searchMessage`, `searchThread`, `transcript`). Every survivor now looks never-pushed.
+2. **Cuts the blueprint server link** via the new constructor input `blueprintDao.cutServerLinkForCloudReset()`. Blueprints replicate through `ai-engine`, not `sync-push`, so the outbox can't protect them — cutting the link turns them into offline drafts that pull leaves alone rather than deleting-as-absent.
+3. **Re-enqueues everything** through the existing `enqueueAllUnsynced()` walk, which now matches every row because step 1 nulled the column it filters on.
+
+It is idempotent (re-clears already-null markers; the outbox `UNIQUE(entityType, rowId)` collapses duplicate enqueues). **Order invariant:** the caller — `runPull`'s `cloud_reset` branch — MUST run this to completion **before** `settings.resetSyncCursor()`. If the cursor advances first and the process dies, the `cloud_reset` signal is lost and the next pull reconciles the library away. See [Pull & Reconciliation](/rollingrecord/app/sync/reconcile-engine) for the pull-side trigger.
 
 <Note>
 Per-user worker scoping is done by the `addUserTag(userSessionManager)` extension applied in the schedulers — there is no `UserWorkTag` class. `UserSessionManager.switchTo` cancels work by that tag on sign-out.

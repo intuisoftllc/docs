@@ -45,6 +45,8 @@ An `OwnerPlan(ownerKind, ownerId, entityTypes, chunks: List<PlannedChunk>)` carr
 
 `ServerConfig.embeddingModel` (default `embed-v4.0`) and `ServerConfig.embeddingDimensions` (default 1024) are server-authoritative; the client reads them to compute a bundle's hash before its first embed.
 
+Since the 2026-08-30 Firebase Remote Config teardown (migration `20260830120000_firebase_rc_to_server_config.sql`), `server_config` is the single config store and `ClientConfig` / `ClientConfigManager` were deleted — the embedding/semantic knobs the reconciler and search engines depend on now read from `ServerConfig` only. That migration formally DROPPED the five dead `local_embedding_*` RC keys, consistent with RR-487's removal of the on-device embedding model: there is no on-device embedding config left.
+
 ## Related
 
 - [Semantic & Keyword Search](/rollingrecord/app/ai/semantic-search)

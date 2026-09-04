@@ -1,6 +1,6 @@
 ---
 title: "Trim & Splice"
-description: "The V2 trim editor — a keepSegments model over the shared trim logic — and the AudioSplicer decode/encode pipeline that writes the final trimmed file."
+description: "The V2 trim editor — a keepSegments model over the shared trim logic — and the AudioSplicer pipeline that writes the final trimmed file: WAV/PCM by a lossless byte-range copy, every other codec by decode/encode."
 ---
 
 `V2TrimScreen` is a V2-styled surface over `V2TrimViewModel`, which is an exact V2-package duplicate of the proven V1 `TrimViewModel` logic (only the package and class name changed). The trim math is shared, proven code, not a V2 rewrite. Trimming opens from the player's options sheet (`onNavigateToTrim`, Pro-gated).
@@ -22,36 +22,49 @@ A multi-segment edit generates a passthrough preview so the play button previews
 
 `synthesizeWaveform` samples the original waveform at the kept positions so the editor's bars reflect the current `keepSegments`.
 
+Every trim seek — a scrub or a repeat/loop boundary — goes through `MediaPlayer.seekAccurate(ms)` = `seekTo(ms, MediaPlayer.SEEK_CLOSEST)`, which lands exactly on the target instead of snapping ~99 ms before the nearest sync frame. Segment membership is then tested with a leading-edge tolerance `SEEK_LANDING_TOLERANCE_MS = 150L` (`origPos >= s - 150 && origPos <= e`): a seek that landed a hair short of a segment start used to read as "in a removed gap" and re-seek to that same start, undershooting again — a self-sustaining loop heard as a stutter over a trimmed region. The tolerance makes that impossible.
+
 ## Blocking errors
 
 `TrimError` is `RecordingMissing` (the row is gone) or `AudioUnreadable` (the audio can't decode). Either sets a blocking full-pane overlay that replaces the editor — because preview playback and the save splice both decode the same source file, a live-looking editor with dead controls would be dishonest.
 
 ## Save
 
-`triggerSave(mode)` → `performSave(mode)` wraps `AudioSplicer.splice` in `busyGuard.withBusy(BlockingOp.CLIP_RESAVE, rec.id)`. `TrimSaveMode` has two modes:
+`triggerSave(mode, copyName)` → `performSave(mode, copyName)` wraps `AudioSplicer.splice` in `busyGuard.withBusy(BlockingOp.CLIP_RESAVE, rec.id)`. `TrimSaveMode` has two modes.
+
+`SAVE_AS_COPY` first routes through a copy-naming step: `V2TrimScreen` shows a `LibraryNameEntrySheet` (title `R.string.trim_copy_name_title`, placeholder `trim_copy_name_placeholder`) prefilled from `viewModel.copyNamePrefill()`. It passes `requireNonEmpty = false` and `requireChanged = false`, so an empty field saves an untitled copy and the suggested prefill can be accepted unchanged. `OVERRIDE_ORIGINAL` keeps the original's identity, so there is nothing to name — it saves immediately.
+
+Before the result goes anywhere near the user's audio, `performSave` validates the splice output: it throws `IllegalStateException("the edit produced no audio")` when `!tempOut.exists() || tempOut.length() == 0L`. `AudioSplicer.spliceRange` can return normally having produced a 0-byte / header-less container (if `INFO_OUTPUT_FORMAT_CHANGED` never arrives the muxer is never started), and the old code renamed that over the only copy the user had.
+
+The temp file keeps a `.wav` extension for a WAV source (it was previously forced toward `.m4a`, which put PCM bytes under an `.m4a` name and broke the format sniffing playback, merge, and transcription rely on).
 
 | Mode | File effect | DB effect |
 | --- | --- | --- |
-| `OVERRIDE_ORIGINAL` | Invalidate the waveform cache, rename the temp splice over the original file. | `updateRecordingDurationAndSize` + `touchRecording` (bumps recency) + `clearCloudBackupSizeExceededFlag` on the same row. |
-| `SAVE_AS_COPY` | Splice written to a new `Base - Copy(.N).ext` file. | `insertRecording` of a new `Recording` (new UUID, `createdAt = now`, new name/duration/size); the original is untouched. |
+| `OVERRIDE_ORIGINAL` | Invalidate the waveform cache, then rename the temp splice over the original — result-checked (`if (!tempOut.renameTo(sourceFile)) throw`; a failed rename previously left untrimmed audio on disk while the row was stamped with the trimmed duration). | `updateRecordingDurationAndSize` + `touchRecording` (bumps recency) + `clearCloudBackupSizeExceededFlag` + `markRecordingForReupload(rec.id)` (the local audio changed, so the cloud copy is now stale). |
+| `SAVE_AS_COPY` | Splice renamed (result-checked) onto a `storageManager.generateSegmentFile(sessionId = null, segmentIndex = 0, extension = outExt, name = copyName)` path — standard `{name}_<ts>` / `manual_<ts>` recording naming, not a bespoke copy name. | `insertRecording` of a new `Recording` whose id is `IdPrefix.formatRecording(UUID)` (the `rec-` prefixed form, not a bare UUID) and whose identity is RESET: `mode = MANUAL`, `sessionId = null`, `segmentIndex = 0`, `protectedAt = null`, `cloudBackupId = null`, `cloudBackupStatus = null`, `cloudBackupCommittedAt = null`, `cloudOnly = false`, `trashedAt = null`, `updatedAt = null`, `createdAt = now`, `name = copyName` (blank/null stays untitled). The original is untouched. |
 
-`generateCopyFile` produces `"Base - Copy"`, `"Base - Copy (2)"`, … stripping any existing copy suffix from the base name first.
+Resetting the copy's identity is load-bearing: without it the copy inherited the source's cloud identity and rolling-session membership, so it could be pruned as a buffer segment or 404 on playback when the player took the cloud path for an id the server never had.
+
+`copyNamePrefill()` returns `"{name} - Copy"` for a named source — stripping any existing ` - Copy` / ` - Copy (n)` suffix so copying a copy doesn't accumulate suffixes — or an empty string for an unnamed source, so the sheet's placeholder shows and an empty save stays untitled. (The old `generateCopyFile` / `generateCopyBaseName` were deleted.)
 
 ## `AudioSplicer`
 
-`AudioSplicer` (`util/AudioSplicer.kt`) is an `object`. It never loads the whole file into memory.
+`AudioSplicer` (`util/AudioSplicer.kt`) is an `object`. It never loads the whole file into memory. `splice` checks `isWav(sourceFile)` (via `AudioFileProbe.parseWavHeader`) FIRST and routes a WAV/PCM source to the byte-copy `spliceWav`, before the single-range / multi-segment codec paths.
 
 | Function | Technique | Use |
 | --- | --- | --- |
-| `splice` (single range) | Decode → AAC/Opus re-encode → `MediaMuxer`, sample-accurate; `SEEK_TO_PREVIOUS_SYNC` skips the pre-cut head, per-frame clipping at the boundaries. | Final Save of a single kept region. |
-| `splice` (multi-segment) | `spliceRange` each part, then `concatenateFiles` (passthrough). | Final Save of multiple kept regions. |
+| `splice` (WAV / PCM) → `spliceWav` | Byte-range copy, no codec: copy the header, then each kept byte range — frame-aligned by rounding every offset DOWN to a whole frame (`channels * bitsPerSample/8`) — then patch the RIFF/`data` size fields. Chunked at `WAV_COPY_CHUNK = 1<<16` (64 KiB), cancellable via `coroutineContext.ensureActive()`. | Final Save of a WAV/PCM source. |
+| `splice` (single range) | Decode → AAC/Opus re-encode → `MediaMuxer`, sample-accurate; `SEEK_TO_PREVIOUS_SYNC` skips the pre-cut head, per-frame clipping at the boundaries. | Final Save of a single kept region (AAC/Opus source). |
+| `splice` (multi-segment) | `spliceRange` each part, then `concatenateFiles` (passthrough). | Final Save of multiple kept regions (AAC/Opus source). |
 | `spliceFast` | Passthrough copy of encoded frames with PTS remap (~23 ms AAC-frame granularity). | Live multi-segment preview — not for final save. |
+
+WAV must bypass the codec: `MediaExtractor` reports a WAV track as `audio/raw`, and the decode/encode loop never terminates for it (a long WAV spins forever instead of raising an error). This mirrors `AudioMerger`, which already special-cases WAV via `mergeWav`. `writeWavHeader` writes the 44-byte header TWICE — once up front so an interrupted file is still well-formed, then again at the end with the bytes actually written — so a short read near EOF yields a header that still matches its payload.
 
 The single-range path preserves the source container: a trimmed Opus-in-OGG stays Opus-in-OGG (a hardcoded AAC output previously broke server-side OGG parsing during transcription).
 
 ## Screen and sheets
 
-`V2TrimScreen.kt` hosts the interactive editor: a blue card (readout + `TrimWaveform`) over a `ControlsCard` (repeat / play / scissors) and Save. `TrimWaveform` supports pinch-zoom from 1× up to a dynamic `maxZoom()` derived from `TRIM_MAX_ZOOM_VISIBLE_MS = 5000f` (the visible span at full zoom), pan, draggable handles/cursor, tap-to-seek, rolling-max bars, blue handles + pills, and a red cursor. A `BackHandler` guards discard when `hasChanges`. `TrimProcessingOverlay` and `V2TrimErrorOverlay` also live in this file.
+`V2TrimScreen.kt` hosts the interactive editor: a blue card (readout + `TrimWaveform`) over a `ControlsCard` (repeat / play / scissors) and Save. `TrimWaveform` supports pinch-zoom from 1× up to a dynamic `maxZoom()` derived from `TRIM_MAX_ZOOM_VISIBLE_MS = 5000f` (the visible span at full zoom), pan, draggable handles/cursor, tap-to-seek, rolling-max bars, blue handles + pills, and a red cursor. A `BackHandler` guards discard when `hasChanges`. `TrimProcessingOverlay` (shown while `isSaving`, i.e. `saveProgress != null`) and `V2TrimErrorOverlay` also live in this file. The save-progress callback assigns `_saveProgress.value = p * 0.9f` (and the terminal `1f`) directly instead of launching a coroutine per tick, so a late tick can't restore a fractional value after the failure path nulls it — which had left the processing overlay stuck up.
 
 `V2TrimSheets.kt` defines `V2TrimActionSheet` (Keep/Remove, rows dimmed when not meaningful), `V2TrimSaveSheet` (Override vs Save copy), and `V2TrimDiscardSheet` (unsaved-changes Discard/Save).
 

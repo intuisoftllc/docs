@@ -30,10 +30,17 @@ The ~180-line plain block comment directly above the enum in `data/models/UserTi
 
 | Tier | Representative features (see the KDoc for the exhaustive list) |
 | --- | --- |
-| `FREE` | Manual record (start/stop/pause/resume), interruption resilience, recordings list, playback (play/seek/rename/delete/share), categories, favorites, Trash (30-day), dark mode, Clerk profile picture, display name |
+| `FREE` | Manual record (start/stop/pause/resume), interruption resilience, recordings list, playback (play/seek/rename/delete/share), categories, favorites, Trash (30-day), dark mode (account-tied — see below), fixed AAC/M4A audio format, Clerk profile picture, display name |
 | `PRO` | Import recordings + receive shared audio, Rolling Record mode, scheduled recordings, live marks, waveform, trim, notes, session detail (segment view/delete/trim/protect), audio-format settings, Quick Settings tiles, on-device transcription (Standard / Whisper) |
 | `PRO_CLOUD` | Google Drive backup, cross-device recording + trash access, semantic search (RR-487, server-side embeddings), cloud transcription (AssemblyAI, up to 8 hrs/mo), Medical Mode, Usage screen, free-up-cloud-space sheet |
-| `PRO_CLOUD_AI` | Cloud transcription raised to 20 hrs/mo, context cards (AI extraction, 30 hrs/mo), AI correction, AI/knowledge-base search, KB chat (Claude), custom extraction templates, context-architecture coaching |
+| `PRO_CLOUD_AI` | Cloud transcription raised to 20 hrs/mo, context cards (AI extraction, 30 hrs/mo), AI correction, AI/knowledge-base search, KB chat (Claude), custom extraction templates, context-architecture coaching. Below this tier the context-detail **and** tasks screens are `READ_ONLY`, not hidden — see below |
+
+A few map entries carry nuance the table can't:
+
+- **Audio format is fixed at AAC/M4A for `FREE`** — not a choice, and not a crippled one: it is the container that plays natively everywhere (iOS, macOS, Windows, Android), so a shared recording opens for whoever receives it (see `AudioFormat.DEFAULT`). Picking a format (AAC / Auto / Opus / WAV) is a `PRO` feature — the existing "audio-format settings" row.
+- **Dark mode is tied to the account, not the device (RR-500)** — free at every tier. Signing out returns the login screen to the system theme instead of the previous user's; signing in adopts that account's choice. It rides the existing settings sync, so `PRO_CLOUD` and above carry it cross-device, while below that it is per-account on the device.
+- **The context size meter is ungated** — each context shows how much of its extraction budget it uses, measured on-device against `extraction_max_input_tokens`. It was once `PRO_CLOUD_AI`-only, but is now visible at **every** tier: informational only, no gate, no metering. A downgraded user still owns the context and needs the number the moment they resubscribe.
+- **Cloud+AI downgrade is read-only, not destructive** — below `PRO_CLOUD_AI` the context-detail and tasks screens go `READ_ONLY`: existing cards, topics, and tasks stay viewable, shareable, and exportable while create / edit / complete / delete are suppressed. See [Feature Gating & Upsell](/rollingrecord/app/monetization/feature-gating) for the mechanism.
 
 ## How a tier is produced
 

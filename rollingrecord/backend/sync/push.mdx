@@ -5,6 +5,8 @@ description: "The batched upsert + tombstone write endpoint: per-op outcome arra
 
 `POST /sync-push` (`functions/sync-push/index.ts`) takes a batch of write ops and returns a per-op outcome array — it is deliberately NOT all-or-nothing. A well-formed batch with one bad op still commits the other nine; only structural abuse of the envelope fails the whole request.
 
+Like every sync endpoint, `sync-push` now hosts a health probe — `healthCheck: dbHealthCheck("sync-push")` (`functions/_shared/db/health-checks.ts`, Sync Services status group) — a read-only DB-liveness gate that short-circuits the whole admission chain on a valid `X-Health-Probe` header.
+
 ## Request and response shape
 
 The body is `{ ops: [ { entity, known_updated_at?, row } ] }`. A tombstone is just an op whose `row` carries a non-null `deleted_at` — there is no separate delete verb. `parsePushRequest` (`functions/sync-push/request.ts`) validates only the outer skeleton; per-field validation is delegated to `wireRowToDb`.
@@ -51,6 +53,10 @@ Each op runs the same sequence: entity resolve (`entityByWire`) → preference c
 
 Because the upsert's `onConflict` targets the bare PK (not scoped to `auth_user_id`), an ownership pre-check probes for an existing row under a different owner and rejects it as `not_found` — the same opaque outcome the LWW path returns for a cross-user PK. The tombstone and LWW-UPDATE branches carry `.eq("auth_user_id", authUserId)` directly.
 
+### Dropped junction-active guards
+
+Migration `20260825020000_drop_context_active_junction_triggers.sql` REMOVED the two BEFORE-INSERT guards on the junction tables — triggers `trg_c_context_recordings_enforce_active` / `trg_c_context_sessions_enforce_active` and their functions `enforce_context_active_on_recording_link()` / `enforce_context_active_on_session_link()`. They raised P0001 `context_not_active` when a junction's parent context was not ACTIVE (a server mirror of the client `canEditInputs` rule), but broke `cloud_reset` restores: a restored months-old link is indistinguishable by state from attaching a recording to an ARCHIVED context, so the re-upload was refused and the links never reached the cloud. They were also trivially bypassable — push the context ACTIVE, push the link, then push the status back. The rule now lives ONLY client-side in `canEditInputs`. The FK-constraint path (PG `23503` / `fk_violation`) is untouched: an INSERT naming an unknown parent is still rejected.
+
 ## Execution ordering
 
 `reorderForExecution` (`functions/sync-push/index.ts`) splits ops into tombstones-first, then sorts topologically by FK depth using `ENTITY_DEPTH`: within tombstones, children before parents (depth descending); within upserts, parents before children (depth ascending). This is the fix for the 2026-05-05 FK-violation incident, where a batch of `[message, message, thread]` — exactly what the client outbox produces — rejected the messages because the thread was not yet written. Unknown entities default to `UNKNOWN_ENTITY_DEPTH = 99` (a safe leaf). The original submission `index` is preserved for response re-sorting.
@@ -67,7 +73,7 @@ When an upsert row carries a `storage_path`, `blobMetadata` does a HEAD-equivale
 | `blob_missing` | 409 | `storage_path` declared but no object found there (the PUT never completed) |
 | `size_mismatch` | 409 | claimed `file_size_bytes` is more than 1% off the actual Storage size |
 | `backup_quota_exceeded` | 409 | upsert would exceed the tier storage cap (pre-check or `enforce_recordings_quota` trigger) |
-| `fk_violation` | 409 | PG `23503` — child references a parent not yet written; retriable next cycle |
+| `fk_violation` | 409 | PG `23503` — child references a parent not yet written; retriable next cycle (but the client splits this outcome — see below) |
 | `not_found` | 404 | cross-user PK (IDOR guard on the upsert path) OR an LWW UPDATE matched no owned row |
 | `validation_failed` | 400 | unknown or mistyped field (carries `field`); also top-level for a bad envelope |
 | `batch_too_large` | 413 | more than 500 ops or a body over 5 MB (top-level; fails the whole request) |
@@ -75,6 +81,15 @@ When an upsert row carries a `storage_path`, `blobMetadata` does a HEAD-equivale
 | `invalid_body` | 400 | non-JSON or non-object body (top-level) |
 
 Top-level 400s / 413s fire only for structural abuse (`invalid_body`, `validation_failed` on the envelope, `batch_too_large` from `SYNC_PUSH_MAX_BATCH_OPS = 500` / `SYNC_PUSH_MAX_BATCH_BYTES = 5 MB`). Everything else is a per-op outcome inside `results`.
+
+### Client-side splitting of `fk_violation`
+
+The server returns `fk_violation` unchanged, but the client (`SyncEngine.kt`) no longer retries it uniformly. On receiving the code it consults `missingLocalParent(entity, rowId)`:
+
+- **Parent row present locally** → transient (later in the batch, or its own push failed this cycle). Left on the outbox, retried next cycle — the documented case.
+- **Parent row MISSING locally** → permanently unsatisfiable: nothing on this device would ever satisfy the constraint, so every retry fails identically and clogs the outbox forever. The client DRAINS the entry (`outbox.markProcessed`, matched on the `CODE_FK_VIOLATION = "fk_violation"` constant, logged `save = true`) instead of retrying.
+
+Only the two composite-PK junctions (`context_recording`, `context_session`) are eligible for the drain — `missingLocalParent` answers `false` for every other entity — and an unparseable entity / rowId falls through to the normal rejection path and stays on the outbox (conservative, since draining an unidentifiable row is unrecoverable).
 
 ## Related pages
 

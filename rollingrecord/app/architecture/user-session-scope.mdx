@@ -22,7 +22,7 @@ It does **not** observe `AuthState` itself. In the V2 surface the observer that 
 
 ## `switchTo` — order of operations
 
-`switchTo(newAuthUserId: String?)` is a no-op when the id is unchanged. Otherwise it runs a strict order — the finalize step is first because `RecordingService` resolves its repositories through `userProperty()` on every access, so a save racing the swap would split writes across two users:
+`switchTo(newAuthUserId: String?)` is a no-op when the id is unchanged. Otherwise it wraps the **entire** switch body in `withContext(Dispatchers.IO)` and delegates to a private `switchToLocked(oldSessionId, newSessionId)` — the no-change fast path stays outside the hop. Every production caller (the V2App / AppNavHost Compose coroutines) invokes `switchTo` from the UI dispatcher, so `oldScope.close()` — which closes the outgoing session's Room/SQLCipher DB (WAL checkpoint, disk I/O) — used to run on Main on every sign-in/out. Enforcing the dispatcher hop at the source makes every present and future caller safe rather than trusting each one to remember it. Within `switchToLocked` the steps run in a strict order — the finalize step is first because `RecordingService` resolves its repositories through `userProperty()` on every access, so a save racing the swap would split writes across two users:
 
 | Step | Action | Why |
 | --- | --- | --- |
@@ -58,6 +58,7 @@ Implementing the interface is **necessary but not sufficient**. Clearing is a po
 | `V2OnboardingSignals` | `nextSignInIsNewAccount` flag. |
 | `RecordingAdmissionBus` | In-flight admission events. |
 | `CloudDecryptFailureStore` | Undecryptable-blob marks keyed by one user's row ids. |
+| `EntitlementRefreshSignal` | Holds one boolean — the post-purchase `X-Entitlement-Refresh` arm state. App-level so the OkHttp interceptor can read it without entering a scope; cleared on switch so a flag armed by the previous account can't fire on the next account's first call. |
 
 ## `SessionDekHolder`
 

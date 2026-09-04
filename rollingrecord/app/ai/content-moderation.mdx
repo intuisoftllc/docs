@@ -17,7 +17,7 @@ A local pass is not final approval: the server can still reject, surfaced to the
 
 ## The keyword check
 
-`moderate(templateText): Result` returns `Approved` or `Rejected(userMessage)`. It runs entirely on `Dispatchers.Default` (Levenshtein over large text should not block Main) and skips the whole pipeline — approving locally — when `ClientConfig.blueprintModerationEnabled` is false.
+`moderate(templateText): Result` returns `Approved` or `Rejected(userMessage)`. It runs entirely on `Dispatchers.Default` (Levenshtein over large text should not block Main) and skips the whole pipeline — approving locally — when `ServerConfig.blueprintModerationEnabled` is false.
 
 `checkKeywords()` has two passes:
 
@@ -46,7 +46,7 @@ On any match it returns the message "This template attempts to override AI safet
 
 ## When it runs, and the config gate
 
-Moderation runs at TEMPLATE/BLUEPRINT SAVE time (before `save_user_blueprint`), not before AI calls in general — KB-chat turns are not client-moderated. It is master-enabled by `ClientConfig.blueprintModerationEnabled`, a Firebase toggle whose key is `template_moderation_enabled` (default true). The client vocabulary uses "blueprint" while the config key and older server naming retain "template" — the two are synonyms.
+Moderation runs at TEMPLATE/BLUEPRINT SAVE time (before `save_user_blueprint`), not before AI calls in general — KB-chat turns are not client-moderated. It is master-enabled by `ServerConfig.blueprintModerationEnabled`, a `server_config` row whose key is `blueprint_moderation_enabled` (default true). Firebase Remote Config was retired 2026-08-30, and migration `20260830120000_firebase_rc_to_server_config.sql` moved this toggle to `server_config`, renaming the RC key `template_moderation_enabled` to `blueprint_moderation_enabled` — "template" is the feature's retired name, and the client now uses "blueprint" throughout.
 
 `BlueprintValidation` (`agentcore/.../data/repository/BlueprintValidation.kt`) is the shared name / description / prompt validation (`NAME_MAX`, `DESCRIPTION_MIN` / `DESCRIPTION_MAX`) enforced by the editor, the `proposeBlueprint` tool, and the proposal dialog before save.
 

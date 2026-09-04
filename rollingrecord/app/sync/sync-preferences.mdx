@@ -3,7 +3,7 @@ title: "Sync Preferences"
 description: "Two distinct systems: the six per-group sync toggles (user-sync-preferences Edge Function) and the encrypted c_settings user-preferences blob (SETTINGS entity) — and what deliberately does not sync."
 ---
 
-"Sync preferences" is two separate mechanisms that are easy to conflate. One is the six per-group toggles that decide *which entity groups* sync at all. The other is the SETTINGS entity — a user's app preferences serialized into an encrypted `c_settings` row that syncs through the ordinary outbox/pull path like any other entity. Device settings (Wi-Fi-only, dark mode, storage location) are a third thing entirely and deliberately sync **nowhere**.
+"Sync preferences" is two separate mechanisms that are easy to conflate. One is the six per-group toggles that decide *which entity groups* sync at all. The other is the SETTINGS entity — a user's app preferences serialized into an encrypted `c_settings` row that syncs through the ordinary outbox/pull path like any other entity. Device settings (Wi-Fi-only, storage location) are a third thing entirely and deliberately sync **nowhere**.
 
 ## Two systems, side by side
 
@@ -11,7 +11,7 @@ description: "Two distinct systems: the six per-group sync toggles (user-sync-pr
 | --- | --- | --- |
 | Per-group toggles | server `user_sync_preferences` row | `SyncPreferencesRepository` + `user-sync-preferences` Edge Function (GET/PATCH) |
 | User settings blob | `UserSettingsDataSource` (DataStore) → `c_settings` | `SETTINGS` `WireEntity` via `SettingsSyncObserver` + `SettingsTransform` (encrypted, LWW) |
-| Device settings (**not synced**) | `DeviceSettingsDataSource` | none — per-device by design (`wifiOnly`, dark mode, storage config) |
+| Device settings (**not synced**) | `DeviceSettingsDataSource` | none — per-device by design (`wifiOnly`, storage config) |
 
 ## The six per-group toggles
 
@@ -43,9 +43,15 @@ There are **two** `SyncGroup` enums. `data.repository.SyncGroup` (`serverKey` + 
 
 ## The SETTINGS entity — an encrypted `c_settings` blob
 
-The second system is a real sync entity. `SettingsBlob` (`data/sync/transform/SettingsBlob.kt`) is the `@Serializable` JSON shape of the `c_settings` encrypted blob — recording defaults, behavior toggles, "don't show again" flags, analytics, and collapsed settings-sections. Every field is nullable so a partial blob from an older client can't write `false`/`0` over a value a newer device set; on apply only non-null fields overwrite the local DataStore. `CURRENT_SCHEMA_VERSION = 1`; merge semantics are blob-level last-write-wins.
+The second system is a real sync entity. `SettingsBlob` (`data/sync/transform/SettingsBlob.kt`) is the `@Serializable` JSON shape of the `c_settings` encrypted blob — recording defaults, behavior toggles, "don't show again" flags, analytics, dark mode, and collapsed settings-sections. Every field is nullable so a partial blob from an older client can't write `false`/`0` over a value a newer device set; on apply only non-null fields overwrite the local DataStore. `CURRENT_SCHEMA_VERSION = 1`; merge semantics are blob-level last-write-wins.
 
-`SettingsBlob` **deliberately excludes** device- and runtime-scoped values: `activeRecordingMode`, `embeddingCacheVersionApplied`, `syncLastPullCursor`, `wifiOnly`, dark mode / storage config, and subscription tier. Those are per-device (in `DeviceSettingsDataSource`) or server-authoritative (via RevenueCat) and must never travel in a user's synced blob.
+### Dark mode joins the blob (RR-500)
+
+Dark mode used to be a device setting. RR-500 moved it from `DeviceSettingsDataSource` to `UserSettingsDataSource` (key `DARK_MODE`) precisely so it would sync: a device-level theme meant signing out left the login screen in the previous account's colours. It travels as `@SerialName("dark_mode") val darkMode: String? = null` (`"system"` / `"on"` / `"off"`), nullable like every other field so a blob written before the key existed simply omits it and the reader leaves the local theme alone. It is projected in `SettingsBlob.fromPreferences` and written back in `writeInto`, both keyed on `UserSettingsDataSource.DARK_MODE`. `DEFAULT_DARK_MODE = "system"` — the signed-out login screen has no account preference, so it defers to the device.
+
+A one-time `[BACKFILL]` migration `UserSettingsDataSource.adoptDeviceDarkModeOnce(deviceValue)`, guarded by the `DARK_MODE_ADOPTED_FROM_DEVICE` key, copies the pre-RR-500 device-level choice into the account once per device. It is **deliberately not** in `SettingsBlob`: it describes a per-device migration, and syncing it would make a second device skip adopting its own prior device-level choice.
+
+`SettingsBlob` **deliberately excludes** device- and runtime-scoped values: `activeRecordingMode`, `embeddingCacheVersionApplied`, `syncLastPullCursor`, `wifiOnly` / storage config, and subscription tier. Those are per-device (in `DeviceSettingsDataSource`) or server-authoritative (via RevenueCat) and must never travel in a user's synced blob.
 
 ### `SettingsSyncObserver`
 

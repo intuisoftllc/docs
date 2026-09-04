@@ -12,7 +12,7 @@ A case's `session.mock_tools` maps each tool name to one of three forms. The reg
 | Form | Shape | When |
 | --- | --- | --- |
 | Loose | the value IS the result | The common path — a single result per tool. |
-| Explicit | a list of `{match, result}` entries, scanned in order | One tool must return different results based on how it was called. |
+| Explicit | a list of `{match, result}` (or `{match, result_ref}`) entries, scanned in order | One tool must return different results based on how it was called. |
 | Staged | `{"stages": [...]}` | The result must CHANGE across the user's conversation turns (progressive disclosure). |
 
 Loose form — a single result served for every call:
@@ -34,6 +34,33 @@ Explicit form — entries scanned in order, first match wins, with a `default`:
   ]
 }
 ```
+
+### Literal `result` vs `result_ref`
+
+Every explicit-form entry (and every entry inside a staged form) supplies its return value in one of two mutually-exclusive ways:
+
+- `result` — a literal JSON value served verbatim.
+- `result_ref` — a KEY into the generated `kb_tool_results.json` fixture, resolved through `render_tool_result` (see [Canonical tool fixtures](/rollingrecord/evals/harness/tool-fixtures)). The ref is either a bare key string, or an object `{"key": ..., "args": {...}}` whose `args` fill the template's `{placeholder}` slots. Prefer `result_ref` for any string production actually emits, so the case cannot drift from it — a literal copy silently rots (the `create_task_server_error` case pasted a dispatcher string that had been replaced, and tested a result the model could never receive).
+
+`_normalize_entries` enforces this at load time: an entry with BOTH `result` and `result_ref` raises `ValueError` ("pick one"); an entry with NEITHER raises `ValueError` ("missing result (or result_ref)"); and a `result_ref` that is not a key string or a `{"key": ...}` dict raises `ValueError`. These sit alongside the existing default/match `ValueError` rules.
+
+`createTask` returning the canonical success template, from `tool_correctness/small/create_task_1.json`:
+
+```json
+"createTask": [
+  {"match": {"contextId": "ctx-ctx_el"},
+   "result_ref": {"key": "createTask.success",
+                  "args": {"context": "Engineering Leadership",
+                           "text": "Review the migration script before Friday."}}},
+  {"default": true, "result": "NOT_FOUND: Context does not exist. Use listAllContexts or findContextByName to find a valid one."}
+]
+```
+
+The refusal siblings `createTask.no_card` (context never extracted) and `createTask.write_failed` (Completed/Archived context) are referenced the same way, with only a `context` arg.
+
+<Note>
+A mock may embed the REAL production wire format on purpose. The result-shape probe cases (`kb_chat_session/small/adversarial_result_shape_probe_1.json`) mock `getBlueprints` with its exact labelled `key=value` output because reciting that format verbatim is itself the leakage the case grades — the fixture has to look like the real thing for the leak to be reproducible.
+</Note>
 
 ## Match operators
 

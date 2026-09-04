@@ -3,7 +3,7 @@ title: "c_recordings Cryptographic-Column Integrity"
 description: "The four sanctioned DELETE callers for c_recordings crypto columns and the unconditional ban on TRUNCATE and DROP."
 ---
 
-Each `c_recordings` row's crypto column-set is what makes its `audio-storage` blob decryptable. Only four caller classes may delete a row or null those columns, and `TRUNCATE`/`DROP TABLE` on the table is permanently banned — a stricter rule than the general destructive-migration confirmation path, because there is no engineering recovery once the wrapped DEKs are gone.
+Each `c_recordings` row's crypto column-set is what makes its `audio-storage` blob decryptable. Only four caller classes may delete a row or null those columns, and `TRUNCATE`/`DROP TABLE` on the table is permanently banned — a stricter rule than the general destructive-migration confirmation path, because there is no engineering recovery once the wrapped DEKs are gone. `supabase/migrations/20260824120000_lapse_cloud_reset.sql` added `subscription_lapse_cleanup` as a new hard-DELETE sweeper within the scheduled caller class; its own header frames it as "a FIFTH sanctioned caller beyond the four the rule enumerates," and CLAUDE.md was amended in the same commit to name it explicitly with the tombstone-vs-wipe reasoning below.
 
 ## The crypto column-set
 
@@ -42,7 +42,12 @@ Four pg_cron functions are the "scheduled" caller class. See [cron sweepers](/ro
 | `prune_tombstones` | Hard-deletes rows whose `deleted_at` is past `cloud_tombstone_grace_days` (default 30) |
 | `purge_expired_trash` | Tombstones rows whose `trashed_at` is past `trash_retention_days`, then tombstones orphaned sessions in the same transaction (sets `deleted_at`, does not raw-delete) |
 | `prune_demoted_rolling` | Hard-deletes husks where `mode='ROLLING'` and `protected_at IS NULL` and `deleted_at IS NULL` past the grace window — demoted rolling segments that carry no crypto/blob (`supabase/migrations/20260605210100_prune_demoted_rolling_cron.sql`) |
+| `subscription_lapse_cleanup` | For a user whose `cloud_grace_started_at` is past `server_config.cloud_grace_days` (default 30): **HARD-DELETEs** the `c_recordings` rows (and the other 12 `c_*` tables plus `user_blueprints`), after capturing each row's `storage_path` **before** the delete and handing the audio blobs to `storage-janitor` over `pg_net` (`supabase/migrations/20260825120000_cloud_grace_window.sql`) |
 | orphan-blob sweeper | The hourly `storage-orphan-lister` reaps blobs no longer claimed by a row |
+
+Of these, `subscription_lapse_cleanup` is the **only** sweeper that hard-deletes **live** rows — `prune_tombstones`, `purge_expired_trash`, `prune_demoted_rolling`, and the orphan lister all GC rows that are already tombstoned, expired, demoted, or orphaned. The distinction matters because a lapse wipe is not a deletion the user asked for.
+
+A tombstone (`deleted_at`) means "the user deleted this" and propagates to every device via sync, wiping their local copies. A lapse wipe means "we stopped storing it" and must **not** propagate — so `subscription_lapse_cleanup` hard-deletes and instead stamps `canonical_users.cloud_wiped_at`, which `sync-pull` surfaces as the `cloud_reset` status telling a returning device to re-upload rather than delete (`supabase/functions/_shared/db/cloud-wipe.ts`). This is why hard-deleting alone is not enough: the client's orphan reconcile would otherwise read the empty server set as a mass deletion.
 
 ## Server functions that null crypto legitimately
 

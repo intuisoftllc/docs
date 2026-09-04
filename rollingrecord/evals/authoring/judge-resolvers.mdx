@@ -93,10 +93,6 @@ Every chain in `judges/chains.py` is itself a `Judge`, so they nest arbitrarily.
 
 `Cascade` ordering is a design tool: put cheap deterministic judges first, expensive LLM judges last, and use `MinConfidence` as the "I'm not sure — escalate" knob. If every child of a chain SKIPs, the chain returns SKIP. See [Chain primitives](/rollingrecord/evals/judges/chains).
 
-## Keeping the Kotlin registry in step
-
-The on-device eval port has a parallel resolver: `SuiteRegistry.judgeFor(case)` (`app/app/src/debug/java/com/intuisoftllc/rollingrecord/evalmode/suites/SuiteRegistry.kt`) wires the same per-case chains for each suite, degrading to structural-only when the rubric or judge client is unavailable — the same "standard fan-out" pattern. When you change a suite's `judges.py`, mirror it in `SuiteRegistry` so the two harnesses grade identically. See [On-device judges & suites](/rollingrecord/evals/on-device/judges-suites).
-
 ## Where to go next
 
 - [Judges overview](/rollingrecord/evals/judges/overview) — the grading model and the `Verdict` vocabulary.

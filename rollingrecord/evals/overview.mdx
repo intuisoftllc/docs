@@ -1,6 +1,6 @@
 ---
 title: "Eval System Overview"
-description: "What the AI evaluation harness grades, its two runtimes, and where the deep pages live."
+description: "What the AI evaluation harness grades, its runtime and parity dimension, and where the deep pages live."
 ---
 
 The eval harness grades the AI behavior of RollingRecord's `ai-engine` operations — above all the KB-chat agent loop (`kb_query`) — by running a fixed set of golden cases against the live dev backend and scoring each response with a judge chain.
@@ -23,14 +23,11 @@ The design rule is that the judge model must be meaningfully smarter than the mo
 
 `run.py` resolves which cases to run, hands each to a `SystemUnderTest`, captures the response, runs the suite's judge chain to produce a `Verdict`, tallies the run, and writes a results JSON plus an analytics row. See [Architecture & Data Flow](/rollingrecord/evals/architecture) for the full path.
 
-## The two runtimes
+## The runtime and its parity dimension
 
-The same case format is executed in two independent places:
+The harness has a single runtime — the Python harness (`evals/`): the CLI in `run.py`, the orchestrator `Runner` (`evals/core/runner.py`), and the default `AiEngineHttp` system-under-test. This is the pre-release safety net run from a developer machine or CI. (A debug-only on-device Kotlin port — the `evalmode` module — once ran the same suites inside the app against a seeded local corpus; it was deleted because it shipped a baked-in Anthropic key, and the Python harness is now the only eval runtime.)
 
-- **The Python harness** (`evals/`) — the CLI in `run.py`, the orchestrator `Runner` (`evals/core/runner.py`), and the default `AiEngineHttp` system-under-test. This is the pre-release safety net run from a developer machine or CI.
-- **The on-device Kotlin port** (`app/app/src/debug/.../evalmode/`) — a debug-only in-app module that runs the same suites against a seeded local corpus, driving the real client through `OnDeviceSystemUnderTest` (`evalmode/systemundertest/OnDeviceSystemUnderTest.kt`). See the [on-device overview](/rollingrecord/evals/on-device/overview).
-
-Within the Python harness there is a further parity dimension. The `--sut` flag chooses how SESSION (multi-round) cases are driven:
+Within the Python harness there is a parity dimension. The `--sut` flag chooses how SESSION (multi-round) cases are driven:
 
 - `--sut=python` (default) uses the in-harness `SessionRunner` (`evals/core/session.py`), an imitation of the client agent loop.
 - `--sut=kotlin` shells out to the `app/agentrunner` CLI, which drives the **literal** production agent loop in `app/agentcore` (`AgentLoop`) — same tool definitions, instructions, message assembly, and caps as the shipping app. See the [Kotlin SUT contract](/rollingrecord/evals/kotlin-sut/contract).
@@ -47,5 +44,4 @@ Single-shot (non-session) cases always use the Python HTTP client regardless of 
 - [Judges overview](/rollingrecord/evals/judges/overview) — the `Judge` ABC and how chains compose verdicts.
 - [System-under-test concept](/rollingrecord/evals/sut/concept) — the `SystemUnderTest` ABC and `ActualOutput`.
 - [Kotlin SUT contract](/rollingrecord/evals/kotlin-sut/contract) — how `--sut=kotlin` drives the real production agent loop.
-- [On-device overview](/rollingrecord/evals/on-device/overview) — the in-app `evalmode` runtime.
 - [Authoring a suite](/rollingrecord/evals/authoring/suite-layout) — the on-disk layout of cases and judge resolvers.

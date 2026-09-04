@@ -26,7 +26,11 @@ Signature and expiry alone would accept **any** Clerk-signed token — one minte
 
 ## JWKS caching
 
-`getClerkJwks()` fetches `CLERK_JWKS_URL` and caches the result for `JWKS_TTL_MS` (`5 * 60 * 1000` — five minutes) via `cachedJwks` / `jwksCachedAt`. This is why a rotated or revoked Clerk **signing key** stops verifying within one TTL window even on a warm isolate, rather than waiting for a cold start that Supabase can defer for hours. It has no effect on user session length — these are Clerk's server keys, not user tokens. The fetch returns `null` (fail closed) when the env var is unset or the request fails.
+`getClerkJwks()` fetches `CLERK_JWKS_URL` and caches the result for `JWKS_TTL_MS` (`5 * 60 * 1000` — five minutes) via `cachedJwks` / `jwksCachedAt`. This is why a rotated or revoked Clerk **signing key** stops verifying within one TTL window even on a warm isolate, rather than waiting for a cold start that Supabase can defer for hours. It has no effect on user session length — these are Clerk's server keys, not user tokens. The fetch returns `null` (fail closed) when the env var is unset or the request fails. The health-reachability check below is the one caller that intentionally does NOT go through this cache — it re-fetches to test live reachability.
+
+## Health-probe reachability check
+
+`checkClerkReachable()` (a new export in `jwt.ts`) backs the account/sign-in uptime probe — it is the Clerk leg of `dbAndClerkHealthCheck`, which `account-otp` subscribes to. It does a FRESH `GET` of `CLERK_JWKS_URL` — the same public keys this module verifies every JWT against — deliberately bypassing the in-isolate JWKS cache so it proves Clerk is reachable *right now*, with a 4s abort (`CLERK_HEALTH_TIMEOUT_MS = 4_000`). It returns `true` only when Clerk answers 2xx within the timeout; a missing URL, network error, timeout, or non-2xx all return `false` (`clerk: error` → degraded). It never throws. See [the health-probe door](/rollingrecord/backend/gates/health-probes) for how the result is shaped into the probe response.
 
 ## Result types
 

@@ -1,0 +1,99 @@
+---
+title: "The Health-Probe Door (Uptime Monitoring)"
+description: "An opt-in step-0 gate that short-circuits the whole admission chain to a near-instant liveness read, so an uptime monitor can probe each Edge Function without ever reaching a handler or seeing caller data."
+---
+
+A function can expose a real, per-component uptime signal by opting into the health-probe door. When a request carries a valid `X-Health-Probe` secret, `runHealthProbe(req, config)` in `functions/_shared/gates/health.ts` runs a cheap, read-only check FIRST — before every other gate — and returns a tiny status response, never touching the operation handler and never returning caller data.
+
+## The step-0 door
+
+`runHealthProbe(req, config)` runs as step 0 inside `runGates` (`functions/_shared/gates/index.ts`), ahead of method, App Check, auth, and rate-limit. It returns `Response | null`:
+
+- a `Response` means the request was a valid health probe — `runGates` returns it immediately as the gate result;
+- `null` means "not a (valid) probe" — the request falls straight through to the normal admission chain.
+
+A function opts in ONLY by setting `healthCheck` in its `GateConfig`. Endpoints without a `healthCheck` ignore the probe header entirely and reject the request like any other unauthenticated caller. Because the door is step 0, a `GET` probe reaches a `POST`-only function without being bounced by the method gate — the handler is never invoked and no caller data is returned.
+
+## The probe header & secret
+
+The trigger is the header `X-Health-Probe: <HEALTH_PROBE_SECRET>`. Two constants name the pieces: `PROBE_HEADER = "X-Health-Probe"` and `PROBE_SECRET_ENV = "HEALTH_PROBE_SECRET"`.
+
+The pure decision lives in `shouldRunProbe(providedHeader, secret, hasHealthCheck)`, which returns `true` only when all four conditions hold: the function subscribed (`hasHealthCheck`), a probe header is present, a secret is configured, and the two match constant-time via `timingSafeEqual` (imported from `functions/_shared/gates/webhook-secret.ts`, which now exports it). A wrong or absent secret returns `null` — the request gets the normal rejection — so there is no bespoke error code to keep in sync.
+
+`HEALTH_PROBE_SECRET` is deliberately low-value: it unlocks only a "we're up" ping with no data and no work, so placing it in an uptime monitor's request headers is fine. One misconfiguration is loud: when a subscribed function receives a probe header while `HEALTH_PROBE_SECRET` is unset, `runHealthProbe` logs `console.error(... not set — health probe disabled)` before falling through.
+
+## Response shape
+
+The probe returns STATUS-shaped bodies, not `{error}` bodies, so it stays out of the client-facing error registry — this endpoint is monitor-only and never reaches the Kotlin client. `buildHealthResponse(result)` maps the outcome:
+
+| `result.ok` | HTTP | Body |
+| --- | --- | --- |
+| `true` | 200 | `{status:"ok", component?, checks?, ts}` |
+| `false` | 503 | `{status:"degraded", ts}` |
+
+The degraded body deliberately omits `component` and `checks` — nothing beyond "degraded" leaks on failure. A `healthCheck` that throws is caught in `runHealthProbe` and coerced to `{ ok: false }`, so a broken check degrades rather than escaping to the caller.
+
+## GateConfig wiring
+
+`GateConfigBase` (`functions/_shared/gates/types.ts`) carries the opt-in as a new optional field alongside `skipAppCheck` / `skipAppVersion`:
+
+- `healthCheck?: HealthCheck`
+- `type HealthCheck = () => Promise<HealthResult>`
+- `interface HealthResult { ok: boolean; component?: string; checks?: Record<string,string> }`
+
+Both `HealthCheck` and `HealthResult` are re-exported from `functions/_shared/gates/index.ts`. The `HealthCheck` contract is strict: it must be cheap (single-digit ms), return no caller data, and never mutate anything — which is what makes it safe to expose even on write endpoints like `sync-push` and `sync-audio`.
+
+## Check builders
+
+Each builder in `functions/_shared/db/health-checks.ts` returns a `HealthCheck` and pairs an impure fetch with a pure, unit-tested interpreter (the `*Result` functions), so the error-to-degraded mapping and the "requires both/all" rules can be pinned in tests while the live calls are validated by the monitors. Every builder reads the tiny `server_config` table for its DB leg and catches any throw into a degraded result via `console.error`.
+
+| Builder | Dependencies checked | `ok` requires | Interpreter |
+| --- | --- | --- | --- |
+| `dbHealthCheck(component)` | one indexed `server_config` read | DB | `dbHealthResult` |
+| `dbAndStorageHealthCheck(component, bucket)` | DB read + `storage.getBucket(bucket)` control-plane call | both | `dbAndStorageHealthResult` |
+| `dbAndCohereHealthCheck(component)` | DB + `checkCohereReachable()` | both | `dbAndCohereHealthResult` |
+| `dbAndClerkHealthCheck(component)` | DB + `checkClerkReachable()` | both | `dbAndClerkHealthResult` |
+| `dbStorageAssemblyAIHealthCheck(component, bucket)` | DB + `getBucket` + `checkAssemblyAIReachable()` | all three | `dbStorageAssemblyAIHealthResult` |
+| `dbAndAiHealthCheck(component)` | DB + `checkAiChainReachable()` | both | `dbAndAiHealthResult` |
+
+The `getBucket` call is a control-plane read that proves the Storage service and bucket are reachable without listing or touching any user object.
+
+## Provider reachability probes
+
+The four external-provider checks each exercise the REAL production client so the probe covers the exact path a user's request takes — not a bespoke ping. All four are non-throwing: any failure (missing key, network error, timeout, non-2xx) maps to `false`, which the interpreter renders as `provider: error` on the degraded body.
+
+| Probe | Location | What it does | Passes when |
+| --- | --- | --- | --- |
+| `checkCohereReachable()` | `functions/_shared/ai/providers/embeddings/index.ts` | reuses the production embedder — `embed(["ok"], "query")` with `EMBEDDING_API_KEY` | a vector comes back (`result.vectors.length > 0`) |
+| `checkClerkReachable()` | `functions/_shared/gates/jwt.ts` | a FRESH `GET` of `CLERK_JWKS_URL` (the keys every JWT is verified against), bypassing the in-isolate cache, with a 4s abort (`CLERK_HEALTH_TIMEOUT_MS = 4_000`) | Clerk answers 2xx within the timeout |
+| `checkAssemblyAIReachable()` | `functions/_shared/transcribe/assemblyai.ts` | a FREE `GET /v2/transcript?limit=1` list with `ASSEMBLYAI_API_KEY` and a 4s abort (`ASSEMBLYAI_HEALTH_TIMEOUT_MS = 4_000`) — no job created, no charge | AssemblyAI answers 2xx within the timeout |
+| `checkAiChainReachable()` | `functions/_shared/ai/health.ts` | the real client `createAiClient(ProviderChains.ANTHROPIC_GEMINI).sendMessage` sends a 5-token `Reply with only: ok` message (`Models.CLAUDE_HAIKU` / `GEMINI_FLASH_LITE`) | ANY provider in the fallback chain answers |
+
+`checkAssemblyAIReachable` uses a LIST, not a get-by-id, so it works even when every transcript has been deleted. `checkAiChainReachable` is config-driven: because it passes if any provider answers, adding a provider to the chain needs no change here.
+
+## Subscribed functions & status-page groups
+
+Fifteen functions currently opt in. A monitor points at one representative function per status-page component.
+
+| Group | Functions | Builder |
+| --- | --- | --- |
+| Sync Services | `sync-pull`, `sync-push`, `sync-reconcile`, `sync-group-exclude`, `user-sync-preferences`, `set-user-pin` | `dbHealthCheck` |
+| Sync Services (Storage) | `sync-reserve`, `sync-audio` | `dbAndStorageHealthCheck(..., "audio-storage")` |
+| Account & Sign-in | `account-otp` | `dbAndClerkHealthCheck` |
+| Account & Sign-in | `resolve-identity`, `recovery-code` | `dbHealthCheck` |
+| Search | `search`, `indexing` | `dbAndCohereHealthCheck` |
+| Transcription | `assemblyai-webhook` | `dbStorageAssemblyAIHealthCheck(..., "transcribe-inbox")` |
+| AI | `ai-engine` | `dbAndAiHealthCheck` |
+
+Because the door is step 0, it runs BEFORE the [webhook-secret gate](/rollingrecord/backend/gates/webhook-secret). A valid `X-Health-Probe` therefore reaches a webhook-authenticated function — such as `assemblyai-webhook`, which hosts `dbStorageAssemblyAIHealthCheck` — without holding the webhook secret. That is intentional: the probe returns no caller data and never reaches the handler.
+
+## Testing
+
+Unit coverage lives in `supabase/tests/_shared/gates/health_test.ts`, which pins `shouldRunProbe` (no subscription / no header / no secret / wrong secret all fall through; a matching secret runs the check) and `buildHealthResponse` (ok → 200 with labels, otherwise → 503 with no labels leaked). The pure interpreters have their own tests under `supabase/tests/_shared/db/health-checks_test.ts`.
+
+## Related
+
+- [The runGates() admission chain](/rollingrecord/backend/gates/run-gates) — where the probe sits as step 0 in the fixed order.
+- [Webhook & server-to-server auth](/rollingrecord/backend/gates/webhook-secret) — the gate the probe runs ahead of, and the source of the shared `timingSafeEqual`.
+- [JWT auth](/rollingrecord/backend/gates/jwt-auth) — the module that hosts `checkClerkReachable` and the JWKS cache it deliberately bypasses.
+- [Edge Functions overview](/rollingrecord/backend/edge-functions/overview) — the functions that subscribe to the probe.

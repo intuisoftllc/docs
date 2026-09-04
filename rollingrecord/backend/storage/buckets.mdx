@@ -1,9 +1,9 @@
 ---
 title: "Storage Buckets"
-description: "The five Storage buckets, their privacy posture, the auth_user_id-first path convention, and which ones the janitor allowlist and delete-user wipe cover."
+description: "The six Storage buckets, their privacy posture, the auth_user_id-first path convention, and which ones the janitor allowlist and delete-user wipe cover."
 ---
 
-RollingRecord uses five Supabase Storage buckets. Four are private and hold user data keyed by the caller's `auth_user_id`; one is public and deliberately sits outside that convention. Every user-data object's first path segment is the owner's `auth_user_id` (the Storage HARD RULE), which is what makes account-deletion cleanup a recursive walk of one folder per user.
+RollingRecord uses six Supabase Storage buckets. Five are private and hold user data keyed by the caller's `auth_user_id`; one is public and deliberately sits outside that convention. Every user-data object's first path segment is the owner's `auth_user_id` (the Storage HARD RULE), which is what makes account-deletion cleanup a recursive walk of one folder per user.
 
 ## The buckets
 
@@ -13,13 +13,14 @@ RollingRecord uses five Supabase Storage buckets. Four are private and hold user
 | `embedding-storage` | private | sealed embedding-bundle blobs | `{auth_user_id}/{owner_kind}-{owner_id}.bin` | yes | yes |
 | `transcribe-inbox` | private | transcription source audio | `{auth_user_id}/...` | yes | yes |
 | `job-plane` | private | transient extraction input / results / state | `{auth_user_id}/jobs/{job_id}/...` | no | no |
+| `bug-logs` | private | optional merged app-log text attached to a bug report | `{auth_user_id}/{bug_report_id}.txt` | no | yes |
 | `brand-assets` | public | static brand images (app icon for emails) | `<path>` (no user segment) | no | no |
 
-Two of these bucket **rows are not created by any migration** in the repo — `audio-storage` and `transcribe-inbox` are only referenced (e.g. the baseline's `bucket_id = 'audio-storage'` predicate), so they were created via the dashboard before the baseline was captured. Only `embedding-storage`, `job-plane`, and `brand-assets` have an `INSERT INTO storage.buckets` migration.
+Every bucket originates from an `INSERT INTO storage.buckets` migration. `audio-storage` and `transcribe-inbox` predate the squash baseline, so their creating migrations now live in `migrations_archive/`: `transcribe-inbox` in `20260415040000_transcribe_data_plane.sql`, and `audio-storage` in `20260421100000_cloud_sync_schema_foundation.sql` (section 13, replacing the earlier `audio-backups` bucket first created in `20260420080000_audio_backups_schema.sql`). The other four — `embedding-storage`, `job-plane`, `brand-assets`, and `bug-logs` — have their `INSERT INTO storage.buckets` in the active `migrations/` directory.
 
 ## audio-storage
 
-The private home for cloud-synced recordings. `sync-reserve` (`functions/sync-reserve/index.ts`) builds the deterministic path `${authUserId}/${recordingId}.enc` and mints a signed upload URL via `createSignedUploadUrl(..., { upsert: true })`; `sync-audio` uses the same path. The `.enc` extension is a cue that the blob is ciphertext — the bytes were sealed on-device with the recording's DEK, so the server stores opaque data. The row's crypto columns live on `c_recordings`; see [Envelope Encryption Model](/rollingrecord/backend/storage/envelope-encryption).
+The private home for cloud-synced recordings. `sync-reserve` (`functions/sync-reserve/index.ts`) builds the deterministic path `${authUserId}/${recordingId}.enc` and mints a signed upload URL via `createSignedUploadUrl(..., { upsert: true })`; `sync-audio` uses the same path. The `.enc` extension is a cue that the blob is ciphertext — the bytes were sealed on-device with the recording's DEK, so the server stores opaque data. The row's crypto columns live on `c_recordings`; see [Envelope Encryption Model](/rollingrecord/backend/storage/envelope-encryption). The uptime health probe verifies the bucket is reachable via a Storage control-plane `getBucket("audio-storage")` call that lists and touches no user object — `dbAndStorageHealthCheck` (`functions/_shared/db/health-checks.ts`), wired on both `sync-reserve` and `sync-audio`.
 
 ## embedding-storage
 
@@ -27,11 +28,19 @@ Private, service-role only, created by migration `20260722130000_embedding_bundl
 
 ## transcribe-inbox
 
-Private. Holds the source audio a transcription job runs against, keyed under `{auth_user_id}/`. It is a first-class user-data bucket: it appears in both the janitor allowlist and the delete-user wipe, and the orphan-lister runs a dedicated `sweepTranscribe` pass against it (see [Storage Janitors & Orphan Reaping](/rollingrecord/backend/storage/janitors)).
+Private. Holds the source audio a transcription job runs against, keyed under `{auth_user_id}/`. It is a first-class user-data bucket: it appears in both the janitor allowlist and the delete-user wipe, and the orphan-lister runs a dedicated `sweepTranscribe` pass against it (see [Storage Janitors & Orphan Reaping](/rollingrecord/backend/storage/janitors)). Its uptime health probe checks the bucket the same control-plane way, via a `getBucket("transcribe-inbox")` call that lists nothing — `dbStorageAssemblyAIHealthCheck("assemblyai-webhook", "transcribe-inbox")` (`functions/_shared/db/health-checks.ts`).
 
 ## job-plane
 
 Private, created by migration `20260720160000_extraction_jobs_foundation.sql` (`public = FALSE`) as the extraction "kitchen" — transient per-job input, results, and `state.json` at `job-plane/{auth_user_id}/jobs/{job_id}/...`. It is **largely superseded**: migration `20260721000000_extraction_payload_in_db.sql` moved the extraction payload to DB columns and retired the direct `storage.objects` DELETE. The bucket row is never dropped, so it still exists, but it is out of scope for the storage section — it is neither in the janitor allowlist nor the delete-user wipe.
+
+## bug-logs
+
+Private, service-role only, created by migration `20260817120000_bug_reports.sql`: `public = false`, a 25 MiB (`26214400`) per-object size limit, and an allowed-MIME list of exactly `text/plain`. It holds the optional merged app-log text a user attaches to a bug report, at `{auth_user_id}/{bug_report_id}.txt` — `auth_user_id` first, so it obeys the Storage HARD RULE. The content is per-user device + activity diagnostics **including the anonymous pre-sign-in log segment**, readable only via the service role.
+
+The owning table is `bug_reports` (`log_storage_path` column). That column is meant to be written together with `log_sha256` and `log_bytes`, but the CHECK `bug_reports_log_triple_check` only pins two of them — `("log_storage_path" IS NULL) = ("log_sha256" IS NULL)` — while `log_bytes` is paired by client convention alone, not by the constraint. The `bug_reports` row is written **before** the log uploads, so an abandoned or failed upload still leaves a readable report — the blob attachment is best-effort.
+
+Because Storage objects never CASCADE, cleanup is two layers. First, an `AFTER DELETE` trigger `trg_bug_reports_delete_log_object` (function `delete_bug_report_log_object`, `SECURITY DEFINER`, `search_path = public, storage`) deletes the row's own object from `bug-logs` on **both** a manual triage delete and the `canonical_users` `ON DELETE CASCADE`. Second, belt-and-braces, `bug-logs` is in delete-user's folder wipe to catch anything whose row was already gone. That trigger is why `bug-logs` needs no janitor entry — its orphan protection is a delete trigger, not a sweep.
 
 ## brand-assets
 
@@ -39,7 +48,7 @@ The one **public** bucket, created by migration `20260816120000_create_brand_ass
 
 ## Deletion coverage
 
-Storage objects never CASCADE with a row delete, so a bucket is only cleaned when it is named in a wipe list. `BUCKETS_TO_WIPE` in `functions/_shared/users/wipe.ts` is exactly `['transcribe-inbox', 'audio-storage', 'embedding-storage']`; delete-user walks each recursively via `wipeBucketFolder(bucket, authUserId)`. The janitor's `ALLOWED_BUCKETS` (`functions/storage-janitor/buckets.ts`) is the same three buckets — the only buckets any sweep is permitted to delete from. `job-plane` and `brand-assets` are in neither list by design.
+Storage objects never CASCADE with a row delete, so a bucket is only cleaned when it is named in a wipe list. `BUCKETS_TO_WIPE` in `functions/_shared/users/wipe.ts` is now `['transcribe-inbox', 'audio-storage', 'embedding-storage', 'bug-logs']`; delete-user walks each recursively via `wipeBucketFolder(bucket, authUserId)`. The janitor's `ALLOWED_BUCKETS` (`functions/storage-janitor/buckets.ts`) is **no longer the same list** — it stays the original three (`audio-storage`, `embedding-storage`, `transcribe-inbox`), while the wipe list has a fourth, `bug-logs`. `bug-logs` is covered by the delete-user wipe plus its own `AFTER DELETE` trigger, so it is intentionally not janitor-swept. `job-plane` and `brand-assets` are in neither list by design.
 
 ## Related pages
 

@@ -35,7 +35,11 @@ The list order is the server id contract. `BlueprintRepository.seedIfNeeded()` s
 - `name`, `description`, `systemPrompt` (`""` for every built-in).
 - `structuredFields` — Guided-mode authoring JSON (`meeting_type` / `capture_goal` / `ignore_items` / `output_format`), or `NULL` for Raw / built-in.
 - `autoDescription` — whether the description is AI-generated ("Auto") vs user-authored ("Manual").
+- `moderationRejectedAt` — when this blueprint last FAILED server moderation, set ONLY by the cloud-reset re-push after a lapse wipe (see below); non-null means it has NO server row, so extraction cannot resolve it. `NULL` normally.
+- `moderationRejectionReason` — the server's reason, shown to the user; `NULL` whenever `moderationRejectedAt` is null.
 - `isBuiltIn`, `isDefault`, `isMultiSpeaker`, `lastUsedAt`, `remoteSyncedAt`.
+
+The two `moderation*` columns ship via DB v78→v79 (`Migration78To79`); that migration is owned by the [Local Database](/rollingrecord/app/architecture/local-database) page.
 
 `BlueprintDao` (`data/local/db/dao/BlueprintDao.kt`) provides the reads and writes: `getAll` / `getById` / `getDefault` / `getCustom` (`isBuiltIn = 0`), `insert` / `upsert` / `insertAll` (all REPLACE-on-conflict), `setDefault` (transactional clear-all-then-set), `updateLastUsed`, `updateBuiltInDescription` / `updateBuiltInPrompt`, and `deleteUserBlueprint` (guarded to `isBuiltIn = 0`) vs `deleteById`. The DAO has no `seed` method — seeding (`seedIfNeeded()`) lives on `BlueprintRepository`.
 
@@ -59,17 +63,23 @@ The wire types for these operations live in `UserTemplateModels` (`data/remote/a
 
 ## Blueprint resolution at extraction time
 
-`ContextExtractionWorker.resolveBlueprintWireId` sends a single `blueprint_id` string: the numeric id as a string for a built-in, the UUID for a custom blueprint, or `"default"` when the context has no blueprint of its own (the runner maps any unrecognized value to its default prompt). For a custom blueprint that was never saved and moderated server-side it returns `null`, and extraction fails with a "re-save the template" error. The old `blueprint_source="inline"` fallback that shipped a raw client prompt was removed — an unmoderated prompt must never reach extraction. (Some in-code doc comments in `BuiltInBlueprints.kt` and `BlueprintEntity.kt` still describe the retired inline path; those are stale.)
+`ContextExtractionWorker.resolveBlueprintWireId` sends a single `blueprint_id` string: the numeric id as a string for a built-in, the UUID for a custom blueprint, or `"default"` when the context has no blueprint of its own (the runner maps any unrecognized value to its default prompt). For a custom blueprint that was never saved and moderated server-side it returns `null`, and extraction fails with a "re-save the template" error. This no-server-row state is now surfaced explicitly rather than only failing at extraction time: the picker card marks the blueprint unapproved (red + `ic_alert`) and tapping it raises `V2UnapprovedBlueprintSheet` (see [Surfacing a re-moderation rejection](#surfacing-a-re-moderation-rejection)). The old `blueprint_source="inline"` fallback that shipped a raw client prompt was removed — an unmoderated prompt must never reach extraction. (Some in-code doc comments in `BuiltInBlueprints.kt` and `BlueprintEntity.kt` still describe the retired inline path; those are stale.)
 
 ## Validation and moderation
 
 `BlueprintValidation` (`app/agentcore` — `data/repository/BlueprintValidation.kt`) is the single source of raw-field validation, shared so the app editor, the chat proposal edit dialog, and the AI's `proposeBlueprint` tool all use the same caps and messages: `NAME_MAX = 50`, `DESCRIPTION_MIN = 40`, `DESCRIPTION_MAX = 250`, and `systemPromptMaxChars = ServerConfig.blueprintMaxTokens × 3`. `nameError` / `descriptionError` / `systemPromptError` / `validate` return the first human/AI-facing message. The server (`save_user_blueprint`) remains the authoritative gate on accept; this is the fast shared pre-check.
 
-`BlueprintModerationService` (`data/moderation/BlueprintModerationService.kt`) is a local keyword/Levenshtein jailbreak pre-check run before the network round-trip (patterns in `JailbreakPatterns.kt`), gated by `ClientConfig.blueprintModerationEnabled`. Its result is `Approved` / `Rejected`, but the server's Haiku moderation is the authoritative decision on every content change.
+`BlueprintModerationService` (`data/moderation/BlueprintModerationService.kt`) is a local keyword/Levenshtein jailbreak pre-check run before the network round-trip (patterns in `JailbreakPatterns.kt`), gated by `ServerConfig.blueprintModerationEnabled` (was `ClientConfig` — Firebase Remote Config was retired, and the RC key `template_moderation_enabled` was renamed `blueprint_moderation_enabled` in migration `20260830120000_firebase_rc_to_server_config.sql`). Its result is `Approved` / `Rejected`, but the server's Haiku moderation is the authoritative decision on every content change.
+
+## Surfacing a re-moderation rejection
+
+After a cloud wipe (a lapsed subscription), custom blueprints are re-pushed through `save_user_blueprint` and re-moderated. One that is now rejected keeps its local row (with `moderationRejectedAt` / `moderationRejectionReason` set) but has no server row, so it cannot extract. `V2UnapprovedBlueprintSheet` (`ui/v2/screens/contexts/components/V2UnapprovedBlueprintSheet.kt`, built on the shared `ConfirmActionSheet`) shows the server's reason and an Edit action. It is raised on EVERY tap of an unapproved blueprint: `V2ContextDetailViewModel.selectBlueprint(id)` sets `_unapprovedBlueprint` when the tapped picker item `isUnapproved`, and the picker card marks it unapproved (red + `ic_alert`). A rejected EDIT of a live blueprint leaves the existing server row intact and never sets `moderationRejectedAt`.
 
 ## The editor
 
 `V2BlueprintEditorScreen` (`ui/v2/screens/contexts/V2BlueprintEditorScreen.kt`) is the full-screen create/edit surface for a **custom** blueprint — built-ins never open here. It offers a swipeable Guided⇄Raw pager and reuses the V1 `BlueprintEditorViewModel` / `BlueprintEditorMode` / `BlueprintSaveState`. Save is gated to `FeatureAccess.FULL` (`GatedFeature.CUSTOM_BLUEPRINT`); a downgraded user views it read-only. It never embeds a built-in prompt body, since those are `""` on-device. The same `GatedFeature.CUSTOM_BLUEPRINT` gate governs the Delete affordance in `ContextIntelligencePreExtraction`.
+
+Guided-mode authoring is now budgeted as one prompt, not four fields. The `BlueprintEditorViewModel` guided setters call `fitGuidedField(GuidedPromptBudget.Field.X, value)`, and the hidden per-field 500-char cap that used to live in `sanitizeGuidedField` (a `.take(500)`) was removed — so the four guided fields (`MEETING_TYPE` / `CAPTURE_GOAL` / `IGNORE_ITEMS` / `OUTPUT_FORMAT`) now share ONE assembled-prompt budget up to `blueprintMaxChars` (`ServerConfig.blueprintMaxTokens × 3`). The new pure object `GuidedPromptBudget` (`ui/v1/screens/context/GuidedPromptBudget.kt`) owns `assemble(...)` — the single definition of the assembled prompt, moved out of the ViewModel — and `remainingFor(field, maxChars, …)`, its sentinel-based remaining-budget math. `V2BlueprintEditorScreen.BlueprintGuidedBody` shows one shared `GuidedBudgetLine` running total, turning amber (`ContextSizeWarning`) at 90% of the ceiling and red at the limit.
 
 ## The `custom_templates` cap
 

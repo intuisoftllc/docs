@@ -50,20 +50,24 @@ Tool names are the constants in `KbToolNames` (`agentcore/.../data/repository/Kb
 | `getContextOverview` | read | library-shape snapshot for architecture coaching |
 | `proposeContext` | proposal | draft a new context card |
 
+`AndroidToolExecutor.execute` returns `ToolResult(text, isWriteOp, isError = isFailureResult(result))`. `isFailureResult` is true when the dispatch string starts with `Error:`, `ERROR:`, or `Unknown tool:` — a `NO_DATA` refusal is deliberately NOT an error (it is a true outcome the model should report, not retry). The loop emits `is_error: true` on the tool_result block only when `isError` is set, so a refused write no longer reaches the model as a success-shaped envelope. See [Agent Loop & Tool Contract](/rollingrecord/app/ai/agent-loop) for the wire wiring.
+
 ## Writes are proposal-first
 
 Membership and structural changes never mutate the DB from inside a tool. `proposeContext`, `proposeBlueprint`, and `proposeAddRecordingToContext` / `proposeRemoveRecordingFromContext` / `proposeMoveRecordingBetweenContexts` only stash a proposal payload and return a `PROPOSAL_DRAFTED:` string; the UI renders a confirmation card the user must accept. Only the direct-write tools — `createTask`, `addNote`, `createSection`, `correctContext`, `renameSection` — mutate through `KbWriteCallbacks` and emit a `KbWrite` event that feeds the undo toast.
 
 `KbWriteCallbacks(addTask, addNoteToSection, createNewSection, syncFts, isContextExtractionInProgress)` holds the write ops that stay in `ContextCardRepository`. Proposal payloads are `ContextProposal(name, scopeDescription, suggestedBlueprintId?)`, `BlueprintProposal(name, description, systemPrompt)`, and `RecordingMembershipProposal` (sealed `Add` / `Remove` / `Move`).
 
+`createTask` returns one of three strings from the shared agentcore `KbToolResults` registry rather than inline literals: `KbToolResults.createTaskNoCard` when the target context has never been extracted (`contextCardDao.getByContextIdOnce(cid) == null`, so there is no card to attach the task to — a `NO_DATA` refusal, not an error), `KbToolResults.createTaskWriteFailed` when `addTask` returns an empty id (a Completed / Archived lifecycle has frozen the task list), and `KbToolResults.createTaskSuccess` on a real write. See [Agent Loop & Tool Contract](/rollingrecord/app/ai/agent-loop) for the `KbToolResults` contract and its eval snapshot.
+
 ## Per-turn caps
 
 | Cap | Value source | Applies to |
 | --- | --- | --- |
-| transcript snippets per turn | `ClientConfig.aiChatMaxTranscriptSnippets` (default 3, Firebase) | `getRecordingTranscriptSnippet` |
+| transcript snippets per turn | `ServerConfig.aiChatMaxTranscriptSnippets` (default 3, `server_config`) | `getRecordingTranscriptSnippet` |
 | recording-search calls per turn | `ServerConfig.aiChatMaxAcrossLibraryCalls` (default 3, `server_config`) | `searchRecordings` |
 | tool rounds per turn | `ServerConfig.kbChatMaxToolRounds` (default 3, `server_config`) + one final round | whole loop |
-| conversation history pairs | `ClientConfig.kbChatMaxHistoryPairs` (default 9, Firebase) | send() window |
+| conversation history pairs | `ServerConfig.kbChatMaxHistoryPairs` (cold-start default 9; live `server_config` row 15) | send() window |
 
 ## Results and undo
 
@@ -71,7 +75,9 @@ Membership and structural changes never mutate the DB from inside a tool. `propo
 
 ## The V2 UI
 
-`V2KnowledgeBaseViewModel` (`ui/v2/screens/knowledgebase/V2KnowledgeBaseViewModel.kt`) owns `send()`, which auto-creates and scope-burns the thread on the first message, persists the user + assistant turns, reads the last `ClientConfig.kbChatMaxHistoryPairs` pairs fresh from the DB, runs `ContextCardRepository.ask`, encodes any proposal PENDING into the message's durable `proposalJson` column, and auto-names the thread after the first answer. It also owns the scope filter, threads search, undo toast, proposal accept/edit/cancel handlers, and downgrade-aware `kbChatAccess` gating (`send()` refuses when access is not `FeatureAccess.FULL`). `V2ChatUiMessage(id, isUser, content, isError, sources, persistedProposal?, hasBeenAnimated, retrievalSummary?, replyToId?)` is the UI projection of a `SearchMessageEntity`; a proposal decoded from `proposalJson` re-renders in PENDING / ACCEPTED / REJECTED across reloads.
+`V2KnowledgeBaseViewModel` (`ui/v2/screens/knowledgebase/V2KnowledgeBaseViewModel.kt`) owns `send()`, which auto-creates and scope-burns the thread on the first message, persists the user + assistant turns, reads the last `ServerConfig.kbChatMaxHistoryPairs` pairs fresh from the DB (the `getConversationWindow(threadId, ServerConfig.kbChatMaxHistoryPairs)` call now reads that value from `server_config`), runs `ContextCardRepository.ask`, encodes any proposal PENDING into the message's durable `proposalJson` column, and auto-names the thread after the first answer. It also owns the scope filter, threads search, undo toast, proposal accept/edit/cancel handlers, and downgrade-aware `kbChatAccess` gating (`send()` refuses when access is not `FeatureAccess.FULL`). `V2ChatUiMessage(id, isUser, content, isError, sources, persistedProposal?, hasBeenAnimated, retrievalSummary?, replyToId?)` is the UI projection of a `SearchMessageEntity`; a proposal decoded from `proposalJson` re-renders in PENDING / ACCEPTED / REJECTED across reloads.
+
+Accepting a **create-context** proposal no longer jumps into the new context mid-conversation. `V2KnowledgeBaseViewModel.onAcceptContextProposal` marks the proposal ACCEPTED and stores the new context id on the resolved card (for its "View" deep-link) but emits no navigation event — the former `_proposalNavEvent` / `proposalNavEvent` `Channel` and the screen's `LaunchedEffect { viewModel.proposalNavEvent.collect { onOpenContext(...) } }` were removed. The user stays in the chat; "View" is there the moment they want it.
 
 Threads and messages persist through `SearchThreadRepository` (`createThread`, `burnScope`, `addMessage`, `getConversationWindow`, `updateMessageProposalJson`, tombstones, sync, auto-naming). Scope is burned into the thread on the first message and locked thereafter. Backing Room entities are `SearchThreadEntity` and `SearchMessageEntity` (the message carries `proposalJson`, `sourcesJson`, `retrievalSummary`, `replyToId`, `hasBeenAnimated`).
 
@@ -87,9 +93,25 @@ Threads and messages persist through `SearchThreadRepository` (`createThread`, `
 | `V2ProposalBlock` | `.../components/V2ProposalCards.kt` | proposal confirmation cards |
 | `V2UndoToast` / `V2UndoDetailsSheet` | `.../components/V2UndoToast.kt`, `V2UndoDetailsSheet.kt` | undo toast + details |
 
+## Proposal cards
+
+`V2ProposalBlock` (`ui/v2/screens/knowledgebase/components/V2ProposalCards.kt`) renders each proposal kind through the shared `ProposalCardShell`. The shell moved Cancel out of the button row into a header X (top-right, `ic_cancel`) so the two real choices — Edit (outlined) and Confirm (filled) — sit on one baseline weighted `1 : 1.6`, and a `submitting` spinner replaces the Confirm label in place so the button keeps its height. The neutral secondary buttons now use `MaterialTheme.colorScheme.surface` / `outline` / `onSurface` (the earlier muted card tokens were nearly invisible on dark sheets).
+
+Editing a proposal opens a **bottom sheet**, not an alert dialog: `EditProposalSheet` (create-context: name + scope, min-height fields) and `BlueprintEditSheet` (create-blueprint: a scrollable name / description / system-prompt stack with inline `BlueprintValidation`) replace the former `EditProposalDialog` / `BlueprintEditDialog`. Both are built on `V2ModalBottomSheet` with `imePadding()` + `navigationBarsPadding()` so the keyboard never covers a field.
+
+### Audio preview on membership cards
+
+A recording-membership card (`V2RecordingMembershipCard`, Add / Remove / Move) carries an optional `ProposalAudioPreview(playing, progress, onToggle)` rendered by `ProposalPlayButton` — a 48dp ring around `ic_play` / `ic_pause` in `Blue500` — so the user can hear the clip before deciding. The ViewModel backs it with a `PreviewPlayerController(Mode.CLIP)` exposing `previewingRecordingId` / `previewProgress` / `previewPlaying` `StateFlow`s plus `togglePreview(recordingId)` and `stopPreview()`. The screen stops playback on leave via `DisposableEffect(Unit) { onDispose { viewModel.stopPreview() } }`, and preview is also stopped before confirm/reject and before a remove / bulk-remove.
+
+### Submitting spinner on membership writes
+
+`membershipSubmitting: StateFlow<Set<String>>` drives the Confirm spinner on Add / Remove / Move; the confirm button is inert while a message id is in that set. These writes are not instant — Remove and Move both run `ContextCardRepository.removeRecordingFromContextWithCleanup`, which prunes insights and attributed tasks (Move then links the destination), so on a large context the tap would otherwise read as having done nothing.
+
 ## Capabilities
 
 `CAPABILITIES_DESCRIPTION` is a companion constant returned verbatim by the `getCapabilities` tool — the single source of truth for "what can you do?", covering find/browse/search, task and note creation, corrections, blueprint suggestion and building, and library reorganization, plus the explicit LIMITATIONS block (every library change runs through a confirmation card; it cannot delete recordings, delete/archive/rename contexts, delete topics/tasks, or mark tasks done).
+
+The create-context proposal has no regenerate/"Try again" affordance: `CAPABILITIES_DESCRIPTION` now offers a proposed context for the user to "accept, edit, or reject" (was "accept, edit, regenerate, or reject"), and the `PROPOSAL_DRAFTED` result string the `proposeContext` tool returns names "Create / Edit / Cancel actions" (was "Create / Edit / Try again / Cancel").
 
 ## Related
 

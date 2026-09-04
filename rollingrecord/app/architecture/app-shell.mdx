@@ -22,10 +22,10 @@ RollingRecord boots through two classes: `App` (the `Application`) does all proc
 | 9 | `CrashReporter.install(this)` | Crash handler, no Koin dependency. |
 | 10 | `startKoin { modules(...) }` | Start DI with the 12 modules below. |
 | 11 | `AppCheckWarmup.start()` | Warm the App Check token cache to beat the cold-start network race. |
-| 12 | DB warm (IO) | `ensureDekForRestoredSession()` then `userSession().get<AppDatabase>()` off-thread. |
-| 13+ | Observers + recovery | `registerAnalyticsLifecycleObserver`, `registerConnectivityRestoreCallback`, `flushPendingCrash`, OS-kill recovery, `recoverOrphanedMergeJobs`, `runPerUserRecovery`, `observeSessionSwitchesForRecovery`, config fetches, RevenueCat / App-Lock / tiles observers, `identityRepository.resolveIdentity()`. |
+| 12 | DB warm (IO) | `ensureDekForRestoredSession()` then `userSession().get<AppDatabase>()` off-thread. The session-scoped DB factory's inline DEK fetch is bounded by `withTimeout(INLINE_DEK_FETCH_TIMEOUT_MS = 45_000L)` so a hung fetch can't hold the whole session scope's lock — it degrades to the recoverable retry screen. |
+| 13+ | Observers + recovery | `registerAnalyticsLifecycleObserver`, `registerConnectivityRestoreCallback`, `flushPendingCrash`, OS-kill recovery, `recoverOrphanedMergeJobs` (now launched on `CoroutineScope(Dispatchers.IO)` — its blocking `WorkManager.getWorkInfosByTag(...).get()` no longer runs on Main), `runPerUserRecovery`, `observeSessionSwitchesForRecovery`, the server-config fetch, RevenueCat / App-Lock / tiles observers, `identityRepository.resolveIdentity()`. |
 
-The two config fetches at the end are best-effort — `ClientConfigManager.fetchAndApply(...)` (Firebase) and `serverConfigManager.fetchAndApply(force = true) { AppVersionGate.reevaluate() }` (Supabase). The app is fully functional on the baked-in `DEFAULT_*` values if either fetch fails. See [Client vs Server Configuration](/rollingrecord/app/architecture/config-split).
+The single config fetch at the end is best-effort — `serverConfigManager.fetchAndApply(force = true) { AppVersionGate.reevaluate() }` (Supabase). The former `ClientConfigManager.fetchAndApply(...)` (Firebase Remote Config) call was removed in the 2026-08-30 RC teardown; `serverConfigManager` is now the app's only config fetch. The app is fully functional on the baked-in `DEFAULT_*` values if the fetch fails. See [Server Configuration](/rollingrecord/app/architecture/config-split).
 
 ### Per-user vs app-wide dependency reads
 
@@ -37,7 +37,15 @@ The two config fetches at the end are best-effort — `ClientConfigManager.fetch
 
 ### `runPerUserRecovery`
 
-Every per-user recovery scan the app needs after a **session boundary** — cold start OR sign-in / sign-out — runs from `runPerUserRecovery()`. A sign-in is treated as semantically equivalent to "the app was force-stopped and is starting fresh for this user," so `observeSessionSwitchesForRecovery` re-invokes the same block on each `UserSessionManager.switchTo`. The scans: `reEnqueueSchedules`, `seedBlueprints`, `pullBlueprints`, `reconcileEmbeddings`, `wipeCloudDownloadStaging`, `recoverMissedEnqueues`, `auditMissingLocalFiles`, `auditOrphanedLocalFiles`, `recoverUnregisteredLocalFiles`, `runTrashSweeper`, `revertOrphanedExtractionSnapshots`, `cancelOrphanedExtractionWork`, `observeTierAndManageSchedulers`, `startSettingsSyncObserver`, `startProfileCache`. Each of these launches its work on `userSessionManager.sessionScope`, which cancels cleanly on the next switch — the exception is `wipeCloudDownloadStaging`, which runs **synchronously with no coroutine** (it iterates the two staging dirs and calls `deleteRecursively()` inline).
+Every per-user recovery scan the app needs after a **session boundary** — cold start OR sign-in / sign-out — runs from `runPerUserRecovery()`. A sign-in is treated as semantically equivalent to "the app was force-stopped and is starting fresh for this user," so `observeSessionSwitchesForRecovery` re-invokes the same block on each `UserSessionManager.switchTo`. The scans: `reEnqueueSchedules`, `seedBlueprints`, `pullBlueprints`, `reconcileEmbeddings`, `wipeCloudDownloadStaging`, `recoverMissedEnqueues`, `auditMissingLocalFiles`, `auditOrphanedLocalFiles`, `recoverUnregisteredLocalFiles`, `runTrashSweeper`, `revertOrphanedExtractionSnapshots`, `cancelOrphanedExtractionWork`, `observeTierAndManageSchedulers`, `startSettingsSyncObserver`, `startProfileCache`, `adoptDeviceDarkMode`. Each of these launches its work on `userSessionManager.sessionScope`, which cancels cleanly on the next switch — the exception is `wipeCloudDownloadStaging`, which runs **synchronously with no coroutine** (it iterates the two staging dirs and calls `deleteRecursively()` inline).
+
+A few of these scans changed behavior:
+
+- **`adoptDeviceDarkMode`** — an RR-500 one-time `[BACKFILL]` that copies the old device-level dark-mode choice into the per-account settings store (theme moved from device-wide to per-account so it stops following the device across sign-outs). It's a no-op after the first run via `UserSettingsDataSource.adoptDeviceDarkModeOnce`.
+- **`pullBlueprints`** — now first drains `blueprintRepository.rePushAfterCloudReset()` before `pullFromServer()`, so a custom blueprint whose server row was wiped by a lapse cloud-reset is re-uploaded (one at a time) rather than being deleted by the pull.
+- **`observeTierAndManageSchedulers`** — on a below-Pro tier its schedule guard now also calls `disableSchedulesIfLapsed()`, flipping the schedule rows themselves off only on a *confirmed* lapse (`isSubscriptionLapsed`, RC-owner-checked) so a transient FREE reading never destroys a paying user's schedules.
+
+Several of the user-scoped jobs (`reEnqueueSchedules`, `seedBlueprints`) route through a `launchUserScoped(name, block)` helper — it wraps the job in `runCatching`, and when `DatabaseRecoveryState.state` is `RecoveryState.DekUnavailable` it logs-and-skips instead of letting an unguarded `by userProperty()` Koin `get()` throw `InstanceCreationException` and crash-loop the recoverable DEK surface. Every other failure still logs at warn so a real bug stays loud.
 
 ## Koin modules loaded in `onCreate`
 
@@ -110,4 +118,4 @@ Companion extras: `EXTRA_NAVIGATE_TO_SETTINGS`, `EXTRA_START_ROLLING_RECORD`, `E
 - [Koin Dependency Injection](/rollingrecord/app/architecture/dependency-injection) — the twelve modules and the binding-lifetime split.
 - [Per-User Session Scope](/rollingrecord/app/architecture/user-session-scope) — how sign-in / sign-out rebuilds every per-user dependency.
 - [Room Database & SQLCipher](/rollingrecord/app/architecture/local-database) — the encrypted per-user database warmed off-thread here.
-- [Client vs Server Configuration](/rollingrecord/app/architecture/config-split) — the two config stores the shell fetches at startup.
+- [Server Configuration](/rollingrecord/app/architecture/config-split) — the single config store the shell fetches at startup.

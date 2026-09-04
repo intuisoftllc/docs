@@ -24,15 +24,17 @@ Its constructor is `AgentLoop(sessionManager: KbQuerySessionManager, toolExecuto
 1. Build an inputs-only `KbQueryInput` with `isFinal = false` — the server owns prompt, tools, model, round number, and round budget. The client only signals "this is a tool round".
 2. Call `sessionManager.start(kbInput)` on round 1, `sessionManager.continueQuery(kbInput)` thereafter — replaying the server-issued `x-query-session-token`.
 3. On `AiEngineResult.Success`, accumulate `usage` tokens, increment `toolRounds`, and read content blocks. `stop_reason == "end_turn"` (or no `tool_use` blocks) ends the turn: the text block is sanitized and returned. Text that appears alongside `tool_use` is treated as internal monologue and never surfaced.
-4. Otherwise, append the assistant round, execute each `tool_use` through `toolExecutor.execute`, OR each result's `isWriteOp` into `hadWriteOp`, wrap results into `tool_result` user messages, and loop.
+4. Otherwise, append the assistant round, execute each `tool_use` through `toolExecutor.execute`, OR each result's `isWriteOp` into `hadWriteOp`, wrap results into `tool_result` user messages, and loop. Each result's `isError` is read too: the loop emits `is_error: true` on the tool_result block only when the call failed — the key is omitted on success so every existing (successful) result keeps its exact wire shape.
 
 On budget exhaustion, the loop pushes a terminal user message plus a client fallback prompt (`FALLBACK_PROMPT_WRITE` when a write happened, else `FALLBACK_PROMPT_READ`) and does one final `isFinal = true` round with no tools — so the model cannot emit XML tool stubs. The server reserves one round beyond `kbChatMaxToolRounds` for this final step, so the loop consumes one extra session slot.
 
-`sanitizeResponseText` strips leaked function-call XML (`<function_calls>`, `<invoke>`, `<parameter>`) and internal id patterns (`contextId=` / `recordingId=` / `sectionId=` / `blueprintId=` / `insightIndex=` / `ID:` / `[internal-only:]`) from the final text.
+`sanitizeResponseText(text, tools)` strips leaked function-call XML (`<function_calls>`, `<invoke>`, `<parameter>`) and internal id patterns (`contextId=` / `recordingId=` / `sectionId=` / `blueprintId=` / `insightIndex=` / `ID:` / `[internal-only:]`) from the final text. It also runs a tool-**name** backstop derived from THIS turn's tool list (`tools.map { Regex.escape(it.name) }`): case-sensitive, word-anchored (`\b`), longest-first, it replaces any tool name that leaks into user-facing prose with the literal `a lookup` — a last-resort catch for the server prompt's Level 1 "never name an internal tool" rule (the prompt is the primary defense; a tool name reached prose anyway in a real session). Both call sites — the final answer and the exhausted-rounds fallback — now pass `tools`.
 
 ## Round budget is server-authoritative
 
 The budget default is `ServerConfig.kbChatMaxToolRounds = 3` (from `server_config`), plus the one reserved `isFinal = true` final-answer round. The server — not the client — is authoritative on the budget via the session token and `max_rounds_exceeded`; client-supplied round counts were removed in RR-194.
+
+`AgentLoop` reads config from `ServerConfig` (not the retired `ClientConfig`): `maxHistoryPairs = ServerConfig.kbChatMaxHistoryPairs` is stamped at both `KbQueryInput` build sites — the per-round tool call and the final `isFinal = true` step — so the server bakes the same window into its CONVERSATION MEMORY prompt section on every round.
 
 ## Error mapping
 
@@ -54,13 +56,13 @@ The budget default is `ServerConfig.kbChatMaxToolRounds = 3` (from `server_confi
 | `DeveloperError` / `Validation` | no (logged, diagnostic set) | generic "Something went wrong" |
 | `Network` | rethrown | wrapped by the outer `runCatching` → `Error` outcome |
 
-`CancellationException` always propagates out of `run`; every other throwable becomes an `Error` outcome and emits the `loop_crash` analytics event.
+`CancellationException` always propagates out of `run`; every other throwable becomes an `Error` outcome and emits the `loop_crash` analytics event. That loop-crash log line is now persisted (`save = true`) — it was logcat-only, so a crash inside a tool round was invisible in an uploaded log and looked identical to the model simply declining to call a tool. The loop also writes `save = true` `[KBDIAG]` diagnostics: a per-round shape line (round / `toolsSent` / `msgs` / `stop` / `toolUses` and the called tool names — counts and names only, never the question or answer), a round-1 "answer with no tool call" detector that counts `priorAssistantTurnsWithoutTools`, and a "rounds exhausted" line before the final no-tools round.
 
 ## Ports the app implements
 
 | Symbol | File | Contract |
 | --- | --- | --- |
-| `ToolExecutor` | `agentcore/.../agentcore/ToolExecutor.kt` | `fun interface { suspend execute(call: ToolCall): ToolResult }`. `ToolCall(name?, id?, input: JsonObject?)`; `ToolResult(text, isWriteOp = false)` — `isWriteOp` ORs into `hadWriteOp`. |
+| `ToolExecutor` | `agentcore/.../agentcore/ToolExecutor.kt` | `fun interface { suspend execute(call: ToolCall): ToolResult }`. `ToolCall(name?, id?, input: JsonObject?)`; `ToolResult(text, isWriteOp = false, isError = false)` — `isWriteOp` ORs into `hadWriteOp`; `isError` marks a failed call and surfaces as `is_error: true` on the tool_result block. |
 | `AiEnginePort` | `agentcore/.../agentcore/AiEnginePort.kt` | `fun interface { suspend kbQuery(input: KbQueryInput, sessionToken: String?): AiEngineResult<AiPassthroughResponse> }`. App binds `AiEngineClient::kbQuery`. |
 | `KbQuerySessionManager` | `agentcore/.../session/KbQuerySessionManager.kt` | Holds the `x-query-session-token` across rounds. `start()` mints it; `continueQuery()` replays it; `isStarted`; `reset()`. |
 | `AgentMessageAssembly` | `agentcore/.../agentcore/AgentMessageAssembly.kt` | `buildInitialMessages(question, conversationHistory, replyContext, orientationSummary)` — shared so app + runner open turns identically. |
@@ -71,6 +73,12 @@ The budget default is `ServerConfig.kbChatMaxToolRounds = 3` (from `server_confi
 ## Wire models
 
 `KbQueryInput(messages, isFinal, hadWriteOp, question, tools?, toolInstructions?, scopeBlock?, fallbackSystemPrompt?, userTimezone?, medicalMode, maxHistoryPairs?, historyTruncated?, evalSystemSuffix?)` is the request; `KbQueryMessage(role, content: JsonElement)` and `KbQueryTool(name, description, input_schema)` are its parts (`agentcore/.../model/AiOperationModels.kt`). The provider-normalized response is `AiPassthroughResponse` — content blocks (`AiContentBlock(type, text?, name?, input?, id?)`), `stop_reason`, and `AiUsage(inputTokens, outputTokens, …)`.
+
+## `KbToolResults` registry
+
+`KbToolResults` (`agentcore/.../data/repository/KbToolResults.kt`) is the canonical tool-result string registry the kb_query dispatcher hands back to the model — the strings ARE the contract the model reads to decide success / refusal / retry. It holds `CREATE_TASK_SUCCESS`, `CREATE_TASK_NO_CARD`, and `CREATE_TASK_WRITE_FAILED` plus their `createTaskSuccess(...)` / `createTaskNoCard(...)` / `createTaskWriteFailed(...)` renderers; the templates interpolate the placeholders `{context}` and `{text}`.
+
+Its `TEMPLATES` map (keys `createTask.success` / `createTask.no_card` / `createTask.write_failed`) is snapshotted to `evals/fixtures/kb_tool_results.json` by `KbToolResultsSnapshotTest` — the same generated-contract pattern `KbToolSpec` uses for the tool definitions, so an eval case names a key instead of pasting a string and the snapshot test fails the build when the fixture drifts. `CREATE_TASK_NO_CARD` is a `NO_DATA` refusal and is deliberately NOT marked an error (`isFailureResult` excludes `NO_DATA`), so it never reaches the model as `is_error: true`.
 
 ## Related
 

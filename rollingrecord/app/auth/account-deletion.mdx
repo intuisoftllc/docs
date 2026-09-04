@@ -12,7 +12,7 @@ The server call happens **first**, and a non-2xx aborts before any local state i
 | Step | Action | On failure |
 | --- | --- | --- |
 | 1 | Capture `authUserId` (`AuthUserStore.getCurrentUserId`) | `null` → `NoSignedInUser`, nothing touched |
-| 2 | `SupabaseApi.deleteUser(DeleteUserRequest(otpTicket))` | throw → `NetworkError`; non-2xx → `ServerFailed(code, body)`; local untouched |
+| 2 | `SupabaseApi.deleteUser(DeleteUserRequest(otpTicket))` | throw → `NetworkError`; non-2xx → `ServerFailed(code, body, errorCode)`; local untouched |
 | 3 | Handle reset: Clerk `signOut`, RevenueCat `logOut`, `AuthUserStore` clear, session `switchTo(null)` | error collected, continue |
 | 4 | Recursive filesystem wipe of every per-user path | each error collected → `PartialSuccess` |
 
@@ -43,19 +43,25 @@ Step 4 walks every per-user root recursively, so it removes untracked strays alo
 | --- | --- | --- |
 | `Success` | Server + local wipe fully clean | `coordinate`, `removeFromDevice` |
 | `PartialSuccess(localWipeErrors)` | Server deleted / detach done; local wipe had non-fatal errors | `coordinate`, `removeFromDevice` |
-| `ServerFailed(httpCode, body)` | Server rejected the delete; local untouched | `coordinate` only |
+| `ServerFailed(httpCode, body, errorCode?)` | Server rejected the delete; local untouched | `coordinate` only |
 | `NetworkError(cause)` | Couldn't reach the server; local untouched | `coordinate` only |
 | `NoSignedInUser` | No signed-in user (defensive) | `coordinate`, `removeFromDevice` |
 
+`ServerFailed.errorCode` is the canonical `_shared/errors.ts` registry code (e.g. `user_delete_active_subscription`, `account_frozen`, `canonical_user_delete_failed`); it is null when the body is missing or unparseable. `parseErrorCode(body)`, a private helper on `AccountDeletionCoordinator`, pulls the `error` field out of the standard `{"error":"..."}` body (via `ERROR_CODE_REGEX`) so the screen can branch on typed codes rather than the transport status. Callers must map KNOWN codes to specific copy and must never render the raw `httpCode` or `body` to the user.
+
 ## The OTP-gated confirm sheet
 
-The UI gate for full deletion is `V2DeleteAccountSheet` (`ui/v2/screens/accountsettings/components/V2DeleteAccountSheet.kt`), a cancel-only, non-swipeable 3-step flow that cannot be dismissed by swipe, scrim, or back — only an explicit Cancel exits. `DeleteStep { CONFIRM, OTP, TYPE }`:
+The UI gate for full deletion is `V2DeleteAccountSheet` (`ui/v2/screens/accountsettings/components/V2DeleteAccountSheet.kt`), a **non-swipeable** 3-step flow. `DeleteStep { CONFIRM, OTP, TYPE }`:
 
 1. **CONFIRM** — "Are you sure?", before any email is sent, so a mis-tap costs nothing.
 2. **OTP** — a fresh email code entered via `V2OtpCodeStep` with `OtpPurpose.ACCOUNT_DELETION`; verifying it mints the single-use ticket.
 3. **TYPE** — the user types the required phrase (`DELETE`) exactly, case-sensitive.
 
-`onConfirm(otpTicket)` fires only after OTP verify AND a matching typed phrase. `OtpPurpose` (`data/remote/accountotp/OtpPurpose.kt`) is the client mirror of the server OTP allowlist — `APP_LOCK_PIN_RESET("app_lock_pin_reset")` and `ACCOUNT_DELETION("account_deletion")`; deletion uses the latter.
+`onConfirm(otpTicket)` fires only after OTP verify AND a matching typed phrase. The sheet is no longer *cancel-only*: it stays **non-swipeable** (`sheetGesturesEnabled = false`), but `onDismissRequest` is now a real teardown (`onDismiss`) rather than `{}`. The empty lambda was actively broken — Material3 runs `sheetState.hide()` first and only then calls `onDismissRequest`, so a scrim/back tap animated the sheet off-screen while `showDeleteSheet` stayed true, leaving an invisible modal + scrim mounted that swallowed every touch on Account Settings until an app restart. A scrim/back tap now cancels the flow — the safe direction, since abandoning a delete costs one tap to reopen while a frozen settings screen costs the app.
+
+`V2DeleteAccountSheet` gained `deleting`, `errorText`, and `canRetry` params and now stays **mounted** through the server round-trip. `onConfirm(ticket)` no longer closes the sheet first — the screen calls `runDeletion(ticket)` directly and closes the sheet only on `Success` / `PartialSuccess` — so a rejection surfaces inline via `errorText` and a retry reuses the still-valid single-use OTP ticket instead of restarting CONFIRM → OTP → TYPE and burning it. While `deleting`, the confirm label swaps to "Deleting…" and both Cancel and Confirm are disabled/guarded; Confirm is also disabled when `canRetry` is false.
+
+`OtpPurpose` (`data/remote/accountotp/OtpPurpose.kt`) is the client mirror of the server OTP allowlist — `APP_LOCK_PIN_RESET("app_lock_pin_reset")` and `ACCOUNT_DELETION("account_deletion")`; deletion uses the latter.
 
 ## The wire call
 
@@ -63,7 +69,7 @@ The UI gate for full deletion is `V2DeleteAccountSheet` (`ui/v2/screens/accounts
 
 ## Screen triggers
 
-`runDeletion` / `runRemoval` (`ui/v2/screens/accountsettings/V2AccountSettingsScreen.kt`) are the screen-level triggers. Both block if `RecordingService` is `RECORDING` / `PAUSED` (snackbar), run the coordinator under `withContext(NonCancellable)` behind a blocking wipe veil, and rely on the coordinator's sign-out (→ V2App routes to login) instead of manual navigation. Deletion maps `ServerFailed` / `NetworkError` / `NoSignedInUser` to snackbars; `Success` / `PartialSuccess` are silent because the screen swaps out.
+`runDeletion` / `runRemoval` (`ui/v2/screens/accountsettings/V2AccountSettingsScreen.kt`) are the screen-level triggers. Both block if `RecordingService` is `RECORDING` / `PAUSED` (snackbar), run the coordinator under `withContext(NonCancellable)` behind a blocking wipe veil, and rely on the coordinator's sign-out (→ V2App routes to login) instead of manual navigation. Deletion errors are mapped from the server's TYPED registry codes via `AiEngineErrorCode.fromCode(result.errorCode)` to specific copy shown **inline** in the still-open sheet, with a snackbar only as a fallback when the sheet is already gone: `USER_DELETE_ACTIVE_SUBSCRIPTION` → active-subscription copy, `ACCOUNT_FROZEN` → account-locked copy, and `CANONICAL_USER_DELETE_FAILED` → partial-delete copy plus a `viewModel.markDeletionBlocked()` that blocks further retries for the screen visit. Active-recording and partial-block reasons also show inline. `Success` / `PartialSuccess` close the sheet and let V2App route to login.
 
 ## Related pages
 

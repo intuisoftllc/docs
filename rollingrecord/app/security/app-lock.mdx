@@ -46,11 +46,13 @@ The delay is chosen in `V2AutoLockSheet` (`ui/v2/screens/security/components/V2A
 | --- | --- |
 | Immediate | `0` (locks directly on background) |
 | 30 seconds | `30000` |
-| 1 minute | `60000` (`DEFAULT_APP_LOCK_AUTO_LOCK_MS`) |
+| 1 minute | `60000` |
 | 5 minutes | `300000` |
-| 10 minutes | `600000` |
+| 10 minutes | `600000` (`DEFAULT_APP_LOCK_AUTO_LOCK_MS`, the default) |
 | 30 minutes | `1800000` |
 | 1 hour | `3600000` |
+
+The default was raised from 1 minute to 10 minutes: per its KDoc in `UserSettingsDataSource` (`data/local/UserSettingsDataSource.kt`), App Lock protects a recorder, not a bank vault — a one-minute delay mostly re-authenticates the owner after every glance while barely slowing an attacker with the device in hand. `DEFAULT_APP_LOCK_AUTO_LOCK_MS` lives in `UserSettingsDataSource.kt`; existing installs that already chose a value keep it, and stricter presets (Immediate / 30s / 1m) remain in the picker.
 
 ## Auto-lock suppression
 
@@ -67,7 +69,9 @@ A Compose `DisposableEffect` flips suppression on while the step is shown and of
 
 `V2LockOverlay` (`ui/v2/screens/security/lock/V2LockOverlay.kt`) is the full-screen unlock UI drawn over the blurred app while `phase == LOCKED`. It is a frosted scrim (`V2Theme.colors.lockScrim`) that consumes all touches and the system back button. Layout: a masked account badge top-left, a red logout affordance top-right, a centered `V2PinKeypad` (or `LockoutContent` countdown while timed out), and "Need help?" / "Forgot PIN?" links pinned to the bottom.
 
-The biometric sheet runs at the `FragmentActivity`; the overlay requests it via `onRequestBiometric` and feeds the result back to the VM. A declarative reconciler decides "should the sheet be showing?" against "is it showing?" — the sheet re-offers itself once per foreground stint (`episodeAnswered` resets on every `ON_RESUME`), `SystemCancelled` results retry up to a cap of 3, and a 250ms settle delay avoids the keyguard-dismiss animation stealing the prompt. The overlay takes `onLogout`, `onNeedHelp`, `onForgotPin`, `onRequestBiometric`, `biometricSuppressed`, and `onCancelBiometric`.
+The biometric sheet runs at the `FragmentActivity`; the overlay requests it via `onRequestBiometric: (userInitiated: Boolean, onResult: (BiometricAuthResult) -> Unit) -> Unit` and feeds the result back to the VM. The `userInitiated` flag distinguishes the two callers: the reconciler auto-prompt passes `userInitiated = false` (it must not disturb a possibly-showing sheet), while the user tapping the fingerprint button passes `userInitiated = true` — a tap proves no system sheet is covering the screen, which lets the gate treat a stuck in-flight state as stale and relaunch it. A declarative reconciler decides "should the sheet be showing?" against "is it showing?" — the sheet re-offers itself once per foreground stint (`episodeAnswered` resets on every `ON_RESUME`), `SystemCancelled` results retry up to a cap of 3, and a 250ms settle delay avoids the keyguard-dismiss animation stealing the prompt. The overlay takes `onLogout`, `onNeedHelp`, `onForgotPin`, `onRequestBiometric`, `biometricSuppressed`, and `onCancelBiometric`.
+
+The gate's in-flight guard is no longer a one-way door: it records `inFlightSinceMs` and relaunches the prompt (rather than only re-pointing the callback) when `userInitiated` is `true` OR the in-flight age exceeds `STALE_IN_FLIGHT_MS = 60_000L`. This recovers from an androidx launch dropped in the saved-state window, which previously left biometrics permanently dead until force-close. See [PIN & Biometrics](/rollingrecord/app/security/pin-and-biometrics) for the full gate behavior.
 
 ### `V2LockOverlayViewModel`
 
@@ -79,7 +83,7 @@ The biometric sheet runs at the `FragmentActivity`; the overlay requests it via 
 
 ## Hosting and lock-aware surfaces
 
-`V2App` (`ui/v2/V2App.kt`) hosts the overlay: it injects `AppLockController`, collects `phase`, blurs `V2MainNavHost` by 20dp when `appLocked || resolvingLock`, renders the `RESOLVING` shield scrim, and draws `V2LockOverlay` when `appLocked && sessionActive`. It wires `onRequestBiometric` to `AppLockBiometricGate.current`, sets `biometricSuppressed = showForgotPin || showLockLogoutConfirm`, and hosts `V2ForgotPinFlow` above the lock.
+`V2App` (`ui/v2/V2App.kt`) hosts the overlay: it injects `AppLockController`, collects `phase`, blurs `V2MainNavHost` by 20dp when `appLocked || resolvingLock`, renders the `RESOLVING` shield scrim, and draws `V2LockOverlay` when `appLocked && sessionActive`. It wires `onRequestBiometric` to `AppLockBiometricGate.current`, forwarding the `userInitiated` flag into `gate.authenticate(...)`; `AppLockBiometricGate` owns the app's one and only `BiometricPrompt` — construction, not concurrency, is the invariant. A second `BiometricPrompt(...)` built anywhere in the activity silently steals the gate's callback slot for the activity's life and breaks unlocking with nothing logged (the sheet shows, the finger is accepted, the result is dropped into a dead callback). The `SingleBiometricPromptTest` (`data/applock/SingleBiometricPromptTest.kt`) is a structural guard — a source-scan asserting exactly one `BiometricPrompt(` construction site, in `AppLockBiometricGate`. `V2App` also sets `biometricSuppressed = showForgotPin || showLockLogoutConfirm` and hosts `V2ForgotPinFlow` above the lock. See [PIN & Biometrics](/rollingrecord/app/security/pin-and-biometrics) for the gate's callback-ownership rule in depth.
 
 Any surface that renders in its own window can react to the same signal via `AppLockUi` (`ui/v2/components/AppLockUi.kt`): `rememberAppLocked(): Boolean` observes `AppLockController.phase == LOCKED` inside composition and backs `V2ModalBottomSheet` / `V2AlertDialog`, while `DismissOnAppLock` dismisses a raw `Dialog` the instant App Lock engages so it can't float over the lock.
 

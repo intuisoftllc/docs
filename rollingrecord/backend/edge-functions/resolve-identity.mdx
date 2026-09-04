@@ -1,13 +1,15 @@
 ---
 title: "resolve-identity"
-description: "The launch-time endpoint that upserts the caller's canonical_users row, carries anti-abuse counters forward on same-email re-signup, and reports lifetime + lapse status."
+description: "The launch-time endpoint that upserts the caller's canonical_users row, carries anti-abuse counters forward on same-email re-signup, and reports lifetime + cloud-grace status."
 ---
 
-`resolve-identity` (`functions/resolve-identity/index.ts`) is a `Deno.serve` POST endpoint called on every app launch after sign-in. It guarantees the caller's `canonical_users` row exists (so FK-bound child inserts work), carries anti-abuse usage counters forward on a same-email re-signup, and returns lifetime + subscription-lapse status. It takes **no body fields** — every identity value comes from the verified JWT, not from anything the client can fake.
+`resolve-identity` (`functions/resolve-identity/index.ts`) is a `Deno.serve` POST endpoint called on every app launch after sign-in. It guarantees the caller's `canonical_users` row exists (so FK-bound child inserts work), carries anti-abuse usage counters forward on a same-email re-signup, and returns lifetime + cloud-grace status. It takes **no body fields** — every identity value comes from the verified JWT, not from anything the client can fake.
 
 ## Gate chain
 
-The entry calls `runGates(req, { method: HttpMethod.Post, auth: AuthMode.Jwt, rateLimit: { bucket: Bucket.ResolveIdentity } })` — method + App Check + App Version + Clerk JWT + a `resolve_identity` rate limit (skipped for developers). Legit clients call this once per cold start; the bucket leaves headroom for retries and account switches. The handler reads `{ authUserId, email, activeEntitlements }` from the resolved context and computes `hashEmail(email)` up front (non-fatal on failure) using `EMAIL_HASH_PEPPER`.
+The entry calls `runGates(req, { method: HttpMethod.Post, auth: AuthMode.Jwt, rateLimit: { bucket: Bucket.ResolveIdentity }, healthCheck: dbHealthCheck("resolve-identity") })` — method + App Check + App Version + Clerk JWT + a `resolve_identity` rate limit (skipped for developers). Legit clients call this once per cold start; the bucket leaves headroom for retries and account switches. The handler reads `{ authUserId, email, activeEntitlements }` from the resolved context and computes `hashEmail(email)` up front (non-fatal on failure) using `EMAIL_HASH_PEPPER`.
+
+The config also carries `healthCheck: dbHealthCheck("resolve-identity")` (`functions/_shared/db/health-checks.ts`) — a read-only DB liveness probe in the Account & Sign-in status group. It short-circuits ahead of the auth chain when an `X-Health-Probe` header is present, so an uptime monitor never needs a real JWT to confirm the endpoint is serving.
 
 ## The atomic upsert
 
@@ -16,16 +18,16 @@ The row is created with `upsert({ auth_user_id, email_hash? }, { onConflict: "au
 | Condition | `status` | Carryover branch |
 | --- | --- | --- |
 | This call inserted the `canonical_users` row | `created` | runs `carryForwardOnResignup` (once) |
-| Row already existed | `existed` | skipped — refreshes `last_seen_at` + `email_hash`, re-reads lapse state |
+| Row already existed | `existed` | skipped — refreshes `last_seen_at` + `email_hash`, re-reads grace state |
 | N parallel first-launches | one `created`, rest `existed` | only the `created` winner carries forward |
 
-On the `created` path the lapse columns come back on the same round-trip (the upsert's `.select()` returned them). On the `existed` path the upsert returns empty, so the handler updates `last_seen_at` / backfills `email_hash` and re-reads `subscription_lapsed_at` / `subscription_lapsed_tier` separately.
+On the `created` path the grace columns come back on the same round-trip — the upsert's `.select("auth_user_id, cloud_grace_started_at, cloud_grace_tier")` returned them. On the `existed` path the upsert returns empty (`ignoreDuplicates` absorbed the conflict), so the handler updates `last_seen_at` / backfills `email_hash` and re-reads `select("cloud_grace_started_at, cloud_grace_tier")` separately.
 
 ## Anti-abuse carryover
 
 Only on fresh creation, `carryForwardOnResignup` (`functions/_shared/users/deleted-identity-history.ts`) consumes a matching `l_deleted_identity` snapshot keyed on `(email_hash, current period)` and applies its usage counters to the new account — so a delete-and-resignup can't reset the monthly cap. It is best-effort: a failure logs and continues, because sign-in must never block on bookkeeping. `carryover: true` in the response means such a snapshot was consumed.
 
-## Lifetime + lapse status
+## Lifetime + cloud-grace status
 
 `computeLifetimeStatus` (`functions/_shared/billing/entitlements.ts`) derives `{ isFounder, lifetimeTier }` purely from the `activeEntitlements` set that `runGates` already fetched — no DB reads. RevenueCat is the single source of truth here; the [revenuecat-webhook](/rollingrecord/backend/edge-functions/webhooks) handles audit-ledger mirroring. `ResolveIdentityResponse` returns:
 
@@ -35,7 +37,7 @@ Only on fresh creation, `carryForwardOnResignup` (`functions/_shared/users/delet
 | `status` | `created` \| `existed` |
 | `carryover` | Whether an `l_deleted_identity` snapshot was consumed |
 | `is_founder` / `lifetime_tier` | Lifetime status from the effective entitlement set |
-| `subscription_lapsed_at` / `subscription_lapsed_tier` | RR-358 grace-banner state; non-null together or null together (paired CHECK on `canonical_users`) |
+| `cloud_grace_started_at` / `cloud_grace_tier` | RR-358 grace-banner state — the ISO timestamp the deletion countdown began (set whenever the user stops holding a recurring cloud entitlement for ANY reason: expiry, plan-switch down, refund, revoke) and the tier being preserved (`pro_cloud` or `pro_cloud_ai`); non-null together or null together (paired CHECK on `canonical_users`) |
 
 The `hashEmail` peppered hash (`functions/_shared/auth/email-hash.ts`) is stored on `canonical_users.email_hash` so `wipeUser()` can write the deletion snapshot without a live Clerk call, and it is the carryover key. The same normalization runs in `resolve-identity`, `clerk-webhook`, and `revenuecat-webhook`, so the hashes match across surfaces.
 

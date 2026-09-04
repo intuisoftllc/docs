@@ -7,7 +7,7 @@ description: "The GET / PATCH endpoint over the six per-group sync toggles on us
 
 ## The two verbs
 
-The gate chain here allows both methods (`method: [Get, Patch]`) and uses the `UserSyncPreferences` rate-limit bucket — differing from the POST-only sibling endpoints.
+The gate chain here allows both methods (`method: [Get, Patch]`) and uses the `UserSyncPreferences` rate-limit bucket — differing from the POST-only sibling endpoints. It also hosts a read-only DB-liveness health probe — `healthCheck: dbHealthCheck("user-sync-preferences")` (`functions/_shared/db/health-checks.ts`, Sync Services status group) — a step-0 gate that short-circuits the gate chain on a valid `X-Health-Probe` header.
 
 | Method | Body | Behavior |
 | --- | --- | --- |

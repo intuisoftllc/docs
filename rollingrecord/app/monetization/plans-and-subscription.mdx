@@ -5,6 +5,8 @@ description: "The Choose-a-Plan paywall, the Your-Plan management screen, the sh
 
 Two V2 screens cover buying and managing a subscription: the "Choose a Plan" paywall for a first purchase, and the "Your Plan" screen for changing, resubscribing, or cancelling. Both read a shared static plan catalog, price it live from RevenueCat, and render the same full-screen result overlay after a transaction.
 
+**Theming.** `V2UpgradeScreen`, `V2ManageSubscriptionScreen`, and the shared `PlanResultOverlay` (`PlanResultOverlays.kt`) were converted to dark mode by swapping hard-coded palette constants (`Gray500` / `Gray800` / `Gray900`, `Red50`, `Gray200`, `Blue50`) for `V2Theme.colors.*` tokens (`strongText`, `secondaryText`, `chatErrorBg`, `cardOutline`). This is purely a theming pass — behavior, the `ManagePlanKind` state machine, and the `PlanResult` states and overlays are unchanged, so every table on this page stays accurate.
+
 ## `PlanCatalog`
 
 `PlanCatalog` (`ui/v2/screens/upgrade/PlanCatalog.kt`) is an internal enum shared by both flows. Names, descriptions, feature lists, and icons are fixed design content (string/array/drawable res IDs); prices come live from RevenueCat, matched to these product IDs. Each entry carries its `RcEntitlement`, monthly + annual store product IDs, res IDs, and a `staticBadge`.
@@ -88,9 +90,17 @@ The purchase, offering, and restore calls all go through `RevenueCatManager` (`d
 
 All of these work identically against the RC Test Store and the real Play Store; which store the SDK talks to is decided purely by the API key passed to `Purchases.configure`.
 
+## Post-purchase entitlement race
+
+The server caches its RevenueCat read for ~5 minutes per customer, so a user who browsed while free is answered from a cached "no entitlements" for minutes after paying. The [`X-Entitlement-Refresh`](/rollingrecord/app/monetization/entitlements-revenuecat) signal asks the server to skip that cache, but two downstream code paths also *tolerate* the stale window so a just-paid user is never wrongly refused a feature they hold.
+
+**Transcription cap UI — `V2PlaybackViewModel`.** The transcription-cap computation (`V2PlaybackViewModel`, `ui/v2/screens/playback/`) now detects a stale snapshot: the snapshot reports the `tier` it was computed for, resolved via `RcEntitlement.fromLookupKey`, and when `snapshotTier.ordinal < tier.ordinal` (the live tier) the snapshot predates the purchase. In that case the cap falls back to the tier's `baseCapMinutes` allowance instead of the stale server cap figure — which for anything below Pro+Cloud is `0`, so `used >= cap` is trivially true at `0 >= 0` and a paid user would otherwise be told they are out of minutes. The fallback is deliberately optimistic: the server still enforces the real cap on every transcribe, so the worst case is the UI letting someone start a request the server then refuses, which is far better than refusing a feature they hold on our own.
+
+**Transcription worker — `TranscriptionWorker`.** `AiEngineResult.Cap` and `AiEngineResult.SubscriptionRequired`, at **both** the init and submit steps, are now thrown as `TransientAiEngineException` (retried) instead of `PermanentAiEngineException` when `isEntitlementRace()` is true; otherwise they remain permanent. `isEntitlementRace()` reads the canonical, owner-checked tier via `getKoin().userSession().getOrNull<EntitlementRepository>()?.currentTier?.first()` — deliberately **not** a raw `RevenueCatManager.customerInfo` read, which would skip the owner check and could match a prior account. It returns true when the local tier `atLeast(UserTier.PRO_CLOUD)`, and defaults to **true** (allow the retry) when the tier can't be read: the two failure directions are not symmetric — a wrongly-permanent refusal leaves a paying customer's transcript dead forever, while a wrongly-transient one costs only a few bounded retries that the next attempt's re-read stops.
+
 ## Add-on bundles — `V2BundlesScreen`
 
-`V2BundlesScreen` (`ui/v2/screens/bundles/V2BundlesScreen.kt`) is an explicit non-functional placeholder for the future add-on bundles screen (extra transcription / AI / storage credits) — its KDoc labels it a "STAGE 5 stub" / "coming soon placeholder." It renders a centered empty-state (a faint cart glyph, heading, and a short blurb about buying extra transcription hours / AI queries) above a full-width **disabled** "Coming Soon" button; the trailing overflow affordance is inert too. There is no purchase flow yet — per its KDoc, "The real add-on purchase flow lands in a later ticket." It is reached from the Usage screen's "Get More" CTA (`onNavigateToBundles`), which the Usage screen shows for `tier.atLeast(UserTier.PRO_CLOUD)`.
+`V2BundlesScreen` (`ui/v2/screens/bundles/V2BundlesScreen.kt`) is an explicit non-functional placeholder for the future add-on bundles screen (extra transcription / AI credits) — its KDoc labels it a "STAGE 5 stub" / "coming soon placeholder." It renders a centered empty-state (a faint cart glyph, heading, and a short blurb about buying extra transcription hours / AI queries) above a full-width **disabled** "Coming Soon" button; the trailing overflow affordance is inert too. There is no purchase flow yet — per its KDoc, "The real add-on purchase flow lands in a later ticket." It is reached from the Usage screen's "Get More" CTA (`onNavigateToBundles`), which the Usage screen shows for `tier.atLeast(UserTier.PRO_CLOUD)`.
 
 ## Related pages
 

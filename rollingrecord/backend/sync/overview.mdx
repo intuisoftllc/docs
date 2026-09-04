@@ -1,6 +1,6 @@
 ---
 title: "Sync Engine Overview"
-description: "Map of the cloud-sync subsystem: seven Edge Functions, the 14-entity encrypted c_* registry, the six sync-preference groups, per-file envelope crypto, and the tombstone / grace-window lifecycle."
+description: "Map of the cloud-sync subsystem: seven Edge Functions, the 14-entity encrypted c_* registry, the six sync-preference groups, per-file envelope crypto, and the tombstone / cloud-reset / grace-window lifecycle."
 ---
 
 Cross-device sync replicates a paying user's recordings, contexts, categories, schedules, chat threads, and settings across their devices as client-encrypted rows on Supabase. Seven Edge Functions carry the traffic; every one of them consults a single registry, `ENTITY_REGISTRY` in `functions/_shared/sync/entities.ts`, to decide what crosses the wire and in what shape.
@@ -8,6 +8,8 @@ Cross-device sync replicates a paying user's recordings, contexts, categories, s
 ## The seven Edge Functions
 
 Every endpoint runs the same fixed admission chain via `runGates` (`functions/_shared/gates/index.ts`) and requires at least one of `Entitlement.ProCloud` / `Entitlement.ProCloudAi` — sync is a paid feature. The `developer` RC entitlement cascades into that set, so dev accounts pass entitlement and skip rate limits.
+
+Every sync Edge Function also hosts a health probe (`dbHealthCheck`, or `dbAndStorageHealthCheck` for `sync-reserve` / `sync-audio`, from `functions/_shared/db/health-checks.ts`, grouped under the "Sync Services" status-page group) — a step-0 gate that short-circuits the whole admission chain to a near-instant DB read (plus a Storage-reachability check for the two audio functions) on a valid `X-Health-Probe` header.
 
 | Endpoint | Role | Direction |
 | --- | --- | --- |
@@ -65,7 +67,13 @@ Three write paths exist in `sync-push`. A tombstone op (`deleted_at` set) is an 
 
 ## Tombstones and the grace window
 
-A delete is a soft-delete tombstone — an UPDATE that sets `deleted_at`, never a raw `DELETE` on `c_recordings`. The encrypted blob is deliberately kept for `server_config.cloud_tombstone_grace_days` (30 by default) so a restore stays playable; the orphan-blob sweeper reaps it only after the window closes. `sync-pull` returns `resync_required` when a client's cursor predates that window, since deletes it never saw may already have been GC'd.
+A normal user delete is a soft-delete tombstone — an UPDATE that sets `deleted_at`. The encrypted blob is deliberately kept for `server_config.cloud_tombstone_grace_days` (30 by default) so a restore stays playable; the orphan-blob sweeper reaps it only after the window closes. `sync-pull` returns `resync_required` when a client's cursor predates that window, since deletes it never saw may already have been GC'd.
+
+Raw `DELETE` on `c_recordings` is no longer forbidden absolutely: the daily lapse sweeper `subscription_lapse_cleanup()` (migration `20260824120000_lapse_cloud_reset.sql`) is a sanctioned exception. For a subscription lapsed beyond the grace window it HARD-DELETEs 13 of the 14 `c_*` tables (every table except `c_settings`, which is never deleted and — with `canonical_users` retained — has nothing to cascade from; this includes `c_recordings`), hands the user's audio blobs to `storage-janitor`, and stamps `canonical_users.cloud_wiped_at`.
+
+## Cloud reset vs tombstone
+
+A cloud WIPE is NOT a user delete, and conflating them destroys the user's local library. A tombstone means "the user deleted this" and propagates as a delete to every device; a wipe means "we stopped storing it after non-payment." To stop a resubscribing user's library from being reconciled away, `sync-pull` returns a THIRD status, `cloud_reset`, driven by the never-cleared `canonical_users.cloud_wiped_at` compared against the incoming cursor. It tells a returning device to RE-UPLOAD its locally-committed rows rather than run the RR-468 orphan reconcile — which, on the now-empty server, would delete every committed row it holds. Contrast with `resync_required`, which means "I may have deletions you never saw" and, on that path, the orphan reconcile SHOULD run.
 
 ## Where to go next
 

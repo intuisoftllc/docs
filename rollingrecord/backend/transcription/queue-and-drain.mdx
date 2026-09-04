@@ -35,7 +35,7 @@ The `cancelled` status was added to both this table's and `transcribe_jobs`' CHE
 - **Layer 2 — cron.** The `transcribe-drain` Edge Function (`functions/transcribe-drain/index.ts`) runs `Deno.cron("transcribe-drain", "* * * * *", …)` every minute for overflow (ceiling was full at enqueue) and 429-backoff retries.
 
 <Note>
-`transcribe-drain` is **cron-only** — it has no `Deno.serve`, no `runGates`, and no `config.toml` entry. It runs on the service role via the auto-injected `SUPABASE_URL` / `SUPABASE_SERVICE_ROLE_KEY`, and also needs the `ASSEMBLYAI_API_KEY` and `ASSEMBLYAI_WEBHOOK_SECRET` secrets.
+`transcribe-drain` is **cron-only** — it has no `Deno.serve`, no `runGates`, and no `config.toml` entry. It runs on the service role via the auto-injected `SUPABASE_URL` / `SUPABASE_SERVICE_ROLE_KEY`, and also needs the `ASSEMBLYAI_API_KEY` and `ASSEMBLYAI_WEBHOOK_SECRET` secrets. A `config.toml` audit that added the previously-missing `[functions.bug-report]`, `[functions.recovery-code-generate]`, and `[functions.notifications]` blocks (all `verify_jwt = false`) leaves `transcribe-drain` as the one function deliberately without a `[functions.*]` block — 32 blocks in total, none of them its. And because it has no `runGates` / `GateConfig`, it cannot host a `healthCheck`, so it is the one transcription-family function excluded from the [Edge Function health probe](/rollingrecord/backend/gates/health-probes) — its HTTP-fronted peer `assemblyai-webhook` carries the Transcription-group probe via `dbStorageAssemblyAIHealthCheck` (see [Pipeline](/rollingrecord/backend/transcription/pipeline)).
 </Note>
 
 Each drain cycle:

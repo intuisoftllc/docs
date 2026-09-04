@@ -48,6 +48,8 @@ Tool definitions are **client-owned** — the server passes `input.tools` straig
 
 RR-431 adds one-shot tool-name hallucination correction (`functions/_shared/ai/tool-validation.ts`): `findHallucinatedToolCalls` detects `tool_use` blocks naming tools that aren't in the `tools` array, and the handler retries **once** with `buildHallucinationCorrectionSuffix` appended to the uncached suffix, offering "did you mean" suggestions. The retry is capped at 1; a persistent hallucination surfaces to the client's tool dispatcher. If the retry call itself fails, the original response is surfaced.
 
+`tool_result` blocks on the wire now carry an optional `is_error?: boolean` flag (`AiToolResultBlock.is_error`, `functions/_shared/ai/types.ts`), set when a tool refused or errored so a failed or refused write is visible to the model at the protocol level rather than only as prose it has to read closely. The key is omitted on success, so results that worked keep their exact wire shape. It is emitted client-side by `AgentLoop` and flows back through the `kb_query` response/continuation contract.
+
 ## Input-size safety net
 
 RR-199 input caps live in `kb-query-caps.ts` (pure, unit-tested). `applyInputSizeCaps` performs pairing-aware eviction of the oldest whole turns — a `tool_use` message and its matching `tool_result` are evicted together, never orphaned — plus last-resort in-place text truncation. Ceilings come from `server_config`: `kb_chat_max_message_count` (default 80) and `kb_chat_max_total_chars` (default 200,000). The former per-message char cap was removed because it dropped whole `tool_use`/`tool_result` messages and produced Anthropic 400s. When truncation fires, the handler sets the `x-kb-truncated` response header.

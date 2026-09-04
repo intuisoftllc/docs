@@ -23,6 +23,12 @@ Raw `DELETE FROM storage.objects` is blocked by Supabase's `protect_delete()` tr
 
 `ALLOWED_BUCKETS` (`functions/storage-janitor/buckets.ts`) is exactly `['audio-storage', 'embedding-storage', 'transcribe-inbox']` — any other bucket name is rejected 400. Duplicate paths are preserved as-is since `remove()` is idempotent.
 
+### The cloud-wipe caller
+
+`subscription_lapse_cleanup()` (migration `20260824120000_lapse_cloud_reset.sql`) is a concrete janitor caller. When a subscription has been lapsed past its 30-day grace window the sweeper HARD-DELETEs the user's `c_*` rows — but first it captures every `c_recordings.storage_path` for that user, then POSTs those paths to storage-janitor with `bucket = 'audio-storage'` via `net.http_post`. It reads the janitor URL and bearer from Vault (`storage_janitor_url` / `storage_janitor_secret`) once, outside the per-user loop. Routing through storage-janitor is exactly why the sweeper avoids a raw `DELETE FROM storage.objects` — that statement is blocked by `protect_delete()` (`42501`), so storage-janitor stays the one sanctioned blob-delete path.
+
+The `net.http_post` is pg_net-queued **inside the same transaction** that deletes the `c_*` rows, so a rollback cancels the POST — storage-janitor can never remove a blob for a row that survived. If the Vault entries are absent the function does not fail: it emits a `RAISE NOTICE` and leaves the now-unclaimed blobs to the hourly `storage-orphan-lister`, which reaps them on its next `sweepAudio` pass. The direct hand-off is the fast path; the lister is the fallback when it is skipped. The `canonical_users.cloud_wiped_at` marker this sweeper stamps is what drives the returning client to re-upload rather than delete — see [sync-pull](/rollingrecord/backend/sync/pull) for the `cloud_reset` status and [Scheduled pg_cron Sweepers](/rollingrecord/backend/database/cron-sweepers) for the sweep's schedule.
+
 ## storage-orphan-lister
 
 `functions/storage-orphan-lister/index.ts` is the single discovery sweep and the ONE place with bucket-specific orphan logic. It carries the same `WebhookSecret` + `STORAGE_JANITOR_SECRET` gate and the same `skipAppCheck` / `skipAppVersion` opt-outs as the janitor. It runs **three independent sweeps** — audio, embeddings, transcribe — each wrapped in `runSweep` so one sweep's failure surfaces as `{ error }` in its section without blocking the others; the call still returns 200.
@@ -45,7 +51,7 @@ Two guards bound what a sweep will touch. `collectAgedPaths` (`functions/_shared
 
 ### The transcribe row reap
 
-`sweepTranscribe` runs a blob sweep and a row reap that are **independent**. The blob sweep uses `transcribeBlobsToDelete(candidates, jobExpiryMap, nowMs)` — a blob with no job row, or an expired/null expiry, is deleted; an active job's blob is kept. Separately, the reap deletes **every** `transcribe_jobs` row `WHERE expires_at < now` unconditionally — even if the blob sweep threw — which is what cleans blob-less stuck-pending rows a bucket walk never encounters. Rows with a null `expires_at` are left alone.
+`sweepTranscribe` runs a blob sweep and a row reap that are **independent**. The blob sweep uses `transcribeBlobsToDelete(candidates, jobExpiry, nowMs)` — a blob with no job row, or an expired/null expiry, is deleted; an active job's blob is kept. Separately, the reap deletes **every** `transcribe_jobs` row `WHERE expires_at < now` unconditionally — even if the blob sweep threw — which is what cleans blob-less stuck-pending rows a bucket walk never encounters. Rows with a null `expires_at` are left alone.
 
 ## audit_orphan_blobs — the inverse sweep
 

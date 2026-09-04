@@ -3,11 +3,13 @@ title: "Room Database & SQLCipher"
 description: "The encrypted per-user Room database: entities, DAOs, migration discipline, DEK-derived keying, and the classify-then-recover open-failure routing."
 ---
 
-Local data lives in a per-user, SQLCipher-encrypted Room database — `AppDatabase`, version 78, 19 entities and 19 DAOs. Each user's file is isolated at `databases/{auth_user_id | anonymous}/rolling_record_db`, built inside `UserSessionScope`. An anonymous session uses a legacy device-bound passphrase; a signed-in session is keyed from the account's DEK. Open failures are classified so only a genuine key mismatch ever wipes the file.
+Local data lives in a per-user, SQLCipher-encrypted Room database — `AppDatabase`, version 79, 19 entities and 19 DAOs. Each user's file is isolated at `databases/{auth_user_id | anonymous}/rolling_record_db`, built inside `UserSessionScope`. An anonymous session uses a legacy device-bound passphrase; a signed-in session is keyed from the account's DEK. Open failures are classified so only a genuine key mismatch ever wipes the file.
 
 ## `AppDatabase`
 
-`AppDatabase` (`data/local/db/AppDatabase.kt`) is `@Database(version = 78, exportSchema = false)` with 19 entities and 19 abstract DAO accessors (`recordingDao()` … `pendingPullApplyDao()`). It is registered as a `scoped<AppDatabase>` in `UserSessionScope` (see [Koin Dependency Injection](/rollingrecord/app/architecture/dependency-injection)), so closing the scope on sign-in/out releases Room's file handle and the next scope opens a fresh DB against the new user's directory.
+`AppDatabase` (`data/local/db/AppDatabase.kt`) is `@Database(version = 79, exportSchema = true)` with 19 entities and 19 abstract DAO accessors (`recordingDao()` … `pendingPullApplyDao()`). It is registered as a `scoped<AppDatabase>` in `UserSessionScope` (see [Koin Dependency Injection](/rollingrecord/app/architecture/dependency-injection)), so closing the scope on sign-in/out releases Room's file handle and the next scope opens a fresh DB against the new user's directory.
+
+`exportSchema = true` (RR-110) makes Room write a per-version schema JSON to `app/app/schemas/` on every build. That committed JSON is what `MigrationTestHelper` builds the source-version database from and what `runMigrationsAndValidate()` diffs the post-migration schema against — the diff catches a mismatched index name, exactly the April-2026 data-loss class of bug (see [Migration-test infrastructure](#migration-test-infrastructure)).
 
 ### Entities → table names
 
@@ -42,7 +44,7 @@ All 19 DAOs are `scoped {}` in `daoModule`.
 Two key paths:
 
 - **Anonymous (signed-out) session** — there is no account DEK and the anonymous DB is never cloud-portable, so it stays on the legacy random device-bound passphrase from `DatabaseKeyManager.getOrCreatePassphrase` (`data/local/security/DatabaseKeyManager.kt`).
-- **Signed-in session** — the DB key is derived from the account DEK so the same account opens the same DB on any device. `BackupRestorer.recoverInterruptedRestore` heals any half-finished restore swap, then `DekKeyStore.loadDek` reads the persisted, Android-Keystore-wrapped DEK offline (self-healing the cold-start race via `SessionDekHolder.requireDek` off the main thread). A null DEK is the recoverable `DekUnavailable` state — the DB is **never** opened and **never** wiped; instead `DatabaseRecoveryState.flagDekUnavailable(...)` is raised and `DekUnavailableException` is thrown. Otherwise `DatabaseKeyTransition.resolvePassphraseOrTransition` produces the DEK-derived (structure-v2) SQLCipher raw key and the DB is built and verified.
+- **Signed-in session** — the DB key is derived from the account DEK so the same account opens the same DB on any device. `BackupRestorer.recoverInterruptedRestore` heals any half-finished restore swap, then `DekKeyStore.loadDek` reads the persisted, Android-Keystore-wrapped DEK offline. When no persisted DEK is found yet (cold-start race), an off-main build fetches it inline via `SessionDekHolder.requireDek()`, bounded by `withTimeout(INLINE_DEK_FETCH_TIMEOUT_MS = 45_000L)` — a hung fetch degrades to the recoverable `DekUnavailable` surface rather than holding the session-scope lock. A null DEK is the recoverable `DekUnavailable` state — the DB is **never** opened and **never** wiped; instead `DatabaseRecoveryState.flagDekUnavailable(...)` is raised, `DekUnavailableException` is thrown, and the reason is reported as a deduped (per user, per reason, per process) Crashlytics non-fatal via `reportDekUnavailableToCrashlytics` (keys only — UUIDs, hashes, counts; no key material). Otherwise `DatabaseKeyTransition.resolvePassphraseOrTransition` (now also passed `kekVersion = persisted.kekVersion`) produces the DEK-derived (structure-v2) SQLCipher raw key and the DB is built and verified.
 
 `DatabaseKeyTransition` (`data/local/security/DatabaseKeyTransition.kt`) returns `Result.Ready(passphrase)` or `Result.DekUnavailable(reason)`. RR-489 removed the legacy v1→v2 in-place re-key, so a non-v2 file now fails safe to the recovery surface rather than the wipe path.
 
@@ -66,9 +68,18 @@ Only `KEY_MISMATCH` wipes. The `SCHEMA_MISMATCH` / `MIGRATION_MISSING` / `UNKNOW
 
 ## Migrations
 
-`allMigrations` is an `Array<Migration>` of all 77 sequential migrations, `MIGRATION_1_2` through `MIGRATION_77_78`, imported from `data/local/db/migrations/*`. Version bumps are atomic across three places: `AppDatabase.version`, the `allMigrations` array in `DatabaseModule.kt`, and `DevBackupManager.CURRENT_DB_SCHEMA_VERSION`.
+`allMigrations` is an `Array<Migration>` of all 78 sequential migrations, `MIGRATION_1_2` through `MIGRATION_78_79`, imported from `data/local/db/migrations/*`. Version bumps are atomic across three places: `AppDatabase.version`, the `allMigrations` array in `DatabaseModule.kt`, and `DevBackupManager.CURRENT_DB_SCHEMA_VERSION`.
 
-`MIGRATION_77_78` (`data/local/db/migrations/Migration77To78.kt`) is a representative example — a purely additive change adding a nullable `audioFormat TEXT` column to `recording_sessions`. Each migration file carries a plain-English risk statement and the version-bump checklist inline.
+`MIGRATION_78_79` (`data/local/db/migrations/Migration78To79.kt`) is a representative example — a purely additive change adding two nullable columns to `blueprints`: `moderationRejectedAt INTEGER` and `moderationRejectionReason TEXT`. NULL (the value every existing row gets) means "not rejected"; the pair records that a re-pushed custom blueprint failed re-moderation after a subscription-lapse cloud-reset wiped its server row. Each migration file carries a plain-English risk statement and the version-bump checklist inline.
+
+## Migration-test infrastructure
+
+Every migration is validated by an instrumented `MigrationTestHelper` test, backed by committed schema exports and gated at push time (RR-110 / RR-111):
+
+- **`MigrationTest.kt`** (`app/app/src/androidTest/.../data/local/db/`) — the `migrate78To79()` test builds the v78 DB from `78.json`, seeds real rows into both the altered table (`blueprints`) and one it must leave alone (`recordings`), then calls `runMigrationsAndValidate(TEST_DB, 79, true, MIGRATION_78_79)`. That call validates the post-migration schema against `79.json` (catching an index-name mismatch — a defect a "did the SQL throw?" test would pass) and the test then asserts the seeded rows survived with their expected values. Adding a test for a new migration copies this block and changes four things: source version, target version, the seed INSERT, and the assertions.
+- **`app/app/build.gradle.kts` wiring** — the Room Gradle plugin (`alias(libs.plugins.room)`), `room { schemaDirectory("$projectDir/schemas") }`, the `androidTest` assets `srcDirs` entry pointing at `$projectDir/schemas` (ships the JSONs into the test APK), and `androidTestImplementation(libs.androidx.room.testing)`.
+- **Committed schema files** — `app/app/schemas/…AppDatabase/78.json` and `79.json`. A version with no exported schema is permanently untestable, since the JSON can only be regenerated from a checkout of the code at that version.
+- **`app/scripts/verify_schema_files.py`** (RR-111) — eight mechanical checks: `exportSchema = true` still set, the current version N has a schema file, `N.json`'s own recorded version equals N, `MIGRATION_{N-1}_{N}` is wired into `allMigrations`, `DevBackupManager.CURRENT_DB_SCHEMA_VERSION == N`, schema files are committed (not untracked or dirty), a version bump M → N also carries `M.json`, and a warning for any schema file ahead of N. It runs as step 0 of `scripts/hooks/pre-push` — instant and offline, so it rejects the push on schema/version drift before any Gradle work.
 
 ## FTS tables
 

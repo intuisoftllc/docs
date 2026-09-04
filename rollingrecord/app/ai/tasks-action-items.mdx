@@ -53,19 +53,30 @@ The mapper calls `parseToEpoch`; the UI calls `isOverdue` and `format`.
 
 ## The V2 Tasks screen
 
-`V2TasksScreen` (`ui/v2/screens/tasks/V2TasksScreen.kt`) renders the per-context list: Pending and Completed sections with a See-All (preview count 3), a `TaskRow` (checkbox, owner, due-date with an overdue accent, long-press menu of Select / Complete / Edit / Delete), a selection-mode bar (Complete / Share / Delete), an Add-task button (ACTIVE only) or a `LockedAddHint` (COMPLETED), and a 3-dot options menu (Share all / Delete completed / Delete all). Sharing goes out via `Intent.ACTION_SEND`.
+`V2TasksScreen` (`ui/v2/screens/tasks/V2TasksScreen.kt`) renders the per-context list: Pending and Completed sections with a See-All (preview count 3), a `TaskRow`, a selection-mode bar (Complete / Share / Delete), an Add affordance, and a 3-dot options menu (Share all / Delete completed / Delete all). Sharing goes out via `Intent.ACTION_SEND`. `TaskRow` now takes `canOpen` + `canModify` (replacing the single `interactive` flag): its long-press menu is built with `buildList` so Complete and Delete are **hidden** (not just disabled) below tier or in ARCHIVED, while Select and Edit are always present; the checkbox is `enabled = if (selectionMode) canOpen else canModify`. Below Cloud+AI the Add button is replaced by a `TierLockedAddHint` (distinct from the COMPLETED-only `LockedAddHint`), and Delete-all stays behind `canModifyTasks`. System back exits selection mode first via `BackHandler(enabled = selectionMode) { viewModel.exitSelection() }`.
 
-`V2TasksViewModel` (`ui/v2/screens/tasks/V2TasksViewModel.kt`) backs it. `tasks` is a `StateFlow` from `ContextCardRepository.getTasks`. It derives `canAddTask` (`canEditInputs` — ACTIVE) and `canModifyTasks` (`canModifyExistingTasks` — not ARCHIVED) from the context lifecycle, drives the multi-select state, and hard-guards every mutation on lifecycle (`addTask` / `updateTask` / `toggleDone` / `deleteTask` / `deleteCompleted` / `deleteAll` / `completeSelected` / `deleteSelected`). `buildShareText` builds the plain-text export; `TASK_DESCRIPTION_MAX = 500`. All writes go through the `ContextCardRepository` task facade, not the DAO.
+`V2TasksViewModel` (`ui/v2/screens/tasks/V2TasksViewModel.kt`) backs it. `tasks` is a `StateFlow` from `ContextCardRepository.getTasks`. Tasks are now behind a **tier gate** as well as the lifecycle: the VM injects `EntitlementRepository` and derives `taskAccess: StateFlow<FeatureAccess> = GatedFeature.CONTEXTS.access(tier, hasContent = true)`, with `readOnly = taskAccess != FeatureAccess.FULL`. The three permission flows fold the tier in:
 
-`V2TaskFormSheet` (`ui/v2/screens/tasks/V2TaskFormSheet.kt`) is the new/edit bottom sheet: name + description (≤ `TASK_DESCRIPTION_MAX`) + due date (via `V2DatePickerSheet`, `allowPast = false`) + owner. A non-null `existing` puts it in edit mode; `onSave(name, description, owner, dueDate)` commits.
+- `canAddTask` = `lifecycle.canEditInputs && taskAccess == FeatureAccess.FULL`
+- `canModifyTasks` = `lifecycle.canModifyExistingTasks && taskAccess == FeatureAccess.FULL` — the WRITE gate
+- `canOpenTasks` = `lifecycle.canModifyExistingTasks` only, **no tier** — a below-Cloud+AI user can still tap, long-press, and multi-select a task to view / share / export it
 
-### Permissions by context lifecycle
+So the tier bites at COMMIT (save / complete / delete), not at touch. The VM drives the multi-select state and hard-guards every mutation on lifecycle (`addTask` / `updateTask` / `toggleDone` / `deleteTask` / `deleteCompleted` / `deleteAll` / `completeSelected` / `deleteSelected`). `buildShareText` builds the plain-text export; `TASK_DESCRIPTION_MAX = 500`. All writes go through the `ContextCardRepository` task facade, not the DAO.
 
-| Lifecycle | Add new task | Modify / complete / delete existing |
+`V2TaskFormSheet` (`ui/v2/screens/tasks/V2TaskFormSheet.kt`) is the new/edit bottom sheet: name + description (≤ `TASK_DESCRIPTION_MAX`) + due date (via `V2DatePickerSheet`, `allowPast = false`) + owner. A non-null `existing` puts it in edit mode; `onSave(name, description, owner, dueDate)` commits. It gained a `canSave: Boolean = true` param — below Cloud+AI the sheet still OPENS (name / description / owner / due-date stay readable) but Save is disabled with a reason hint (`task_form_readonly_hint`); the primary button is `enabled = canSave && name.isNotBlank()`.
+
+### Permissions by context lifecycle and tier
+
+There are two axes. The lifecycle rows below apply **at Cloud+AI (`FeatureAccess.FULL`)**; below that tier the whole screen is read-only regardless of lifecycle — creating, editing, completing, and deleting are all blocked at commit, while view / select / share / export stay available (`canOpenTasks`).
+
+| Lifecycle (at Cloud+AI FULL) | Add new task | Modify / complete / delete existing |
 | --- | --- | --- |
 | `ACTIVE` | yes (`canEditInputs`) | yes |
 | `COMPLETED` | no (`LockedAddHint` shown) | yes |
 | `ARCHIVED` | no | no (fully read-only) |
+| below Cloud+AI (any lifecycle) | no (`TierLockedAddHint` shown) | no — view / select / share / export only |
+
+`ContextPermissionsTest` (`data/local/db/entity/ContextPermissionsTest.kt`) pins the lifecycle matrix: `canEditInputs` is ACTIVE-only, `canModifyExistingTasks` is blocked only in ARCHIVED (COMPLETED still allows completing / deleting EXISTING tasks), and `canExtract` is ACTIVE-only, plus cross-cutting invariants guarding against a new status collapsing the frozen-inputs-vs-editable-tasks distinction. `ContextPermissions.kt` itself was unchanged — the open-vs-modify split lives in `V2TasksViewModel`.
 
 ## Sync transform
 

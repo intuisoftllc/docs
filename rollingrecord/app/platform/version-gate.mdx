@@ -3,7 +3,7 @@ title: "App Version Gate"
 description: "The minimum-supported-version kill switch: local re-evaluation against server_config, the X-App-Version header, and the 410 client_too_old catch."
 ---
 
-`AppVersionGate` (RR-222) is an app-scoped state machine that hard-blocks a build whose `versionCode` has fallen below the server-enforced floor. It flips through two converging triggers — a local floor check and a server `410 client_too_old` catch — and once blocked it cannot un-block in-process.
+`AppVersionGate` (RR-222) is an app-scoped state machine that hard-blocks a build whose `versionCode` has fallen below the server-enforced floor. It flips through two converging triggers — a local floor check and a server `410 client_too_old` catch — and the two blocked sources un-block differently: a `LOCAL_RC` block **self-heals** in-process (every `reevaluate()` recomputes, so a reverted floor flips it back to `Ok` and dismisses the blocking screen with no relaunch), while a `SERVER_410` block stays latched for the life of the process.
 
 ## `AppVersionGate`
 
@@ -14,10 +14,10 @@ description: "The minimum-supported-version kill switch: local re-evaluation aga
 
 | Method | Behavior |
 | --- | --- |
-| `reevaluate()` | Compares `ServerConfig.minSupportedAppVersionCode` (the floor) against `BuildConfig.VERSION_CODE`; flips to `NeedsUpdate(LOCAL_RC)` when `floor > 0 && running < floor`. No-op once already blocked. |
+| `reevaluate()` | Recomputes `ServerConfig.minSupportedAppVersionCode` (the floor) against `BuildConfig.VERSION_CODE` each call. `Ok → NeedsUpdate(LOCAL_RC)` when `floor > 0 && running < floor`; **clears** an existing `NeedsUpdate` back to `Ok` only when it was `Source.LOCAL_RC` and the floor no longer binds. A `Source.SERVER_410` block is never cleared here. |
 | `markBlocked(source)` | Idempotent flip called by `ClientTooOldInterceptor` on a server `410`. |
 
-Both paths converge on the same blocked state, and there is no production un-block path — the user must update and relaunch.
+Both paths converge on the same blocked state, but they un-block differently. A `SERVER_410` block has no production un-block path — the user must update and relaunch. A `LOCAL_RC` block now self-heals in-process on a reverted floor (an admin undoing a fat-fingered raise), so no "clear your storage / relaunch" support script is needed for field users.
 
 ## How the gate flips
 
@@ -28,11 +28,13 @@ Both paths converge on the same blocked state, and there is no production un-blo
 
 ### Local re-evaluation
 
-The floor lives in Supabase `server_config`, mirrored onto `ServerConfig.minSupportedAppVersionCode` in the shared pure-JVM agentcore module (`app/agentcore/src/main/kotlin/com/intuisoftllc/rollingrecord/config/ServerConfig.kt`) — a `@Volatile var` defaulting to `0`, keyed `min_supported_app_version_code`, mapped in `update()` via `toIntOrNull()`. `App.onCreate` calls `serverConfigManager.fetchAndApply(force = true) { getKoin().get<AppVersionGate>().reevaluate() }`, so the gate re-evaluates after **both** the cached apply (which blocks an under-floor build instantly on relaunch, even offline) and the fresh fetch (so a newly-raised floor blocks within a moment of launch).
+The floor lives in Supabase `server_config`, mirrored onto `ServerConfig.minSupportedAppVersionCode` in the shared pure-JVM agentcore module (`app/agentcore/src/main/kotlin/com/intuisoftllc/rollingrecord/config/ServerConfig.kt`) — a `@Volatile var` defaulting to `0`, keyed `min_supported_app_version_code`, mapped in `update()` via `toIntOrNull()`. `App.onCreate` calls `serverConfigManager.fetchAndApply(force = true) { getKoin().get<AppVersionGate>().reevaluate() }`, so the gate re-evaluates after **both** the cached apply (which blocks an under-floor build instantly on relaunch, even offline) and the fresh fetch (so a newly-raised floor blocks within a moment of launch). Because `reevaluate()` runs on every apply, a fresh fetch that shows a *reverted* floor clears a `LOCAL_RC` block the same way it raised one — in-process, no relaunch — which is what makes the local block self-healing.
 
 ### Server 410 catch
 
 `ClientTooOldInterceptor` (`data/version/ClientTooOldInterceptor.kt`) is an internal OkHttp interceptor holding the gate. On a `410` response it `peekBody(256)` and substring-matches the needle `client_too_old` — peeking rather than draining so the downstream client can still parse the body, and substring-matching rather than JSON-parsing to keep kotlinx.serialization out of the interceptor hot path. On a match it calls `gate.markBlocked(SERVER_410)`. This is the defense-in-depth path for clients that missed the local check.
+
+A `SERVER_410` block stays latched for the life of the process — unlike a `LOCAL_RC` block, `reevaluate()` will not clear it. The server itself rejected the client, and that outranks the local `ServerConfig` mirror; the server gates also read the floor through a config cache with a ~5-minute TTL that can lag a revert, so clearing on local evidence would only flap against `ClientTooOldInterceptor` re-latching on the next call. A relaunch — or the real fix, updating the app — clears it.
 
 ## `X-App-Version` header
 

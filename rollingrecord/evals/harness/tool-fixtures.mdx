@@ -7,7 +7,7 @@ description: "Injecting the real production tool set into kb_query cases, and va
 
 ## Why the real tool set
 
-`kb_query` cases used to hand-write a tiny two-tool sandbox (`searchContext` + `getRecordingTranscriptSnippet`). Production sends roughly 14 real tools (`KbToolSpec` in the Kotlin client), and the bot behaves differently under the full set — the sandbox masked real production bugs, such as the bot getting "stuck in card world" and refusing to pull a transcript. Evals must exercise the real tool set. When a `kb_query` case omits its own `tools` and `tool_instructions`, `AiEngineHttp` injects the canonical set; a case that supplies its own explicit `tools` keeps them, so migration of un-migrated sandbox cases is incremental. See [Kb tool spec](/rollingrecord/evals/kotlin-sut/kb-tool-spec).
+`kb_query` cases used to hand-write a tiny two-tool sandbox (`searchContext` + `getRecordingTranscriptSnippet`). Production sends 23 real tools (`KbToolSpec` in the Kotlin client), and the bot behaves differently under the full set — the sandbox masked real production bugs, such as the bot getting "stuck in card world" and refusing to pull a transcript. Evals must exercise the real tool set. When a `kb_query` case omits its own `tools` and `tool_instructions`, `AiEngineHttp` injects the canonical set; a case that supplies its own explicit `tools` keeps them, so migration of un-migrated sandbox cases is incremental. See [Kb tool spec](/rollingrecord/evals/kotlin-sut/kb-tool-spec).
 
 ## Fixture file and generation
 
@@ -53,3 +53,20 @@ The `-D` flag must be quoted — PowerShell otherwise splits it at the dot and G
 `validate_mock_tool_names(operation, mock_tools, case_id)` checks that every key in a case's `mock_tools` is a real tool name present in the canonical fixture. A mismatch raises `MockToolNameError`, naming the offending key(s) and listing the valid tool names — catching typos and stale hand-written sandbox names (e.g. a leftover `searchContext`) after a case was supposed to migrate to the real tool set.
 
 The check is meaningful only when the case uses the canonical tool set; the caller (`Runner._check_mock_tool_names`, see [Runner](/rollingrecord/evals/harness/runner)) skips it when the case supplies its own explicit `tools` — an un-migrated sandbox case — and it is a no-op when `mock_tools` is empty. A violation surfaces as a `stale_mock_tool_name` FAIL verdict so one stale case fails in isolation rather than aborting the run.
+
+## Tool RESULT templates
+
+The same module carries a sibling surface to the tool-SET fixture above: the canonical result STRINGS the dispatcher hands BACK to the model. Both live under `evals/fixtures/`, but they are distinct — the tool-set fixture is the tool DEFINITIONS a case runs against, the result fixture is the strings a mock returns. `RESULTS_FIXTURE_PATH` is `FIXTURES_ROOT / "kb_tool_results.json"`, a GENERATED file shaped `{"templates": {key: template}}` produced by the Kotlin `KbToolResultsSnapshotTest`, never hand-written. See [Canonical tool RESULTS — KbToolResults](/rollingrecord/evals/kotlin-sut/kb-tool-spec).
+
+`load_tool_result_templates()` returns the `{key: template}` map, memoized in a process-wide `_results_cache` guarded by `_results_cache_lock` (the runner drives cases on a thread pool). It raises `ToolFixtureError`, always naming the regenerate command, when the file is missing, is not valid JSON, or lacks a non-empty `templates` object.
+
+`render_tool_result(key, args)` resolves a `result_ref` to the production string: it looks the `key` up in the loaded templates, then fills each `{placeholder}` slot from `args`. Two failures are loud rather than silent:
+
+- An unknown `key` raises `ToolFixtureError` listing the valid keys (which come from `KbToolResults.TEMPLATES` in the Kotlin client) — a case pointing at a renamed template says so plainly instead of failing later as a confusing mock mismatch.
+- A LEFTOVER `{placeholder}` after substitution is an ERROR, not a pass-through — an unfilled `{context}` would reach the model verbatim and read as a broken tool result, quietly changing what the case tests. The error names the missing slot and shows the `result_ref.args` form that supplies it.
+
+The results fixture regenerates through the same snapshot flow as `kb_query_tools.json` — one flag produces both, since the `*SnapshotTest` filter matches `KbToolSpecSnapshotTest` and `KbToolResultsSnapshotTest` (run from `app/`):
+
+```
+./gradlew :app:testDebugUnitTest --tests "*SnapshotTest" "-Dregenerate.kbtools=true"
+```

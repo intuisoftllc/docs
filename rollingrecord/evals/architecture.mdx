@@ -57,7 +57,6 @@ Every production call goes through the `SystemUnderTest` ABC (`evals/core/system
 | --- | --- | --- |
 | `AiEngineHttp` | `evals/ai_engine/client.py` | Live `ai-engine` HTTP call (all single-shot cases; Python session rounds). |
 | `KotlinSessionDriver` | `evals/ai_engine/kotlin_runner.py` | `app/agentrunner` → the real `app/agentcore` `AgentLoop` (session cases under `--sut=kotlin`). |
-| `OnDeviceSystemUnderTest` | `evalmode/systemundertest/OnDeviceSystemUnderTest.kt` | The in-app Kotlin runtime against a seeded local corpus. |
 
 ### Where fidelity is deliberately imperfect
 

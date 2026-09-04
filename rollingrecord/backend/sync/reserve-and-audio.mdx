@@ -44,6 +44,10 @@ The signed upload URL has a fixed ~2h SDK TTL (`SIGNED_URL_TTL_SEC = 7200` is in
 
 Both ops opt into `allowGracePeriodRead: true` with `rateLimit: { bucket: SyncAudio, gracePeriodBucket: SyncDownloadGrace }`. The grace bucket throttles the DOWNLOAD op so a lapsed subscriber can rescue their audio before the sweeper wipes it. The DELETE op is a WRITE and is REJECTED outright for a grace-period caller (`ctx.isGracePeriod`) with `subscription_required` — a lapsed user may rescue, never strip a blob they might still want to re-protect.
 
+The grace window the DOWNLOAD op relies on is a server-config dial, not a hard-coded constant. `functions/_shared/gates/grace.ts` replaced the removed `GRACE_WINDOW_MS = 30 days` constant with `graceWindowMs()`, which reads `server_config.cloud_grace_days` (default 30) at call time so the same key drives the gate, the sweeper, and the warning emails together.
+
+Both functions also host a Storage-reachability health probe — sync-reserve `healthCheck: dbAndStorageHealthCheck("sync-reserve", "audio-storage")`, sync-audio `healthCheck: dbAndStorageHealthCheck("sync-audio", "audio-storage")` (`functions/_shared/db/health-checks.ts`, Sync Services status group). Each probes DB liveness PLUS Storage reachability — reserve depends on Storage for the signed upload URL, audio for download / delete — and short-circuits the gate chain to that read on a valid `X-Health-Probe` header.
+
 ## Error codes
 
 | code | HTTP | Endpoint / cause |

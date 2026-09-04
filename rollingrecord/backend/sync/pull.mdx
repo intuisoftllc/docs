@@ -1,9 +1,9 @@
 ---
 title: "sync-pull"
-description: "The paginated two-phase delta-pull endpoint: opaque (updated_at, id, syncedAt) cursor, per-entity fan-out, phase-1 tag select + phase-2 hydrate for fat entities, row + byte page caps, remaining count, bundled preferences, and the resync path."
+description: "The paginated two-phase delta-pull endpoint: opaque (updated_at, id, syncedAt) cursor, per-entity fan-out, phase-1 tag select + phase-2 hydrate for fat entities, row + byte page caps, remaining count, bundled preferences, and the resync / cloud-reset paths."
 ---
 
-`POST /sync-pull` (`functions/sync-pull/index.ts`) is the read side of sync: a paginated delta query that returns every row newer than the client's cursor across the entities it asks for. The response is a discriminated union on `status` — either an `ok` page or a `resync_required` signal.
+`POST /sync-pull` (`functions/sync-pull/index.ts`) is the read side of sync: a paginated delta query that returns every row newer than the client's cursor across the entities it asks for. The response is a three-variant discriminated union on `status` — an `ok` page, a `resync_required` signal, or a `cloud_reset` signal.
 
 ## Request
 
@@ -21,7 +21,9 @@ The body is `{ cursor, groups }`, parsed by `parsePullRequest` (`functions/sync-
 | `entities` | `Partial<Record<WireEntity, Row[]>>` | keyed by WIRE name (`"recording"`), never a `c_*` identifier; empty entities omitted |
 | `sync_preferences` | six-boolean row | RR-334 preference bundle, mirrored on every pull |
 
-`buildResyncResponse` (`functions/sync-pull/response.ts`) returns `{ status: "resync_required", server_time, sync_preferences }` — it still bundles preferences so the client advances its mirror before the fresh full pull. Both builders live in `response.ts`.
+`buildResyncResponse` (`functions/sync-pull/response.ts`) returns `{ status: "resync_required", server_time, sync_preferences }` — it still bundles preferences so the client advances its mirror before the fresh full pull. All three builders live in `response.ts`.
+
+`buildCloudResetResponse(serverTime, cloudWipedAt, syncPreferences)` (`functions/sync-pull/response.ts`) returns the `PullResponseCloudReset` interface — `{ status: "cloud_reset", server_time, cloud_wiped_at, sync_preferences }`. It signals that the caller's cloud data was DESTROYED by the daily `subscription_lapse_cleanup` sweeper after the subscription stayed lapsed past the grace window, and the user has since resubscribed. It is deliberately NOT a flavour of `resync_required`: `resync_required` means "I may have deletions you never saw" — the client's RR-468 orphan reconcile SHOULD run — whereas `cloud_reset` means "I forgot your data; you did not delete it." Under `cloud_reset` the client must instead re-enqueue its locally-committed rows and re-upload them, and must NOT run the orphan reconcile — since every committed row is absent from the now-empty server, running it would delete the entire local library. `cloud_wiped_at` is informational only (for client logging and a "backup is being rebuilt" message); the client self-clears by advancing its cursor past that timestamp and need not persist it.
 
 ## The delta query
 
@@ -57,13 +59,21 @@ The pull fans out `entities × (pageSize + 1)` rows to emit at most `pageSize`, 
 | Response bytes | `SYNC_PULL_MAX_PAGE_SIZE_BYTES = 5 MB` (measured JSON) | `functions/_shared/sync/constants.ts` |
 | Clock-skew buffer | `CLOCK_SKEW_BUFFER_SEC = 1` (exclude rows within 1s of `now()`) | `functions/_shared/sync/constants.ts` |
 
+## The cloud-reset check
+
+Before the expiry/resync branch, `index.ts` runs a cloud-reset check whose ordering is an invariant, not a preference. It calls `loadCloudWipedAt(authUserId)` (`functions/_shared/db/cloud-wipe.ts`), which reads `canonical_users.cloud_wiped_at` — a nullable `TIMESTAMPTZ` added by migration `20260824120000_lapse_cloud_reset.sql` and NEVER cleared (each device clears itself by advancing its cursor past it). The check only fires for a non-empty cursor (`cursorResult.kind === "valid"`) — an empty cursor is a fresh install with no local library to protect. It compares `wipedAt` against the client's last sync time `cursorResult.syncedAt ?? cursorResult.ts` (a legacy `v=1` cursor has no `syncedAt`, so `ts` is the honest fallback, erring toward SENDING the signal). When `wipedAt` is newer, it returns `buildCloudResetResponse(...)`.
+
+This MUST precede the expiry check because a wiped user's cursor is always ALSO expired — the wipe lands ~30 days after lapse while the cursor stopped advancing at lapse — so testing expiry first would emit `resync_required`, under which the client's RR-468 orphan reconcile deletes every locally-committed row absent from a clean full pull. After a wipe, that is every row the user owns.
+
 ## The cursor and resync
 
 The cursor is a `v=2` `CursorData` — `{ ts, id, syncedAt }` (`functions/_shared/sync/cursor.ts`). A legacy `v=1` cursor (no `syncedAt`) still parses and forces exactly one resync, after which the client holds a `v=2` cursor. Expiry is measured by `isCursorExpired` from `syncedAt` (when the client last synced), NOT from `ts` (the age of its newest row) — the RR-489 fix so a caught-up but dormant account is not stuck in a perpetual resync loop. When the freshness stamp is older than `cloud_tombstone_grace_days` minus a 1-hour buffer, the endpoint returns `resync_required`, since deletes the client never saw may already have been GC'd.
 
 ## Gate chain specifics
 
-`sync-pull` is a READ, so it opts into `allowGracePeriodRead: true` with `rateLimit: { bucket: SyncPull, gracePeriodBucket: SyncDownloadGrace }`. A lapsed cloud subscriber inside their 30-day grace window can still pull (on the smaller grace bucket); a pro-only-lapsed user cannot, because `pro` is not in the entitlement array.
+`sync-pull` is a READ, so it opts into `allowGracePeriodRead: true` with `rateLimit: { bucket: SyncPull, gracePeriodBucket: SyncDownloadGrace }`. A lapsed cloud subscriber inside their configurable grace window (`server_config.cloud_grace_days`, default 30 days — read at call time by `graceWindowMs()` in `functions/_shared/gates/grace.ts`, which replaced the removed `GRACE_WINDOW_MS` module constant) can still pull (on the smaller grace bucket); a pro-only-lapsed user cannot, because `pro` is not in the entitlement array.
+
+`sync-pull` also hosts a health probe — `healthCheck: dbHealthCheck("sync-pull")` (`functions/_shared/db/health-checks.ts`, Sync Services status group) — a step-0 gate that short-circuits the entire admission chain to a near-instant DB read (touching no user data) on a valid `X-Health-Probe` header.
 
 ## Related pages
 

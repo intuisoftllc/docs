@@ -39,6 +39,12 @@ Both create and edit are backstopped by a cloud-storage-quota DB trigger, `enfor
 
 `delete_user_blueprint` takes a `blueprint_id` and calls `deleteUserBlueprint`, which verifies ownership: `"not_found"` → `blueprint_not_found` (404), `"forbidden"` → `not_owner` (403). The DB helpers (`functions/_shared/users/user-blueprints.ts`) — `countUserBlueprints`, `findExistingByIdempotencyKey`, `insertUserBlueprint`, `loadUserBlueprintForOwner`, `updateUserBlueprint`, `listUserBlueprints`, `deleteUserBlueprint` — all verify ownership by comparing `auth_user_id` against the caller's ID rather than trusting the loaded row.
 
+## Write-boundary text sanitization
+
+`insertUserBlueprint` and `updateUserBlueprint` sanitize user-authored text at the **write boundary** before persisting — `sanitizeDbText(name)`, `sanitizeDbTextOrNull(description)`, and `sanitizeDbText(system_prompt)` from `functions/_shared/text/db-text.ts`. The reason is a concrete failure: Postgres `TEXT` rejects `U+0000` outright, so a single NUL anywhere in the name, description, or system prompt would fail the entire `INSERT`/`UPDATE` and lose the blueprint the user just wrote, with no error message that could explain why. `sanitizeDbText` strips NUL plus the rest of the C0 range and DEL (keeping `\t` and `\n`), strips bidi overrides (`U+202A`–`U+202E` / `U+2066`–`U+2069`, the Trojan-Source class), normalizes CRLF to LF, then trims; `sanitizeDbTextOrNull` yields `null` for anything that ends up empty. Doing this at the write boundary rather than in a caller's validator means every path into the `user_blueprints` table — including future ones — is covered.
+
+After a cloud wipe or reset, the client re-pushes each surviving blueprint one at a time back through `save_user_blueprint`, which re-runs create-path inline moderation on each — re-moderation reuses the existing save path, with no new backend operation.
+
 Error codes (`functions/_shared/errors.ts`): `blueprint_limit_reached` (user, 429), `moderation_failed` (user, 422), `not_owner` (user, 403), `blueprint_not_found` (user, 404), `missing_auth_user_id` (developer, 403), `missing_blueprint_id` (developer, 400), `backup_quota_exceeded` (user, 409).
 
 ## Where to go next

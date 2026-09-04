@@ -7,10 +7,13 @@ description: "How ai-engine operations are registered, validated, and dispatched
 
 ## Request lifecycle
 
-`Deno.serve` calls `runGates(req, { method: HttpMethod.Post, auth: AuthMode.Jwt })` first. Note it passes **no** `rateLimit` chain-sugar: the rate limit runs later, inside `dispatchOperation`, so the `x-developer-bypass` / `x-ai-stubbed` response headers survive alongside it. After the gates resolve `authUserId`, `activeEntitlements`, and `isDeveloper`, the handler parses the JSON body, resolves the operation, and hands off to `dispatchOperation`.
+`Deno.serve` calls `runGates(req, { method: HttpMethod.Post, auth: AuthMode.Jwt, healthCheck: dbAndAiHealthCheck("ai-engine") })` first. Note it passes **no** `rateLimit` chain-sugar: the rate limit runs later, inside `dispatchOperation`, so the `x-developer-bypass` / `x-ai-stubbed` response headers survive alongside it. After the gates resolve `authUserId`, `activeEntitlements`, and `isDeveloper`, the handler parses the JSON body, resolves the operation, and hands off to `dispatchOperation`.
+
+`ai-engine` also hosts the **AI-service health probe** via that `healthCheck` (`dbAndAiHealthCheck` from `functions/_shared/db/health-checks.ts`). It is a step-0 door inside `runGates`: on a request carrying a valid `X-Health-Probe` secret, it runs DB liveness plus **one** minimal completion through the real `createAiClient` chain (Anthropic→Gemini fallback — the same one the operations use) and returns `200 {status:"ok"}` or `503` **without invoking the handler** or returning caller data. See [Health probes](/rollingrecord/backend/gates/health-probes) for the door mechanics.
 
 | Step | What happens | Failure |
 | --- | --- | --- |
+| Health probe (step 0) | `dbAndAiHealthCheck("ai-engine")` — on `X-Health-Probe`, DB + one real AI completion | `200`/`503` status, handler never runs |
 | Admission gates | `runGates` — method, App Check, App Version floor, JWT, entitlement fetch | gate's own response |
 | Parse body | `await req.json()` | `invalid_body` (400) |
 | Read operation | `body.operation` must be a string | `missing_operation` (400) with `valid` |

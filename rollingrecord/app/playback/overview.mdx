@@ -60,6 +60,8 @@ Any player error surfaces as the full-screen `V2PlaybackErrorOverlay` (`ui/v2/sc
 
 `PreviewPlayerController` (`ui/v2/common/PreviewPlayerController.kt`) is a separate snippet-preview player (CLIP / FULL modes) used by session-detail segment cards and library list rows — it is **not** the single-recording player, which drives `PlaybackMediaManager` directly.
 
+Every mutating action on a surface that shares this snippet-preview player stops the preview BEFORE the repository call, so preview audio can never outlive the row it was playing — the preview player owns its own `MediaPlayer` and knows nothing about the list, so a deleted or restored row would otherwise leave audio playing with no row left to pause it. `V2TrashViewModel` restore / permanent-delete / empty-trash route through one `stopPreviewForMutation()` helper (`= preview.stop()`); `V2AllRecordingsViewModel.deleteItems`, `V2SessionDetailViewModel.delete`, and `V2ContextDetailViewModel.removeRecording` / `removeSession` / `bulkRemove` each call `preview.stop()`. The stop is unconditional — not gated on whether the playing row is among the affected ids — so a new mutation entry point can't forget it.
+
 ## Where to go next
 
 - [Session Detail (Segments)](/rollingrecord/app/playback/session-detail) — the player ViewModel's actions, cloud on-demand download, and the rolling-session segment manager.

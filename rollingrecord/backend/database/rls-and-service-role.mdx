@@ -13,7 +13,7 @@ Every table runs with Row Level Security enabled and zero policies — the defau
 | Direct anon caller | anon key (extractable from the APK) | RLS on + no policies → zero rows |
 | Direct authenticated caller | user JWT | RLS on + no policies → zero rows (no client-direct access by design) |
 
-Because RLS is enabled with no permissive policy, the gate chain — not RLS policies — is the actual authorization layer. `runGates()` / `GateConfig` (`supabase/functions/_shared/gates/types.ts`) fronts every Edge Function with a fixed admission order (method → App Check → app-version → JWT → entitlement fetch → entitlement check → optional rate-limit).
+Because RLS is enabled with no permissive policy, the gate chain — not RLS policies — is the actual authorization layer. `runGates()` (`supabase/functions/_shared/gates/index.ts`) / `GateConfig` (`supabase/functions/_shared/gates/types.ts`) fronts every Edge Function with a fixed admission order (method → App Check → app-version → JWT → entitlement fetch → entitlement check → optional rate-limit).
 
 ## The service-role client
 
@@ -22,6 +22,14 @@ Because RLS is enabled with no permissive policy, the gate chain — not RLS pol
 ## RLS on every table, no policies
 
 The baseline (`supabase/migrations/20260508000000_baseline.sql`) issues `ALTER TABLE ... ENABLE ROW LEVEL SECURITY` for every table and defines no `CREATE POLICY` anywhere. The tables also carry `GRANT ALL ... TO anon`, `TO authenticated`, and `TO service_role`, but with RLS enabled and no permissive policy those anon/authenticated grants resolve to nothing — only the service role reaches rows. The grant is present; the policy that would make it usable is deliberately absent.
+
+## Function EXECUTE grants (SECURITY DEFINER)
+
+RLS protects tables, not functions — and a `SECURITY DEFINER` function owned by `postgres` (which has `rolbypassrls`) runs with full privileges and ignores RLS entirely, so a caller who can `EXECUTE` one bypasses the closed-RLS model completely. Supabase's baseline ships `ALTER DEFAULT PRIVILEGES ... GRANT ALL ON FUNCTIONS TO anon` and `TO authenticated`, so every function created in `public` after the baseline shipped world-callable. PostgREST exposes public-schema functions returning `void`/`jsonb` as `POST /rest/v1/rpc/<name>`, and the anon key is compiled into the APK — so "granted to anon" means "callable by anyone with the app."
+
+`REVOKE ALL ... FROM PUBLIC` is **not** sufficient. The `ALTER DEFAULT PRIVILEGES` grants `TO anon` and `TO authenticated` are separate ACL entries that a `PUBLIC`-only revoke leaves intact — `enforce_user_blueprints_quota` proved this, doing the `PUBLIC`-only revoke in its own migration yet still showing an `anon` grant in production. The fix (`supabase/migrations/20260828120000_revoke_public_execute_on_secdef_functions.sql`) revokes `EXECUTE` from all three — `PUBLIC`, `anon`, **and** `authenticated` — then `GRANT`s to `service_role`. Copy that name-all-three shape for every new `SECURITY DEFINER` function.
+
+That migration locked down 16 `SECURITY DEFINER` functions. The one that mattered is `support_ops_restore_tombstones(p_auth_user_id, p_group, p_grace_days)` — an admin cross-user un-delete that took an arbitrary user id and was reachable **unauthenticated** with no authorization in front of it. The rest (prune/purge sweepers, trigger functions PostgREST cannot expose, `rls_auto_enable`) were low-impact and revoked only so the privilege state is uniform and "is this one safe?" stops being a per-function judgment call. Legitimate callers keep working: `pg_cron` runs these as the owner `postgres`, and Edge Functions call them as `service_role`.
 
 ## Deletion integrity is what makes closed-RLS safe
 

@@ -3,7 +3,7 @@ title: "Email OTP Step-Up"
 description: "The two-phase email OTP that mints single-use tickets sensitive operations consume to prove the caller controls their account email."
 ---
 
-`functions/account-otp/index.ts` (RR-492) is a general-purpose email-ownership step-up. Clerk can't drive an email OTP for an already-signed-in user, so the server issues its own 6-digit code, delivers it via Brevo, verifies it, and mints a single-use **ticket** that a sensitive endpoint later consumes. It is two operations — `send` then `verify` — behind a JWT gate chain with no entitlement gate, so every tier can use it.
+`functions/account-otp/index.ts` (RR-492) is a general-purpose email-ownership step-up. Clerk can't drive an email OTP for an already-signed-in user, so the server issues its own 6-digit code, delivers it via Brevo, verifies it, and mints a single-use **ticket** that a sensitive endpoint later consumes. It is two operations — `send` then `verify` — behind a JWT gate chain with no entitlement gate, so every tier can use it. The `runGates()` config also registers `dbAndClerkHealthCheck("account-otp")`, placing account-otp in the **Account & Sign-in** uptime group: a request carrying a valid `X-Health-Probe` header short-circuits the chain before the send/verify handler to a DB-liveness read **plus** a free Clerk JWKS reachability check (Clerk is the auth provider — if it is down, sign-in is down), touching no user data.
 
 ## Two-phase flow
 

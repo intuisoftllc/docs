@@ -76,7 +76,15 @@ Only `DONE` transcripts sync: `TranscriptDao.getUnsyncedRecordingIds` filters on
 
 ## `TranscriptionWorker`
 
-`TranscriptionWorker` (`worker/TranscriptionWorker.kt`) is a foreground `CoroutineWorker` (`FOREGROUND_SERVICE_TYPE_DATA_SYNC`) that performs the entire cloud transcription. It marks `PROCESSING` on dequeue, runs the four-step async AssemblyAI flow, then calls `markDone` or `markError`. All jobs share one unique WorkManager queue (`QUEUE_NAME = "transcription_queue"`) so they run one at a time. On success — before `markDone` — it calls `UsageRepository.invalidate()` so the next cap read refetches the server-consumed minute quota. Only successful transcriptions bill; failures and support-cancellations are free. The full pipeline is documented in [Cloud Transcription](/rollingrecord/app/transcription/cloud-transcription).
+`TranscriptionWorker` (`worker/TranscriptionWorker.kt`) is a foreground `CoroutineWorker` (`FOREGROUND_SERVICE_TYPE_DATA_SYNC`) that performs the entire cloud transcription. It marks `PROCESSING` on dequeue, runs the four-step async AssemblyAI flow, then calls `markDone` or `markError`. All jobs share one unique WorkManager queue (`QUEUE_NAME = "transcription_queue"`) so they run one at a time. On success — before `markDone` — it calls `UsageRepository.invalidate()` so the next cap read refetches the server-consumed minute quota. Only successful transcriptions bill; failures and support-cancellations are free.
+
+An entitlement refusal at transcription time is no longer unconditionally permanent. When the `transcribe_upload_init` step *or* the `transcribe_submit` step returns `AiEngineResult.Cap` or `AiEngineResult.SubscriptionRequired`, the worker first consults the private `isEntitlementRace()` before classifying the failure. When it returns `true` the worker throws `TransientAiEngineException` (so WorkManager retries) instead of `PermanentAiEngineException` (which would strand the transcript in `ERROR` forever). Both the `Cap` and `SubscriptionRequired` branches were changed this way at *both* the init and submit steps; the mid-poll `transcribe_fetch` branches keep their prior permanent handling.
+
+`isEntitlementRace()` reads the CANONICAL tier via `getKoin().userSession().getOrNull<EntitlementRepository>()?.currentTier?.first()` and returns `true` when `localTier.atLeast(UserTier.PRO_CLOUD)`. It deliberately reads the owner-checked `EntitlementRepository` tier rather than `RevenueCatManager.customerInfo` directly — a raw RC read skips the owner check, and the RC SDK's identity can stick on a prior signed-out account, so a correct refusal against a free account would be misread as a race. It also **defaults to `true`** (treat as a race, allow the retry) when the tier can't be read, because the two failure directions are asymmetric: a wrongly-permanent failure is unrecoverable (a paying customer's transcript dead forever), while a wrongly-transient one self-corrects on the next re-read. The purpose is a post-purchase timing window: the server reads RevenueCat live but caches the answer for roughly five minutes, so immediately after a purchase it can still serve a cached "no entitlements" — retrying heals that window instead of permanently failing a paying customer's transcript. Race-path refusals are logged at warn with `save = true`.
+
+To answer "does this device hold transcription?" for the race check, the worker gains an app-level (`by inject()`, not `userInject`) `RevenueCatManager` dependency — but the verdict itself is read from `EntitlementRepository.currentTier`, never from `RevenueCatManager` directly.
+
+The full pipeline is documented in [Cloud Transcription](/rollingrecord/app/transcription/cloud-transcription).
 
 ## Triggers
 
@@ -85,10 +93,12 @@ Transcription is enqueued from two places, both hardcoding `TranscriptionEngine.
 | Trigger | Site | Notes |
 | --- | --- | --- |
 | Manual | `V2PlaybackViewModel.triggerTranscription` | offline pre-check emits `transcribeOfflineEvents` and enqueues nothing when offline; adds a `NetworkType.CONNECTED` constraint |
-| Auto on-save | `RecordingService.enqueueTranscriptionWork` | fires only when the `autoTranscribe` setting is `true` |
-| Rolling rotation | `RecordingService` (protected clip rotated) | re-enqueues the rotated recording when `autoTranscribe` is on |
+| Auto on-save | `RecordingService.enqueueTranscriptionWork` | fires only when the `autoTranscribe` setting is `true` **and** the live canonical tier is at least `PRO_CLOUD` |
+| Rolling rotation | `RecordingService` (protected clip rotated) | re-enqueues the rotated recording when `autoTranscribe` is on; routes through `enqueueTranscriptionWork`, so it inherits the same live-tier gate |
 
 `autoTranscribe` (`data/local/UserSettingsDataSource.kt`) is a DataStore `Flow<Boolean>` that defaults to `false` — auto-transcribe-on-save is opt-in, not on by default. Companion settings include `transcriptionLanguage` (default `"auto"`), `diarizationEnabled` (default `false`), and `medicalModeEnabled` (default `false`).
+
+Both auto-transcribe paths route through `RecordingService.enqueueTranscriptionWork`, which reads the live canonical tier (`EntitlementRepository.currentTier.first()`, falling back to `UserTier.FREE` when unreadable) and returns without enqueueing when `!tier.atLeast(UserTier.PRO_CLOUD)` — even if `autoTranscribe` is `true`. The persisted `autoTranscribe` flag survives a downgrade and syncs across devices, so without this a lapsed user would buy a guaranteed server 403 on every recording. The tier is read live (it re-emits on a RevenueCat change), so an upgrade takes effect on the very next recording, and the check runs *before* `createOrResetProcessing` so a refusal can never strand a transcript row in `PROCESSING` with no worker coming to move it out. The manual trigger (`V2PlaybackViewModel.triggerTranscription`) is a separate path and does not carry this auto-transcribe tier gate.
 
 ## `TranscribeQueueObserver`
 

@@ -27,7 +27,7 @@ An RPC error fails **closed**: `checkRateLimit` returns `500 database_error` wit
 
 ## Near-limit signal
 
-The RPC also returns `near_limit_crossed` (added by migration `20260601000000_rate_limit_near_limit_flag.sql`) — `true` the first time a call crosses 90% of `max` in a window. On that crossing `checkRateLimit` fire-and-forgets a `NearLimitApproach` (`near_limit_approach`, default weight 2) abuse event; a log failure never blocks the primary request. The chain-sugar `abuseEventOnReject` path separately logs `RateLimitHit` (`rate_limit_hit`, weight 1) on a rejection for security-sensitive buckets.
+The RPC also returns `near_limit_crossed` (added by migration `20260601000000_rate_limit_near_limit_flag.sql`) — `true` the first time a call crosses 90% of `max` in a window. On that crossing `checkRateLimit` fire-and-forgets a `NearLimitApproach` (`near_limit_approach`, default weight 2) abuse event; a log failure never blocks the primary request. The chain-sugar `abuseEventOnReject` path separately logs an abuse event on a *rejection* for security-sensitive buckets — `RateLimitHit` (`rate_limit_hit`, weight 1) for most, and now `BugReportFlood` (`bug_report_flood`, weight 1) for `bug-report`, which wires `abuseEventOnReject: AbuseEventType.BugReportFlood` so a rejected bug-report burst is recorded on the account's history. Its weight is the floor deliberately — the overwhelmingly likely cause is a user who just found several things wrong and filed them all, so a single hit must never push anyone up the top-offenders list.
 
 ## Registered buckets
 
@@ -36,6 +36,7 @@ Every `Bucket` enum member (`functions/_shared/gates/types.ts`) has a `bucket_ke
 | Bucket member | `bucket_key` | Fallback max / window_sec | Purpose |
 | --- | --- | --- | --- |
 | `AiEngine` | `ai_engine` | 60 / 3600 | ai-engine runaway guard (one counter across all ops) |
+| `BugReport` | `bug_report` | 10 / 3600 | `bug-report` submissions — free on every tier, so this ceiling is the ONLY abuse control on the endpoint (no entitlement gate behind it); it also caps Storage churn since each accepted report can carry a multi-MB log upload |
 | `AiExtraction` | `ai_extraction` | 300 / 3600 | per-chunk extraction model calls, keyed on job owner |
 | `ExtractionSubmit` | `extraction_submit` | 60 / 3600 | `extract-submit` + `extract-results` (~3 calls/attempt) |
 | `ExtractionStatus` | `extraction_status` | 600 / 3600 | polled `extract-results` status / cancel progress plane |

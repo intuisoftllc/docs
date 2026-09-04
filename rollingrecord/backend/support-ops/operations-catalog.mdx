@@ -1,9 +1,9 @@
 ---
 title: "Support-Ops Operations"
-description: "The full registry of 27 support-ops operations — read-only diagnostics and dry-run-guarded mutating actions — with their permissions and behavior."
+description: "The full registry of 30 support-ops operations — read-only diagnostics and dry-run-guarded mutating actions — with their permissions and behavior."
 ---
 
-The `OPERATIONS` registry (`functions/support-ops/operations/registry.ts`) exposes 27 operations: 8 mutating ones that enforce the dry-run → commit flow, and 19 read-only ones that skip it. Each is an `OperationDef` with a snake_case wire `name`, an `isReadOnly` flag, a `requiredPermission`, a `validateParams` validator, and a `handler`. Callers send the wire name in the request body's `operation` field.
+The `OPERATIONS` registry (`functions/support-ops/operations/registry.ts`) exposes 30 operations: 8 mutating ones that enforce the dry-run → commit flow, and 22 read-only ones that skip it. Each is an `OperationDef` with a snake_case wire `name`, an `isReadOnly` flag, a `requiredPermission`, a `validateParams` validator, and a `handler`. Callers send the wire name in the request body's `operation` field.
 
 ## Full registry
 
@@ -24,8 +24,11 @@ The `OPERATIONS` registry (`functions/support-ops/operations/registry.ts`) expos
 | `get_clerk_metadata` | Read | `can_read_user_state` | Clerk record + public/private/unsafe metadata |
 | `user_rate_limits` | Read | `can_read_user_state` | Currently-active `rate_limit_counters` |
 | `get_admin_audit` | Read | `can_read_audit` | Recent `l_admin_audit` (meta-audit) |
-| `get_user_audit` | Read | `can_read_user_audit` | Per-user `l_admin_audit` + abuse events merged |
+| `get_user_audit` | Read | `can_read_user_audit` | Per-user `l_admin_audit` + abuse events + `l_notification_sent` merged |
 | `link_audit_ticket` | Read (metadata write, no preview) | `can_read_user_audit` | Attach a `ticket_ref` to a past audit row |
+| `get_bug_reports` | Read | `can_view_user_data` | Bug triage queue — global list OR one user's reports (keyset paginated, multi-select status/area filters, 240-char excerpts) |
+| `set_bug_status` | Read (metadata write, no preview) | `can_view_user_data` | Move one bug report through triage; stamps / clears `closed_at` on terminal statuses |
+| `get_my_grant_budget` | Read | null (any admin row) | Caller's own remaining monthly credit-grant allowance (per-resource ceiling vs spend) |
 | `get_abuse_top_offenders` | Read | `can_triage_abuse` | Cross-customer `SUM(weight)` offenders leaderboard |
 | `get_user_transcribe_history` | Read | `can_read_user_audit` | `h_transcribe_history` with billed ms / credits |
 | `get_user_credit_ledger` | Read | `can_read_user_audit` | Chronological credit events (grants + `l_credit_log`) |
@@ -52,22 +55,26 @@ Each mutating op runs a dry-run preview (no writes) before a `preview_id`-gated 
 
 ## Identity lookup
 
-- **`lookup_user_by_email`** (`operations/lookup-user-by-email.ts`) — resolves an EXACT email to an `auth_user_id` identity card via the Clerk Backend API (the old `auth.users` RPC is dead for Clerk users).
-- **`search_users`** (`operations/search-users.ts`) — the fuzzy multi-candidate counterpart for a partial or misremembered address; returns candidates rather than a single exact answer.
+- **`lookup_user_by_email`** (`operations/lookup-user-by-email.ts`) — resolves an EXACT email to an `auth_user_id` identity card via the Clerk Backend API (the old `auth.users` RPC is dead for Clerk users). The card carries `admin_role` for the LOOKED-UP account (not the caller): `null` | `"admin"` | `"super"`, where the presence of an `admin_permissions` row IS admin and `is_super_admin` escalates it to `"super"`.
+- **`search_users`** (`operations/search-users.ts`) — the fuzzy multi-candidate counterpart for a partial or misremembered address; returns candidates rather than a single exact answer. Each result also carries `admin_role` (`null` | `"admin"` | `"super"`) for that account, batched via `loadAdminRoles` — one `.in()` read that degrades to an empty map on error, run in `Promise.all` alongside `loadCanonical`.
 
 ## User snapshots
 
-- **`get_user_overview`** — summary card: identity, tier, storage headline, data counts.
+- **`get_user_overview`** — summary card: identity, tier, storage headline, and `entity_counts`, plus three blocks the card also assembles:
+  - **Subscription-lapse deadline** — `cloud_grace_started_at`, `cloud_grace_tier`, the server-computed `subscription_purge_at` (= lapse start + `graceWindowMs()`) and `subscription_grace_days_left` (whole days, floored, never negative), plus `cloud_wiped_at`. The deadline is computed server-side so support, the `subscription_lapse_cleanup` sweeper, and any future consumer read the same number from the same clock. `cloud_wiped_at` is set by the sweeper's final step and never cleared, so a "where did my recordings go" ticket stays answerable after `subscription_purge_at` and `subscription_grace_days_left` both go null. (These are the current field names — the older `subscription_lapsed_at` / `subscription_lapsed_tier` naming was renamed to `cloud_grace_started_at` / `cloud_grace_tier`.)
+  - **`monthly_usage`** — up to 6 calendar-month periods (`YYYY-MM`, UTC), newest first; the array may be shorter than six or empty because quiet months have no row, so the client must read `period` rather than assume index 0 is the current month. Each period carries `ai_queries`, `syntheses`, `deep_reasoning_syntheses`, `extraction_ms`, `transcription_ms`, `input_tokens`, `output_tokens`.
+  - **`usage_caps`** — the per-resource ceilings for the user's tier (`ai_queries`, `syntheses`, `deep_reasoning_syntheses`, `transcription_ms`, `extraction_ms`), resolved via `resolveUserUsageCaps` from the entitlement key set `resolveBilling` already fetched, so it costs no extra RC round trip. A raw consumption figure is only half an answer to a "why am I blocked" ticket; the ceiling is the other half.
 - **`get_user_state`** — deeper technical dump: sync prefs, per-group storage, usage counters, `user_crypto` presence, pending support token + ledger rows.
 - **`get_clerk_metadata`** — the Clerk record plus its public / private / unsafe metadata namespaces.
 - **`user_rate_limits`** (`operations/get-user-rate-limits.ts`) — only currently-active `rate_limit_counters` (windows not yet elapsed), joining `rate_limit_config.window_sec` at runtime so it always reflects the live window. Note the wire name drops the `get_` prefix that every other op carries.
 - **`get_user_credits`** — current manual / bundle / total balances as a plain read (previously only obtainable from `grant_manual_credit`'s dry-run, which required intent to grant).
 - **`get_tombstone_report`** — restorable-row counts per sync group (settings excluded); pairs with `restore_tombstones`.
+- **`get_my_grant_budget`** (`operations/get-my-grant-budget.ts`) — read-only, `requiredPermission: null` (any authenticated admin — deliberately NOT `can_grant_credits`, so an operator can check their own shrinking allowance before asking for more). It is about the CALLER, never a customer: there is no `target_auth_user_id`. Returns `window_days` (30), `window_start`, `is_super_admin`, and per-resource `{ limit, used, remaining, unlimited }` for `transcription_ms` / `extraction_ms` / `ai_queries` in raw storage units (ms / count). A super admin or a 0 ceiling both report `unlimited: true`, `limit: 0`, `remaining: null`. See the [grant-ceiling section](/rollingrecord/backend/support-ops/permissions) on the permissions page.
 
 ## Forensic feeds
 
 - **`get_admin_audit`** (`operations/get-admin-audit.ts`) — recent `l_admin_audit`, filterable — the meta-audit of what operators have done.
-- **`get_user_audit`** — per-user `l_admin_audit` + `l_user_abuse_event` merged by time.
+- **`get_user_audit`** — per-user `l_admin_audit` + `l_user_abuse_event` merged by time, plus a third group `notifications_sent` (`{ count, entries }` of `notification_type`, `dedupe_key`, `sent_at`, `delivered`) read straight from `l_notification_sent` with no Clerk enrichment, non-fatal on read error (degrades to an empty group). Notifications ride this op because they answer "you deleted my data and never warned me" on the same timeline as the operator actions, and a separate op would be a second round trip for one screen.
 - **`get_user_timeline`** — merges `h_transcribe_history` + `h_ai_engine_sessions` + `l_admin_audit` + `l_user_abuse_event` + `l_credit_log` (credit events, discriminated by the `source` column) over an N-hour window.
 - **`get_user_transcribe_history`** — reads `h_transcribe_history` with `billed_ms` / credits.
 - **`get_user_credit_ledger`** — merges admin grants and `l_credit_log` chronologically.
@@ -82,7 +89,7 @@ Each mutating op runs a dry-run preview (no writes) before a `preview_id`-gated 
 ## Metadata write and introspection
 
 - **`link_audit_ticket`** (`operations/link-audit-ticket.ts`) — read-only in the dispatcher's sense (no preview) but performs a LIGHT metadata write: it sets `ticket_ref` on a past `l_admin_audit` row, after which the dispatcher writes its own `link_audit_ticket` audit row.
-- **`whoami`** (`operations/whoami.ts`) — the ONLY op with `requiredPermission: null`; any `admin_permissions` row suffices, but a non-admin is still rejected. It returns the caller's effective permissions (a super-admin reads back all-true) plus `allowed_operations` computed live from the registry, so a client never restates the permission → operation map.
+- **`whoami`** (`operations/whoami.ts`) — one of two ops with `requiredPermission: null` (the other is `get_my_grant_budget`); any `admin_permissions` row suffices, but a non-admin is still rejected. It returns the caller's effective permissions (a super-admin reads back all-true) plus `allowed_operations` computed live from the registry, so a client never restates the permission → operation map.
 
 ## The user-facing counterpart
 

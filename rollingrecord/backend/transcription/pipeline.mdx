@@ -3,7 +3,7 @@ title: "Transcription Pipeline"
 description: "The async webhook transcribe flow: upload_init allocates a job, submit measures + enqueues, the drain submits to AssemblyAI, the webhook persists an encrypted result, and fetch returns it."
 ---
 
-Cloud transcription is a Pro+Cloud / Cloud+AI feature that fronts AssemblyAI through an asynchronous webhook flow. Four `ai-engine` operations plus one dedicated webhook Edge Function move a recording from the phone to a decrypted transcript, and no single Edge Function invocation ever waits on AssemblyAI — the completion arrives out-of-band as a webhook callback.
+Cloud transcription is a Pro+Cloud / Cloud+AI feature that fronts AssemblyAI through an asynchronous webhook flow. Three `ai-engine` operations plus one dedicated webhook Edge Function move a recording from the phone to a decrypted transcript, and no single Edge Function invocation ever waits on AssemblyAI — the completion arrives out-of-band as a webhook callback.
 
 ## The four operations and the webhook
 
@@ -43,7 +43,7 @@ The response carries `transcribe_job_id`, `duration_ms`, and `assemblyai_transcr
 
 ## The webhook callback
 
-`assemblyai-webhook` is POST-only and runs `runGates` with `AuthMode.WebhookSecret` against `ASSEMBLYAI_WEBHOOK_SECRET`, opting out of App Check and App Version (server-to-server caller — see [Webhook-secret auth](/rollingrecord/backend/gates/webhook-secret)). AssemblyAI's `webhook_auth_header_name=Authorization` + `Bearer <secret>` config yields exactly the header the gate validates. The payload is `{transcript_id, status}`; the handler looks the job up by `assemblyai_transcript_id` and dispatches on status. Every path is replay-safe against AssemblyAI's retry policy: `transcribe_results` has PK `transcribe_job_id` with `ON CONFLICT DO NOTHING`, and a missing job row (already deleted by the first delivery) returns 200 `already_processed` with the result discarded.
+`assemblyai-webhook` is POST-only and runs `runGates` with `AuthMode.WebhookSecret` against `ASSEMBLYAI_WEBHOOK_SECRET`, opting out of App Check and App Version (server-to-server caller — see [Webhook-secret auth](/rollingrecord/backend/gates/webhook-secret)). AssemblyAI's `webhook_auth_header_name=Authorization` + `Bearer <secret>` config yields exactly the header the gate validates. The same `GateConfig` also carries a `healthCheck`, which makes `assemblyai-webhook` the representative Edge Function for the **Transcription** status-page component — an uptime probe runs *before* the webhook-secret gate ever sees the request (see [The health-probe door](#the-health-probe-door) below). The payload is `{transcript_id, status}`; the handler looks the job up by `assemblyai_transcript_id` and dispatches on status. Every path is replay-safe against AssemblyAI's retry policy: `transcribe_results` has PK `transcribe_job_id` with `ON CONFLICT DO NOTHING`, and a missing job row (already deleted by the first delivery) returns 200 `already_processed` with the result discarded.
 
 | AssemblyAI status / condition | Handler | Result written | Billed? |
 | --- | --- | --- | --- |
@@ -53,6 +53,25 @@ The response carries `transcribe_job_id`, `duration_ms`, and `assemblyai_transcr
 | duplicate delivery, job row gone | (none) | none — 200 `already_processed` | No |
 
 `handleCompletedStatus` fetches the full transcript with `fetchCompletedTranscript` (which asserts `status === "completed"` so a mismatch 5xxes and AssemblyAI retries), bills off the persisted `reservation.opCostMs` (AssemblyAI's `audio_duration` echo is only a fallback), inserts the encrypted result, fire-and-forgets `deleteTranscript`, commits the meter, adds transcription cost to `f_user_financials.ai_cost_micros`, records `h_transcribe_history`, then deletes the job row + inbox blob. `handleErrorStatus` first GETs the transcript to capture the real provider reason (the transcript is deleted moments later, so this is the only chance), routes "no spoken audio" to `handleNoSpeech`, and otherwise writes an error result. On both error paths the reservation is captured-but-never-committed, so the user is not charged. `handleNoSpeech` treats AssemblyAI's auto-language-detect failure on a non-speech file as a truthful empty transcript rather than an error.
+
+## The health-probe door
+
+`assemblyai-webhook` doubles as the uptime signal for the **Transcription** status-page component. Its `GateConfig` sets `healthCheck: dbStorageAssemblyAIHealthCheck("assemblyai-webhook", "transcribe-inbox")` (`functions/_shared/db/health-checks.ts`), and `runHealthProbe` (`functions/_shared/gates/health.ts`) runs **first** in `runGates` — before the POST-only method gate *and* before the `AuthMode.WebhookSecret` check — so a monitor's `GET` carrying the header `X-Health-Probe: <HEALTH_PROBE_SECRET>` short-circuits to a status response and never reaches the webhook handler or the `ASSEMBLYAI_WEBHOOK_SECRET` check. A wrong or absent probe secret returns `null` and falls straight through to the normal gate chain (the usual rejection), so there is no bespoke error code to keep in sync. See [Health probes](/rollingrecord/backend/gates/health-probes).
+
+The reply is a **status** shape, deliberately *not* an `{error}` from the client error registry — this door is monitor-only and never reaches the Kotlin client:
+
+- Healthy → `200 {status:"ok", component, checks, ts}`
+- Any check failed or threw → `503 {status:"degraded", ts}`
+
+`dbStorageAssemblyAIHealthCheck` fires three READ-ONLY calls in parallel via `Promise.all` and is `ok` only when **all three** pass (`checks: {db, storage, assemblyai}`, each `"ok"` or `"error"`); any throw degrades the whole probe (all-false):
+
+| Check | Call | Proves |
+| --- | --- | --- |
+| `db` | `server_config` `SELECT key LIMIT 1` via the service client | Edge runtime + service client + Postgres are reachable |
+| `storage` | `supabase.storage.getBucket("transcribe-inbox")` | Storage control plane + the inbox bucket are reachable — no object is listed or touched |
+| `assemblyai` | `checkAssemblyAIReachable()` | AssemblyAI answers and the API key is valid |
+
+`checkAssemblyAIReachable` (`functions/_shared/transcribe/assemblyai.ts`) is a **free** reachability + key-validity check: `GET https://api.assemblyai.com/v2/transcript?limit=1` — a paginated metadata **list** (deliberately not a get-by-id, so it works even when every transcript has been deleted) with the `ASSEMBLYAI_API_KEY` in the `authorization` header, bounded by `ASSEMBLYAI_HEALTH_TIMEOUT_MS` (`4_000` ms) via an `AbortController`. It returns `true` only on a 2xx within the timeout; a missing key, network error, timeout, or non-2xx all return `false` (`assemblyai: error` → degraded). It never creates a job, never throws, and is never charged.
 
 ## At-rest encryption of held transcripts
 

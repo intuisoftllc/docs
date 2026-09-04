@@ -76,6 +76,12 @@ Owner-stamping on both sides is what makes an in-flight response landing after a
 
 Freshness is a 60-second client TTL (`TTL_MS = 60_000`); cache expiry is also keyed on `periodResetAt` so the cache invalidates at month rollover with no scheduled job. `invalidate()` drops only the freshness stamp (keeping the last-good value visible through `latest: StateFlow<UserUsageSnapshot?>`), and is called from the success handler of any op that moved a counter server-side.
 
+### Reporting the server's tier view
+
+`UsageRepository` takes a second required constructor lambda, `onServerTierObserved: (String?) -> Unit`. On the `UsageResult.Fresh` path — after storing the snapshot for the active user — the repository calls `runCatching { onServerTierObserved(result.snapshot.tier) }`, reporting the **server's own** entitlement view (the snapshot `tier`, or null when it sees no paid entitlement). `EntitlementRefreshSignal` compares that against the local RevenueCat SDK tier and, on disagreement, arms the next request's `X-Entitlement-Refresh` header — closing the post-purchase window where the server serves a cached "no entitlements" for minutes after a purchase.
+
+It is a lambda, not a direct dependency, for the same reason as `currentUserId`: the repository has no business knowing about billing. And it is deliberately **not** defaulted — mirroring `currentUserId`, and because an empty-lambda default would also hide the type from `UserScopedCacheRegistryTest`'s implementor scan, whose pattern cannot cross an opening brace before the supertype list. The `runCatching` wrapper guarantees the report can never break the fetch. See [Entitlements & RevenueCat](/rollingrecord/app/monetization/entitlements-revenuecat) for the signal that consumes it.
+
 ## `UsageResetFormat`
 
 `UsageResetFormat` (`util/UsageResetFormat.kt`) is the canonical UTC reset-label formatter — no ViewModel hand-rolls reset labels. Caps reset on the 1st at 00:00 **UTC**, so formatting the boundary in the device timezone would be off by one for users west of UTC; every label is therefore computed and rendered in UTC with a "(UTC)" marker. Its pure time math (`Instant` in, value out, injectable `now`) is unit-testable without Android:

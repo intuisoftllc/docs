@@ -32,7 +32,7 @@ Feature gating for the V2 UI is downgrade-aware (RR-486): when a user drops belo
 | --- | --- | --- | --- |
 | `SESSIONS` | `PRO` | `UPSELL` | Rolling-record sessions; `READ_ONLY` when the user has sessions. |
 | `PROTECT_SEGMENT` | `PRO` | `HIDE` | Read-only action; simply not offered below `READ_ONLY`. |
-| `SCHEDULED_RECORDINGS` | `PRO` | `UPSELL` | Resolved with `hasContent = false` (always `LOCKED` below Pro); the fire path is independently disabled. |
+| `SCHEDULED_RECORDINGS` | `PRO` | `UPSELL` | Resolved with `hasContent = false` (always `LOCKED` below Pro); the fire path is independently disabled, and a confirmed lapse durably disables every schedule (see [Subscription-lapse guard](#subscription-lapse-guard)). |
 | `IMPORT` | `PRO` | `UPSELL` | Resolved with `hasContent = false`; imported files are just recordings. |
 | `TRANSCRIBE` | `PRO_CLOUD` | `HIDE` | Hides its create affordances when locked. |
 | `CONTEXTS` | `PRO_CLOUD_AI` | `HIDE` | Shares `hasAnyAiContent`. |
@@ -73,6 +73,35 @@ Below-tier gating is enforced at real code paths so the server-side check has a 
 | `V2ScheduleScreen` (`ui/v2/screens/schedule/`) | Renders `ScheduleLockedState` when `GatedFeature.SCHEDULED_RECORDINGS.access(tier, hasContent = false) != FeatureAccess.FULL`. |
 | `MainActivity.handleShareIntent` (`MainActivity.kt`) | Gates shared-audio import through `IMPORT` exactly as the in-app Import path does — a below-Pro user who picks the share target lands on Upgrade; signed out imports nothing. |
 | `V2SessionDetailViewModel`, `V2PlaybackViewModel`, `V2ContextsViewModel`, `V2KnowledgeBaseViewModel`, `V2ContextDetailViewModel` | Resolve `PROTECT_SEGMENT`, `TRANSCRIBE`, `CONTEXTS`, `KB_CHAT`, and `CUSTOM_BLUEPRINT` respectively at the point the real action is offered. |
+| `V2TasksViewModel` (`ui/v2/screens/tasks/`) | Resolves `GatedFeature.CONTEXTS` with `hasContent = true` and gates task create / edit / complete / delete at the write point while leaving open / view / share intact (`ARCHIVED` lifecycle still closes both open and modify). See [Tasks commit-time gate](#tasks-commit-time-gate). |
+
+## Tasks commit-time gate
+
+`V2TasksViewModel` (`ui/v2/screens/tasks/`) is the reference for gating a mutation at the point it commits rather than at the point it is touched. It derives `taskAccess: StateFlow<FeatureAccess>` from `GatedFeature.CONTEXTS.access(tier, hasContent = true)` — tasks on screen self-evidently mean AI content, so the gate resolves `READ_ONLY` (not `LOCKED`) below Cloud+AI — plus a `readOnly` flag.
+
+The VM splits the two questions a naïve gate conflates:
+
+- `canOpenTasks` is **lifecycle only** — tapping into the edit sheet, long-pressing for the menu, and selecting for share all still work below Cloud+AI (`ARCHIVED` still closes them, being terminal).
+- `canModifyTasks` requires lifecycle **and** `access == FeatureAccess.FULL`. `canAddTask` now also requires `FULL`.
+
+So the tier bites at **commit** (Save disabled, mutating menu rows absent), not at touch. Conflating the two previously made a tapped task go dead, which reads as a broken screen rather than a paid feature. View, review, and export stay fully intact for someone who still owns the content, and the paywall is legible at the moment they try to change something.
+
+## Subscription-lapse guard
+
+Scheduled recordings turn the microphone on by themselves, so a lapsed subscription needs a durable off-switch beyond the two runtime guards (the tier observer disarms the alarms; `ScheduleAlarmReceiver` re-checks tier at fire time — both are runtime checks a bug could get wrong).
+
+`ScheduledRecordingRepository.disableAllForLapse()` (`data/repository/ScheduledRecordingRepository.kt`) is that durable third guard: on a **confirmed** lapse it flips OFF every enabled schedule and enqueues each for sync, returning the count flipped. It is:
+
+- **Keyed on `CustomerInfo?.isSubscriptionLapsed()`**, not `tier < PRO` (see below).
+- **Idempotent** — the DAO `UPDATE` matches only enabled rows, so repeat calls flip and enqueue nothing. That matters because the caller observes a frequently re-emitting flow.
+- **Not reversed on re-upgrade** — silently re-arming a batch of schedules the instant a payment clears would start recordings the user never asked for in this billing period.
+- **Durable** — it survives a reinstall, a restore from backup, and any future code path that arms alarms without consulting tier.
+
+### Why `isSubscriptionLapsed()`, not `tier < PRO`
+
+The guard keys on `CustomerInfo?.isSubscriptionLapsed()` (`data/billing/RcEntitlement.kt`), the shared SUBSCRIPTION_LAPSED predicate. A lapse is a known `RcEntitlement` key that appears in `entitlements.all` but is no longer active **and** no currently-active recognized entitlement. Never-subscribed `FREE` users have an empty `entitlements.all`, so they never trip it, and a null `CustomerInfo` is **not** lapsed.
+
+That distinction is the whole point: `isSubscriptionLapsed()` asserts "there was a subscription and it is gone", never "we don't know yet". A plain `tier < PRO` test cannot tell those apart — and destroying user state (switching a paying customer's schedules off) on a transient "don't know yet" is exactly the false positive that nothing restores automatically. See [Entitlements & RevenueCat](/rollingrecord/app/monetization/entitlements-revenuecat#subscription-lapse-detection) for the predicate's full definition.
 
 ## Related pages
 

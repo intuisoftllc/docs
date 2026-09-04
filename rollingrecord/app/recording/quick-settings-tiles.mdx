@@ -32,7 +32,9 @@ Neither tile is ever painted `STATE_UNAVAILABLE` for entitlement or safety reaso
 
 ### State updates
 
-`onStartListening` starts a coroutine that `combine`s `RecordingService.state`, `settingsRepository.tileMode`, and `settingsRepository.tilePinnedSessionName`, then calls `updateTile(state, mode, pinnedName)` on each change. `updateTile` sets `Tile.state`, `Tile.label` ("Record"), and `Tile.subtitle` (API 29\+).
+`onStartListening` starts a coroutine that first resolves the `settingsRepository` user-scoped delegate inside `withContext(Dispatchers.IO)`, then `combine`s `RecordingService.state` with `settings.tileMode` and `settings.tilePinnedSessionName` off that resolved instance, calling `updateTile(state, mode, pinnedName)` on each change. `updateTile` sets `Tile.state`, `Tile.label` ("Record"), and `Tile.subtitle` (API 29\+).
+
+The IO resolution is an `[ANR 2026-08-30]` fix: the first touch of the `settingsRepository` `userProperty` is a synchronous Koin session-scope resolution, and the shade can fire this callback on Main while a sign-in's database build holds that scope's factory lock — a Main first-touch would then queue on the lock and freeze the app. Entitlement is still deliberately **not** observed here (unchanged): the tile paints the action only, so nothing it renders depends on tier.
 
 Painted states:
 

@@ -12,7 +12,7 @@ The rule enumerates specific prohibited uses with the default answer being "no",
 | Prohibited (default = no) | Allowed |
 |---|---|
 | Training / fine-tuning any model on customer data | Aggregate, content-free metrics (recording counts, AI success/error rates, token-cost totals) |
-| Eval scoring by sampling live production AI sessions | Customer-uploaded fixtures with explicit, documented consent (e.g. a consented bug report) |
+| Eval scoring by sampling live production AI sessions | The opt-in bug-report log bundle — a now-shipped feature — attached only when the user toggles `attach_logs`, and content-free by the App File Logger rule (see below) |
 | Production telemetry / drift detection reading transcript or insight content | Internal test fixtures: research papers, public datasets, fake-author transcripts, hand-crafted scenarios |
 | Internal / admin dashboards showing recorded text, insight bodies, or AI answers | — |
 | Anonymization-then-use ("just strip names") workarounds | — |
@@ -26,7 +26,7 @@ The server side of this posture is that operational tables store consumption cou
 
 | Table / target | What it holds | Why it's content-free |
 |---|---|---|
-| `usage` | per-`(auth_user_id, period)` counters: `ai_queries`, `transcription_ms`, `extraction_ms`, `syntheses`, `custom_templates`, plus `input_tokens` / `output_tokens` | counts operations and token throughput, not what was said |
+| `usage` | per-`(auth_user_id, period)` counters: `ai_queries`, `transcription_ms`, `extraction_ms`, `syntheses`, plus `input_tokens` / `output_tokens` | counts operations and token throughput, not what was said |
 | `f_user_financials.ai_cost_micros` | per-`(user, period)` cost in micro-USD | a money figure derived from token counts and model, attributable but content-free |
 | `h_ai_engine_sessions` / `query_sessions` | short-retention round / session bookkeeping for AI ops | session state, never stored transcript or answer bodies for internal reuse |
 | `l_eval_run` (via `functions/analytics/index.ts`) | eval-harness run analytics — fixtures + judge scores, gated by `ANALYTICS_INGEST_SECRET` | analytics for **internal** fixtures, not production customer content |
@@ -41,6 +41,15 @@ Two adjacent HARD RULES enforce the posture where content could otherwise leak:
 - **Eval harness fixtures-only** — eval suites use research papers, public datasets, fake-author transcripts, and hand-crafted scenarios; their analytics land in `l_eval_run`, never in a customer table.
 
 When a proposed feature would read customer content (transcripts, insights, AI answers, search queries) for any purpose other than serving that exact customer's request right now, the rule is to stop and ask before designing further — the default answer is no.
+
+## The bug-report log bundle
+
+The consented bug report is the one sanctioned customer-adjacent upload, and it stays inside the posture precisely because it is consent-gated and content-free — not an exception to the rule.
+
+- **Explicit opt-in.** The log is attached only when the user toggles `attach_logs`. The client toggle surfaces the guarantee verbatim through `bug_report_attach_logs_desc` (`strings.xml`): *"Sends recent app activity and anonymous device details. None of your private information is included."* That claim is **true because of** the App File Logger content-free invariant — it is not a promise layered on top of raw logs.
+- **One hashed, bounded bundle.** `BugReportLogBundler` (`app/app/src/main/java/com/intuisoftllc/rollingrecord/data/remote/bugreport/BugReportLogBundler.kt`) merges every rotating per-user log **segment** into a single SHA-256-hashed file, oldest content first, capped at 8 MiB (`MAX_BUNDLE_BYTES`; when the sources exceed it the **oldest** content is trimmed, because a bug is reported after it happens and the tail is what describes it).
+- **The anonymous segment is included on purpose.** The bundle deliberately merges the `anonymous` (pre-sign-in) segment alongside the current user's segment, clearly delimited (`===== BEGIN LOG SEGMENT: anonymous (pre-sign-in) =====`), so a reader can tell which side of sign-in each line came from. That segment holds the auth-flow logs and is otherwise unreachable from the in-app log viewer and the support-email export, both of which read only the current user's files — a sign-in bug report that shipped only the signed-in log would omit the part that matters. It carries no customer content because the App File Logger rule keeps **every** segment content-free: only UUIDs, counts, error codes, byte sizes, and HTTP statuses — never transcripts, notes, queries, AI content, or emails.
+- **Report before attachment.** In `functions/bug-report/index.ts` the `bug_reports` row is written **before** the log is uploaded, so a failed, cancelled, or abandoned upload still leaves a complete, content-free report behind. The log object, when present, lands in the private `bug-logs` bucket at `{auth_user_id}/{bug_report_id}.txt` — `auth_user_id` as the first path segment, per the schema rule, so account deletion's folder wipe can find it.
 
 ## Where to go next
 

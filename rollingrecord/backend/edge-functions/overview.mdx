@@ -1,18 +1,19 @@
 ---
 title: "Edge Function Catalog & Conventions"
-description: "The 31 function directories, their auth modes and rate-limit buckets, and the shared runGates() admission chain every HTTP function scaffolds with."
+description: "The 33 function directories, their auth modes and rate-limit buckets, and the shared runGates() admission chain every HTTP function scaffolds with."
 ---
 
-The backend is a set of Deno Edge Functions under `supabase/functions/`. There are 31 directories; 29 are HTTP endpoints registered in `config.toml`, and every one of those shares a single admission-chain entry point — `runGates()` — so authentication, App Check, and rate limiting always run in the same fixed order.
+The backend is a set of Deno Edge Functions under `supabase/functions/`. There are 33 directories; 32 are HTTP endpoints registered in `config.toml`, and every one of those shares a single admission-chain entry point — `runGates()` — so authentication, App Check, and rate limiting always run in the same fixed order.
 
 ## Function count vs. registered endpoints
 
-There are **31 directories** under `supabase/functions/` (excluding `_shared/`), but `config.toml` declares only **29** `[functions.<name>]` blocks. Two directories are intentionally unregistered:
+There are **33 directories** under `supabase/functions/` (excluding `_shared/`), but `config.toml` declares **32** `[functions.<name>]` blocks. One directory is intentionally unregistered:
 
 | Directory | Why it is not in `config.toml` |
 | --- | --- |
 | `transcribe-drain` | A `Deno.cron("transcribe-drain", "* * * * *", …)` minute job — it has no HTTP handler and never calls `runGates()`. Its primary path is an inline `runDrain()` import from the `transcribe_submit` handler; the cron only mops up overflow and 429-backoff retries. |
-| `recovery-code-generate` | Deprecated. `config.toml` notes it "has been superseded by" `recovery-code` "and should be deleted from both Supabase branches." The live path is the two-op `recovery-code` function. |
+
+`recovery-code-generate` was previously unregistered too. It is deprecated (superseded by the two-op `recovery-code` function), but `config.toml` now declares `[functions.recovery-code-generate]` with `verify_jwt = false` — closing the same inherited `verify_jwt = true` auth trap that every block-less `AuthMode.Jwt` function hits, so a stray call to the old path is rejected by our gate chain rather than by Supabase Auth.
 
 Every registered function sets `verify_jwt = false`. That is deliberate: the built-in Supabase JWT check is replaced by our own `runGates()` chain, which verifies a **Clerk** session token (or App Check, or a webhook secret) depending on the function's auth mode. Leaving Supabase's check on would reject legitimate callers.
 
@@ -34,6 +35,10 @@ Gates always run in a fixed order — per-function reordering is structurally im
 | 8 | Rate-limit sugar (if `rateLimit: { bucket }`) | `functions/_shared/gates/rate-limit.ts` | skipped for dev callers |
 
 Entitlement **check** runs before rate limit on purpose: a non-paying caller gets `403 subscription_required` on the first request rather than spending rate budget to also collect a `429`.
+
+### The step-0 health-probe door
+
+The gate-order table above (steps 1–8) is preceded by a **step-0 door**: 15 functions host a read-only liveness probe declared via `healthCheck` in their `GateConfig`. When an `X-Health-Probe` header is present it short-circuits the chain **before** the method and App Check gates and returns a component-health result, so an uptime monitor can confirm the endpoint's critical dependency (DB, Storage, Clerk, Cohere, AssemblyAI, or the AI chain) is actually serving — without a real request, a JWT, or an App Check token. The functions hosting one: `account-otp`, `ai-engine`, `assemblyai-webhook`, `indexing`, `recovery-code`, `resolve-identity`, `search`, `set-user-pin`, `sync-audio`, `sync-group-exclude`, `sync-pull`, `sync-push`, `sync-reconcile`, `sync-reserve`, and `user-sync-preferences`. See [health probes](/rollingrecord/backend/gates/health-probes) for the probe types.
 
 ### Auth modes
 
@@ -66,9 +71,10 @@ Every `error` string returned to a client comes from the canonical registry in `
 | `delete-user` | Jwt | POST | `delete_user` (in-handler) | User-initiated GDPR account wipe |
 | `set-user-pin` | Jwt | POST | — | App Lock PIN verifier write (RR-492) |
 | `account-otp` | Jwt | POST | `account_otp_send` / `account_otp_verify` (in-handler) | App Lock email OTP send/verify (RR-492) |
+| `bug-report` | Jwt | POST | `bug_report` (sugar, 10/hour, `abuseEventOnReject` `bug_report_flood`) | User bug-report submit — writes the `bug_reports` row, then signs a `bug-logs` upload URL; Free on every tier |
 | `generate-support-token` | Jwt | POST | `support_token_generate` (sugar, `abuseEventOnReject`) | User-initiated support code, emailed to the registered address |
 | `recovery-code` | Jwt | POST | `recovery_code_generate` / `recovery_code_acknowledge` (per-op) | Two-op recovery-code generate + acknowledge (RR-315) |
-| `recovery-code-generate` | — | — | — | DEPRECATED — superseded by `recovery-code`; not in `config.toml` |
+| `recovery-code-generate` | Jwt | POST | — | DEPRECATED — superseded by `recovery-code`; now declared in `config.toml` (`verify_jwt=false`) to close the inherited `verify_jwt=true` auth trap |
 | `support-ops` | Jwt (`skipAppCheck`) | POST | `support_ops` (in-handler) | Admin/support dispatcher; extra `X-Admin-Secret` / HMAC / dry-run gates |
 | `user-sync-preferences` | Jwt | GET/PATCH | `user_sync_preferences` (sugar) | Read/write per-group sync toggles |
 | `sync-pull` | Jwt (`allowGracePeriodRead`) | POST | `sync_pull` / `sync_download_grace` | Paginated delta pull of `c_*` rows |
@@ -87,13 +93,14 @@ Every `error` string returned to a client comes from the canonical registry in `
 | `assemblyai-webhook` | WebhookSecret (`ASSEMBLYAI_WEBHOOK_SECRET`) | POST | — | Transcription completion callback → `transcribe_results` + cost |
 | `analytics` | WebhookSecret (`ANALYTICS_INGEST_SECRET`) | POST | — | Eval-harness ingest; op `log_eval_run` upserts `l_eval_run` |
 | `server-config` | None (App Check only) | GET | — | Public config bootstrap; `skipAppVersion` opt-out |
+| `notifications` | WebhookSecret (`NOTIFICATIONS_SECRET`) | POST | — | Generic operation-dispatched outbound-email sweeps driven by pg_cron (e.g. `cloud_wipe_warning`) |
 | `storage-janitor` | WebhookSecret (`STORAGE_JANITOR_SECRET`) | POST | — | Generic "delete these paths from this bucket" service (cron) |
 | `storage-orphan-lister` | WebhookSecret (`STORAGE_JANITOR_SECRET`) | POST | — | Orphaned-blob discovery sweep across buckets (cron) |
 | `transcribe-drain` | `Deno.cron` (no `runGates`) | n/a | — | Minute cron draining the transcription queue to AssemblyAI; not in `config.toml` |
 
 ## Operation-dispatch functions
 
-Several functions front many logical operations behind one endpoint and switch on a `body.operation` field — the single-secret-deploy pattern. Adding an operation is a new `switch` case plus a client helper, with no new function deployment, secret, or gate config. `ai-engine` (a full handler registry) and `analytics` (`log_eval_run`) are the canonical examples; `extract-results`, `indexing`, `sync-audio`, and `sync-reconcile` also dispatch this way.
+Several functions front many logical operations behind one endpoint and switch on a `body.operation` field — the single-secret-deploy pattern. Adding an operation is a new `switch` case plus a client helper, with no new function deployment, secret, or gate config. `ai-engine` (a full handler registry) and `analytics` (`log_eval_run`) are the canonical examples; `extract-results`, `indexing`, `sync-audio`, and `sync-reconcile` also dispatch this way. `notifications` uses the same name-keyed `OPERATIONS` map with a derived `OPERATION_NAMES` as `ai-engine` and `support-ops` — the dispatcher resolves by name and can never reach an unregistered one.
 
 ## Where to go next
 
@@ -103,4 +110,6 @@ Several functions front many logical operations behind one endpoint and switch o
 - [get-user-usage](/rollingrecord/backend/edge-functions/get-user-usage) — the usage-screen read: counters, caps, credits, storage.
 - [resolve-identity](/rollingrecord/backend/edge-functions/resolve-identity) — the launch-time `canonical_users` upsert + anti-abuse carryover.
 - [server-config](/rollingrecord/backend/edge-functions/server-config) — the public bootstrap endpoint and its `skipAppVersion` opt-out.
+- [bug-report](/rollingrecord/backend/edge-functions/bug-report) — the Free-on-every-tier bug-submit endpoint and its `bug-logs` upload flow.
+- [notifications](/rollingrecord/backend/edge-functions/notifications) — the generic pg_cron-driven outbound-email dispatcher.
 - [Inbound webhooks](/rollingrecord/backend/edge-functions/webhooks) — `clerk-webhook`, `revenuecat-webhook`, and `assemblyai-webhook`.

@@ -8,7 +8,7 @@ Three inbound webhooks drive identity, entitlements, and transcription completio
 | Webhook | Auth (`runGates`) | Secret env var | Primary writes |
 | --- | --- | --- | --- |
 | `clerk-webhook` | `AuthMode.None` + Svix HMAC in handler | `CLERK_WEBHOOK_SECRET` | `canonical_users` provision (created/updated), full GDPR `wipeUser` (deleted) |
-| `revenuecat-webhook` | `AuthMode.WebhookSecret` | `REVENUECAT_WEBHOOK_SECRET` | `lifetime_entitlements`, `canonical_users` lapse columns, `l_entitlement_events`, bundle credits/refunds, `f_user_financials.revenue_micros` |
+| `revenuecat-webhook` | `AuthMode.WebhookSecret` | `REVENUECAT_WEBHOOK_SECRET` | `lifetime_entitlements`, `canonical_users` cloud-grace columns (`cloud_grace_started_at`/`cloud_grace_tier`) + `last_known_entitlements`, `l_entitlement_events`, bundle credits/refunds, `f_user_financials.revenue_micros` |
 | `assemblyai-webhook` | `AuthMode.WebhookSecret` | `ASSEMBLYAI_WEBHOOK_SECRET` | `transcribe_results` (encrypted), metered-op commit, `f_user_financials.ai_cost_micros`, `h_transcribe_history` |
 
 ## clerk-webhook
@@ -19,24 +19,36 @@ Three inbound webhooks drive identity, entitlements, and transcription completio
 | --- | --- | --- |
 | `user.created` | `handleUserCreated` | Upsert `canonical_users` (`ON CONFLICT DO NOTHING`, stores `email_hash`) + `carryForwardOnResignup` on fresh creation |
 | `user.updated` | `handleUserUpdated` | Refresh `canonical_users.email_hash` |
-| `user.deleted` | `handleUserDeleted` | `wipeUser(authUserId, { skipSubscriptionCheck: true })` — full GDPR cascade |
+| `user.deleted` | `handleUserDeleted` | `wipeUser(authUserId, { skipSubscriptionCheck: true })` — full GDPR cascade, **unless** the account is frozen, in which case it quarantines instead of wiping (see the freeze hold below) |
 | any other | default | `200` no-op |
 
 A missing `data.id` returns `missing_event_fields`. `wipeUser` (`functions/_shared/users/wipe.ts`) is the shared erasure ladder used by both this webhook and the in-app `delete-user` function: it wipes every user-data table and Storage bucket, writes the `l_deleted_identity` anti-abuse snapshot, and deletes the RC customer + Clerk user. On partial failure it throws `IdentityLookupFailedError` / `CanonicalUserDeleteFailedError`, which map to `500` so Svix retries — `wipeUser` is idempotent, so the retry resumes cleanly.
+
+**Frozen accounts are never wiped here (freeze hold).** Before wiping, `handleUserDeleted` reads `canonical_users.frozen_at` — the same check the account-frozen gate performs, done here because the webhook carries no JWT for that gate to run. If the account is frozen it QUARANTINES instead of wiping: it logs an `AbuseEventType.FrozenUserClerkDeletion` event (slug `frozen_user_clerk_deletion`, weight `10` — the ceiling) via `logAbuseEvent`, returns `200 { status: "quarantined_frozen" }`, and preserves the server data for the investigation (an admin resolves the hold via support-ops). A freeze is an evidence hold, and a Clerk-side deletion is the one path that used to slip past the account-frozen gate; self-serve Clerk deletion is disabled in the Clerk dashboard, so this guard is the defense-in-depth layer beneath that toggle. An unknown or failed frozen-state read returns `500` so Svix retries — `wipeUser` stays idempotent for the eventual clean run. (`AbuseEventType` and `logAbuseEvent` are imported from `functions/_shared/users/abuse-log.ts`.)
 
 ## revenuecat-webhook
 
 `functions/revenuecat-webhook/index.ts` calls `runGates(req, { method: Post, skipAppCheck: true, skipAppVersion: true, auth: AuthMode.WebhookSecret })` (default `REVENUECAT_WEBHOOK_SECRET`). It is the authoritative writer of `lifetime_entitlements` — every path (admin script, real purchase, refund) flows through RC and arrives here. `dispatchEvent` runs, in order:
 
 1. `logEntitlementEvents` — upserts one `l_entitlement_events` row per entitlement-in-event for **every** delivery (`onConflict: "event_id,entitlement_id"`), returning `isFreshEvent` for downstream dedup.
-2. `handleRecurringSubEvent` — RR-358 lapse tracking on `canonical_users.subscription_lapsed_at` + `subscription_lapsed_tier`.
+2. `handleRecurringSubEvent` — RR-358 / RR-328 cloud-grace tracking: maintains `canonical_users.cloud_grace_started_at` + `cloud_grace_tier` and the `last_known_entitlements` key snapshot they are derived from (see below).
 3. `handleRecurringSubRevenue` — writes `f_user_financials.revenue_micros` for `INITIAL_PURCHASE` / `RENEWAL` on `pro` / `pro_cloud` / `pro_cloud_ai`, gated on `isFreshEvent`.
 4. `NON_SUBSCRIPTION_PURCHASE` → `handleNonSubscriptionPurchase` (bundle credit); `CANCELLATION` on a non-entitlement product → `handleBundleRefund`.
 5. Lifetime grant / revoke for mirrored keys.
 
 Only entitlements in `WEBHOOK_MIRRORED_LOOKUP_KEYS` (lifetime + `developer`) are mirrored to the DB — recurring subs are log-only because the gate chain reads entitlements live from RC. Grants (`INITIAL_PURCHASE` / `NON_RENEWING_PURCHASE` / `TEMPORARY_ENTITLEMENT_GRANT`) insert with a `source` from `attributeSource()` (`developer` / `manual_admin` / `employee_perk` / `founders_edition_purchase`); revocations (`CANCELLATION` → `cancel_reason`, `EXPIRATION` → `rc_expiration` fallback) are idempotent via the partial `UNIQUE (email_hash, rc_entitlement) WHERE revoked_at IS NULL`.
 
-**Lapse tracking** only fires for `RECURRING_CLOUD_KEYS` (`pro_cloud`, `pro_cloud_ai`): `EXPIRATION` sets both lapse columns; `INITIAL_PURCHASE` / `RENEWAL` / `UNCANCELLATION` / `PRODUCT_CHANGE` clear both; `CANCELLATION` is a no-op (it waits for `EXPIRATION`). `developer`, `lifetime`, and `pro` are deliberately excluded — a hard cutoff with no grace window. **Bundle IAPs** read `bundle_config` for the SKU and grant tier-aware credits via `creditBundle` (idempotent on `l_credit_log UNIQUE(purchase_token)`); refunds clamp-at-zero via `refundBundle` keyed on `refund_of_token`. The handler always returns 2xx to RC unless a transient error (`500` → RC retries).
+**Cloud-grace tracking** no longer keys on the `EXPIRATION` event type. `entitlement_ids` on a webhook are the entitlements OF THAT PRODUCT, not the customer's full set, and Google Play downgrades are DEFERRED — `PRODUCT_CHANGE` fires immediately but is informational, and the entitlements are REPLACED at `RENEWAL` with NO `EXPIRATION` for the old cloud entitlement — so keying on `EXPIRATION` missed every plan-switch downgrade. Instead, any recurring-sub webhook is treated as a **trigger**: the handler re-reads the authoritative RC set via `getActiveEntitlementKeys(authUserId, { bypassCache: true })` and diffs it against the stored `last_known_entitlements` through `pickHighestRecurringCloudTier`.
+
+| Transition | Action |
+| --- | --- |
+| had cloud, no longer (`hadCloud && !hasCloud`) | open the window — set `cloud_grace_started_at` + `cloud_grace_tier` to the tier they held (guarded on the window not already being open so a redelivered webhook can't push the deadline out) |
+| holds cloud now (`hasCloud`) | clear the pair (active / resubscribed / upgraded) |
+| neither | snapshot `last_known_entitlements` only |
+
+Every route out of cloud — expiry, a deferred plan switch landing at renewal, a refund, a chargeback, a dashboard revoke — collapses into the first case. `CANCELLATION` needs no special handling any more: RC fires it while the entitlement is still live, so the authoritative fetch still shows cloud and it lands in "has cloud". `developer`, `lifetime`, and `pro` are deliberately excluded — a hard cutoff with no grace window — because `RECURRING_CLOUD_KEYS` (`pro_cloud`, `pro_cloud_ai`) is the allowlist behind `pickHighestRecurringCloudTier`, so their removal is never a cloud transition; the `canonical_users_cloud_grace_tier_values` CHECK constraint further pins the column to `pro_cloud` / `pro_cloud_ai`. Storing KEYS rather than a resolved tier is what makes the cutoff work — `developer` and `pro_cloud_ai` resolve to the same tier but must behave differently here. See [billing → RevenueCat](/rollingrecord/backend/billing/revenuecat) and [entitlement & grace](/rollingrecord/backend/gates/entitlement-and-grace) for the full model.
+
+**Bundle IAPs** read `bundle_config` for the SKU and grant tier-aware credits via `creditBundle` (idempotent on `l_credit_log UNIQUE(purchase_token)`); refunds clamp-at-zero via `refundBundle` keyed on `refund_of_token`. The handler always returns 2xx to RC unless a transient error (`500` → RC retries).
 
 <Warning>
 `revenuecat-webhook` records **revenue** into `f_user_financials.revenue_micros` (from `event.price` via `usdToMicros`). It never writes transcription or LLM cost. Transcription cost goes to `f_user_financials.ai_cost_micros` via `assemblyai-webhook`; LLM cost goes to the same column via the AI dispatcher (`_shared/ai/client.ts::trackTokenUsage`).

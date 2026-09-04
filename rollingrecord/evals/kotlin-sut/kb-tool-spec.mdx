@@ -7,14 +7,14 @@ description: "The single source of truth for the KB-chat tool definitions and us
 
 ## Two pure functions
 
-`KbToolSpec` exposes exactly two functions, both PURE — they depend only on the global `KbToolNames` and `ClientConfig` objects, never on any `KnowledgeBaseAdvisor` instance state. The advisor's tool DISPATCH logic (the `when (toolUse.name)` handlers that execute tools against DAOs and search engines) stays in `KnowledgeBaseAdvisor`; only the spec lives here.
+`KbToolSpec` exposes exactly two functions, both PURE — they depend only on the global `KbToolNames` and `ServerConfig` objects, never on any `KnowledgeBaseAdvisor` instance state. The advisor's tool DISPATCH logic (the `when (toolUse.name)` handlers that execute tools against DAOs and search engines) stays in `KnowledgeBaseAdvisor`; only the spec lives here.
 
 | Function | Returns | Role |
 | --- | --- | --- |
 | `definitions()` | `List<KbQueryTool>` | The tool definitions passed through to the AI provider — each a `{name, description, input_schema}` JSON-Schema object. |
 | `usageInstructions()` | `String` | The usage-instruction prose injected into the server prompt at the `{TOOL_USAGE_INSTRUCTIONS}` placeholder — when/how to call each tool, multi-tool workflows, context resolution, write ops, blueprint drafting, transcript snippets. |
 
-Every tool name comes from `KbToolNames` (`app/agentcore/.../data/repository/KbToolNames.kt`), the single source of truth for tool-name strings. The usage instructions interpolate those constants (never raw literals) so a rename is a compile error, and they also interpolate live config — e.g. the per-turn transcript-snippet cap `ClientConfig.aiChatMaxTranscriptSnippets`. IDs referenced in tool descriptions carry a type prefix (`ctx-`, `rec-`, `sec-`, `bp-` via `IdPrefix`) so the model passes the right shape back.
+Every tool name comes from `KbToolNames` (`app/agentcore/.../data/repository/KbToolNames.kt`), the single source of truth for tool-name strings. The usage instructions interpolate those constants (never raw literals) so a rename is a compile error, and they also interpolate live config — e.g. the per-turn transcript-snippet cap `ServerConfig.aiChatMaxTranscriptSnippets`. IDs referenced in tool descriptions carry a type prefix (`ctx-`, `rec-`, `sec-`, `bp-` via `IdPrefix`) so the model passes the right shape back.
 
 ## The tool catalog
 
@@ -58,6 +58,39 @@ Both `definitions()` and `usageInstructions()` feed the production loop and the 
 - **The eval fixture** — the Gradle snapshot test `KbToolSpecSnapshotTest` serializes `KbToolSpec` into `evals/fixtures/kb_query_tools.json` (shape `{tools: [...], tool_instructions: "..."}`) and fails the build on drift. That generated file is the canonical fixture `load_tool_fixture("kb_query")` loads and `_inject_canonical_tools()` splices into any bare `kb_query` case.
 
 The Python SUT injects this fixture because a hand-written two-tool sandbox masked real bugs (the bot got "stuck in card world" and refused to pull a transcript) — the full tool set changes the bot's behavior. `validate_mock_tool_names()` cross-checks a case's `mock_tools` keys against the fixture's tool names, so a stale sandbox name like `searchContext` left after a case should have migrated is caught immediately.
+
+## Canonical tool RESULTS — KbToolResults
+
+`KbToolResults` (`app/agentcore/.../data/repository/KbToolResults.kt`) is the sibling object to `KbToolSpec`: where `KbToolSpec` owns the tool DEFINITIONS the model is handed, `KbToolResults` owns the canonical result STRINGS the `kb_query` dispatcher hands BACK to the model after a tool runs. Those strings ARE the dispatcher↔model contract — the model decides whether to report success, report a refusal, or retry from the exact wording here, so an eval case that scripts a mock result must use the same string production emits or it proves nothing.
+
+Three result templates ship today, all for `createTask`:
+
+| Constant | Class | Intent |
+| --- | --- | --- |
+| `CREATE_TASK_SUCCESS` | success | `Task created in "{context}": "{text}"` — the model may confirm creation on seeing it. |
+| `CREATE_TASK_NO_CARD` | `NO_DATA:` refusal | The context has never been extracted, so it has no card and tasks have nowhere to attach. Deliberately NOT phrased as an error — it is a true state with a user-actionable fix (attach a recording and extract first), and calling it an error invites a pointless retry. |
+| `CREATE_TASK_WRITE_FAILED` | `ERROR:` refusal | The write reached the store and was rejected because the context's lifecycle froze its task list — only ACTIVE contexts accept new tasks (see `ContextPermissions.canEditInputs`). |
+
+The placeholders are `{context}` and `{text}`; the render helpers `createTaskSuccess(contextName, text)`, `createTaskNoCard(contextName)`, and `createTaskWriteFailed(contextName)` substitute them, and production interpolates the constants through those helpers rather than emitting raw literals.
+
+### The generated contract
+
+`KbToolResults.TEMPLATES` is a `Map<String, String>` from a stable KEY to its template — `createTask.success`, `createTask.no_card`, `createTask.write_failed`. Keys are dotted `<tool>.<outcome>` and are treated as append-only in spirit, because a rename breaks every case that addresses one. The map is snapshotted to `evals/fixtures/kb_tool_results.json` (shape `{"templates": {key: template}}`) by the Gradle test `KbToolResultsSnapshotTest`, exactly the way `KbToolSpecSnapshotTest` snapshots the tool definitions. An eval case references a result by KEY (`result_ref`) instead of pasting the string, so editing the wording here updates every referencing case and the snapshot test fails the build if the fixture wasn't regenerated.
+
+Regenerating uses ONE flag that produces BOTH fixtures (the `*SnapshotTest` filter matches `KbToolSpecSnapshotTest` and `KbToolResultsSnapshotTest`):
+
+```
+cd app && ./gradlew :app:testDebugUnitTest --tests "*SnapshotTest" "-Dregenerate.kbtools=true"
+```
+
+Quote the `-D` flag on PowerShell — it otherwise splits at the dot and Gradle reports a task-not-found error.
+
+The drift this closes is concrete: the `create_task_server_error` case mocked `The database did not accept the insert` long after the dispatcher stopped emitting that string, so it was asserting the model handles a result it could never actually receive — green, and worthless. Because nothing compared the pasted copy to production, the rot was silent by construction. Naming a key makes that impossible.
+
+### Consuming the results from Python
+
+- [Tool fixtures](/rollingrecord/evals/harness/tool-fixtures) — `load_tool_result_templates()` loads `kb_tool_results.json`, and `render_tool_result(key, args)` resolves a `result_ref` key to the production string.
+- [Mock tools](/rollingrecord/evals/harness/mock-tools) — the `result_ref` fixture form a case uses instead of a literal `result`.
 
 ## Where to go next
 

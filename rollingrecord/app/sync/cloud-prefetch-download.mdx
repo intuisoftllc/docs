@@ -24,7 +24,7 @@ A cloud-only recording (`cloudOnly = true`, empty `filePath`) is a placeholder c
 | (already local) | `AlreadyLocal` | no network |
 | `NotFound` (row gone) | `Permanent` | delete local placeholder + transcript + context links |
 | `BlobMissing` (row alive, object gone) | `Permanent` | **keep** the row; mark this version failed in `CloudDecryptFailureStore` |
-| `DecryptFailed` | `Permanent` | mark this version failed |
+| `CloudDownloadResult.DecryptFailed` | `Permanent` | mark this version failed |
 | `RateLimited` / `Transient` | `Retry` | next run retries |
 | (ENOSPC) | `StorageFull` | stop; no corrupt leftovers |
 
@@ -35,7 +35,7 @@ The `NotFound` vs `BlobMissing` split is load-bearing: `NotFound` means the row 
 `CloudPrefetchWorker` (`data/sync/audio/CloudPrefetchWorker.kt`) warms the local cache. It:
 
 - Re-checks Wi-Fi-only at execution time and lowers its thread priority to `THREAD_PRIORITY_BACKGROUND` so the scheduler favors UI threads (no foreground-state gate — foreground-but-idle is exactly when the user expects prefetch to run).
-- Guards on a `SAFETY_FLOOR_BYTES = 1GB` device-free floor, checked before the run and again before each download (Android force-kills apps as free space nears zero).
+- Guards on a `SAFETY_FLOOR_BYTES = 1GB` device-free floor, checked before the run and again before each download (Android force-kills apps as free space nears zero). Its `deviceFreeBytes()` now reads free space via `StorageManager.readFreeBytes(applicationContext)` rather than a direct `StatFs(filesDir).availableBytes`, so the dev low-disk override applies to prefetch too — low disk during a cloud prefetch was previously untestable without genuinely filling the device.
 - Prechecks the cloud entitlement and defers on a `sync-audio` rate-limit cooldown.
 - Walks `getCloudOnlyPrefetchCandidates(MAX_CANDIDATES_PER_RUN = 200)` — cloud-only rows sorted favorites-first then most-recent — calling `downloadRecording` on each.
 

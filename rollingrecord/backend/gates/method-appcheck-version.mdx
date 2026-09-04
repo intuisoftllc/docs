@@ -35,9 +35,11 @@ Two failure modes, and they are distinct: a missing `FIREBASE_PROJECT_NUMBER` re
 
 `runAppVersionGate(req)` in `functions/_shared/gates/app-version.ts` (RR-222) enforces the server-side minimum-supported-version floor. It wraps `checkAppVersionFloor(request)`, which returns an `AppVersionCheckResult` of `{ ok, floor, seen }`:
 
-- `floor` comes from `server_config.min_supported_app_version_code`, read via `getServiceClient()` and cached per Edge Function cold start. Any read error or missing row falls back to `0` (allow-all).
+- `floor` comes from `server_config.min_supported_app_version_code`, now read from the shared `server_config` map via `getServerConfigMap()` (imported from `../db/server-config.ts`) rather than a targeted per-key SELECT. Any read error or missing row falls back to `0` (allow-all).
 - `seen` is the parsed `X-App-Version` header; missing, blank, or non-numeric values resolve to `0`.
 - `ok` is `seen >= floor`.
+
+Reading through the shared map also fixes a correctness bug. The old code memoized the floor in a module-local `cachedFloor` with **no TTL**, so once an isolate read the floor it was pinned for the life of that instance — a raised minimum only took effect on that isolate's next cold start, indefinitely later on a warm one. The shared `server_config` map expires every 5 minutes, so the version kill-switch now actually propagates. Fail-open is preserved deliberately: `getServerConfigMap()` throws when the database is unreachable, and `readFloor()` catches that and treats it as floor `0` (allow-all) exactly as before — a transient DB blip must not turn into `410 client_too_old` for every caller.
 
 On failure the gate returns `410 client_too_old` built by `clientTooOldResponseBody()`, whose body is deliberately minimal — **only the error code**. The `floor` and `seen` values are withheld so a bad actor can't probe the exact floor. The client renders a blocking "Please update" screen with a Play Store deep-link; the code is not retriable.
 
@@ -47,7 +49,7 @@ On failure the gate returns `410 client_too_old` built by `clientTooOldResponseB
 | --- | --- | --- | --- | --- |
 | Method (`method.ts`) | `req.method` vs allowlist | in list | `405 method_not_allowed` | no (structural) |
 | App Check (`app-check.ts`) | `X-Firebase-AppCheck` + `FIREBASE_PROJECT_NUMBER` | valid Firebase JWT | `401 invalid_app_check` (`500 server_misconfiguration` if project number unset) | no — opt-out only via `skipAppCheck` |
-| App Version (`app-version.ts`) | `X-App-Version` vs `server_config.min_supported_app_version_code` | `seen >= floor` | `410 client_too_old` (body: error code only) | no — opt-out only via `skipAppVersion` |
+| App Version (`app-version.ts`) | `X-App-Version` vs `min_supported_app_version_code` (from the shared `server_config` map) | `seen >= floor` | `410 client_too_old` (body: error code only) | no — opt-out only via `skipAppVersion` |
 
 ## Opt-outs
 
@@ -62,6 +64,7 @@ On failure the gate returns `410 client_too_old` built by `clientTooOldResponseB
 | `clerk-webhook` | yes | yes | server-to-server (`AuthMode.None` + Svix verify); no headers |
 | `storage-janitor` / `storage-orphan-lister` | yes | yes | `pg_cron` `net.http_post`; no headers |
 | `extract-runner` | yes | yes | `pg_cron` self-call + `extract-submit` inline kick; no headers |
+| `notifications` | yes | yes | `pg_cron` `net.http_post`; no headers |
 | `analytics` | yes | yes | server-to-server ingest from the eval harness machine |
 
 ## Related

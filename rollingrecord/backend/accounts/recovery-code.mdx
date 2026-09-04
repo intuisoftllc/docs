@@ -7,7 +7,7 @@ A recovery code is a 16-digit (four groups of four) per-user secondary credentia
 
 ## Operations
 
-Both operations run a JWT gate chain and read `recovery_code_hash` + `recovery_code_pending` off `canonical_users`. Rate limits are applied per-operation so each bucket tunes independently.
+Both operations run a JWT gate chain and read `recovery_code_hash` + `recovery_code_pending` off `canonical_users`. Rate limits are applied per-operation so each bucket tunes independently. The `runGates()` config also registers `dbHealthCheck("recovery-code")`, so the two-op `/recovery-code` hosts an **Account & Sign-in** uptime probe: a request carrying a valid `X-Health-Probe` header short-circuits before the handler to a read-only DB-liveness read. The probe is on the two-op `recovery-code` only — the legacy `recovery-code-generate` has none.
 
 | Operation | Success | Errors |
 | --- | --- | --- |
@@ -52,6 +52,8 @@ Storing the display plaintext in `recovery_code_pending` for the minutes between
 ## The superseded one-shot
 
 `functions/recovery-code-generate/index.ts` is the original one-shot generator: it generates a code, hashes it with argon2id immediately, stores only the hash via an atomic `UPDATE ... WHERE recovery_code_hash IS NULL`, and returns the plaintext exactly once. It never stores plaintext. It is still deployed but **legacy** — a dropped network response under this design lost the code permanently, which is precisely the bug the two-op `/recovery-code` fixes. Both functions refuse to re-issue once a hash exists, and both draw on the same `RecoveryCodeGenerate` bucket.
+
+The legacy function previously had **no** `[functions.recovery-code-generate]` block in `supabase/config.toml`, so it silently inherited Supabase's built-in `verify_jwt = true` — which rejects the Clerk-signed JWT before `runGates()` ever runs, a latent break on the still-deployed endpoint. A `[functions.recovery-code-generate]` block with `verify_jwt = false` now makes the function's own `runGates()` Clerk-JWT check authoritative, matching every other `AuthMode.Jwt` function. The legacy function itself carries no code change — only the config declaration was added.
 
 ## One code per account
 

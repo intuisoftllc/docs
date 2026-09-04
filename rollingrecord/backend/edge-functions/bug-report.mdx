@@ -1,0 +1,81 @@
+---
+title: "bug-report"
+description: "The user bug-submission endpoint — writes the bug_reports row first, then signs a short-lived upload URL for the merged app log to the private bug-logs bucket. Free on every tier; a 10/hour rate limit, not a paywall, is the abuse control."
+---
+
+`bug-report` (`functions/bug-report/index.ts`) is a `Deno.serve` POST endpoint that accepts one user-submitted bug report and, when the user chose to attach their logs, hands back a short-lived signed URL to upload the merged log file to the private `bug-logs` Storage bucket. It is Free on every tier: a report is how we learn the app is broken, and the free tier is exactly where sign-in, permission, and onboarding failures concentrate.
+
+## Gate chain
+
+The entry calls `runGates(req, { method: HttpMethod.Post, auth: AuthMode.Jwt, rateLimit: { bucket: Bucket.BugReport, abuseEventOnReject: AbuseEventType.BugReportFlood } })`. The chain is method + App Check + App Version floor + Clerk JWT + rate limit. There is deliberately **no** entitlement gate — bug reporting is Free on all tiers, and the rate limit (not a paywall) is the only abuse control. After the chain passes, a missing identity returns `AppError.MISSING_AUTH_USER_ID`.
+
+## Rate limit + soft signal
+
+The `Bucket.BugReport` bucket (`functions/_shared/gates/rate-limit.ts`) is **10 requests / 3600s** (10 per user per hour), seeded by the migration's `rate_limit_config` INSERT for `bug_report`. High enough that nobody legitimately filing a burst of findings gets blocked, low enough to bound a scripted flood.
+
+Tripping the limit records an `AbuseEventType.BugReportFlood` event (slug `bug_report_flood`, weight `1` — the floor) through the shared `abuseEventOnReject` chain-sugar path (`functions/_shared/users/abuse-log.ts`). It shows up in a suspicious account's history but is weighted so it can never by itself push anyone up the top-offenders list. It earns its own slug rather than folding into `rate_limit_hit` because the two mean different things — hammering `ai_engine` burns money, hammering `bug_report` writes us paragraphs.
+
+## Request body
+
+`BugReportInput` is fully untyped on the wire and validated in-handler:
+
+| Field | Handling |
+| --- | --- |
+| `description?` | Run through `normalizeDescription` / `describeDescriptionProblem` (`functions/_shared/bugreport/sanitize.ts`) — `empty` → `BUG_REPORT_EMPTY_DESCRIPTION`, `too_long` → `BUG_REPORT_DESCRIPTION_TOO_LONG` |
+| `area?` | `normalizeArea` — an unknown area is normalized to `'other'`, never rejected |
+| `client_metadata?` | `sanitizeClientMetadata` — app version, Android version, device model, tier, locale |
+| `attach_logs?` | `=== true` means the client wants a signed upload URL back |
+| `log_sha256?` | Must match `/^[a-f0-9]{64}$/i` or the attachment intent is dropped |
+| `log_bytes?` | Positive finite number, rounded |
+
+A malformed digest never fails the submission — it just means we can't vouch for the bytes, so we don't claim to. The same principle governs the area: an unfamiliar value costs the user nothing.
+
+## Write-order invariant (row before log)
+
+The `bug_reports` row is INSERTed **before** any log upload. When logs are attached the storage path is `{auth_user_id}/{bug_report_id}.txt` in the `bug-logs` bucket, and `null` otherwise — `auth_user_id` is ALWAYS the first path segment, which is what makes `delete-user`'s folder wipe able to find these objects. The insert columns are `bug_report_id`, `auth_user_id`, `area`, `description`, `client_metadata`, `log_storage_path`, `log_sha256`, and `log_bytes`; an insert failure returns `AppError.BUG_REPORT_INSERT_FAILED`.
+
+The ordering is the point: a failed, cancelled, or abandoned upload still leaves a readable report behind, and the worst case is a row whose `log_storage_path` points at an object that was never created. The reverse order — upload, then submit — would throw away everything the user typed if the last call failed on a network blip, which is the one outcome that must not happen when someone is already annoyed enough to file a bug.
+
+## Signed log upload (best-effort)
+
+When `attachLogs` is set, the handler mints `supabase.storage.from('bug-logs').createSignedUploadUrl(storagePath, { upsert: true })`. The call passes only `{ upsert: true }` — supabase-js's `createSignedUploadUrl` accepts no expiry argument, so the URL takes the client library's fixed default lifetime (~2 hours) rather than a custom TTL. A `UPLOAD_URL_TTL_SECONDS = 600` constant is declared in the file but is currently unused and does not affect the URL's lifetime. The URL is single-use for one known path.
+
+If minting fails, the report is already safely stored, so the handler nulls out `log_storage_path` / `log_sha256` / `log_bytes` on the row (so it doesn't advertise a file that will never exist) and still answers `200`. The response is `{ bug_report_id, upload_url }`, where `upload_url` is `null` when no logs were requested or minting failed.
+
+## Storage + table (migration `20260817120000_bug_reports.sql`)
+
+The migration is additive: it creates the private `bug-logs` bucket, the `bug_reports` table, one AFTER DELETE trigger, and one `rate_limit_config` seed row.
+
+The `bug-logs` bucket is `public = false`, with `file_size_limit` `26214400` (25 MiB) and `allowed_mime_types` `['text/plain']` — generous against the client's rolling log cap while still bounding a hostile upload.
+
+The `bug_reports` table follows the `auth_user_id`-first column spine, with PK `bug_report_id`, an FK to `canonical_users(auth_user_id) ON DELETE CASCADE`, and RLS ENABLED with **no policies** (service-role only; a leaked anon key gets nothing).
+
+| Constraint / index | Detail |
+| --- | --- |
+| `bug_reports_status_check` | `status` is one of `['new', 'triaged', 'in_progress', 'resolved', 'wont_fix']`, default `'new'` |
+| `bug_reports_log_triple_check` | `CHECK ((log_storage_path IS NULL) = (log_sha256 IS NULL))` — the log columns are meaningful only together |
+| `area` | Deliberately **not** a CHECK enum — the client's list grows, and a report must never be rejected for an unfamiliar area string |
+| `index_bug_reports_auth_user_id` | on `auth_user_id` |
+| `index_bug_reports_area_created_at` | on `(area, created_at DESC)` |
+| `index_bug_reports_status_created_at` | on `(status, created_at DESC)` |
+
+<Note>
+This migration is the **base** table. The triage `closed_at` column, the `'stale'` status, and the retention / stale sweepers arrive in later migrations (`20260817160000_bug_report_triage.sql`, `20260817200000_bug_report_stale_status.sql`) — see [support-ops bug triage](/rollingrecord/backend/support-ops/bug-triage) and [cron sweepers](/rollingrecord/backend/database/cron-sweepers) rather than this page.
+</Note>
+
+## Orphan prevention
+
+Storage objects do not participate in foreign keys, so an AFTER DELETE trigger `trg_bug_reports_delete_log_object` runs `delete_bug_report_log_object()` (SECURITY DEFINER) to delete the row's own object from `storage.objects` on **any** delete — a manual triage delete OR the `canonical_users` CASCADE when a user deletes their account. This makes the blob's lifetime follow the row's for both paths.
+
+`delete-user` **additionally** wipes the whole `bug-logs/{auth_user_id}/` folder through the Storage API — deliberate belt-and-braces: the trigger is exact but silent, and the folder wipe catches anything whose row was already gone.
+
+## config.toml
+
+`config.toml` declares `[functions.bug-report]` with `verify_jwt = false`. This is required, not optional: a function with no block silently inherits Supabase's default `verify_jwt = true`, which validates against Supabase Auth and would `401` every Clerk-signed request before `runGates()` ever runs.
+
+## Related pages
+
+- [Edge Function catalog](/rollingrecord/backend/edge-functions/overview) — the shared `runGates()` chain and the full function list.
+- [Bug triage](/rollingrecord/backend/support-ops/bug-triage) — the `get_bug_reports` / `set_bug_status` support-ops queue operations.
+- [Storage buckets](/rollingrecord/backend/storage/buckets) — the private `bug-logs` bucket.
+- [delete-user](/rollingrecord/backend/accounts/delete-user) — the `bug-logs/{auth_user_id}/` folder wipe.

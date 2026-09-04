@@ -7,20 +7,20 @@ description: "The diagnostic screens, override flags, and utilities bundled into
 
 ## Diagnostic screens
 
-Each of these is a full screen in `src/debug/` with an inert release stub, reached from a card in `DevModeScreen`.
+Each of these is a full screen in `src/debug/`, reached from a card in `DevModeScreen`. `SyncDebugScreen`, `LogDiagnosticsScreen`, and `LogFullViewScreen` carry an inert release stub; `TranscriptionDiagnosticsScreen` and `DevChatTracesScreen` have none, since they're referenced only from debug-only code (`addDebugRoutes` and `DevModeScreen`) and so never need a release counterpart.
 
 | Screen | File | What it shows |
 | --- | --- | --- |
 | `SyncDebugScreen` | `devmode/SyncDebugScreen.kt` | RR-354 sync observability: `SyncEngine` state, a `SyncOutbox` dump, session DEK status, sync prefs, and `NetworkConnectivity`. Three destructive actions: force resync (cursor reset + sync), clear outbox, force DEK refresh (cache invalidation). |
 | `LogDiagnosticsScreen` + `LogFullViewScreen` | `devmode/LogDiagnosticsScreen.kt`, `devmode/LogFullViewScreen.kt` | On-device viewer for the rolling `AppLogger` file with expandable, searchable cards. `LogFullViewScreen` shows one entry's full body. |
 | `TranscriptionDiagnosticsScreen` | `devmode/TranscriptionDiagnosticsScreen.kt` | Live transcription queue — joins `TranscriptionWorker` `WorkInfo` against transcript DB rows and the `InMemoryTranscribeUploadCache`, rendered as running / queued / recently-completed, auto-refreshing every 2 s. |
-| `DevChatTracesScreen` | `devmode/DevChatTracesScreen.kt` | Lists KB chat conversations that have captured trace data (by real conversation name); tap a row to copy the aggregated trace to clipboard or save to Downloads. |
+| `DevChatTracesScreen` | `devmode/DevChatTracesScreen.kt` | Lists KB chat conversations that have captured trace data (by real conversation name); tap a row to copy the aggregated trace to clipboard or save to Downloads. When `KbTraceUploader.isConfigured` (an `EVAL_UPLOAD_URL` is set in `.env.local`) each row also shows a full-width "Upload to PC" button that POSTs that one conversation's aggregated trace to the dev PC's `serve_apk.py` `/kb-trace` endpoint (written server-side as `kb_trace.json`); the button is hidden when no upload URL is configured. |
 
 Because a long stack trace (~10–50 KB) serialized into the nav savedState `Bundle` would exceed the Binder transaction limit, the `LogFullView` route carries only a UUID `key`; the body is stashed process-scope in `LogFullTextHolder` (`devmode/LogFullTextHolder.kt`, a `ConcurrentHashMap` cleared on dispose) and read back by key.
 
 ## KB chat trace capture
 
-When `DevFlags.captureKbChatTraces` is on, `DevChatTraceCapture` (`devmode/DevChatTraceCapture.kt`) records each KB chat turn — the user message, every assistant content-block array (text + `tool_use`), and every tool result — to `cacheDir/kb_chat_traces/` as one JSON file per turn. The capture calls sit inside `KnowledgeBaseAdvisor.ask()`, and every entry point fast-returns when the flag is false. `DevChatTracesScreen` groups the files by `threadId`, shows one row per conversation by its real name, and copies the full aggregated trace (all turns as a JSON array) to the clipboard or Downloads — for pasting into an LLM to debug bot behavior end-to-end. `DevChatLogger` (`devmode/DevChatLogger.kt`) is a separate logcat-only (never persisted) per-turn printer. The same capture surface is what the in-app eval harness reuses to build its session trace — see [In-App Eval Harness](/rollingrecord/app/devmode/in-app-evals).
+When `DevFlags.captureKbChatTraces` is on, `DevChatTraceCapture` (`devmode/DevChatTraceCapture.kt`) records each KB chat turn — the user message, every assistant content-block array (text + `tool_use`), and every tool result — to `cacheDir/kb_chat_traces/` as one JSON file per turn. The capture calls sit inside `KnowledgeBaseAdvisor.ask()`, and every entry point fast-returns when the flag is false. `DevChatTracesScreen` groups the files by `threadId`, shows one row per conversation by its real name, and copies the full aggregated trace (all turns as a JSON array) to the clipboard or Downloads — for pasting into an LLM to debug bot behavior end-to-end. `DevChatLogger` (`devmode/DevChatLogger.kt`) is a separate logcat-only (never persisted) per-turn printer. Beyond clipboard and Downloads, the aggregated trace can now be pushed to the dev PC via `KbTraceUploader` (the "Upload to PC" row action — see [Log upload and JSON exporters](#log-upload-and-json-exporters)).
 
 ## Onboarding and auth previews
 
@@ -30,7 +30,7 @@ When `DevFlags.captureKbChatTraces` is on, `DevChatTraceCapture` (`devmode/DevCh
 
 `DevBackupManager` (`devmode/DevBackupManager.kt`) is a dev-only full backup/restore. `backup()` writes a timestamped ZIP (`rr_backup_*.zip`) to Downloads containing `metadata.json` (including `dbVersion`), `recordings_meta.json` (a recordings + sessions JSON safety net), the Room DB files (WAL checkpointed first), the `EncryptedSharedPreferences` that wraps the SQLCipher key, the DataStore files, and internal + external audio. `restore()` validates the metadata, overwrites everything in place, and kills the process so Room reopens fresh. `restoreFromMetadataJson()` is an emergency metadata-only path that re-inserts sessions + recordings when the DB file itself can't be decrypted.
 
-The restore path guards against a schema **downgrade**: it blocks when the backup's `dbVersion` exceeds `CURRENT_DB_SCHEMA_VERSION` (78), because Room can migrate forward (old backup → new app) but not backward. That constant must be kept in sync with `AppDatabase.version` whenever a Room migration is added, per the DB-migration HARD RULE. `BACKUP_VERSION` is 1.
+The restore path guards against a schema **downgrade**: it blocks when the backup's `dbVersion` exceeds `CURRENT_DB_SCHEMA_VERSION` (79), because Room can migrate forward (old backup → new app) but not backward. That constant must be kept in sync with `AppDatabase.version` whenever a Room migration is added, per the DB-migration HARD RULE. `BACKUP_VERSION` is 1.
 
 ## Two distinct database-failure testers
 
@@ -41,11 +41,15 @@ There are two separate ways to exercise the DB failure paths, and they trigger d
 
 ## Log upload and JSON exporters
 
-`AppLogUploader` (`devmode/AppLogUploader.kt`) one-taps the active user's merged rolling app log to the dev PC's `serve_apk.py` `/app-log` endpoint (host derived from `EvalConfig.uploadUrl` / the `.env.local` `EVAL_UPLOAD_URL`), overwriting `app_log.txt` at the repo root. It merges via `FileLogger.mergedLogForUser()`, deletes the transient merge after sending, and reports `Ok` / `Failed` / `Empty` / `NoEndpoint`. Two private exporters in `DevModeScreen.kt` write to Downloads: `exportChatThreads` dumps all KB chat threads + messages to a `.txt`, and `exportContextJson` writes one selected context (card sections, action-item tasks, linked recordings + transcripts) to a `.json`.
+`AppLogUploader` (`devmode/AppLogUploader.kt`) one-taps the active user's merged rolling app log to the dev PC's `serve_apk.py` `/app-log` endpoint (host derived from `DevUploadConfig.uploadUrl`, itself backed by the `.env.local` `EVAL_UPLOAD_URL` field via `BuildConfig.EVAL_UPLOAD_URL`), overwriting `app_log.txt` at the repo root. It merges via `FileLogger.mergedLogForUser()`, deletes the transient merge after sending, and reports `Ok` / `Failed` / `Empty` / `NoEndpoint`. The POST carries an `Authorization: Bearer <BuildConfig.SERVE_UPLOAD_TOKEN>` header (a header, never a URL query string, since `endpoint()` rebuilds the address from scheme/host/port and drops any query); the dev-PC server fails closed, so a blank token yields a `503` rather than an unauthenticated write.
+
+`KbTraceUploader` (`devmode/KbTraceUploader.kt`) is the sibling uploader that backs the "Upload to PC" action in `DevChatTracesScreen`: it POSTs one thread's aggregated KB-chat trace to `/kb-trace` (the server writes `kb_trace.json`) using the same `DevUploadConfig` host and the same `Authorization: Bearer <BuildConfig.SERVE_UPLOAD_TOKEN>` header, plus an `X-Trace-Name` header (the conversation's display name, ASCII-sanitized and capped at 80 chars, since header values must stay ASCII-safe). It reports the same `Ok` / `Failed` / `Empty` / `NoEndpoint` results. Both uploaders read the shared `DevUploadConfig` (`devmode/DevUploadConfig.kt`) object — the single source of the dev-PC scheme/host/port — and each swaps in only its own path (`/app-log` vs `/kb-trace`).
+
+Two private exporters in `DevModeScreen.kt` write to Downloads: `exportChatThreads` dumps all KB chat threads + messages to a `.txt`, and `exportContextJson` writes one selected context (card sections, action-item tasks, linked recordings + transcripts) to a `.json`.
 
 ## Embedding Search Eval
 
-`EmbeddingEvalRunner` (`devmode/eval/EmbeddingEvalRunner.kt`) backs the "Embedding Search Eval" card and is **separate from** the `evalmode` AI-suite harness. It is an RR-487 semantic-search threshold-tuning tool: it loads a fabricated labeled corpus (`assets/eval/eval_set.json`, debug-only), embeds it through the **server** path (Cohere via `SearchApiClient`, using the same asymmetric `search_query` / `search_document` input types production uses), replicates both production retrieval pipelines (Topic search: the real `TranscriptChunker` + max-chunk cosine; Section search: whole-text cosine), sweeps thresholds `0.10`–`0.60`, and grades the live `ClientConfig.topicSearchThreshold` / `sectionSemanticThreshold`. It writes a report + CSV to `cacheDir/embedding_eval/` and needs connectivity plus a semantic-search-eligible (Pro+Cloud and up) account.
+`EmbeddingEvalRunner` (`devmode/eval/EmbeddingEvalRunner.kt`) backs the "Embedding Search Eval" card and is unrelated to the former on-device `evalmode` AI-suite harness (deleted in this commit — see [Dev Mode Architecture](/rollingrecord/app/devmode/architecture)). It is an RR-487 semantic-search threshold-tuning tool: it loads a fabricated labeled corpus (`assets/eval/eval_set.json`, debug-only), embeds it through the **server** path (Cohere via `SearchApiClient`, using the same asymmetric `search_query` / `search_document` input types production uses), replicates both production retrieval pipelines (Topic search: the real `TranscriptChunker` + max-chunk cosine; Section search: whole-text cosine), sweeps thresholds `0.10`–`0.60`, and grades the live `ServerConfig.topicSearchThreshold` / `ServerConfig.sectionSemanticThreshold`. It writes a report + CSV to `cacheDir/embedding_eval/` and needs connectivity plus a semantic-search-eligible (Pro+Cloud and up) account.
 
 ## `DevModeScreen` cards
 
@@ -54,17 +58,17 @@ There are two separate ways to exercise the DB failure paths, and they trigger d
 | Usage | Live `get-user-usage` counters (tokens, AI queries, extraction/transcription minutes, deep reasoning) with force-refresh |
 | Tier Override | `FilterChip`s writing `DevFlags.tierOverride` (None or a `UserTier`) |
 | Onboarding Preview / Permissions Screen / Recording Interrupted Sheet | Launch `DevOnboardingPreviewScreen` / `V2PermissionsScreen` / signal `RecordingInterruptedState` (RECOVERED / FAILED variants) |
-| Diagnostics / Logs | Clear logs (active user), Sync diagnostics, Log diagnostics, Transcription queue, KB chat traces, AI evals |
+| Diagnostics / Logs | Clear logs (active user), Sync diagnostics, Log diagnostics, Transcription queue, KB chat traces |
 | Playback | `disableWaveformCache`, `audioFilePathOverride` (None/Corrupt/Missing/Pick-from-disk), `forceRecordingGone`, reset transcript disclaimer |
 | Merge Worker | `forceMergeInProgress` + progress slider, `forceMergeFailed` |
-| Storage Health / Battery Health | `forceStorageNotAccessible`, `forceDeviceStorageTooLow`, `forceBatteryLow` |
+| Storage Health / Battery Health | `forceStorageNotAccessible`; `deviceFreeBytesOverride` ("Reported free space" `CapOverrideRow` + `CapPickerDialog`, in MB, seeds 100 MB, max 2000 MB); `forceBatteryLow` |
 | Database Open / Database Recovery Test | `forceFatalDbErrorOnOpen` (synthetic classifier throw); `corruptDatabaseAndKill` (real SQLCipher corruption → recovery dialog) |
 | Account Management / Cloud Sync UI | `stubStorageBreakdown`; force quota / sync-error / free-up-sheet / first-pull / grace / syncing-70 / paused surfaces; fire the revive-fails dialog via `CloudUploadErrorBus` |
 | Context Size Meter Override | `contextBudgetPercent` (0–120%, warning at 85%) |
 | Transcription / Usage Cap Overrides | `transcriptionStatusOverride`; `transcriptionMinutesCapOverride` / `aiQueriesCapOverride` / `extractionsCapOverride` via wheel picker |
 | Knowledge Base / Context Export / Backup & Restore | Export chat threads; export context JSON; `DevBackupManager` backup / restore / metadata-only restore |
 | Embedding Search Eval | `EmbeddingEvalRunner` threshold sweep |
-| Remote Config (live values) | Read-only snapshot of `ServerConfig` / `ClientConfig` values (with DEV OVERRIDE markers) |
+| Server Config (live values) | Read-only snapshot of `ServerConfig` values (with DEV OVERRIDE markers) |
 
 ## Override flags
 
@@ -79,7 +83,8 @@ Every override toggle in `DevModeScreen` maps to exactly one `DevFlags` field, r
 | `transcriptionStatusOverride` | force a `TranscriptStatus` (NOT_STARTED / PROCESSING / DONE / ERROR) | `V2PlaybackViewModel` |
 | `transcriptionMinutesCapOverride` / `aiQueriesCapOverride` / `extractionsCapOverride` | trip transcription / KB-chat / extraction caps without burning quota | `V2PlaybackViewModel` / `KnowledgeBaseViewModel` / `ContextExtractionWorker` + `V2ContextDetailViewModel` |
 | `tierOverride` | force a `UserTier` without holding the RC entitlement | `EntitlementRepository` |
-| `forceStorageNotAccessible` / `forceDeviceStorageTooLow` | storage-unavailable banner / low-space banner + record gate | `StorageManager` / `V2HomeViewModel` |
+| `forceStorageNotAccessible` | storage-unavailable banner + record gate | `StorageManager` |
+| `deviceFreeBytesOverride` (`Long?`, in bytes) | any reported free-byte count, so every low-disk consumer runs for real (set below the 250 MB floor to trip low-disk behaviour; `0` reproduces a full disk) | `StorageManager.readFreeBytes()` (the single `StatFs` read) |
 | `forceBatteryLow` | low-battery banner + record gate | `V2HomeScreen` |
 | `forceFatalDbErrorOnOpen` | synthetic schema-mismatch → `FatalDbErrorScreen` (one-shot, survives force-stop) | `DatabaseModule` |
 | `stubStorageBreakdown` | synthetic segmented cloud-storage bar (~10 / 20 GB) | Usage screen |
@@ -92,4 +97,3 @@ Every override toggle in `DevModeScreen` maps to exactly one `DevFlags` field, r
 ## Where to go next
 
 - [Dev Mode Architecture](/rollingrecord/app/devmode/architecture) — the source-set duplication, the 7-tap entry, and the full `DevFlags` injection-site map.
-- [In-App Eval Harness](/rollingrecord/app/devmode/in-app-evals) — the "AI evals" row and the `evalmode` suite runner (distinct from the Embedding Search Eval above).

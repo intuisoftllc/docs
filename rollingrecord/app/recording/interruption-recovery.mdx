@@ -3,17 +3,17 @@ title: "Interruption Handling & Recovery"
 description: "How calls, audio-focus loss, and kills are handled during recording."
 ---
 
-Recording is designed to survive interruptions without user intervention where possible. Calls pause capture (and auto-resume after), audio-focus loss does not stop capture on Rolling, and post-kill files are recovered and surfaced to the user through a modal sheet.
+Recording is designed to survive interruptions without user intervention where possible. Calls pause capture (and stay paused — the user resumes manually), audio-focus loss does not stop capture on Rolling, and post-kill files are recovered and surfaced to the user through a modal sheet.
 
 ## Phone calls
 
-`CallStateHandler` (`service/CallStateHandler.kt`) registers a `TelephonyCallback` (API 31\+) or a legacy `PhoneStateListener` when the service starts. It requires `READ_PHONE_STATE`; if the permission is missing, the listener is not registered and calls have no effect on recording. The handler tracks a `pausedForCall` flag so it can auto-resume after a call-driven pause.
+`CallStateHandler` (`service/CallStateHandler.kt`) registers a `TelephonyCallback` (API 31\+) or a legacy `PhoneStateListener` when the service starts. It requires `READ_PHONE_STATE`; if the permission is missing, the listener is not registered and calls have no effect on recording. The handler tracks a `pausedForCall` flag for logging and diagnostics; it does **not** auto-resume — after a call-driven pause the user must resume manually (auto-resume is unreliable across OEMs).
 
 Transitions:
 
 - **`RINGING`.** If `SettingsRepository.blockCallsWhileRecording` is enabled, the handler calls `TelecomManager.endCall()` to decline the call — recording continues uninterrupted. If the setting is off, or the decline fails, the handler dispatches `ACTION_PAUSE` to the service and sets `pausedForCall = true`.
 - **`OFFHOOK`.** Call answered or outgoing call started. If not already paused, the handler pauses and sets `pausedForCall = true`.
-- **`IDLE`.** Call ended. If `pausedForCall` is true, the handler dispatches `ACTION_RESUME` and clears the flag. If the recording was paused for another reason, `IDLE` does nothing.
+- **`IDLE`.** Call ended. If `pausedForCall` is true, the handler clears the flag but leaves the recording paused — there is no auto-resume, so the user resumes manually (auto-resume is deliberately avoided because it is unreliable across OEMs). If the recording was paused for another reason, `IDLE` does nothing.
 
 `CallStateHandler.reset()` is called from the service's stop and cancel paths so a fresh recording starts with `pausedForCall = false`.
 
@@ -21,13 +21,34 @@ Transitions:
 
 `SettingsRepository.blockCallsWhileRecording` is a boolean Flow surfaced in Recording settings as **Block calls while recording**. Requires `READ_PHONE_STATE` and typically `ANSWER_PHONE_CALLS` on newer OS versions. If either runtime permission is missing, `tryDeclineCall` returns `false` and the handler falls through to the pause path. Decline happens at the OS level via `TelecomManager.endCall()`; the caller hears whatever the carrier's decline behavior is.
 
+Enabling the toggle now actually **requests** `ANSWER_PHONE_CALLS`. Previously in V2 the toggle only saved the preference and requested nothing, so `CallStateHandler.tryDeclineCall()` failed its permission check every time and silently degraded to merely **pausing** — the setting looked on but did nothing. `V2AppSettingsScreen`'s block-calls `onCheckedChange` now, when switching **on** and on API 28\+ (`Build.VERSION_CODES.P`, the floor for `endCall()`), checks whether `ANSWER_PHONE_CALLS` is already held and launches the runtime permission request if not. Denial is acceptable — it degrades to pause-on-call, which still protects the take.
+
 ## Audio-focus loss
 
 The audio-focus policy differs by mode:
 
 - **Rolling** ignores `AUDIOFOCUS_LOSS`. The microphone keeps capturing — Rolling exists to preserve audio through interruptions, so pausing on focus loss would defeat the purpose.
-- **Manual** pauses on `AUDIOFOCUS_LOSS` and resumes on `AUDIOFOCUS_GAIN`.
+- **Manual** also keeps capturing through `AUDIOFOCUS_LOSS`. Focus loss is an output-arbitration signal — another app is making sound — not a loss of the microphone, so pausing would stop capture even though the mic was never taken. Manual never pauses for focus, so `AUDIOFOCUS_GAIN` has nothing to resume; Rolling uses `AUDIOFOCUS_GAIN` only as a secondary trigger to recover from a mic error that nulled the recorder.
 - Both modes ignore `AUDIOFOCUS_LOSS_TRANSIENT` and `AUDIOFOCUS_LOSS_TRANSIENT_CAN_DUCK`. Those are output-side directives that do not apply to a recorder.
+
+### Mic-failure recovery (Rolling)
+
+When the microphone fails unrecoverably, both recorder paths used to `currentFile?.delete(); releaseActiveRecorder()` in the Rolling branch — discarding real captured audio. `WavRecorder` only raises `captureError` after five failed `AudioRecord` re-inits, and `AacRecorder`'s `onError` fires after the stream is already written, so the file holds every sample captured before the glitch, up to a full segment.
+
+Both Rolling branches now call `recoverRollingSegmentAfterMicFailure(activeRecorder)`, which **saves** the partial by running it through the ordinary `finalizeCurrentSegment()` rotation path (duration probe, row insert, storage accounting) and then advancing `segmentIndex`, before starting fresh. It **bails** when `activeRecorder !== failedRecorder` — a concurrent scheduled `finalizeCurrentSegment()` on IO may already own the segment — and **re-asserts** that identity check after the suspension before releasing, so it never kills a freshly installed healthy recorder. The Manual branch is unchanged: it calls `stopRecording()`, saving the audio captured so far rather than spinning on a dead mic.
+
+### Recorder-leak fix on start failure
+
+Recorders are now started via the inline `AudioRecorder.startOrRelease { it.start(...) }` helper (previously `.also { it.start(...) }`). If `start()` throws, `startOrRelease` releases the half-started instance in place. Previously the throw left an orphan holding the microphone (`MediaRecorder` acquires it in `prepare()`, `AudioRecord` in `startRecording()`) because `activeRecorder` was never assigned, so a caller's `releaseActiveRecorder()` in its catch block acted on `null`. The rotation retry path (three attempts) could leak up to three recorders and leave recording broken until process death.
+
+## Rolling segment progress bar
+
+`SegmentProgressBar` (`ui/v2/screens/recording/V2RecordingScreen.kt`) no longer animates via `Animatable.animateTo(1f, tween(remainingMs))`. It now samples `System.currentTimeMillis()` at ~4 Hz (a 250 ms tick) into a `mutableFloatStateOf` fraction and reads the service-published `serviceState.segmentStartTimeMs`. The old tween had two defects:
+
+- Compose animation durations are multiplied by the system animator duration scale, so a sub-1× setting in Developer Options filled the bar in a fraction of the real multi-minute segment.
+- It was frame-driven, so it drifted whenever the composition was not animating, and it re-derived the segment start as `startTimeMs + index * duration` — which runs ahead of the real rotation.
+
+The new predicate mirrors `SegmentRotationManager` exactly: `now - segmentStartMs >= segmentDurationMs`, with **no** `totalPausedMs` term (rotation subtracts none either), so the bar cannot disagree with the event it is predicting. It holds in place while paused. This consumes the `segmentStartTimeMs` field the service now publishes — see [Recording foreground service](/rollingrecord/app/recording/recording-service).
 
 ## OS kills
 
@@ -57,7 +78,7 @@ Auto-resume of capture is deliberately not attempted. For Rolling, the user taps
 Interruption outcomes reach the user through four channels, chosen to fit the situation:
 
 - **Modal sheet.** `V2RecordingInterruptedSheet` for the after-kill outcome. Waits out App Lock.
-- **Ongoing notifications.** `recording_urgent` fires for hard stops — battery too low, device storage full, protected storage full. `recording_alerts` fires for the mid-range battery warning (15%..20% band) and storage-limit updates.
+- **Ongoing notifications.** `recording_urgent` fires for battery events — the battery-too-low hard stop and the mid-range battery warning. `recording_alerts` fires for storage alerts — device storage full, protected storage full, and storage-limit updates.
 - **Home screen state.** `HomeViewModel` and `V2RecordingViewModel` observe `RecordingService.state` and update the UI so the user sees the current mode, elapsed time, and paused status without a modal.
 - **One-shot flows.** `RecordingService.batteryTooLow`, `deviceStorageTooLow`, `storageLimitResult`, and `continueSessionFailed` are collected by the Home / recording screens for snackbars.
 

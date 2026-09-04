@@ -1,9 +1,9 @@
 ---
 title: "Result Files & Analytics"
-description: "The per-run results JSON, the l_eval_run analytics row, and the on-device results file."
+description: "The per-run results JSON and the l_eval_run analytics row."
 ---
 
-Each run writes a per-run results JSON to disk and upserts one analytics row that tracks the run's lifecycle. The on-device eval port writes an equivalent JSON to device storage for parity checking.
+Each run writes a per-run results JSON to disk and upserts one analytics row that tracks the run's lifecycle.
 
 ## The per-run results JSON
 
@@ -59,10 +59,6 @@ The payload carries run identity, status, git context, the case counts, the pass
 </Note>
 
 The lifecycle is `running` on open, then `completed`, `aborted`, or `failed` on finalize, with retry on the finalizing upsert.
-
-## The on-device results file
-
-The in-app eval port writes the same shape to the device. `ResultWriter` (`app/app/src/debug/java/com/intuisoftllc/rollingrecord/evalmode/results/ResultWriter.kt`) serializes a completed run to `{getExternalFilesDir}/evals/results/<yyyy-MM-dd>/<uuid>.json` — output-only, adb-pullable, with per-case rows carrying id / suite / status / verdict / reason so a device run can be diffed against the Python results in the parity gate. See [On-device results UI](/rollingrecord/evals/on-device/results-ui).
 
 ## Where to go next
 

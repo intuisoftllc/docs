@@ -19,17 +19,26 @@ From the player, `V2PlaybackViewModel.startContinueRecording()` (`ui/v2/screens/
 
 On a fresh merge it calls `AudioMerger.merge`, replaces the original audio in place (invalidate cache → delete → rename temp), writes a durable `.merge_sentinel`, then `finalizeMergedState` (idempotent): read the true duration via `MediaMetadataRetriever`, `markRecordingForReupload` + `updateRecordingDurationAndSize`, delete the stale transcript, and clean up caches, the continuation file, and the sentinel. Two more steps run **only** on the fresh-merge path (not on resume, to stay idempotent): `applyMarksToMerged` (rebases continuation marks) and `applyPostMergeSideEffects` (`touchRecording`, `touchCategory`, waveform re-extract, and `reTranscribe` when auto-transcribe is on).
 
+Post-merge `reTranscribe` is additionally tier-gated: it reads `EntitlementRepository.currentTier` (defaulting to `UserTier.FREE` on failure) and returns early unless `tier.atLeast(UserTier.PRO_CLOUD)`, checked BEFORE `createOrResetProcessing` so a server-side refusal can't leave the transcript row stuck in `PROCESSING`. This mirrors `RecordingService.enqueueTranscriptionWork`; the `autoTranscribe` flag outlives a downgrade, so re-checking the live tier here is required.
+
+`finalizeMergedState`'s `markRecordingForReupload` pairs with a wire-transform guard: `RecordingTransform.applyPulledRecording` (`data/sync/transform/RecordingTransform.kt`) now qualifies its `staleLocalBlob` check with an added `existing.cloudBackupCommittedAt != null` condition. A row just marked for re-upload — its `cloudBackupCommittedAt` nulled right after a continue-merge — is NOT a stale cross-device blob; its local file is the newest copy. Previously the null local commit coalesced to `0`, so any non-null server `cloud_backup_committed_at` read as "a newer blob exists elsewhere" and blanked the freshly-merged local recording.
+
 ### Resume safety and outcomes
 
 A partial prior run is detected by a `.merge_sentinel` file or an original file larger than the DB size by more than `SIZE_TOLERANCE_BYTES = 1024` — either signals the rename happened but the DB didn't catch up, so the worker runs finalization only and skips the merge and mark-rebase.
+
+A third resume case is a **merged temp left by a run that died between writing the temp and renaming it into place**. It is found by PREFIX match on `"${originalFile.name}.merge_tmp."` (`listFiles`, newest non-empty file) rather than by reconstructing the exact name — the temp extension is chosen by a fallback chain (`originalFile.extension → newFormat → "m4a"`), so reconstruction would miss an extension-less original. When such a temp exists, there is no `.merge_sentinel`, and the original does not already appear merged, the worker renames the temp into place, writes the sentinel, runs `finalizeMergedState`, and returns `Result.success()` — re-merging would needlessly re-encode, or run against an original a pre-fix build had already deleted. If that rename fails it leaves the temp intact and falls through to a normal merge.
 
 | Situation | Detection | Result |
 | --- | --- | --- |
 | Fresh merge succeeds | no sentinel, continuation exists | `AudioMerger.merge` → replace original in place, write sentinel, finalize, rebase marks, side effects |
 | Partial prior run | `.merge_sentinel` exists **or** original larger than DB size + 1 KB | finalize-only (idempotent); skip merge + mark-rebase |
+| Interrupted swap left a merged temp | `<original>.merge_tmp.*` present, no sentinel, original not oversized | rename temp into place → sentinel → finalize-only (falls through to a fresh merge if the rename fails) |
 | Original deleted before merge | `getRecordingById == null` | save continuation as standalone `Recording` (marks stay continuation-relative) |
 | Merge fails ≤ 3× | `AudioMerger.merge` false or rename fails | `Result.retry()` (exponential backoff, 30 s) |
 | Merge fails 3× | `runAttemptCount ≥ 3` | `permanentFallback` → standalone `Recording` (audio never lost) |
+
+On the out-of-retries `permanentFallback` after a failed temp→original swap, the leftover merged temp is deleted (`tempFile.takeIf { it.exists() }?.delete()`) before the standalone save — it lives in the recordings directory, not `cacheDir`, where the startup scan would otherwise import it as a spurious library entry.
 
 ## Mark rebasing
 

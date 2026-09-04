@@ -36,6 +36,7 @@ One row per user, holding `dek_ct` + `dek_iv` + `kek_version` (all `NOT NULL`, w
 | --- | --- | --- |
 | `canonical_users` | Losing one row CASCADEs away that user's whole dataset | That cascade is the *designed* account-deletion behavior; mass loss recovers from the auth provider + PITR |
 | `lifetime_entitlements` | Loss means founders / admin grants must be re-claimed | Reconstructable from RevenueCat + Play/App Store receipts; RC is the enforcement layer, this is an intent ledger |
+| `bug_reports` | User-attributable rows with an optional attached log blob | Deliberately **not** high-risk (`supabase/migrations/20260817120000_bug_reports.sql`): a lifecycle work-item with no crypto columns; its merged log lives in the private `bug-logs` bucket and is removed by the `AFTER DELETE` trigger plus `delete-user`'s folder wipe. The content is diagnostic, not irreplaceable user data, so loss has an engineering / re-file recovery path |
 
 ## Protections in force
 
@@ -43,7 +44,7 @@ One row per user, holding `dek_ct` + `dek_iv` + `kek_version` (all `NOT NULL`, w
 - **FK + CASCADE** to `canonical_users` on both tables, so account deletion is clean.
 - **Belt-and-suspenders wipe**: `wipeUser()` lists both `user_crypto` and `c_recordings` in `TABLES_TO_WIPE`, and `audio-storage` / `embedding-storage` / `transcribe-inbox` in `BUCKETS_TO_WIPE` — Storage objects never CASCADE, so the bucket wipe is what removes the ciphertext blobs.
 - **PITR** on production Supabase, 14-day retention (RR-287). A daily off-platform encrypted backup is noted in the registry as pending — not yet a guaranteed second copy.
-- **`subscription_lapse_cleanup`**: 30 days after `subscription_lapsed_at`, this daily sweeper deletes the user's `audio-storage` objects and tombstones every `c_*` row — `canonical_users`, `user_crypto`, and the audit logs deliberately survive.
+- **`subscription_lapse_cleanup`**: once `cloud_grace_started_at` (renamed from `subscription_lapsed_at` in `supabase/migrations/20260825120000_cloud_grace_window.sql`) is older than `server_config.cloud_grace_days` (default 30), the daily `04:07` UTC sweeper **HARD-DELETEs** all 13 `c_*` tables plus `user_blueprints`, hands the audio blobs to `storage-janitor`, zeroes `user_storage_usage`, clears the grace pair, and stamps `canonical_users.cloud_wiped_at`; `canonical_users`, `user_crypto`, and the audit logs survive. It deliberately does **not** tombstone — a tombstone means "the user deleted this" and would propagate to their devices and wipe their local libraries — so there is **no support restore** after it runs (`support_ops_restore_tombstones` no longer applies); returning devices re-upload via `sync-pull`'s `cloud_reset` status (`supabase/migrations/20260824120000_lapse_cloud_reset.sql`). It is now a sanctioned hard-DELETE caller on `c_recordings` — see [c_recordings integrity](/rollingrecord/backend/database/c-recordings-integrity).
 
 ## Adding a new high-risk table
 

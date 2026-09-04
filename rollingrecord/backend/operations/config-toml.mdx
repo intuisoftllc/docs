@@ -7,13 +7,17 @@ description: "How every Edge Function is declared with verify_jwt = false, why, 
 
 ## `verify_jwt = false` on every function
 
-`config.toml` (path relative to `supabase/`) holds 29 `[functions.<name>]` blocks, and all 29 set `verify_jwt = false`. No function sets it `true`. Disabling the platform check is what lets `runGates()` (`functions/_shared/gates/`) perform the app's own admission chain — App Check, app-version floor, auth, entitlement, rate limit — rather than having Supabase reject a request before any of that code runs. The rationale is stated once in a header comment above `[functions.resolve-identity]`:
+`config.toml` (path relative to `supabase/`) holds 32 `[functions.<name>]` blocks, and all 32 set `verify_jwt = false`. Omitting the block is **not** neutral: a function directory with no `[functions.<name>]` entry silently inherits `verify_jwt = true`, which rejects a Clerk-signed Bearer token before `runGates()` ever runs — the exact bug the newly-added `bug-report` and `recovery-code-generate` blocks fix. Disabling the platform check is what lets `runGates()` (`functions/_shared/gates/`) perform the app's own admission chain — App Check, app-version floor, auth, entitlement, rate limit — rather than having Supabase reject a request before any of that code runs. The rationale is stated once in a header comment above `[functions.resolve-identity]`:
 
 > `verify_jwt = false` disables Supabase's built-in JWT verification — we perform our own auth using Firebase App Check (and RevenueCat for user-scoped endpoints), so Supabase's JWT check would block legitimate requests before our code runs.
 
 <Note>
 That header comment predates the Clerk auth migration. User-facing endpoints today verify a **Clerk** Bearer JWT (`functions/_shared/gates/jwt.ts`) in addition to App Check; RevenueCat is used for the entitlement fetch, not for JWT verification. The comment names App Check and RevenueCat but not Clerk.
 </Note>
+
+<Warning>
+The default is the trap. A brand-new `AuthMode.Jwt` function with no `[functions.<name>]` block does **not** run open — it inherits Supabase's built-in `verify_jwt = true` and rejects the Clerk-signed Bearer token before any gate runs, because Supabase cannot validate a Clerk JWT. `recovery-code-generate` did exactly this until this commit declared its block; the `bug-report` block carries the same rationale comment. Every function directory must have an explicit `verify_jwt = false` block — its absence is a silent auth outage, not a safe fallback.
+</Warning>
 
 The replacement auth is **not** uniform. Only user-facing endpoints run a Clerk-JWT check. Webhooks and server-to-server callers authenticate with a shared bearer secret or an HMAC signature — the second column below names each one. See [Environment Variables & Secrets](/rollingrecord/backend/operations/env-and-secrets) for the secret values and [Gates](/rollingrecord/backend/gates/run-gates) for the chain itself.
 
@@ -26,6 +30,7 @@ The replacement auth is **not** uniform. Only user-facing endpoints run a Clerk-
 | `revenuecat-webhook` | `REVENUECAT_WEBHOOK_SECRET` | `OPT-OUT: skipAppCheck + skipAppVersion` — RC server-to-server |
 | `clerk-webhook` | Svix HMAC-SHA256 (`CLERK_WEBHOOK_SECRET`) | RR-446; `user.deleted` only |
 | `assemblyai-webhook` | `ASSEMBLYAI_WEBHOOK_SECRET` | transcription completion callback |
+| `notifications` | `NOTIFICATIONS_SECRET` (WebhookSecret) | 2026-08-24; the one generic outbound-email dispatcher, server-to-server only, invoked by `pg_cron` (cloud-wipe warnings); dedicated secret, not the service-role key |
 | `storage-janitor` | `STORAGE_JANITOR_SECRET` | service-role only; called by `pg_cron` `net.http_post` |
 | `storage-orphan-lister` | `STORAGE_JANITOR_SECRET` | single orphan-blob discovery sweep across all three buckets |
 | `extract-submit` | Clerk JWT | RR-499 / RR-503; inline sealed payload |
@@ -36,6 +41,8 @@ The replacement auth is **not** uniform. Only user-facing endpoints run a Clerk-
 | `set-user-pin` | Clerk JWT | RR-492 App Lock PIN write |
 | `account-otp` | Clerk JWT | RR-492 App Lock email OTP |
 | `user-sync-preferences` | Clerk JWT | sync toggles |
+| `bug-report` | Clerk JWT | user bug submission; no entitlement gate (Free on every tier); per-op rate limit via the `bug_report` bucket (10/hour) with `abuseEventOnReject: bug_report_flood` |
+| `recovery-code-generate` | Clerk JWT | RR-315 one-shot recovery-code generate; block newly **declared** this commit — it had been silently inheriting `verify_jwt = true`. Note: `config.toml`'s comment on the `[functions.recovery-code]` block marks this function **superseded by `recovery-code`** and slated for deletion from both branches before next deploy — declaring the block fixed its auth inheritance in the interim, but it is not a long-term supported endpoint |
 | `sync-pull` | Clerk JWT | RR-237 |
 | `sync-reserve` | Clerk JWT | storage reservation |
 | `sync-push` | Clerk JWT | RR-238 |
@@ -49,10 +56,10 @@ The replacement auth is **not** uniform. Only user-facing endpoints run a Clerk-
 | `indexing` | Clerk JWT | RR-487 document-chunk embeddings / reconciler / backfill |
 | `analytics` | `ANALYTICS_INGEST_SECRET` | RR-108 eval-harness ingest |
 
-Several blocks carry their own per-block rationale comment beyond the shared header — `clerk-webhook` (Svix HMAC), `assemblyai-webhook` (shared secret), `extract-runner` / `extract-submit` (service-to-service), the `storage-janitor` / `storage-orphan-lister` consolidation (2026-07-31), `search` / `indexing` (RR-487), `analytics` (RR-108), and `set-user-pin` / `account-otp` / `recovery-code` (RR-492 / RR-315).
+Several blocks carry their own per-block rationale comment beyond the shared header — `clerk-webhook` (Svix HMAC), `assemblyai-webhook` (shared secret), `notifications` (dedicated `NOTIFICATIONS_SECRET`, 2026-08-24), `extract-runner` / `extract-submit` (service-to-service), the `storage-janitor` / `storage-orphan-lister` consolidation (2026-07-31), `search` / `indexing` (RR-487), `analytics` (RR-108), `bug-report` and `recovery-code-generate` (the omission-inherits-`true` trap), and `set-user-pin` / `account-otp` / `recovery-code` (RR-492 / RR-315).
 
 <Note>
-Two function directories have **no** `config.toml` entry: `functions/transcribe-drain` (driven by `Deno.cron`, never externally invoked) and `functions/recovery-code-generate` (superseded by `recovery-code`; the `config.toml` comment states the old function should be deleted from both Supabase branches before the next deploy).
+One function directory has **no** `config.toml` entry: `functions/transcribe-drain`, which is driven by `Deno.cron` and has no external HTTP surface, so the platform's `verify_jwt` default never affects it. `functions/recovery-code-generate` used to be undeclared too — this commit added its block, because it is an `AuthMode.Jwt` function that had been silently inheriting `verify_jwt = true` and rejecting Clerk tokens. It is, however, superseded: the comment on the `[functions.recovery-code]` block states `recovery-code-generate` "has been superseded by this one and should be deleted from both Supabase branches before next deploy," so the block declaration is a stopgap for a function on its way out, not an endorsement of a supported endpoint.
 </Note>
 
 ## Local-dev CLI configuration
@@ -77,6 +84,8 @@ The rest of `config.toml` is the standard Supabase CLI local-development configu
 | `sweep_extraction_jobs_ttl` | `20 * * * *` | `sweep_extraction_jobs_ttl()` | `20260720170000_extraction_sweepers.sql` |
 | `extract-runner-tick` | `* * * * *` | `extract-runner` Edge Function via `net.http_post` | `20260720180000_extraction_runner_cron.sql` (re-scheduled by `20260721020000_extract_runner_dedicated_secret.sql`) |
 | `storage_orphan_lister` | `23 * * * *` | `storage-orphan-lister` Edge Function via `net.http_post` | `20260731150000_storage_janitor_cutover.sql` |
+| `notify-cloud-wipe-7d` | `10 5 * * *` | `notifications` Edge Function via `net.http_post` (`cloud_wipe_warning`, `days_before: 7`) | `20260824130000_notification_sent_log.sql` |
+| `notify-cloud-wipe-1d` | `20 5 * * *` | `notifications` Edge Function via `net.http_post` (`cloud_wipe_warning`, `days_before: 1`) | `20260824130000_notification_sent_log.sql` |
 | `transcribe-drain` | `* * * * *` (`Deno.cron`) | `runDrain()` every minute | `functions/transcribe-drain/index.ts` |
 
 ## Where to go next

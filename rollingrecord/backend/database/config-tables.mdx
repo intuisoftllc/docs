@@ -25,7 +25,28 @@ RLS is enabled with no policies. Edge Functions read it through `getServerConfig
 | `getBool(key, fallback)` | `raw === "true"` | Feature flags, kill switches |
 | `getString(key, fallback)` | raw | Model names, string config |
 
-`getServerConfigMap()` fetches the whole table once and caches it for 5 minutes per warm instance, failing loud (throwing) on a DB error so a config read can't silently return stale zeros. As of RR-164, `server_config` no longer exposes an enforced `allowed_models` allowlist — `getAllowedModels()` was removed and each operation reads its own model key directly (e.g. `extraction_model`, `kb_query_model`).
+`getServerConfigMap()` fetches the whole table once and caches it for 5 minutes per warm instance, failing loud (throwing) on a DB error so a config read can't silently return stale zeros. Concurrent callers within one request share a single query: it also holds the in-flight fetch **promise** (`inFlight` in `supabase/functions/_shared/db/server-config.ts`), so gate callers that all arrive before the first fetch resolves join it instead of each firing their own — production logs had shown six full-table `server_config` reads inside 3ms on one request while the 5-minute cache was working exactly as written. The promise is cleared in a `finally`, so a rejected fetch is never cached and the next caller retries against the DB. As of RR-164, `server_config` no longer exposes an enforced `allowed_models` allowlist — `getAllowedModels()` was removed and each operation reads its own model key directly (e.g. `extraction_model`, `kb_query_model`).
+
+### The single config store
+
+`server_config` is the single server-authoritative config store since Firebase Remote Config was retired (Firebase moved Remote Config to per-user billing). `supabase/migrations/20260830120000_firebase_rc_to_server_config.sql` folds RC's surviving client-read knobs into eight new `public = true` rows, each read by the Android client through `ServerConfigManager` and mirrored by a `KEY_*` constant in `ServerConfig.kt` — `ServerConfigDriftSmokeTest` enforces exact parity between `public = true` rows and those mirrors.
+
+| Key | Value | Client read |
+| --- | --- | --- |
+| `kb_chat_max_history_pairs` | `15` | Prior Q/A pairs included in KB-chat history sent to Claude |
+| `ai_chat_max_transcript_snippets` | `6` | Max recordings the AI retrieves transcript snippets from per turn |
+| `topic_search_threshold` | `0.30` | Min cosine-similarity floor for Topic search |
+| `section_semantic_threshold` | `0.32` | Min cosine-similarity floor for per-section KB search |
+| `semantic_search_margin` | `0.02` | Rank-aware margin: results within this of the top score are kept |
+| `semantic_search_result_cap` | `8` | Max results from margin-filtered semantic search |
+| `semantic_snippet_chunk_count` | `3` | Transcript chunks the snippet tool returns per recording |
+| `blueprint_moderation_enabled` | `true` | Master enable for the on-device blueprint content-moderation pipeline |
+
+The same migration **renames** `template_moderation_enabled` → `blueprint_moderation_enabled` (`template` is the feature's retired name). A ninth `public = true` row, `cloud_grace_days` (`30`, `supabase/migrations/20260825120000_cloud_grace_window.sql`), is the single dial for the cloud-data retention window — read by `subscription_lapse_cleanup()`, by the 7-day / 1-day `cloud_wipe_warning` emails, and by the client's grace-banner countdown — replacing a value formerly hard-coded in three places.
+
+### Private rows read only by SQL
+
+`bug_report_retention_days` (`90`, drives `prune_closed_bug_reports`) and `bug_report_stale_days` (`60`, drives `mark_stale_bug_reports`) are `public = false`. Both were first inserted (`supabase/migrations/20260817160000_bug_report_triage.sql`, `supabase/migrations/20260817200000_bug_report_stale_status.sql`) **without** naming the `public` column, so they defaulted to `true` and were wrongly served to clients — failing `ServerConfigDriftSmokeTest`, which flags any public row lacking a `ServerConfig.kt` mirror. `supabase/migrations/20260824140000_bug_report_config_private.sql` `UPDATE`s both to `public = false`. The teaching point: the `public` flag governs **only** what the client-facing `server-config` endpoint exposes. A `pg_cron` SQL read (`prune_closed_bug_reports` / `mark_stale_bug_reports`) never consults `public` at all, so these knobs stay readable by the sweepers while hidden from clients.
 
 ## `rate_limit_config`
 

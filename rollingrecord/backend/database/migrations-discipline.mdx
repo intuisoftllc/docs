@@ -18,7 +18,7 @@ Every schema change is a migration file under `supabase/migrations/` — never t
 
 ## The baseline
 
-The applied chain starts from `supabase/migrations/20260508000000_baseline.sql`, a squashed `pg_dump` (~4958 lines) that every later migration builds on — all tables, functions, triggers, indexes, FKs, and per-table `ENABLE ROW LEVEL SECURITY`. There are 114 migration files under `supabase/migrations/` (the baseline plus 113 incremental, timestamp-prefixed `YYYYMMDDHHMMSS`). A sibling `supabase/migrations_archive/` holds ~115 pre-baseline / never-applied files kept for reference — those are **not** part of the applied chain.
+The applied chain starts from `supabase/migrations/20260508000000_baseline.sql`, a squashed `pg_dump` (~4958 lines) that every later migration builds on — all tables, functions, triggers, indexes, FKs, and per-table `ENABLE ROW LEVEL SECURITY`. There are 125 migration files under `supabase/migrations/` (the baseline plus 124 incremental, timestamp-prefixed `YYYYMMDDHHMMSS`); the *Sync To Main* squash added 11 of them. A sibling `supabase/migrations_archive/` holds ~115 pre-baseline / never-applied files kept for reference — those are **not** part of the applied chain.
 
 ## RLS on create
 
@@ -39,6 +39,10 @@ A migration that has pushed to `develop` has already run on the preview DB; edit
 ## Index names
 
 The Room-style `index_{table}_{column}` auto-generated format is a client-side (Room) concern. Postgres index names in these migrations follow their own `idx_*` convention (e.g. `idx_c_recordings_sync`) — keep the two rules separate; the Room index-name-matching rule does not apply to the Supabase migrations.
+
+## The write-boundary text guard
+
+Schema discipline has a runtime companion: every caller-supplied string written to a Postgres `TEXT` column must first pass through `sanitizeDbText` / `sanitizeDbTextOrNull` (`supabase/functions/_shared/text/db-text.ts`), run **before** any length check. The guard strips `U+0000` plus the rest of the C0 controls and `DEL` (keeping `\t` and `\n`), strips bidi overrides (`U+202A`–`U+202E`, `U+2066`–`U+2069`), normalizes CRLF → LF, and trims. The reason is concrete: Postgres `TEXT` cannot store `U+0000`, so a single NUL anywhere in a name, note, or reason rejects the whole `INSERT` with no meaningful error, and the user loses what they were saving. This is a pure, no-DB guard applied at the write boundary — not SQL escaping (writes go through PostgREST with bound parameters) and not validation (length, required-ness, and allowed values remain each caller's business).
 
 ## Related pages
 

@@ -50,8 +50,10 @@ Clearing the PIN is a security-control removal, so it is gated on a single-use O
 
 Two components cooperate, sharing one error mapping so the user-vs-system cancel distinction can never drift.
 
-- `BiometricHelper` (`data/applock/BiometricHelper.kt`) — a one-shot suspend prompt used by the Security screen's enable-confirm. `isAvailable(context)` checks for an enrolled `BIOMETRIC_STRONG` or `BIOMETRIC_WEAK`. A single non-matching read does not resolve; the system sheet stays up for a retry.
-- `AppLockBiometricGate` (`data/applock/AppLockBiometricGate.kt`) — the lock overlay's biometric path. It is **one** long-lived `BiometricPrompt` created in `MainActivity.onCreate` via `install(activity)` and reused for every unlock (companion `current`). This is load-bearing: androidx `BiometricPrompt` is designed around a single early-created instance, and `authenticate()` called while the FragmentManager state is saved is a silent no-op. The gate queues launches made before `RESUMED` and fires them at `ON_RESUME`; `authenticate(onResult)` is idempotent while in-flight (a repeat request only re-points the callback, never relaunches), and `cancel()` abandons a showing or queued prompt with no result.
+- `BiometricHelper` (`data/applock/BiometricHelper.kt`) — a thin suspend **adapter** over `AppLockBiometricGate`; it constructs no `BiometricPrompt` of its own. Its `authenticate` dropped the `activity: FragmentActivity` parameter and is now `authenticate(title, subtitle): BiometricAuthResult`, delegating to `AppLockBiometricGate.current.authenticate(...)` with `userInitiated = true` (every caller is reacting to a tap). When no gate is installed (`current == null`), it resolves `SystemCancelled`. `isAvailable(context)` checks for an enrolled `BIOMETRIC_STRONG` or `BIOMETRIC_WEAK`. The Security screen's enable-confirm caller (`ui/v2/screens/security/V2SecurityScreen.kt`) was updated to drop the `context as FragmentActivity` cast and just call `BiometricHelper.authenticate(title, subtitle)`.
+- `AppLockBiometricGate` (`data/applock/AppLockBiometricGate.kt`) — the lock overlay's biometric path. It is **one** long-lived `BiometricPrompt` created in `MainActivity.onCreate` via `install(activity)` and reused for every unlock (companion `current`). The load-bearing invariant is about **construction**, not concurrency: exactly one `BiometricPrompt` may be constructed per activity, in the gate. A second `BiometricPrompt(activity, …)` anywhere resolves the activity-scoped `BiometricViewModel` and overwrites the gate's callback slot **permanently** — so unlocking fails silently: the sheet shows, the finger is accepted, and the result is dropped into a dead no-op callback with nothing logged (androidx's `getClientCallback()` hands back an empty callback rather than failing). This is enforced by `SingleBiometricPromptTest` (`data/applock/SingleBiometricPromptTest.kt`), a source-scan asserting only `AppLockBiometricGate.kt` may contain `BiometricPrompt(`. androidx also makes `authenticate()` a silent no-op while the FragmentManager state is saved, so the gate queues launches made before `RESUMED` and fires them at `ON_RESUME`.
+
+  `authenticate(onResult, userInitiated, title, subtitle)` now carries the request's own strings (defaulting to the overlay wording) and a `userInitiated` flag. Its in-flight behavior is conditional: a **non-user-initiated** reconciler re-fire only re-points the callback (never relaunches — relaunching a showing prompt caused a supersede storm that dropped a genuine success), but a `userInitiated = true` request **or** an in-flight age greater than `STALE_IN_FLIGHT_MS = 60_000L` (tracked via `inFlightSinceMs`) is treated as a dropped/stale launch and **relaunches**. A user tap is proof no sheet is up, and the stale timeout covers a launch androidx accepted then dropped in the saved-state window — either way the gate self-heals instead of staying dead until force-close. `cancel()` abandons a showing or queued prompt with no result.
 
 `mapBiometricError` classifies the terminal outcome:
 
@@ -59,7 +61,7 @@ Two components cooperate, sharing one error mapping so the user-vs-system cancel
 | --- | --- | --- |
 | `Success` | Authenticated | Unlock |
 | `Cancelled` | User dismissed the sheet (Cancel / back / negative button) | Fall back to PIN silently; do **not** re-prompt |
-| `SystemCancelled` | Framework killed the prompt (pre-`RESUMED` launch, keyguard race, sensor stolen) | Retryable — the overlay re-arms its auto-prompt, capped at 3 per foreground stint |
+| `SystemCancelled` | Framework killed the prompt (pre-`RESUMED` launch, keyguard-dismiss race), or `BiometricHelper.authenticate` found no gate installed (`AppLockBiometricGate.current == null`) | Retryable — the overlay re-arms its auto-prompt, capped at 3 per foreground stint |
 | `Error(message)` | Genuine failure (lockout, hardware) | Show the system message |
 
 ## Lockout backoff: `PinLockoutPolicy`
@@ -88,7 +90,7 @@ Two components cooperate, sharing one error mapping so the user-vs-system cancel
 | --- | --- | --- |
 | `app_lock_enabled` | Boolean | Master toggle (also the sole lock signal) |
 | `app_lock_biometric_enabled` | Boolean | Device-specific biometric preference |
-| `app_lock_auto_lock_ms` | Long | Auto-lock delay (`DEFAULT_APP_LOCK_AUTO_LOCK_MS = 60000`) |
+| `app_lock_auto_lock_ms` | Long | Auto-lock delay (`DEFAULT_APP_LOCK_AUTO_LOCK_MS = 600000`, 10 minutes) |
 | `app_lock_pin_ct` / `app_lock_pin_iv` | String | Base64 verifier (exposed as `appLockPinVerifier: Pair(ct, iv)?`) |
 | `app_lock_failed_attempts` | Int | Running wrong-PIN count |
 | `app_lock_pin_pending_sync` | Boolean | A local change not yet pushed to the server |

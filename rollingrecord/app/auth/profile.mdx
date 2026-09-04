@@ -9,6 +9,8 @@ The V2 Account screen renders and edits the signed-in user's identity — name a
 
 `V2AccountScreen` (`ui/v2/screens/account/V2AccountScreen.kt`) is the Accounts-tab root (Figma node 1809:62941). It composes the avatar (with a camera-overlay badge and busy spinner), a name/email/sync card, a "Manage" nav section, and a header with a red logout icon. On every `ON_RESUME` it calls `viewModel.refreshProfile()`, which pulls a fresh Clerk user so a profile edit made elsewhere shows up.
 
+The "Manage" section's **System Status** row is now handled in-screen: `V2AccountScreen`'s `onOpenSystemStatus` callback param was removed, and the row launches `BuildConfig.STATUS_URL` (release → `status.rollingrecord.ai`; debug / releaseDev → the BetterUptime dev URL) via an `ACTION_VIEW` intent with `FLAG_ACTIVITY_NEW_TASK`, falling back to an `account_system_status_no_browser` snackbar when no browser can open it — it was previously an unwired `= {}` no-op that ate every tap.
+
 `V2AccountViewModel` (`ui/v2/screens/account/V2AccountViewModel.kt`) combines five flows — `AuthRepository.authState`, `SyncEngine.state`, the effective tier, `AccountHealthProvider.health`, and the cached profile — into a single `AccountUiState`. During `AuthState.Loading` (cold start), it falls back field-by-field to the cached `CachedUserProfile` so the screen never shows a blank card. It owns the photo pipeline as a delegate named `photo`.
 
 `AccountUiState` fields:
@@ -24,7 +26,7 @@ The V2 Account screen renders and edits the signed-in user's identity — name a
 | `showSyncTime` | The sync element renders only for `PRO_CLOUD`+ (cloud tiers have a surface to sync). |
 | `accountHealth` | Worst-case client-derived health; drives a glance-only status dot next to the name. |
 
-`AccountMessage` is a one-shot snackbar enum for outcomes the screen must explain: `SYNC_FAILED`, `SYNC_WIFI_ONLY_BLOCKED`, `SIGN_OUT_OFFLINE`, `SIGN_OUT_FAILED`. Tapping the card fires `syncNow()` (which both `reloadUser()`s the Clerk profile and runs `SyncEngine.sync()`); tapping the bold name or edit icon opens the change-name dialog.
+`AccountMessage` is a one-shot snackbar enum for outcomes the screen must explain: `SYNC_FAILED`, `SYNC_OFFLINE`, `SYNC_WIFI_ONLY_BLOCKED`, `SIGN_OUT_OFFLINE`, `SIGN_OUT_FAILED`. Tapping the card fires `syncNow()`, which now **always** runs the work — `reloadUser(force = true)` past its self-throttle and `SyncEngine.sync(force = true)` past the RR-468 cooldown — so the user is never left tapping into a silent cache window. An offline tap emits `SYNC_OFFLINE` immediately (via `ConnectivityMonitor.isOnlineNow()`) instead of spinning silently; because `SyncEngine.sync()` swallows push/pull failures into its state and never throws, failure is detected from the POST-RUN state (`lastError != null && lastSuccessAt != lastAttemptAt`), not from `onFailure`. Tapping the bold name or edit icon opens the change-name dialog.
 
 ## Editing the name
 
@@ -32,13 +34,15 @@ Name editing is deliberately split into **two** fields. `V2EditNameDialog` (`ui/
 
 The save is **awaited**, not fire-and-forget. `V2AccountViewModel.updateName(first, last)` is `suspend` and returns `Result<Unit>`; the dialog shows a spinner while it runs, then closes on success or keeps the sheet open with an inline error on failure. On success it calls `reloadUser()` so the new name reflects immediately.
 
+The dialog distinguishes a validation failure from a network failure. A name with no letters in it (emoji / punctuation / digits only) trips the repository's `require()` and throws `IllegalArgumentException` **before** any network call, so the dialog shows `account_edit_name_invalid` ("Your name needs at least one letter.") instead of the generic connection error `account_edit_name_error`. The dialog's `Column` is also `verticalScroll`-wrapped now, so a keyboard-up sheet scrolls rather than squishing the Cancel/Save row.
+
 Sanitization happens one layer down, inside `AuthRepository.updateName` (`data/auth/AuthRepository.kt`) — **not** in the dialog. Each part is passed through `DisplayNameSanitizer.sanitize` (`util/DisplayNameSanitizer.kt`); a part that is blank after sanitization is written as `null` so Clerk clears it, and at least one of the two must survive. `updateName` is preferred over the older `updateDisplayName`, which joins the two parts and re-splits at the first space (re-bucketing "Mary Jane" / "Van Der Berg").
 
 `DisplayNameSanitizer` NFC-normalizes, replaces embedded `\r\n\t` with spaces, strips control / format / private-use / surrogate / unassigned / line-separator / paragraph-separator categories plus an explicit set of bidi and zero-width codepoints, then trims and collapses whitespace runs. It does **not** block profanity, non-Latin scripts, or emoji, and does **not** enforce length — the 50-char cap is the dialog's job.
 
 ## The profile photo pipeline
 
-The photo pipeline is driven by `ProfilePhotoController` (`ui/v2/screens/account/photo/ProfilePhotoController.kt`) — not a ViewModel, but a delegate the account VM owns, constructed with `viewModelScope`, the `AuthRepository`, and the app `Context`. It exposes `isBusy: StateFlow<Boolean>` (drives the avatar spinner and guards against double-taps) and `errors: SharedFlow<ProfilePhotoError>`. Each of `uploadFromGallery(uri)`, `uploadFromCamera()`, and `removePhoto()` no-ops while busy and always cleans up temp files.
+The photo pipeline is driven by `ProfilePhotoController` (`ui/v2/screens/account/photo/ProfilePhotoController.kt`) — not a ViewModel, but a delegate the account VM owns, constructed with `viewModelScope`, the `AuthRepository`, and the app `Context`. It exposes `isBusy: StateFlow<Boolean>` (drives the avatar spinner and guards against double-taps) and `errors: SharedFlow<ProfilePhotoError>`. Each of `uploadFromGallery(uri)`, `uploadFromCamera()`, and `removePhoto()` no-ops while busy and always cleans up temp files. All three now rethrow `CancellationException` before their generic catch, so scope death (session teardown) is no longer misreported as an upload/removal failure. It also exposes `reportCaptureFailed()`, which the screen calls when the camera capture file couldn't even be prepared — it logs and emits `ProfilePhotoError.UPLOAD_FAILED` so a camera-setup failure shows the same generic snackbar instead of crashing (as it previously did).
 
 `ProfilePhotoError` is a coarse, content-free failure enum mapped to snackbar strings — `READ_FAILED`, `COMPRESS_FAILED`, `UPLOAD_FAILED`, `REMOVE_FAILED` — and never carries the picked image or its path.
 
@@ -53,13 +57,13 @@ All file plumbing lives in `ProfilePhotoFiles` (`ui/v2/screens/account/photo/Pro
 | Remove | `AuthRepository.removeProfileImage()` → Clerk `user.deleteProfileImage`. |
 | Cleanup | `ProfilePhotoFiles.cleanUp(...)` deletes every temp file, success or fail. |
 
-The picker plumbing is separate from the sheet UI. `V2ProfilePhotoSheet` (`ui/v2/screens/account/components/V2ProfilePhotoSheet.kt`) is pure UI: rows for "Choose from gallery", "Take photo" (omitted when `showCamera` is false), and "Remove photo" (shown only when `hasImage`, rendered brand red). Its companion `rememberProfilePhotoLaunchers` wires the two `ActivityResult` launchers — gallery via `PickVisualMedia` (no storage permission), camera via `TakePicture` to a FileProvider `Uri`. Because the manifest declares `CAMERA`, launching `IMAGE_CAPTURE` without the grant would `SecurityException`, so `launchCamera` checks and requests `CAMERA` at point-of-use on every tap; a denial logs and toasts rather than crashing.
+The picker plumbing is separate from the sheet UI. `V2ProfilePhotoSheet` (`ui/v2/screens/account/components/V2ProfilePhotoSheet.kt`) is pure UI: rows for "Choose from gallery", "Take photo" (omitted when `showCamera` is false), and "Remove photo" (shown only when `hasImage`, rendered brand red). Its companion `rememberProfilePhotoLaunchers` wires the two `ActivityResult` launchers — gallery via `PickVisualMedia` (no storage permission), camera via `TakePicture` to a FileProvider `Uri`. Because the manifest declares `CAMERA`, launching `IMAGE_CAPTURE` without the grant would `SecurityException`, so `launchCamera` checks and requests `CAMERA` at point-of-use on every tap; a denial logs and toasts rather than crashing. `ProfilePhotoFiles.createCaptureUri(context)` now returns `Uri?` (was non-null) — it returns null (logged) on a full/unavailable cache dir or FileProvider drift instead of crashing, so `rememberProfilePhotoLaunchers` gained a required `onCaptureError` param (wired in `V2AccountScreen` to `viewModel.photo.reportCaptureFailed()`) that fires when the capture target can't be created.
 
 The photo is stored **only** in Clerk's CDN — `AuthRepository.updateProfileImage` never persists it locally or in Supabase. `CachedUserProfile` mirrors just `imageUrl` + `hasImage`; the actual bytes come from Coil's durable per-user disk cache keyed by `imageUrl`, so there is no saved file to manage.
 
 ## `V2ProfileAvatar` fallback ladder
 
-`V2ProfileAvatar` (`ui/v2/components/V2ProfileAvatar.kt`) is the single avatar surface for the whole V2 account UX, and it is never empty — it renders a 4-step fallback ladder over a deterministic 2-stop gradient:
+`V2ProfileAvatar` (`ui/v2/components/V2ProfileAvatar.kt`) is the single avatar surface for the whole V2 account UX, and it is never empty — it renders a 4-step fallback ladder over a deterministic three-color mesh:
 
 | Priority | Condition | Renders |
 | --- | --- | --- |
@@ -68,7 +72,7 @@ The photo is stored **only** in Clerk's CDN — `AuthRepository.updateProfileIma
 | 3 | else, `lastName` non-blank | Uppercase first letter of the last name. |
 | 4 | else | Person icon (`ic_profile`) centered. |
 
-Case 1 is gated on `hasImage`, not on a blank `imageUrl`, because Clerk always serves a generated default URL. The background is `avatarBrushFor` (`ui/v2/theme/Color.kt`), a two-stop `Brush` seeded from `auth_user_id` (stop A) and email (stop B): the same user renders the same gradient everywhere and nothing is persisted. With no identity at all, it degrades to a neutral grey circle with dark initials.
+Case 1 is gated on `hasImage`, not on a blank `imageUrl`, because Clerk always serves a generated default URL. The background is `avatarMeshFor(primarySeed, secondarySeed)` (`ui/v2/theme/Color.kt`), which returns `AvatarMesh(base: Brush, overlay: Brush, hasIdentity: Boolean)` — a **three-color mesh**: a diagonal linear `base` blend of two palette colors seeded from `auth_user_id` (stop A) and email (stop B), plus a soft radial `overlay` bloom of a derived third color biased toward the upper-right (centre 0.78/0.22, radius 0.85, alpha 0.75). `V2ProfileAvatar` paints `mesh.base` as the background and, only when `mesh.hasIdentity`, composites `mesh.overlay` as a sibling `Box` over it. The mesh is kept in lock-step with RRSupport's `avatarMeshFor` (`ui/theme/AvatarPalette.kt`) via shared constants — the palette, the index math, the `+7` third-stop offset, the `+3` collision nudge, and the bloom centre/radius/alpha — so both apps render a user's avatar identically. The same user renders the same avatar everywhere and nothing is persisted; with no identity at all (both seeds null/blank — signed out) it degrades to a flat `Gray200` circle with dark initials.
 
 ## Cold-start profile cache
 

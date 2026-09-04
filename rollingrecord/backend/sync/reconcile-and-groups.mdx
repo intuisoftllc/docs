@@ -5,6 +5,8 @@ description: "The counts-then-ids drift-detection handshake and the bulk cloud e
 
 `sync-reconcile` catches divergence between a client's local mirror and the server cheaply, then hands the client the id list it needs to repair. `sync-group-exclude` is the whole-group escape hatch for taking a group out of the cloud and putting it back. Both are separate from the per-row `sync-push` / `sync-pull` protocol because they are inherently set-wide operations.
 
+Both endpoints host a read-only DB-liveness health probe — sync-reconcile `healthCheck: dbHealthCheck("sync-reconcile")`, sync-group-exclude `healthCheck: dbHealthCheck("sync-group-exclude")` (`functions/_shared/db/health-checks.ts`, Sync Services status group) — a step-0 gate that short-circuits the admission chain on a valid `X-Health-Probe` header.
+
 ## sync-reconcile — the drift handshake
 
 `sync-reconcile` (`functions/sync-reconcile/index.ts`) exposes two operations, discriminated by `parseRequest`. Fixing the actual drift is the client's job (a cursor reset for "server has, local doesn't"; a local hard-delete for "local has, server doesn't"). Both ops apply the client's synced-set predicate: `deleted_at IS NULL AND cloud_excluded_at IS NULL AND auth_user_id = caller` — tombstones and opt-out rows are not counted.

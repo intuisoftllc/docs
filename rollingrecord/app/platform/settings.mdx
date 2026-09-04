@@ -45,18 +45,33 @@ The theme selector writes the same `"system"` / `"off"` / `"on"` values the V1 t
 
 ## `DeviceSettingsDataSource`
 
-`data/local/DeviceSettingsDataSource.kt` is the device-scoped `DataStore` backing the settings this screen touches indirectly — values that describe *this install on this device* and must not follow a user across devices. Per-user preferences live in `UserSettingsDataSource` instead.
+`data/local/DeviceSettingsDataSource.kt` is the device-scoped `DataStore` backing the settings this screen touches indirectly — values that describe *this install on this device* and must not follow a user across devices. Per-user preferences live in `UserSettingsDataSource` instead. Dark mode is **no longer** one of these keys: per RR-500 it moved to the per-account `UserSettingsDataSource` so the theme follows the account rather than the device (see below).
 
 | Key | Default | Notes |
 | --- | --- | --- |
-| `DARK_MODE` | `"system"` | `on` / `off` / `system` |
 | `STORAGE_LOCATION` | `"internal"` | SAF tree choice — a per-device grant |
 | `TILE_MODE` / `TILE_PINNED_SESSION_*` | `"MANUAL"` / `""` | QS-tile state; reset on account switch |
 | `PERMISSIONS_SETUP_DONE` | `false` | one-time permission screen gate |
 | `SYNC_WIFI_ONLY` | `false` | per-device "don't burn my cell data" |
 | `UI_VERSION` | `"v2"` | which UI generation renders |
 
-The store implements `UserScopedCache`: `clearForUserSwitch()` resets the tile pinned-session pair and `TILE_MODE` to `MANUAL` on an account change, because a pinned session id belongs to the previous user's database. Everything else (dark mode, storage location, permission setup) is genuinely device-scoped and survives the switch.
+A `DARK_MODE` key still exists on the store but is **read-only legacy** — a `darkMode` Flow marked `[BACKFILL]` whose sole remaining reader is `App.adoptDeviceDarkMode()`; its `setDarkMode()` writer was deleted, so nothing writes it any more.
+
+The store implements `UserScopedCache`: `clearForUserSwitch()` resets the tile pinned-session pair and `TILE_MODE` to `MANUAL` on an account change, because a pinned session id belongs to the previous user's database. Everything else (storage location, permission setup) is genuinely device-scoped and survives the switch.
+
+## Per-account theme (RR-500)
+
+The light/dark preference moved from the device store to the per-account one so it stops following the *device* across sign-outs — signing out used to leave the login screen in the previous user's theme, and signing in on a shared device gave you whatever the last person picked.
+
+`UserSettingsDataSource` (`data/local/UserSettingsDataSource.kt`) now owns `DARK_MODE = stringPreferencesKey("dark_mode")` with `DEFAULT_DARK_MODE = "system"`, plus `darkMode` / `setDarkMode` accessors. `SettingsRepository.darkMode` delegates to `userSettings.darkMode` (it was `deviceSettings.darkMode`), and `setDarkMode` writes `userSettings`. The setting is ungated — Free tier at every level — and it rides the existing settings sync for cloud-sync tiers with no extra plumbing, because `SettingsBlob` projects this store at push time. A signed-out session reads its own empty store, which yields `"system"`.
+
+### `ThemePreference`
+
+`ThemePreference` (`data/repository/ThemePreference.kt`) is an app-level flow that re-resolves the session-scoped `UserSettingsDataSource` on every `UserSessionManager.sessionIdFlow` emission (`flatMapLatest`). It exists because `MainActivity.setContent` and `V2App` apply the theme **above** the session tree — and also wrap the pre-sign-in login flow — so they cannot hold a session-scoped source directly without pinning a scope that sign-out tears down (the exact leak `UserScopedCache` exists to prevent). Both `MainActivity` and `V2App` now collect `themePreference.darkMode` (initial `DEFAULT_DARK_MODE`) instead of `settingsRepository.darkMode` / `deviceSettings.darkMode`. A scope caught mid-switch emits `"system"` rather than propagating — a theme read must never take down the Activity, and the next session emission re-resolves it correctly anyway.
+
+### Dark-mode adoption backfill
+
+`UserSettingsDataSource.adoptDeviceDarkModeOnce(deviceValue)` is a `[BACKFILL]` that copies the pre-RR-500 device-level dark-mode choice into the account once, guarded by the `DARK_MODE_ADOPTED_FROM_DEVICE` key. It runs at most once per account per device, and only when the device value is a real choice (`!= "system"`) and the account has none — so an existing dark-mode user does not silently revert to system on update, while a device still on "system" carries nothing that could override a genuine preference the account already holds from another device. Its guard key is deliberately **not** in `SettingsBlob` (it describes a migration on *this* device, so syncing it would make a second device skip its own copy). The caller is `App.adoptDeviceDarkMode()`.
 
 ## Related pages
 

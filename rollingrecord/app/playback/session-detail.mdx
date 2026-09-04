@@ -7,7 +7,7 @@ This page covers two distinct surfaces. The single-recording **player** (`V2Play
 
 ## The player ViewModel
 
-`V2PlaybackViewModel` (`ui/v2/screens/playback/V2PlaybackViewModel.kt`) seeds duration from the DB row on open, validates the audio file, and watches the row `Flow` for a remote tombstone. Its transport surface delegates straight to `PlaybackMediaManager`:
+`V2PlaybackViewModel` (`ui/v2/screens/playback/V2PlaybackViewModel.kt`) seeds duration from the DB row on open, validates the audio file, and watches the row `Flow`. It reacts to two changes there: a **remote tombstone** (the row went non-null → null while open) and an **in-place audio replacement** under the same id — an in-place trim / `OVERRIDE_ORIGINAL` — detected when `durationMs`, `fileSizeBytes`, or `filePath` differs from the previous row. On an in-place change it reloads the player — `pause()`, `release()`, `seekTo(0)`, `setDuration(row.durationMs)`, `clearError()`, then re-validate — so the scrubber and duration reflect the trimmed audio. Previously only the row-DELETED case was handled and an in-place change fell through, leaving a scrubber describing audio that no longer existed. Its transport surface delegates straight to `PlaybackMediaManager`:
 
 | Action | Effect |
 | --- | --- |
@@ -74,9 +74,11 @@ The sealed `PlaybackError` lives in `ui/v1/screens/playback/PlaybackViewModel.kt
 | `rename` / `setCategory` / `setSegmentsFavorite` | Per-segment organize; `renameSession` / `setSessionCategory` / `setSessionFavorite` act on the whole session. |
 | `setSessionCloudExcluded(excluded)` | Session-level, all-or-nothing cloud — cascades to every segment. |
 | `setMaxStorage(bytes)` | Per-session rolling cap, clamped to the protected floor. |
-| `delete(ids, onAllDeleted)` | Moves segments to Trash; navigates back if the session empties. |
+| `delete(ids, onAllDeleted)` | Calls `preview.stop()` first (so the snippet preview doesn't keep playing for a segment just moved to Trash), then `moveRecordingsToTrash`; navigates back if the session empties. |
 | `togglePreview(id)` / `seekPreview(f)` | Snippet preview via `PreviewPlayerController` (CLIP mode). |
 | `continueSession()` | Pre-flights storage, then starts a `CONTINUE_SESSION` rolling recording through the gatekeeper. |
+
+When `continueSession()` can't proceed — the session is full and every segment is protected — the screen surfaces a `LibraryConfirmSheet` that is now an acknowledgement, not a decision. `V2SessionDetailScreen` passes `showCancel = false` — a new `showCancel: Boolean = true` parameter on `LibraryConfirmSheet` (`ui/v2/screens/library/components/LibraryDetailComponents.kt`) — which omits the Cancel button and lets the confirm button take the full width. Both buttons only closed the sheet, so a Cancel implied a choice that was never offered.
 
 Segment **trim** is not launched here — trimming opens `V2TrimScreen` from the player's options sheet. Tapping a segment card's body calls `onNavigateToPlayback(id)` to open the player.
 

@@ -3,7 +3,7 @@ title: "server-config"
 description: "The public config bootstrap endpoint the Android client reads at cold start — App Check only, no JWT, returning only client-safe rows."
 ---
 
-`server-config` (`functions/server-config/index.ts`) is a `Deno.serve` GET endpoint. The Android `SupabaseConfigManager` fetches it once per cold start, caches the result in DataStore, and exposes typed accessors. It returns only the client-facing rows of the `server_config` table as a flat `Record<string, string>`.
+`server-config` (`functions/server-config/index.ts`) is a `Deno.serve` GET endpoint. The Android `ServerConfigManager` (the cold-start cache-and-expose reader, formerly `SupabaseConfigManager`) fetches it once per cold start, caches the result in DataStore, and exposes typed accessors. It returns only the client-facing rows of the `server_config` table as a flat `Record<string, string>`.
 
 ## Gate chain
 
@@ -17,13 +17,36 @@ The entry calls `runGates(req, { method: HttpMethod.Get, auth: AuthMode.None, sk
 | JWT / entitlement | **no** (`AuthMode.None`) | public config, no user identity |
 | Rate limit | **no** | `AuthMode.None` has no rate-limit subject; `runGates` throws at startup if one is declared |
 
-The `skipAppVersion` opt-out carries a required `// OPT-OUT:` comment. The reason is structural: the App Version gate reads `min_supported_app_version_code` from `server_config` — the same table this endpoint serves — so blocking an old client here would prevent it from ever learning about the raised floor. Firebase Remote Config is the fast-path notifier of floor changes anyway.
+The `skipAppVersion` opt-out carries a required `// OPT-OUT:` comment. The reason is structural: the App Version gate reads `min_supported_app_version_code` from `server_config` — the same table this endpoint serves — so blocking an old client here would prevent it from ever learning about the raised floor. The raised floor still propagates: the client's `AppVersionGate` re-evaluates after every apply of this endpoint's response, so no server-side floor check is needed on this one endpoint. (Firebase Remote Config, the former fast-path notifier of floor changes, has been retired — see below.)
 
 ## The public filter
 
 Every `server_config` row carries a `public` boolean. The handler selects `key, value WHERE public = true` and returns `Object.fromEntries(...)`. Server-enforcement knobs — rate-limit ceilings, model selection, runaway caps, truncation limits — carry `public = false` and never leave the server. Exposing or hiding a value is data-driven: flip the `public` column, no code change or redeploy.
 
 Values are always strings (matching the TEXT column type); the client parses each by key. Error responses are `405 method_not_allowed`, `401 invalid_app_check`, `500 server_misconfiguration` (missing `FIREBASE_PROJECT_NUMBER`), and `500 database_error` (the `server_config` select failed).
+
+## The single config store (Firebase RC retired)
+
+Migration `20260830120000_firebase_rc_to_server_config.sql` tore down Firebase Remote Config (Firebase announced per-user RC billing) and folded its surviving knobs into `server_config` as the ONE config store. Eight new `public = true` rows now ship through this endpoint, each with a `KEY_*` mirror in `ServerConfig.kt` enforced by `ServerConfigDriftSmokeTest`:
+
+| Key | Seeded value |
+| --- | --- |
+| `kb_chat_max_history_pairs` | `15` |
+| `ai_chat_max_transcript_snippets` | `6` |
+| `topic_search_threshold` | `0.30` |
+| `section_semantic_threshold` | `0.32` |
+| `semantic_search_margin` | `0.02` |
+| `semantic_search_result_cap` | `8` |
+| `semantic_snippet_chunk_count` | `3` |
+| `blueprint_moderation_enabled` | `true` (renamed from `template_moderation_enabled` — "template" is the feature's retired name) |
+
+Dead or duplicate RC keys were dropped, not migrated: the model keys (`extraction_model`, `synthesis_model`, `synthesis_deep_reasoning_model`, `kb_chat_model` — `server_config` already owns model selection via operation-model keys), the five `local_embedding_*` keys (on-device embedding removed, RR-487), `template_semantic_threshold` (dead), `assemblyai_speech_model` (unwired), and the two `reconcile_*` keys (zero consumers).
+
+## Server-side reads and the stampede fix
+
+This PUBLIC endpoint is not the only reader of `server_config`. It serves `WHERE public = true` as a flat `Record<string, string>` of strings; the **server-authoritative** reader `getServerConfigMap()` (`functions/_shared/db/server-config.ts`), used by the gate chain and `ai-engine`, reads **all** rows.
+
+That reader now holds the in-flight fetch **promise** (`inFlight`), not just the resolved value. Several gates and helpers await the map concurrently inside a single request and all arrive before the first fetch resolves — production logs showed **six** full-table `server_config` reads within 3ms on one request, with the 5-minute cache working exactly as written. Holding the promise collapses those concurrent callers onto one query. It is cleared in a `finally` so a rejected fetch is never cached — the next caller retries against the DB rather than inheriting a failure. The per-warm-instance TTL is unchanged at 5 minutes.
 
 ## Related pages
 

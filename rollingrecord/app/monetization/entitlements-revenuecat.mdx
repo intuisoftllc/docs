@@ -28,6 +28,17 @@ RevenueCat is the entitlement authority. A single enum defines every entitlement
 - `LIFETIME_LOOKUP_KEYS` is the set of all internal + public lifetime keys (includes `founders_edition`).
 - `resolveTier(customerInfo)` returns the max-ordinal tier across the user's active entitlements — mirroring the server-side cascade — with unknown keys ignored and a null `CustomerInfo` mapping to `UserTier.FREE`.
 
+### Subscription-lapse detection
+
+`CustomerInfo?.isSubscriptionLapsed()` (`data/billing/RcEntitlement.kt`) is the shared SUBSCRIPTION_LAPSED predicate — one definition used by both the account-health roll-up and the scheduled-recording lapse guard so the two can never drift apart. Its `internal` pure core `isSubscriptionLapsed(activeKeys: Set<String>, allKeysActive: Map<String, Boolean>)` is split from the SDK types so it unit-tests without constructing a `CustomerInfo`.
+
+RevenueCat exposes every entitlement the user has ever held in `entitlements.all` and only the currently-valid ones in `entitlements.active`. A lapse is a known `RcEntitlement` key that appears in `entitlements.all` but is no longer active **and** no currently-active recognized entitlement. The two clauses matter:
+
+- Never-subscribed `FREE` users have an empty `entitlements.all`, so they never trip it.
+- A null `CustomerInfo` (signed out, or RC mid-fetch) is **not** lapsed. Asserting "there was a subscription and it is gone" is the whole point — a plain `tier < PRO` test cannot tell that apart from "we don't know yet", which is why it is unsafe to destroy user state on.
+
+This predicate is consumed by `ScheduledRecordingRepository.disableAllForLapse()` (see [Feature Gating & Upsell](/rollingrecord/app/monetization/feature-gating)) and the [Account Health](/rollingrecord/app/auth/account-health) roll-up.
+
 ## Developer bypass
 
 `bypassesCaps` is true on `DEVELOPER` only. Per its KDoc, holding the `developer` entitlement grants `pro_cloud_ai`-tier access **and** skips the usage-cap gate and the rate-limit gate in ai-engine (the code labels these Gate 4 and Gate 5). Every tier entitlement — including the lifetimes and `FOUNDERS_EDITION` — is always subject to its tier's normal quota; only the ops grant bypasses. The developer entitlement is granted through the RC dashboard.
@@ -38,7 +49,7 @@ RevenueCat is the entitlement authority. A single enum defines every entitlement
 
 ## `RevenueCatManager`
 
-`RevenueCatManager` (`data/billing/RevenueCatManager.kt`) is a thin wrapper over the SDK singleton. It exposes `customerInfo: StateFlow<RcCustomerInfo>`, the `customerId`, and `isConfigured`, plus:
+`RevenueCatManager` (`data/billing/RevenueCatManager.kt`) is a thin wrapper over the SDK singleton. It takes one constructor param — `onTierRaised: (UserTier) -> Unit = {}` — and exposes `customerInfo: StateFlow<RcCustomerInfo>`, the `customerId`, and `isConfigured`, plus:
 
 | Method | Purpose |
 | --- | --- |
@@ -50,6 +61,46 @@ RevenueCat is the entitlement authority. A single enum defines every entitlement
 | `purchase(activity, pkg, oldProductId?)` | Launches the store purchase / plan-change flow. |
 | `restorePurchases()` | Explicit "Restore purchases" path. |
 | `startObserving()` | Wires the `updatedCustomerInfoListener` and does the initial customer-info fetch. |
+
+### `onTierRaised` — the single upward-movement hook
+
+Every customer-info path — `linkToAuthUser`, `purchase`, `restorePurchases`, `logOut`, and the SDK's `updatedCustomerInfoListener` — funnels through the private `emitCustomerInfo(info)`. That method now also computes `RcEntitlement.resolveTier(info)`, tracks a `lastTier` (initialised `FREE`), and fires `onTierRaised(tier)` **only** when the tier moves up (`tier.ordinal > previous.ordinal`). Hooking it here rather than in the two purchase ViewModels catches every raise — purchase, restore, promotional grant, and cross-device sync — in one place. The call is wrapped in `runCatching { }` so a listener failure can never break the customer-info flow the whole UI reads.
+
+Downgrades and lapses deliberately do **not** fire: the server is the stricter authority, so asking it to re-read could only take access away sooner, and the stale entitlement it still has cached expires on its own. `onTierRaised` is wired in `di/DataSourceModule.kt` to `EntitlementRefreshSignal.markPurchaseCompleted` (see below).
+
+The `purchase()` `onError` log now emits `error.underlyingErrorMessage` and the replaced `oldProductId` alongside `error.message`: `PurchasesError.message` is a constant `code.description`, so four distinct Play Billing failures (`BILLING_UNAVAILABLE`, `ITEM_NOT_OWNED`, `FEATURE_NOT_SUPPORTED`, and RC's own non-subscription guard) all collapse into the same `PurchaseNotAllowedError` text — a log carrying only `message` cannot tell them apart.
+
+## Instant-purchase entitlement refresh (`X-Entitlement-Refresh`)
+
+The server reads RevenueCat live on every request, but caches the result per customer for roughly five minutes in per-warm-instance module scope. A user who browsed the app while free leaves an empty entitlement set cached against their id; the instant they buy, the client flips to the paid tier while the server keeps answering from that cached "no" for minutes — refusing transcription and reporting "out of minutes" on a plan they just paid for. Nothing external can invalidate that cache: it is per warm instance, so neither the RevenueCat webhook nor any other request can reach the instance holding the stale entry.
+
+### `EntitlementRefreshSignal`
+
+`EntitlementRefreshSignal` (`data/billing/EntitlementRefreshSignal.kt`) decides when the next request should ask the server to skip that cache. It is an **app-level** `UserScopedCache` holding a single `AtomicBoolean pending` — no per-user data, but it implements the cache anyway so a pending flag from a prior account cannot stamp the next account's first call. It is constructed with `localTier: () -> UserTier` (a lambda over `RevenueCatManager` rather than the session-scoped `EntitlementRepository`, which a sign-out would tear down).
+
+| Method | Behavior |
+| --- | --- |
+| `isPending()` | True while the next request should carry the header. **Not** consumed on read — the header must ride every request until the server's answer actually changes, because the request carrying it may be throttled server-side, rejected, or simply not the call the user is waiting on. |
+| `markPurchaseCompleted(tier)` | Arms the hint immediately on a local purchase or restore, so the very first post-purchase request already carries it. |
+| `onServerTierObserved(serverTierWire)` | Resolves the wire key via `RcEntitlement.fromLookupKey(it)?.tier` and delegates to the testable `internal reconcile(serverTier, localTier)`. |
+| `clearForUserSwitch()` | Resets `pending` on a session change. |
+
+`reconcile(serverTier, localTier)` treats a null server tier as `UserTier.FREE` (null means "no paid entitlement", the same statement as FREE, not a rung below it — otherwise every genuinely free user would look like a disagreement and arm the hint permanently). It **arms** only when `localTier.ordinal > effectiveServerTier.ordinal` — the client believes it holds more than the server granted. Local-below-server is never armed: the server is the stricter authority, and a re-read would not change its answer. Once the server agrees, `reconcile` **clears** the flag.
+
+Firing on disagreement rather than only on a local purchase callback is what covers restores, purchases made on another device, and promotional grants — none of which fire a local purchase callback — while costing nothing for genuinely free users, whose local tier already agrees with the server's answer so the hint never fires.
+
+### `EntitlementRefreshInterceptor`
+
+`EntitlementRefreshInterceptor` (`data/remote/EntitlementRefreshInterceptor.kt`) is an OkHttp `Interceptor` that adds the header `X-Entitlement-Refresh: 1` while `signal.isPending()`, and otherwise proceeds untouched. It is a **caching hint, never an entitlement claim**: the server still reads the answer from RevenueCat (subject to a 20-second server-side age floor), so a forged header earns only a fresh, honest "no". Making the header itself unforgeable would mean verifying the Play receipt ourselves — precisely the job RevenueCat already does.
+
+### Wiring
+
+The signal is constructed in `di/NetworkModule.kt` with `localTier` resolving through `RcEntitlement.resolveTier(RevenueCatManager…)`, and it is armed from two sources:
+
+- `RevenueCatManager.onTierRaised` → `markPurchaseCompleted` (wired in `di/DataSourceModule.kt`) for local purchase, restore, promo, and cross-device raises.
+- `UsageRepository.onServerTierObserved` → `onServerTierObserved` (wired in `di/NetworkModule.kt`) for the server's own tier view reported on each usage snapshot.
+
+See [Usage Metering & Caps](/rollingrecord/app/monetization/usage-metering) for the snapshot side of that second source.
 
 ## `EntitlementRepository`
 

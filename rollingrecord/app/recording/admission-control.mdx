@@ -75,6 +75,10 @@ The rule:
 
 `StorageManager.hasMinimumFreeStorage(context)` enforces `MIN_FREE_STORAGE_BYTES = 250 MB` on `filesDir`. Checked at the gatekeeper, at start-time inside the service, and between segments. Failure at start emits `deviceStorageTooLow` on the service's `SharedFlow` and `StorageTooLow` on the admission bus. A running Rolling session that trips this mid-flight stops on the `recording_urgent` channel.
 
+The start-time check still runs inside the service, but `RecordingService.startRecording` now performs `hasMinimumFreeStorage()` inside an IO coroutine rather than on the synchronous `onStartCommand` path, to avoid the sign-in session-scope-lock ANR (`[ANR 2026-08-30]`). Foreground is already promoted before that guard, so the early-return semantics are unchanged.
+
+The device storage-full sheet (`V2StorageFullSheet`) now makes its primary action real. **Free up space** calls `openDeviceStorageSettings()`, which fires `Settings.ACTION_INTERNAL_STORAGE_SETTINGS` and falls back to `Settings.ACTION_SETTINGS`, each wrapped in `runCatching` so an OEM shipping neither logs and closes instead of crashing with `ActivityNotFoundException`. Previously all three callers passed a lambda that only closed the sheet, making the primary action indistinguishable from **Not now**. It deliberately does **not** open the in-app Free-Up-Space sheet — that reclaims *cloud* storage and frees zero device bytes. The primary button color also changed from the hardcoded `Blue500` (a secondary accent) to `MaterialTheme.colorScheme.primary` (the brand red, theme-tracking). The sheet's ENOSPC trigger list now also includes a **scheduled** recording refused at the free-space floor.
+
 ## Only one recorder at a time
 
 `RecordingService` is a singleton foreground service. Every start intent routes to the same instance. The state machine (`RecordingStateHandler`) accepts `START` only from `IDLE` or `STANDBY`, so a second `START` racing an already-active one is rejected with no side effects. The gatekeeper's already-recording gate catches this earlier, but the state machine is the belt-and-braces enforcement inside the service itself.

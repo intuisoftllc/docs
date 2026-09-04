@@ -25,11 +25,13 @@ There is one exception: **OFFLINE suppresses SYNC_ERROR**. A sync failure while 
 | --- | --- | --- | --- |
 | FROZEN | `AccountHealthRepository.frozenState` (persisted 403 `account_frozen`, owner-stamped) | `StatusFrozen`, full | Contact support (pre-filled email) |
 | SYNC_ERROR | `SyncEngine.state` `isSyncError()` — only when ONLINE | `StatusError`, full | Retry sync |
-| SUBSCRIPTION_LAPSED | RevenueCat `customerInfo` (expired known entitlement, none active) | `StatusWarning`, full | Manage subscription |
+| SUBSCRIPTION_LAPSED | `IdentityRepository.graceState` non-null — the recurring cloud subscription ended and the cloud data is inside the server's deletion grace window | `StatusWarning`, full | Manage subscription |
 | OFFLINE | `ConnectivityMonitor.isOnline` inverted | `StatusWarning`, 0.45 alpha | none (informational) |
 | HEALTHY | no condition active | no dot | none |
 
-`isSyncError()` mirrors the V1 `SyncStatusViewModel` predicate exactly: `lastError` set, `lastAttemptAt` set, and `lastSuccessAt < lastAttemptAt`. `isSubscriptionLapsed()` checks RevenueCat's `entitlements.all` vs `.active` — a recognized `RcEntitlement` that has expired with no active paid entitlement. Never-subscribed Free users have an empty `.all` and never trip it.
+`isSyncError()` mirrors the V1 `SyncStatusViewModel` predicate exactly: `lastError` set, `lastAttemptAt` set, and `lastSuccessAt < lastAttemptAt`. The SUBSCRIPTION_LAPSED arm is `identityRepository.graceState.map { it != null }` — the provider no longer calls RevenueCat's lapse predicate at all. A non-null `GraceState` (from the `StateFlow<GraceState?>`) means the user's recurring cloud subscription ended and their cloud data is inside the server's deletion grace window; the value is bounded by construction, because the server clears the grace columns on resubscribe (via the RevenueCat webhook) and again when the window closes (the daily sweeper). The repoint exists because RevenueCat never removes an expired entitlement from `entitlements.all`, so its lapse predicate stays true forever after a single cancellation — the dot would otherwise announce "your subscription has ended" for the rest of the account's life, long after there was anything to act on.
+
+The old RevenueCat predicate was moved, not deleted: the private `CustomerInfo?.isSubscriptionLapsed()` that used to live in `AccountHealthProvider` is now a shared top-level `CustomerInfo?.isSubscriptionLapsed()` (with a pure, unit-testable core `isSubscriptionLapsed(activeKeys, allKeysActive)`) in `RcEntitlement.kt` (`data/billing/RcEntitlement.kt`), consumed by the scheduled-recording lapse guard — not by account health anymore.
 
 The provider also blends in a debug-only override: `DevFlags.forcedAccountHealth` / `DevFlags.forcedFrozenReason` (inert `null` in release, so R8 collapses the branch) let the dot, sheet, and CTAs be exercised without a real lapse / freeze / offline / sync failure.
 

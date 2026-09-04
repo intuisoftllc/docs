@@ -1,55 +1,61 @@
 ---
-title: "Client vs Server Configuration"
-description: "The split between client-only Firebase Remote Config (ClientConfig) and server-authoritative Supabase server_config (ServerConfig), and their fetch/apply managers."
+title: "Server Configuration"
+description: "Supabase server_config as the single config store — ServerConfig, its fetch/apply manager, and the Firebase Remote Config teardown that folded every client knob into it."
 ---
 
-Every config value lives in exactly one store. Client-only knobs live in `ClientConfig` (fetched from Firebase Remote Config); server-authoritative knobs live in `ServerConfig` (fetched from the Supabase `server-config` Edge Function). Both objects live in the `app/agentcore` module and hold `private DEFAULT_*` constants, `@Volatile var` fields with `private set`, and an `update()` applier. The `DEFAULT_*` values apply only on first-ever cold start or a cache miss — once the server responds, the server always wins.
+Every config value lives in `ServerConfig` (`app/agentcore/src/main/kotlin/com/intuisoftllc/rollingrecord/config/ServerConfig.kt`), an `object` fetched from the Supabase `server-config` Edge Function. It holds `private const val DEFAULT_*` constants, `@Volatile var` fields with `private set`, and an `update(values: Map<String, String>)` applier. The `DEFAULT_*` values apply only on first-ever cold start or a cache miss — once the server responds, the server always wins. There is no longer a client/server split: the **Firebase Remote Config teardown (2026-08-30)** removed the former `ClientConfig` / `ClientConfigManager` pair (RC began charging per-user) and migrated its surviving keys into `public = true` `server_config` rows via `supabase/migrations/20260830120000_firebase_rc_to_server_config.sql`.
 
 <Note>
-`ClientConfig` and `ServerConfig` are in the `app/agentcore` module (`com.intuisoftllc.rollingrecord.config`), so the same objects compile into the eval runner. The `app/app` config package holds only the two managers. CLAUDE.md's references to a `RemoteConfig.kt` and an `app/app` `ServerConfig.kt` are stale — `RemoteConfig` was renamed `ClientConfig` and moved to `agentcore`.
+Only Remote Config was torn out — Firebase App Check, Crashlytics, and Analytics still ship. `ServerConfig` lives in the `app/agentcore` module (`com.intuisoftllc.rollingrecord.config`), so the same object compiles into the eval runner. The `app/app` config package now holds only `ServerConfigManager` — its former `ClientConfigManager` sibling was deleted in the teardown. CLAUDE.md's reference to a `RemoteConfig.kt` is stale — that object (once renamed `ClientConfig`) no longer exists.
 </Note>
 
 ## Store responsibilities
 
-| Store | Object (module) | Manager | Holds |
-| --- | --- | --- | --- |
-| Firebase Remote Config (client-only) | `ClientConfig` (`agentcore`) | `ClientConfigManager` (object) | client-loop limits, on-device similarity thresholds/margins, moderation toggle, reconcile cadence |
-| Supabase `server_config` (server-authoritative) | `ServerConfig` (`agentcore`) | `ServerConfigManager` (class) + `ServerConfigDataSource` | token ceilings, monthly usage caps, feature kill-switches, storage quotas, trash retention, medical multiplier, min-supported-version, embedding model/dims |
+`server_config` is the one config store; the row's `public` flag decides who sees a value. `ServerConfig` mirrors only the `public = true` rows — the client-facing lane.
 
-## `ClientConfig`
-
-`ClientConfig` (`app/agentcore/src/main/kotlin/com/intuisoftllc/rollingrecord/config/ClientConfig.kt`) is an `object` holding only genuinely client-only values — the ones that can't be practically enforced server-side without inspecting the opaque Claude message array, plus the similarity thresholds on-device code uses to compare **server-produced** embedding vectors. Fields include:
-
-- `kbChatMaxHistoryPairs` (9), `aiChatMaxTranscriptSnippets` (3) — client-loop limits.
-- `topicSearchThreshold` (0.48f), `sectionSemanticThreshold` (0.50f), `semanticSearchMargin` (0.02f), `semanticSearchResultCap` (8), `semanticSnippetChunkCount` (3) — on-device similarity dials.
-- `blueprintModerationEnabled` (true) — client-only moderation toggle.
-- `reconcilePeriodicIntervalHours` (4), `reconcileForegroundDebounceMinutes` (60) — drift-handshake cadence.
-
-It exposes `defaults(): Map<String, Any>` (used by the manager's `setDefaultsAsync`), `update(values: Map<String, Any>)` (a partial applier — any absent key keeps its current value), and `KEY_*` constants matching the Firebase dashboard keys.
-
-<Note>
-Model selection moved fully server-side in RR-164 — `ClientConfig` holds **no** model allowlist or preference, and the client never picks, sends, or validates model names.
-</Note>
+| Object (module) | Manager | Holds |
+| --- | --- | --- |
+| `ServerConfig` (`agentcore`) | `ServerConfigManager` (class) + `ServerConfigDataSource` | token ceilings, monthly usage caps, feature kill-switches, storage quotas, trash retention, medical multiplier, min-supported-version, embedding model/dims, plus the knobs migrated from Firebase RC: client-loop limits (KB-chat history pairs, transcript-snippet cap), on-device similarity thresholds/margins (topic/section thresholds, semantic margin, result cap, snippet chunk count), and the blueprint-moderation toggle |
 
 ## `ServerConfig`
 
-`ServerConfig` (`app/agentcore/src/main/kotlin/com/intuisoftllc/rollingrecord/config/ServerConfig.kt`) mirrors the `public = true` rows of the Supabase `server_config` table. Callsites read fields directly — `ServerConfig.extractionMaxInputTokens` — with no injection. Its fields cover:
+`ServerConfig` mirrors the `public = true` rows of the Supabase `server_config` table. Callsites read fields directly — `ServerConfig.extractionMaxInputTokens` — with no injection. Its fields cover:
 
 - **Token ceilings** — `extractionMaxInputTokens` (72,000), `kbChatMaxInputChars` (1,800), `blueprintMaxTokens` (4,200), `kbChatMaxToolRounds` (3), and more.
 - **Monthly caps** — Pro+Cloud / Cloud+AI transcription minutes (480 / 1200), `aiQueriesPerMonth` (150), `synthesesPerMonth` (72), `cloudAiExtractionMinutesPerMonth` (1800).
 - **Feature flags** — `kbChatEnabled` / `aiExtractionEnabled` (each with a `StateFlow` mirror so Compose can recompose on a kill-switch flip), `foundersEditionAvailable`.
 - **Storage quotas** — `cloudBackupQuotaProCloudBytes` / `cloudBackupQuotaProCloudAiBytes` (Long).
+- **Cloud grace** — `cloudGraceDays` (`KEY_CLOUD_GRACE_DAYS` → `cloud_grace_days`, `DEFAULT_CLOUD_GRACE_DAYS = 30`). Display-only: it drives the grace banner's "N days left" countdown, but the server (`subscription_lapse_cleanup`) is what actually deletes the data.
 - **Other dials** — `trashRetentionDays` (30), `medicalModeUsageMultiplier` (1.35), `minSupportedAppVersionCode` (0), `embeddingModel` / `embeddingDimensions`.
+
+Model selection moved fully server-side in RR-164 — `ServerConfig` holds **no** model allowlist or preference, and the client never picks, sends, or validates model names.
+
+### Fields migrated from Firebase Remote Config
+
+The 2026-08-30 teardown added eight `@Volatile var` fields (each with a `KEY_*` constant and a `DEFAULT_*`) that were previously served by RC:
+
+| Field | `server_config` key | Cold-start default |
+| --- | --- | --- |
+| `kbChatMaxHistoryPairs` | `kb_chat_max_history_pairs` | 9 |
+| `aiChatMaxTranscriptSnippets` | `ai_chat_max_transcript_snippets` | 3 |
+| `topicSearchThreshold` | `topic_search_threshold` | 0.48f |
+| `sectionSemanticThreshold` | `section_semantic_threshold` | 0.50f |
+| `semanticSearchMargin` | `semantic_search_margin` | 0.02f |
+| `semanticSearchResultCap` | `semantic_search_result_cap` | 8 |
+| `semanticSnippetChunkCount` | `semantic_snippet_chunk_count` | 3 |
+| `blueprintModerationEnabled` | `blueprint_moderation_enabled` | true |
+
+<Note>
+**Key rename:** the moderation toggle was `template_moderation_enabled` in Firebase RC and was renamed to `blueprint_moderation_enabled` during the migration ("template" is the feature's retired name). Two former `ClientConfig` knobs were **not** migrated and are simply gone — `reconcilePeriodicIntervalHours` / `reconcileForegroundDebounceMinutes`, recorded as "zero consumers" in the migration comment.
+</Note>
+
+The cold-start `DEFAULT_*` values are **deliberately more conservative** than the live server rows (overusage protection) — e.g. the live `topic_search_threshold` row is `0.30` while the baked-in default is `0.48f`. Never "align" a default upward to match the server.
 
 `update(values: Map<String, String>)` applies a partial or full map; invalid strings are ignored (the current value is kept rather than reset to the default). `setFeatureDisabled(feature)` / `setFeatureEnabled(feature)` are the RR-118 kill-switch mirror, called from `AiEngineClient` on a `feature_disabled` response (or a success) so the UI hides/shows a feature within a few frames instead of waiting for the next config fetch.
 
-## `ClientConfigManager`
-
-`ClientConfigManager` (`config/ClientConfigManager.kt`) is an `object`. `fetchAndApply(onApplied)` sets the Firebase min-fetch interval (0s in debug, 3600s in release), calls `setDefaultsAsync(ClientConfig.defaults())`, then `fetchAndActivate()`, then `ClientConfig.update(buildValuesMap(rc))`; `onApplied` drives `AppVersionGate` re-evaluation. `buildValuesMap` maps each RC key to its typed value (Firebase stores ints as Long and floats as Double). If the fetch fails, the in-app defaults stay in effect.
-
 ## `ServerConfigManager`
 
-`ServerConfigManager` (`config/ServerConfigManager.kt`) is a **class** (not an object) because it needs injected dependencies — `SupabaseApi` and `ServerConfigDataSource`. Its log TAG is `"SupabaseConfig"`.
+`ServerConfigManager` (`config/ServerConfigManager.kt`) is a **class** (not an object like `ServerConfig`) only because it needs injected dependencies — `SupabaseApi` and `ServerConfigDataSource`. It is the app's only config fetch (the former Firebase sibling `ClientConfigManager` was deleted in the teardown). Its log TAG is `"SupabaseConfig"`.
 
 <Note>
 The class is named `ServerConfigManager` — its log TAG and some internal comments say "SupabaseConfig" / "SupabaseConfigManager", and CLAUDE.md's name `SupabaseConfigManager` does not match the actual class name.
@@ -70,20 +76,18 @@ Cold start passes `force = true` so a new install sees the latest values immedia
 
 ## Startup wiring
 
-`App.onCreate` kicks both fetches, best-effort:
+`App.onCreate` kicks the single server-config fetch, best-effort, on `Dispatchers.IO`:
 
 ```kotlin
-ClientConfigManager.fetchAndApply(onApplied = {})
-// ...on Dispatchers.IO:
 serverConfigManager.fetchAndApply(force = true) {
     getKoin().get<AppVersionGate>().reevaluate()
 }
 ```
 
-The app is fully functional on the baked-in `DEFAULT_*` values if either fetch fails. See [Application Shell & Entry Points](/rollingrecord/app/architecture/app-shell).
+The app is fully functional on the baked-in `DEFAULT_*` values if the fetch fails. See [Application Shell & Entry Points](/rollingrecord/app/architecture/app-shell).
 
 ## Where to go next
 
-- [Shared JVM Modules](/rollingrecord/app/architecture/shared-modules) — the `agentcore` module that hosts both config objects.
-- [Application Shell & Entry Points](/rollingrecord/app/architecture/app-shell) — where the two fetches are kicked.
+- [Shared JVM Modules](/rollingrecord/app/architecture/shared-modules) — the `agentcore` module that hosts the `ServerConfig` object.
+- [Application Shell & Entry Points](/rollingrecord/app/architecture/app-shell) — where the fetch is kicked.
 - [Koin Dependency Injection](/rollingrecord/app/architecture/dependency-injection) — the modules that bind `ServerConfigManager` / `ServerConfigDataSource`.

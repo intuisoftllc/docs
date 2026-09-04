@@ -71,7 +71,7 @@ The docs on the class explain why this is polling and not Supabase Realtime: `:a
 
 ## `ExtractionJobPhase` and `ExtractionProgress`
 
-`ExtractionJobPhase` (`data/extraction/ExtractionJobPhase.kt`) is the UI-facing timeline. A run only ever moves forward through it (by `ordinal`):
+`ExtractionJobPhase` (`data/extraction/ExtractionJobPhase.kt`) is the UI-facing timeline. A run only ever moves forward through it (by `ordinal`) — with one exception: `Cancelling` (ordinal 7, the highest) outranks any beat a dying worker is still publishing, so a teardown always wins `ExtractionProgress.fold`.
 
 | Phase | Origin | Bar |
 | --- | --- | --- |
@@ -82,10 +82,15 @@ The docs on the class explain why this is polling and not Supabase Realtime: `:a
 | `Extracting` | server: runner working (`chunksDone` / `chunksTotal`) | determinate, capped at 99% |
 | `ProcessingResults` | local: fetching + decrypting the results blob | indeterminate |
 | `Applying` | local: writing merged results into Room (merge + tasks + FTS + embeddings) | indeterminate |
+| `Cancelling` | local: set EXPLICITLY by the ViewModel on cancel (never inferred from a worker) | indeterminate (`showsProgressBar` true, `progress` null, `isDeterminate` false) |
+
+`Cancelling` (ordinal 7) is the highest phase. A worker never publishes it — `toData` encodes it as `PHASE_IDLE` — because the ViewModel is the only thing that sets it, and it deliberately draws a bar (teardown is real work in progress).
 
 `Extracting.percent` caps at 99 because the runner syncs `chunks_done` to `chunks_total` when it marks the job `DONE`, while the client still has to fetch, apply, and ack. `fromState()` derives a phase from a server observation — a `DONE` job with `chunksDone > 0` maps to `ProcessingResults` (the fetch is the very next thing), while a 0-chunk `DONE` (a context-full pre-flight refusal) goes straight to `Idle`.
 
-`ExtractionProgress` (same file) is the WorkManager transport: the phase rides `WorkInfo.progress`. `toData` / `fromData` / `fromDataOrNull` encode and decode it (`KEY_PHASE`, `KEY_CHUNKS_DONE`, `KEY_CHUNKS_TOTAL`, `KEY_UPLOADED_FRACTION`). `fromWorkInfo` maps `ENQUEUED` / `BLOCKED` to `Preparing` (never `Queued`, which would claim the transcripts are already on the server), and `fold()` collapses every `WorkInfo` carrying a context's tag into the one furthest along by ordinal — the ViewModel's single read.
+`ExtractionProgress` (same file) is the WorkManager transport: the phase rides `WorkInfo.progress`. `toData` / `fromData` / `fromDataOrNull` encode and decode it (`KEY_PHASE`, `KEY_CHUNKS_DONE`, `KEY_CHUNKS_TOTAL`, `KEY_UPLOADED_FRACTION`). `fromWorkInfo` maps `ENQUEUED` / `BLOCKED` to `Preparing` (never `Queued`, which would claim the transcripts are already on the server), and `fold()` collapses every `WorkInfo` carrying a context's tag into the one furthest along by ordinal.
+
+`fold()` is no longer the ViewModel's sole read. `V2ContextDetailViewModel.extractionPhase` now `combine`s `getWorkInfosByTagFlow` with two override flows, `cancelVerifiedIdle` and `cancelInFlight`, with precedence: `cancelInFlight` → `Cancelling`, `cancelVerifiedIdle` → `Idle`, else `fold(jobs)`. `cancelVerifiedIdle` is latched true only after the server confirms no live job (via `statusOnce` / `pendingOnce`) and is cleared when a new run enqueues, so a cancel can't be undone by a stale in-flight `WorkInfo` beat.
 
 ## `extract-results` operations
 
@@ -108,6 +113,12 @@ The docs on the class explain why this is polling and not Supabase Realtime: `:a
 Retry and durability hinge on the client-generated job id in `inputData`. But when the work itself is gone — the 20-minute poll deadline or retry exhaustion — the id goes with it, while `extract-runner` keeps going, finishes, and **commits the per-recording charge**. Without recovery the user is billed and receives nothing until the 48h TTL sweeper deletes the results.
 
 `ExtractionJobReconciler` (`data/extraction/ExtractionJobReconciler.kt`) closes that hole. On every app open, `reconcile()` calls `repository.pendingOnce()` and enqueues `ContextExtractionWorker.enqueueAttach` for each outstanding job whose context has no active work. It re-uses the worker's attach path rather than a second apply path (a second place for the merge semantics to drift would be a bug generator). Two guards keep it restrained: a 30-second coalesce window collapses foreground flapping to one reconcile, and any context that already has enqueued or running extraction work is skipped. It never throws — reconcile is best-effort, and the next open tries again.
+
+It is now tier-gated. The reconciler injects `EntitlementRepository`, and `reconcile()` returns `0` early when the live tier is below `UserTier.PRO_CLOUD_AI` (`currentTierOrFree().atLeast(...)`), placed **before** the coalesce stamp — extraction is server-gated, so a below-tier reconcile on every foreground was the largest source of wasted 403s (Supabase + Clerk + App Check + RevenueCat per call). Tier is read LIVE; `currentTierOrFree()` defaults to FREE when it can't be read, which is safe because reconcile is automatic and repeating.
+
+`reconcile()` also runs an orphan sweep, `sweepOrphanedWork(localWork, serverJobs)`: it cancels any local WorkManager item whose PUBLISHED job id (`WorkInfo.progress[KEY_JOB_ID]`) is absent from `pendingOnce()` — the client-side recovery for a run wedged on "Waiting to start…" forever (the client had no equivalent of the server's TTL sweep). The old `if (jobs.isEmpty()) return` was REMOVED, because an empty server list is exactly when the sweep matters. Local work is snapshotted BEFORE the server read for race-freeness, and work that has not yet published an id (pre-submit) is left alone for WorkManager to manage.
+
+The [worker](/rollingrecord/app/ai/context-extraction) itself is tier-gated the same way. `ContextExtractionWorker` injects `EntitlementRepository` and, in `runJob` just after the STEP 0 resume probe, gates on the live tier — below `PRO_CLOUD_AI` it takes the same `failAndRestore(...)` path a real 403 would, avoiding the wasted probe + submit round trips when a downgrade lands between enqueue and run.
 
 ## Related pages
 

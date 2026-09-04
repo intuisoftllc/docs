@@ -21,7 +21,9 @@ Scheduled recordings start and stop themselves at planned times using `AlarmMana
 
 `isActive()` returns true if the schedule is enabled and `System.currentTimeMillis() >= (skipUntilMs ?: 0)`.
 
-`ScheduledRecordingRepository` owns CRUD, `setEnabled`, `setSkipUntil`, and `nextFireTime(schedule, afterMs)`. `nextFireTime` computes the next real fire timestamp by walking forward from `afterMs` respecting the schedule's `repeatMode` and `repeatDays`.
+`ScheduledRecordingRepository` owns CRUD, `setEnabled`, `setSkipUntil`, `disableAllForLapse()`, and `nextFireTime(schedule, afterMs)`. `nextFireTime` computes the next real fire timestamp by walking forward from `afterMs` respecting the schedule's `repeatMode` and `repeatDays`.
+
+`disableAllForLapse(): Int` turns **off** every enabled schedule and syncs the change — it enqueues a `WireEntity.SCHEDULED_RECORDING` upsert per flipped id — and returns the count flipped (0 when there was nothing to do). It is called on a **confirmed** subscription lapse as a durable third guard on top of the two runtime guards (the tier observer disarms the alarms, and `ScheduleAlarmReceiver` re-checks tier at fire time): disabling the **row** survives a reinstall, a restore from backup, and any future path that arms alarms without consulting tier. It is deliberately **not** reversed on re-upgrade — a schedule turns the microphone on by itself, so re-arming a batch of them the moment a payment clears would start recordings the user never asked for. It is idempotent by construction: the underlying `dao.disableAllEnabled()` only matches rows returned by `dao.getEnabledIds()`, so repeat calls flip and enqueue nothing (the caller observes a frequently re-emitting flow).
 
 ## Enqueue path
 
@@ -93,4 +95,6 @@ Three workers back the schedule stack:
 
 ## Schedule UI
 
-The schedule list and add/edit screens live under `ui/screens/schedule/` and are backed by `ScheduleViewModel`. The list shows every schedule with its next fire time and enabled/skip state. The add/edit screen writes to `ScheduledRecordingRepository` and calls `ScheduleEnqueuer.enqueue` (or `cancel`) on save so alarms stay in sync with the row.
+The schedule list and add/edit screens (`V2ScheduleScreen`, `V2AddScheduleScreen`) live under `ui/v2/screens/schedule/` and are backed by `V2ScheduleViewModel`. (The legacy V1 `ScheduleViewModel` under `ui/v1/screens/schedule/` is unrelated.) The list shows every schedule with its next fire time and enabled/skip state. The add/edit screen writes to `ScheduledRecordingRepository` and calls `ScheduleEnqueuer.enqueue` (or `cancel`) on save so alarms stay in sync with the row.
+
+`V2AddScheduleScreen`'s `NameField` caps input at `MAX_SCHEDULE_NAME_CHARS = 50` (the same limit the custom-blueprint name field uses). The cap is enforced by truncating inside the field — `onValueChange = { onValueChange(it.take(MAX_SCHEDULE_NAME_CHARS)) }` — so both the create and edit paths through the single `NameField` are covered by construction, paste included. No character counter is shown.

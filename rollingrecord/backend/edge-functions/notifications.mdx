@@ -1,0 +1,91 @@
+---
+title: "notifications"
+description: "The one generic outbound-email Edge Function — a dumb operation dispatcher driven by pg_cron, authenticated with a dedicated NOTIFICATIONS_SECRET, with send-once dedupe backed by l_notification_sent."
+---
+
+`notifications` (`functions/notifications/index.ts`) is a `Deno.serve` POST endpoint: the single generic outbound-email service. It is a dumb dispatcher — it authenticates the caller, resolves an operation by name, validates its params, and runs it. It holds no knowledge of what any notification says or who should get one; that always lives with the operation, one file per kind, registered in `operations/index.ts`.
+
+## Shape + gate chain
+
+The entry calls `runGates(req, { method: HttpMethod.Post, skipAppCheck: true, skipAppVersion: true, auth: AuthMode.WebhookSecret, secretEnvVar: "NOTIFICATIONS_SECRET" })`. It is server-to-server only (pg_cron `net.http_post`), so App Check and App Version are opted out. It authenticates with a **dedicated** secret, not the service-role key — the right to trigger an email sweep must not carry god-mode DB access, and it lets this rotate independently (the same posture as `extract-runner` and `storage-janitor`). The wire shape is `{ operation, params? }`, the same envelope as `ai-engine` and `support-ops`:
+
+```
+POST /functions/v1/notifications
+{ "operation": "cloud_wipe_warning", "params": { "days_before": 7 } }
+```
+
+## Dispatcher
+
+After the chain, the body is parsed (`INVALID_BODY` on failure) and the dispatcher resolves `OPERATIONS[body.operation]` — the registry in `operations/index.ts`, keyed by each operation's own `name`. `OPERATION_NAMES` is derived from `Object.keys(OPERATIONS)`, never hand-maintained, so the two cannot drift.
+
+| Condition | Result |
+| --- | --- |
+| `body.operation` missing / not a string | `AppError.MISSING_OPERATION` (echoes `supported: OPERATION_NAMES`) |
+| Unknown operation | `AppError.INVALID_OPERATION` (echoes `supported: OPERATION_NAMES`) |
+| `operation.validateParams(params)` returns a code | `400` with that error-code string |
+| Handler throws | `AppError.INTERNAL_ERROR` |
+
+`params` is optional — an absent object is treated as `{}`, so an operation whose params all have defaults works from a bare `{ "operation": "..." }`. On success the dispatcher runs `operation.handler(params, { now: new Date() })` — one clock for the whole sweep — and returns `{ operation, ...result }`.
+
+## Operation contract (`operations/handler.ts`)
+
+Every operation implements `OperationDef` = `{ name, validateParams(raw) → string | null, handler(params, ctx) → OperationResult }`. Two shapes complete the contract:
+
+| Type | Fields | Notes |
+| --- | --- | --- |
+| `OperationContext` | `now: Date` | Intentionally the ONLY thing here — operations resolve their own `getServiceClient()` rather than being handed one |
+| `OperationResult` | `matched`, `sent`, `deduped`, `failed` | Rows considered, emails actually sent, skipped as already-sent, and attempted-but-failed |
+
+Operations are **sweeps**, not per-user sends: the caller names WHAT to send, and the operation's own query decides WHO qualifies. A cron entry cannot know which users are 7 days from a wipe, so pushing that logic into the caller would spread it across pg_cron definitions where nobody would find it.
+
+## `cloud_wipe_warning` operation
+
+`cloud_wipe_warning` (`functions/notifications/operations/cloud-wipe-warning.ts`) warns a lapsed user before `subscription_lapse_cleanup` destroys their cloud data. It is sent **twice** — at 7 days and 1 day out — as two cron entries with different `days_before` (default `7`).
+
+The handler reads the live grace length `getInt("cloud_grace_days", 30)` once per sweep, then selects `canonical_users` rows whose `cloud_grace_started_at` falls in the half-open band returned by the pure, exported `warningWindow(now, daysBefore, graceDays)` (`> lower` and `<= upper` — half-open so a daily cron never double-counts a row landing exactly on a boundary across two runs). Per matched row it:
+
+1. Computes `wipeAtFor(lapsedAt, graceDays)` and `dedupeKeyFor(wipeAt, daysBefore)` = `` `${wipeAt.toISOString()}:${daysBefore}` ``, then calls `claimNotification` (below).
+2. Resolves the address server-side from Clerk via `getClerkUser` (primary email) — there is no JWT on a cron run, and the address is never client-supplied.
+3. Sends via `sendBrevoEmail` using `cloudWipeEmailSubject` / `renderCloudWipeEmailHtml` / `renderCloudWipeEmailText` (`functions/_shared/email/cloud-wipe-email.ts`) — the red-accent branded template reserved for lockout-class messages.
+
+`validateParams` rejects a `days_before` outside `1..30` with `invalid_days_before` (a static sanity check on the operator-supplied cron param, deliberately synchronous so the validator takes no DB round-trip).
+
+## `+clerk_test` skip (dev only)
+
+`isClerkTestEmail(email)` plus `clerkTestBypassEnabled()` (env `CLERK_TEST_EMAILS_ENABLED === "true"`, dev branch only) mirror `account-otp`. A `+clerk_test@` address counts as **sent** — the claim is taken and the outcome recorded `delivered = true` — but no Brevo message goes out. In production the bypass is off, so such an address gets a normal send: there, that string is just an unusual mailbox name and skipping it would silently deny a real customer their deletion warning.
+
+## Send-once dedupe (`dedupe.ts` + `l_notification_sent`)
+
+The guard is claim-**before**-send: a UNIQUE INSERT into `l_notification_sent` (PK `auth_user_id, notification_type, dedupe_key`). `claimNotification` returns true only when this caller owns the send. On a `23505` conflict it re-claims one of two states, and each retry path is exclusive by construction — the UPDATE's own WHERE clause is the lock, so it is safe without a transaction:
+
+| Existing `delivered` | Meaning | Re-claim? |
+| --- | --- | --- |
+| `true` | Already sent | Never re-sends |
+| `false` | Send was attempted and the provider rejected it | Yes — reset to `null`, which closes the door on a concurrent retrier |
+| `NULL` older than `STALE_CLAIM_MS` (15 min) | Sender died between claiming and writing back | Yes — a live sender within the window is not raced |
+
+`recordNotificationOutcome` writes back `delivered` afterwards (best-effort — the claim is what prevents duplicates, so a failed status write costs visibility, not correctness). The three-state `delivered` column is the whole answer to a "you never told me" complaint: `true` = sent, `false` = provider rejected, `NULL` = the sender died mid-send.
+
+## Table + crons (migration `20260824130000_notification_sent_log.sql`)
+
+`l_notification_sent` uses the `l_` prefix (long retention — 36 months via `server_config.log_retention_months`, swept by `prune_log_tables()`, which this migration extends to add the new table). The dispute it answers — "you deleted my recordings and never warned me" — can arrive months later. RLS is on with no policies; it has an FK CASCADE from `canonical_users` and an index on `sent_at` (the sweeper's predicate).
+
+Two pg_cron entries drive it:
+
+| Cron | Schedule (UTC) | Body |
+| --- | --- | --- |
+| `notify-cloud-wipe-7d` | `10 5 * * *` | `operation: cloud_wipe_warning`, `days_before: 7` |
+| `notify-cloud-wipe-1d` | `20 5 * * *` | `operation: cloud_wipe_warning`, `days_before: 1` |
+
+Both are scheduled **after** `subscription_lapse_cleanup` (04:07 UTC) on purpose: a user who crosses the 30-day line today should be wiped by the sweeper, not warned about a wipe that already happened — running later means the sweeper has already removed them from the lapsed set, so they cannot match. The crons need Vault entries `notifications_url` and `notifications_secret` (the secret must equal the `NOTIFICATIONS_SECRET` Edge Function secret); missing either leaves them unscheduled with a `NOTICE` rather than failing the migration.
+
+## config.toml
+
+`config.toml` declares `[functions.notifications]` with `verify_jwt = false` — Supabase's built-in check would reject the shared-secret bearer before `runGates(WebhookSecret)` ever sees it.
+
+## Related pages
+
+- [Edge Function catalog](/rollingrecord/backend/edge-functions/overview) — the shared `runGates()` chain and the full function list.
+- [Cron sweepers](/rollingrecord/backend/database/cron-sweepers) — `subscription_lapse_cleanup` and the retention sweep.
+- [Entitlement & grace](/rollingrecord/backend/gates/entitlement-and-grace) — the cloud grace window this operation warns about.
+- [Environment & secrets](/rollingrecord/backend/operations/env-and-secrets) — `NOTIFICATIONS_SECRET` and the Vault entries.

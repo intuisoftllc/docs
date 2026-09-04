@@ -1,19 +1,18 @@
 ---
 title: "Server vs Client Configuration"
-description: "The three config stores — server_config, rate_limit_config, and Firebase Remote Config — where each value lives, and why nothing is duplicated."
+description: "The two config stores — server_config, the single config store, and the dedicated rate_limit_config — where each value lives, and why nothing is duplicated."
 ---
 
-Every backend knob has exactly one home. Server-enforced values live in Supabase (`server_config`, or the dedicated `rate_limit_config`); client-only values live in Firebase Remote Config. No value is intentionally duplicated across stores, and the Kotlin `DEFAULT_*` constants are cold-start fallbacks only — when the server has a value, the server wins.
+Every backend knob has exactly one home. Since the Firebase Remote Config teardown (2026-08-30), `server_config` is the single config store, and a row's `public` flag turns on one question — does the *client* read the value? Server-only values are `public=false` rows (plus the dedicated `rate_limit_config` for the one structured exception); any value the client reads is a `public=true` row, even when the server also enforces it — migration `20260830120000_firebase_rc_to_server_config.sql` moved the surviving Remote Config keys into them. No value is intentionally duplicated across stores, and the Kotlin `DEFAULT_*` constants are cold-start fallbacks only — when the server has a value, the server wins.
 
-## The three stores
+## The two stores
 
-The split is three-way, not two-way. Rate limits earn their own table because their shape (bucket → max + window + enabled) is structured enough to benefit from dedicated columns.
+The split is two-way. `rate_limit_config` is the one structured exception carved out of `server_config` — its shape (bucket → max + window + enabled) is structured enough to earn dedicated columns rather than a third independent store.
 
 | Store | Authority | Holds | Read by | Tuned via |
 | --- | --- | --- | --- | --- |
-| `server_config` (Supabase table) | Server | token ceilings, model names + allowlists, monthly caps, feature flags, page sizes, kill switches | Edge Functions via `getServiceClient()` (service role); client via the `server-config` endpoint (`public=true` rows only) | Supabase dashboard / migration |
+| `server_config` (Supabase table) | Server | token ceilings, model names + allowlists, monthly caps, feature flags, page sizes, kill switches, plus the migrated client-read tuning knobs (KB-chat history window, transcript-snippet count, on-device cosine thresholds + margin, semantic result caps, the blueprint moderation toggle) | Edge Functions via `getServiceClient()` (service role); client via the `server-config` endpoint (`public=true` rows only) | Supabase dashboard / migration |
 | `rate_limit_config` (Supabase table) | Server | per-bucket `max_requests` + `window_sec` + `enabled` | `checkRateLimit()` → `getBucketConfig()` | Supabase dashboard / migration |
-| Firebase Remote Config | Client-only | client-loop limits, on-device similarity thresholds, UI toggles | Android `ClientConfigManager` → `ClientConfig` | Firebase console |
 
 Both Supabase tables are `RLS ENABLED` with zero policies. That is the default-safe state for this architecture: Edge Functions read through `getServiceClient()` (`functions/_shared/db/client.ts`), the service-role client that bypasses RLS, while a direct anon-key read from a decompiled APK gets nothing.
 
@@ -50,7 +49,9 @@ Representative keys seeded across migrations (values are illustrative — they c
 | `semantic_search_enabled` | `true` |
 | `scan_index_candidates` | `50` |
 
-The Kotlin mirror is `ServerConfig` (`app/agentcore/src/main/kotlin/com/intuisoftllc/rollingrecord/config/ServerConfig.kt`) — typed accessors plus `DEFAULT_*` cold-start fallbacks, populated from the endpoint's public rows. It moved into the `agentcore` module so the eval agent loop can read it too.
+The Kotlin mirror is `ServerConfig` (`app/agentcore/src/main/kotlin/com/intuisoftllc/rollingrecord/config/ServerConfig.kt`) — typed accessors plus `DEFAULT_*` cold-start fallbacks, populated from the endpoint's public rows. It moved into the `agentcore` module so the eval agent loop can read it too. The 2026-08-30 Firebase RC teardown added the eight migrated fields (`kbChatMaxHistoryPairs` through `blueprintModerationEnabled`), and the mirror carries `KEY_CLOUD_GRACE_DAYS` (`cloud_grace_days`, `DEFAULT_CLOUD_GRACE_DAYS = 30` — the cold-start fallback for the grace-banner countdown). `ServerConfigDriftSmokeTest` asserts exact bidirectional parity: every `public=true` row must have a `KEY_*` mirror and vice versa, so a public row without a mirror (or a mirror without a public row) fails the suite. The migrated cold-start defaults are deliberately more conservative than the live server rows — `kb_chat_max_history_pairs` defaults to `9` against a live `15`, `topic_search_threshold` to `0.48f` against a live `0.30` — so never "align" the Kotlin defaults up to match the server.
+
+Server-side, Edge Functions read `server_config` through `getServerConfigMap()` (`functions/_shared/db/server-config.ts`), which caches the full table per warm isolate and collapses concurrent gate reads within one request onto a single in-flight promise (cleared in a `finally` so a rejected fetch is never cached) — see [the `server-config` endpoint](/rollingrecord/backend/edge-functions/server-config) for detail.
 
 ## `rate_limit_config`
 
@@ -80,33 +81,43 @@ Reads go through `getBucketConfig()` in `functions/_shared/gates/rate-limit.ts`,
 
 Adding a bucket is a same-commit trio: the enum member in `Bucket`, the `BUCKET_DEFAULTS` entry, and a seeded `rate_limit_config` row. See [rate limiting](/rollingrecord/backend/gates/rate-limiting) for the gate wiring.
 
-## Firebase Remote Config
+## Retired: Firebase Remote Config
 
-The client-only store. `ClientConfigManager` (`app/app/src/main/java/com/intuisoftllc/rollingrecord/config/ClientConfigManager.kt`) fetches once per session and applies `buildValuesMap()` into the in-memory `ClientConfig` (`app/agentcore/.../config/ClientConfig.kt`). Release fetch interval is one hour; debug fetches every launch. If the fetch fails, the in-app `ClientConfig` defaults stay in effect — the app always works without a successful fetch.
+Firebase Remote Config used to hold the client-only knobs. On **2026-08-30** Firebase moved Remote Config to per-user billing, so migration `20260830120000_firebase_rc_to_server_config.sql` migrated its surviving keys into `server_config` as `public=true` rows and the same commit deleted the Firebase RC SDK along with the `ClientConfig` / `ClientConfigManager` pair. `server_config` is now the single config store, and the Android client reads these rows through the existing `server-config` endpoint via `ServerConfigManager` — the only remaining config fetch.
 
-The keys it carries are all client-behavior only — none is server-enforced:
+Eight keys migrated (all `public=true`, all client-read):
 
-| Key | Kind | Controls |
+| Migrated key | Kind | Controls |
 | --- | --- | --- |
 | `kb_chat_max_history_pairs` | int | conversation-history window fed to the agent loop |
 | `ai_chat_max_transcript_snippets` | int | transcript snippets attached to a chat turn |
-| `reconcile_periodic_interval_hours` | int | background drift-reconcile cadence |
-| `reconcile_foreground_debounce_minutes` | int | foreground reconcile debounce |
-| `semantic_search_result_cap` | int | on-device search result ceiling |
-| `semantic_snippet_chunk_count` | int | chunks per semantic snippet |
-| `topic_search_threshold` | double | on-device similarity threshold |
-| `section_semantic_threshold` | double | on-device section-match threshold |
-| `semantic_search_margin` | double | search score margin |
-| `template_moderation_enabled` | boolean | client-side moderation toggle |
+| `topic_search_threshold` | float | on-device Topic-search cosine floor |
+| `section_semantic_threshold` | float | on-device per-section semantic-match floor |
+| `semantic_search_margin` | float | rank-aware margin around the top score |
+| `semantic_search_result_cap` | int | margin-filtered semantic result ceiling |
+| `semantic_snippet_chunk_count` | int | transcript chunks per KB-chat snippet |
+| `blueprint_moderation_enabled` | boolean | client-side blueprint moderation master flag |
+
+`blueprint_moderation_enabled` was **renamed** from Remote Config's `template_moderation_enabled` — "template" is the feature's retired name.
+
+The rest of the RC dashboard was **dropped, not migrated** — dead or duplicate keys deleted with the dashboard:
+
+| Dropped key(s) | Why |
+| --- | --- |
+| `extraction_model`, `synthesis_model`, `synthesis_deep_reasoning_model`, `kb_chat_model` | `server_config` already owns model selection via its per-operation model rows |
+| `local_embedding_*` (×5) | on-device embedding path removed (RR-487) |
+| `template_semantic_threshold` | dead |
+| `assemblyai_speech_model` | unwired — `assemblyai.ts` hardcodes `universal-2` |
+| `reconcile_periodic_interval_hours`, `reconcile_foreground_debounce_minutes` | zero consumers |
 
 <Note>
-`ClientConfig` + `ClientConfigManager` are the current Android class names. Older references to `RemoteConfig.kt` / `FirebaseRemoteConfigManager` are stale, and `ServerConfig.kt` now lives in `app/agentcore`, not `app/app`.
+`ServerConfig` and `ServerConfigManager` are the only config classes now. Any reference to `ClientConfig`, `ClientConfigManager`, or the Firebase RC SDK is stale — all were deleted in the 2026-08-30 teardown.
 </Note>
 
 ## Why no duplication
 
-Classifying a new value is a single question: does the Edge Function or the server need to enforce it (a cost, quota, kill switch, or allowlist)? If yes, it is Supabase-only. If it is purely client display, client behavior, A/B testing, or on-device code, it is Firebase-only. Never both by default — a duplicated value must be justified explicitly (e.g. an A/B test needing both instant Firebase propagation and server enforcement).
+Classifying a new value is a single question about its `server_config` row's `public` flag: does the *client* need to read it (display, on-device behavior, or a cap/multiplier/version-floor surfaced or pre-checked in the app)? If no — only the Edge Function or the server ever touches it — it is a `public=false` row the client never sees. If yes, it is a `public=true` row the client reads (and mirrors in `ServerConfig.kt`), *even when the server also enforces it*: the monthly quota caps the server counts against but the UI displays (`ai_queries_per_month`, `syntheses_per_month`), the `medical_mode_usage_multiplier` the server meters on but the confirm dialog shows, and the `min_supported_app_version_code` kill switch the server enforces via a 410 gate but the client pre-checks are all server-enforced *and* `public=true`. With Firebase RC gone there is no separate client-only store to duplicate into — one row, one `public` flag, read by whichever side needs it.
 
-The reason the split has teeth: the Kotlin `DEFAULT_*` constants only apply on first-ever launch before any fetch completes, or when the cache is missing. Once the server has a value, it overrides the local default unconditionally. Silently editing a `DEFAULT_*` constant to fix a tuning problem does nothing for existing installs — the live dial is the Supabase or Firebase console, not the code.
+The reason the split has teeth: the Kotlin `DEFAULT_*` constants only apply on first-ever launch before any fetch completes, or when the cache is missing. Once the server has a value, it overrides the local default unconditionally. Silently editing a `DEFAULT_*` constant to fix a tuning problem does nothing for existing installs — the live dial is the Supabase dashboard or a migration, not the code.
 
 Related: [config tables](/rollingrecord/backend/database/config-tables) · [the `server-config` endpoint](/rollingrecord/backend/edge-functions/server-config) · [RLS and the service role](/rollingrecord/backend/database/rls-and-service-role) · [env and secrets](/rollingrecord/backend/operations/env-and-secrets) · [architecture overview](/rollingrecord/backend/architecture/overview).

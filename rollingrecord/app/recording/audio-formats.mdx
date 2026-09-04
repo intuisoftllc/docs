@@ -23,12 +23,16 @@ Format preference is a user setting (`SettingsRepository`, key surfaced as "Audi
 
 | Preference | Container | Encoder | Notes |
 | --- | --- | --- | --- |
-| `"aac"` | MPEG-4 (`.m4a`) | AAC | Universally compatible. |
+| `"aac"` | MPEG-4 (`.m4a`) | AAC | Universally compatible. The default for new / free users (`AudioFormat.DEFAULT = AAC`; `fromWire(null/unknown)` also resolves to AAC). |
 | `"opus"` | OGG (`.ogg`) | Opus | Requires API 29\+; falls back to AAC on older devices. Sample rate is forced to 48 kHz regardless of the user setting (see below). |
 | `"wav"` | WAV (`.wav`) | PCM 16-bit | Uncompressed. Uses `WavRecorder`, bypassing `MediaRecorder`. |
-| `"auto"` | Opus on API 29\+ with bitrate ≤ 128 kbps, otherwise AAC |  | Default. |
+| `"auto"` | Opus on API 29\+ with bitrate ≤ 128 kbps, otherwise AAC |  | Selected only when the user picks it explicitly. |
 
 `"auto"` prefers Opus because at ≤ 128 kbps it is roughly 30–40% smaller than AAC at the same perceived quality, which matters for Rolling's storage cap and cloud upload bandwidth.
+
+The default is now `AAC`, not `AUTO` (`AudioFormat.DEFAULT = AAC`; the KDoc explains the swap). The free tier is pinned to 128 kbps and cannot change format, so `AUTO` resolved to Opus/OGG (`.ogg`) for most free users — a file iOS and macOS cannot play natively, which silently broke **Share recording** (a Free feature) with the failure landing on the recipient rather than anywhere the user could see it. AAC/M4A plays natively on iOS, macOS, Android, and Windows, and the quality delta versus Opus at 128 kbps is negligible. Opus stays a Pro **choice**, not the default.
+
+The Recording-settings description text now reflects the **selected** option instead of a single fixed string. `V2AppSettingsScreen`'s `RecordingSection` picks `settings_rec_mode_desc_hifi` / `settings_rec_mode_desc_voice` for the capture-mode row, and `settings_audio_format_desc_aac` / `_opus` / `_opus_unsupported` (the last when Opus is chosen below API 29, where it silently records its AAC fallback) / `_wav` / `_auto` for the format row. Previously one static string — the High-Fidelity / AUTO copy — always showed regardless of the user's actual selection (a V1-parity fix).
 
 ### Opus is always captured at 48 kHz
 
@@ -48,7 +52,9 @@ Three settings feed into `AudioConfig`:
 
 ### `AacRecorder`
 
-`AacRecorder` installs `setOnErrorListener` and `setOnInfoListener` on `MediaRecorder`. Disk-full is detected two ways: the `extra == -28` code (POSIX `ENOSPC`), or `StatFs(filesDir).availableBytes < 512 KiB`. On disk-full it sets `diskFull = true` and calls the `onDiskFull` callback the service supplies; on any other error it calls `onError`.
+`AacRecorder` installs `setOnErrorListener` and `setOnInfoListener` on `MediaRecorder`. Disk-full is detected two ways: the `extra == -28` code (POSIX `ENOSPC`), or `StorageManager.readFreeBytes(context) < 512 * 1024L`. On disk-full it sets `diskFull = true` and calls the `onDiskFull` callback the service supplies; on any other error it calls `onError`.
+
+Routing the free-space read through `StorageManager` (rather than a direct `StatFs`) lets the dev free-space override reach this path too. The 512 KiB threshold is kept on purpose: it is the last-ditch "the write itself is failing" check, distinct from the 250 MB admission floor. Raising it to the floor would abort a live manual recording the moment free space dipped, which the floor deliberately does not do once recording has started.
 
 Vendor-specific `MediaRecorder` info codes (Samsung firmware fires `what=268436456` on every clean stop, for example) are ignored so they don't bloat the rolling log.
 

@@ -31,16 +31,18 @@ The BM25 path uses FTS4 `matchinfo(context_fts, 'pcnalx')` with a porter tokeniz
 
 ## Manual (typed) context ranking
 
-`ContextSearchRanker` (`data/repository/ContextSearchRanker.kt`) powers the manual search bar (`SearchSource.USER`), separate from `KnowledgeBaseSearchEngine` so a typed query never burns AI tokens (no HyDE / expansion). `rank(query, contextIds, floor = sectionSemanticThreshold)` grades each context as `max(context vector, best section vector)` over the `embeddings` table, then applies the margin filter. It returns empty on any embed failure so the caller falls back to text search.
+`ContextSearchRanker` (`data/repository/ContextSearchRanker.kt`) powers the manual search bar (`SearchSource.USER`), separate from `KnowledgeBaseSearchEngine` so a typed query never burns AI tokens (no HyDE / expansion). `rank(query, contextIds, floor = ServerConfig.sectionSemanticThreshold)` grades each context as `max(context vector, best section vector)` over the `embeddings` table, then applies the margin filter. It returns empty on any embed failure so the caller falls back to text search. `RecordingSemanticSearchEngine`, `KnowledgeBaseSearchEngine`, and `ContextSearchRanker` all read these thresholds/margin/cap from `ServerConfig` (was `ClientConfig`).
 
 ## The rank-aware margin filter
 
 `applySemanticMarginFilter(items, floor, margin, cap, score)` (`data/repository/SemanticMarginFilter.kt`) is the shared policy, applied in order: the top hit must clear the absolute `floor` (else return empty); keep only items within `margin` of the top score (an adaptive per-query cutoff); then `take(cap)`. This exploits that embedding scores compress into a narrow band where ranking is near-perfect even when absolute scores drift per query.
 
-| Value | Default | Firebase key |
+All five are `ServerConfig` fields read from `server_config` rows (Firebase Remote Config was retired 2026-08-30). The `Default` column is the in-app **cold-start** default; the live `server_config` value differs for the two thresholds — `topic_search_threshold` is live 0.30 and `section_semantic_threshold` live 0.32 (both looser than the conservative cold-start default). The three semantic knobs were never overridden, so live = default.
+
+| Value | Cold-start default | `server_config` key |
 | --- | --- | --- |
-| `topicSearchThreshold` (recording floor) | 0.48 | `topic_search_threshold` |
-| `sectionSemanticThreshold` (section floor) | 0.50 | `section_semantic_threshold` |
+| `topicSearchThreshold` (recording floor) | 0.48 (live 0.30) | `topic_search_threshold` |
+| `sectionSemanticThreshold` (section floor) | 0.50 (live 0.32) | `section_semantic_threshold` |
 | `semanticSearchMargin` | 0.02 | `semantic_search_margin` |
 | `semanticSearchResultCap` | 8 | `semantic_search_result_cap` |
 | `semanticSnippetChunkCount` | 3 | `semantic_snippet_chunk_count` |
@@ -48,6 +50,14 @@ The BM25 path uses FTS4 `matchinfo(context_fts, 'pcnalx')` with a porter tokeniz
 ## Embedding transport
 
 `SearchApi` (`data/remote/search/SearchApi.kt`) is the Retrofit interface for the `search` and `indexing` Edge Functions (sharing the `aiengine` OkHttp client). `SearchApiClient` exposes `embedQuery(query, source): ApiResult<QueryEmbedding>` and `embedDocuments(texts): ApiResult<DocumentEmbeddings>` (batch ≤96), plus `getBundles` / `putBundle` for the bundle cache. `SearchSource` is `USER("user")` / `AI("ai")` — it drives server telemetry (`usage.searches` vs `usage.ai_searches`); cost is tracked either way. `QueryEmbedding(vector: FloatArray, modelVersion)` and `DocumentEmbeddings(vectors: List<FloatArray>, modelVersion)` are the public result shapes. The little-endian float32 BLOB codec and `cosineSimilarity` (returns 0 on a zero norm) live as top-level helpers in `data/local/db/dao/EmbeddingDao.kt`.
+
+## Loading-aware lookup flow
+
+`SemanticLookup<Res>` and the extension `Flow<Req?>.asSemanticLookup(scope, debounceMs = 300, lookup)` (`ui/v2/components/SemanticLookup.kt`) are a shared debounced semantic-lookup helper the two V2 search controllers reuse instead of hand-rolling one each. It exposes BOTH `results: StateFlow<Res?>` and `loading: StateFlow<Boolean>`, derived off the same emission stream inside `flatMapLatest` so they cannot disagree: a `Running` state is emitted BEFORE the suspend call (the spinner appears the moment the debounce settles, and a superseded lookup can't leave `loading` stuck), and while `Running` the `results` flow maps to `null` rather than holding a stale ranking that answers a query the user has already changed. A `null` request ("not searching") passes through with no debounce so clearing the query settles instantly.
+
+## Search-bar trailing control
+
+`V2SearchTrailingAction(loading, onClick, tint)` (`ui/v2/components/V2SearchTrailingAction.kt`) is the search bar's trailing clear/dismiss X, which swaps to a spinner while a semantic lookup is in flight (and is not a button in that state). It is sized 20dp to match the X so the row does not reflow, and is applied across the nine controller instances / seven search surfaces (all-recordings, category detail, favourites, trash, context list, contexts dashboard, and the two add-pickers).
 
 ## Related
 

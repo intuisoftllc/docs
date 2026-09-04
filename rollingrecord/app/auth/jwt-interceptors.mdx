@@ -3,7 +3,7 @@ title: "Auth Token Injection & Refresh"
 description: "The OkHttp interceptor chain that stamps the Clerk JWT + App Check headers on Edge Function calls, refreshes on 401, and reacts to account freeze and version gates."
 ---
 
-Both authed Supabase OkHttp clients — `supabase` and `aiengine` — are built in `di/NetworkModule.kt` with the **identical** ordered interceptor chain plus a 401 authenticator. The dedicated `audio_signed_url` client carries none of these interceptors because a Supabase Storage signed URL self-authenticates via its `token` query param, and stamping the user's JWT onto a third-party storage host would be wrong.
+Both authed Supabase OkHttp clients — `supabase` and `aiengine` — are built in `di/NetworkModule.kt` with the **identical** ordered interceptor chain plus a 401 authenticator. The dedicated `audio_signed_url` client carries none of these interceptors because a Supabase Storage signed URL self-authenticates via its `token` query param, and stamping the user's JWT onto a third-party storage host would be wrong. For the same reason `BugReportApiClient`'s log upload uses a bare `OkHttpClient` (a 2-minute `callTimeout`, no interceptors) for its signed-Storage-URL PUT — the signature is the whole authorization, so it must not carry the `Authorization` or App Check headers (see [Networking](/rollingrecord/app/platform/networking) and [Bug Reports](/rollingrecord/app/platform/bug-reports)).
 
 ## The authed chain
 
@@ -15,9 +15,10 @@ Interceptors run outermost-first on the way out. The chain short-circuits client
 | 2 | `AppCheckTokenInterceptor` | Interceptor | `apikey` + `X-Firebase-AppCheck` (blocks on the cold-start warmup) |
 | 3 | `BearerJwtInterceptor` | Interceptor | `Authorization: Bearer <Clerk JWT>` via `awaitAccessToken` |
 | 4 | `AccountFreezeInterceptor` | Interceptor | Set/clear FROZEN from a 403 `account_frozen` / any 2xx (authed requests only) |
-| 5 | `AppVersionHeaderInterceptor` | Interceptor | `X-App-Version` = real `versionCode` |
-| 6 | `ClientTooOldInterceptor` | Interceptor | Flip `AppVersionGate` on a 410 `client_too_old` |
-| 7 | `HttpLoggingInterceptor` | Interceptor | `HEADERS` in debug, `NONE` in release |
+| 5 | `EntitlementRefreshInterceptor` | Interceptor | Stamp `X-Entitlement-Refresh: 1` while `EntitlementRefreshSignal.isPending()` (the post-purchase window) so `runGates` skips its per-customer RevenueCat entitlement cache |
+| 6 | `AppVersionHeaderInterceptor` | Interceptor | `X-App-Version` = real `versionCode` |
+| 7 | `ClientTooOldInterceptor` | Interceptor | Flip `AppVersionGate` on a 410 `client_too_old` |
+| 8 | `HttpLoggingInterceptor` | Interceptor | `HEADERS` in debug, `NONE` in release |
 | on 401 | `TokenRefreshAuthenticator` | Authenticator | Re-fetch the token, retry once (loop-guarded) |
 
 ## `BearerJwtInterceptor`
@@ -43,6 +44,12 @@ Interceptors run outermost-first on the way out. The chain short-circuits client
 - **everything else** (401, App-Check 403, 410/426, other 4xx/5xx, network failure) → no-op; those are inconclusive about freeze.
 
 The matched code is `AiEngineErrorCode.ACCOUNT_FROZEN` (`"account_frozen"`) in `app/agentcore/src/main/kotlin/com/intuisoftllc/rollingrecord/data/remote/aiengine/AiEngineErrorCode.kt`, a mirror of the server's `_shared/errors.ts` registry.
+
+## `EntitlementRefreshInterceptor` and the refresh signal
+
+`EntitlementRefreshInterceptor` (`data/remote/EntitlementRefreshInterceptor.kt`) fires only when `signal.isPending()`; otherwise it proceeds untouched. When armed it adds `X-Entitlement-Refresh: 1`, which tells `runGates` to skip its per-customer RevenueCat entitlement cache for that request (subject to a 20-second age floor on the server side). The header is a **caching hint, never a claim** — the answer still comes from RevenueCat, so a forged header earns nothing but a fresh, honest "no". It closes the up-to-five-minute window where a user who just purchased is answered from a cached "no entitlements" — refused transcription and told they are out of minutes on a plan they have already paid for.
+
+The backing single is `EntitlementRefreshSignal` (`data/billing/EntitlementRefreshSignal.kt`), registered in `NetworkModule.kt` as an app-level `single` that is also a `UserScopedCache`: it holds one boolean and no per-user data, but implements the cache anyway so a flag armed by the previous account can't send a pointless header on the next account's first call. Its `localTier` lambda reads `RcEntitlement.resolveTier(RevenueCatManager.customerInfo.value.info)` as the local side of the check. It is armed on **disagreement**, not on a local purchase callback: `UsageRepository` is wired with an `onServerTierObserved(tierWire)` callback that forwards each server usage snapshot's tier to `EntitlementRefreshSignal.onServerTierObserved(...)`, so whenever the server's reported tier is *below* what local RC believes (the user thinks they're entitled to more than the server granted) the hint arms for the next request; once the server's answer agrees again the flag clears. That covers restores and out-of-process / promotional grants, and costs a genuinely free user nothing (their local tier already agrees with the server). See [Entitlements & RevenueCat](/rollingrecord/app/monetization/entitlements-revenuecat) for the full signal/interceptor pair.
 
 ## Rate-limit and version interceptors
 

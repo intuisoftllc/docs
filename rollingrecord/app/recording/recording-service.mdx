@@ -55,17 +55,25 @@ The relevant extras are `EXTRA_MODE`, `EXTRA_RECORDING_NAME`, `EXTRA_CATEGORY_ID
 - **`RECORDING`** — actively capturing audio.
 - **`PAUSED`** — captured audio dropped, but session and file are still open.
 
-Transitions are triggered by `START`, `STOP`, `PAUSE`, and `RESUME` events. Invalid transitions (for example, `PAUSE` while `IDLE`) are rejected without side effects. The state handler emits state changes into `RecordingServiceState` so the UI and tiles observe them consistently.
+Transitions are triggered by `START`, `STOP`, `PAUSE`, and `RESUME` events. Invalid transitions (for example, `PAUSE` while `IDLE`) are rejected without side effects. `RecordingStateHandler` itself is a pure transition table — `transition`, `canPerform`, and `availableActions` — that holds no state and emits nothing. `RecordingService` calls `transition(current, action)`, and when it returns a non-null next state the service writes that into the `RecordingServiceState` it publishes on the `_state` `MutableStateFlow`, so the UI and tiles observe state changes consistently.
 
 ## Foreground service type strategy
 
 `RecordingService.startForegroundCompat` picks the FGS type at runtime:
 
-- On API 34\+ it first tries `FOREGROUND_SERVICE_TYPE_MICROPHONE`.
+- On API 29\+ it first tries `FOREGROUND_SERVICE_TYPE_MICROPHONE` (below API 29 it calls `startForeground` with no type argument).
 - If that throws `SecurityException` (typically when an alarm callback tries to start a mic FGS from the background on Android 14/15), it falls back to `FOREGROUND_SERVICE_TYPE_DATA_SYNC` and immediately schedules a promotion back to `MICROPHONE` on the next foreground opportunity.
 - `microphoneFgsGranted` is a boolean on the state that gates capture. If the service is running with `DATA_SYNC` type only, capture is deferred so we don't produce silent files.
 
 Scheduled recordings avoid this fallback path entirely by pre-warming the service into `STANDBY` with `MICROPHONE` type before the alarm fires. See [Scheduled recordings](/rollingrecord/app/recording/scheduled-recordings).
+
+## Dispatcher discipline (ANR hardening)
+
+The **first** touch of a session-scoped `userProperty` on `RecordingService` (e.g. `settingsRepository`, `storageManager`) is a synchronous Koin resolution that can block on the session-scope factory lock while a sign-in's database build holds it — and that build can sit in a network DEK fetch behind App Check waits (30s\+). Because `serviceScope` is `Dispatchers.Main`, a first-touch on that scope froze Main. Three sites carry `[ANR 2026-08-30]` fixes:
+
+- **`resumeIfActive`** computes the standby / upcoming-schedule decision inside `withContext(Dispatchers.IO)`, leaving only the service and notification tail on Main.
+- **`startStandby`** / **`cancelStandby`** run `settingsRepository.setScheduleStandbyActive(...)` via `serviceScope.launch(Dispatchers.IO)` — the thread-safe `stopForeground` / `stopSelf` calls ride along.
+- **`startRecording`**'s storage-floor guard moved off the synchronous `onStartCommand` path into an IO coroutine that also warms the other session-scoped delegates. Foreground is already promoted at the top of the function, so the early-return semantics are unchanged.
 
 ## `RecordingServiceState`
 
@@ -74,6 +82,8 @@ Scheduled recordings avoid this fallback path entirely by pre-warming the servic
 - `recordingState` — one of the four state-machine states above.
 - `mode` — `RecordingMode.MANUAL` or `RecordingMode.ROLLING`.
 - `sessionId`, `startTimeMs`, `currentSegmentIndex`, `currentRecordingName`.
+- `segmentDurationMs` — the segment length locked for the active session (ms); 0 when not rolling.
+- `segmentStartTimeMs` — wall-clock start of the **current** segment (0 when not rolling), the same instant `SegmentRotationManager` measures against. The service **publishes** this — the setter of the private `segmentStartTime` var mirrors every assignment into the state — rather than letting the UI derive it. The old derivation `startTimeMs + currentSegmentIndex * segmentDurationMs` assumed rotations were instantaneous and perfectly periodic; they are not (each rotation finalizes the recorder, writes the file, inserts a row, and prunes before the next `segmentStartTime` is stamped), so it drifted ahead of reality by the accumulated per-rotation cost and the progress bar filled early.
 - `rollingStorageUsedBytes`, `protectedRollingStorageUsedBytes`, `sessionStorageLimitBytes`.
 - `isContinueRecording`, `isCurrentSegmentProtected`, `activeScheduleId`.
 - `totalPausedMs`, `pausedAtMs` (used to compute effective elapsed time).
@@ -91,8 +101,8 @@ Live marks captured during a Manual recording are held on `RecordingService.pend
 | Channel id | Importance | Purpose |
 | --- | --- | --- |
 | `recording_channel_v2` | `IMPORTANCE_LOW` | The ongoing "Recording…" notification. Silent to avoid noise on every rotation. |
-| `recording_alerts` | `IMPORTANCE_DEFAULT` | Non-urgent alerts (protected storage 70% warning, storage limit updates). |
-| `recording_urgent` | `IMPORTANCE_HIGH` | Urgent alerts (device storage full, protected storage full, battery too low). |
+| `recording_alerts` | `IMPORTANCE_DEFAULT` | Non-urgent alerts (device storage full, protected storage full, protected storage 70% warning, storage limit updates). |
+| `recording_urgent` | `IMPORTANCE_HIGH` | Urgent alerts (battery too low, battery getting low). |
 
 The ongoing notification uses the app brand color (`0xFFD32F2F`) and includes action buttons that change with state and mode:
 
@@ -101,8 +111,16 @@ The ongoing notification uses the app brand color (`0xFFD32F2F`) and includes ac
 
 Actions are `PendingIntent`s pointed back at `RecordingService` with the corresponding `ACTION_*`.
 
+## Auto-transcription gate
+
+When a recording or rotated segment finalizes, the service calls `enqueueTranscriptionWork(recordingId)`. That method now short-circuits below `PRO_CLOUD`: it reads tier live via `EntitlementRepository.currentTier` (defaulting to `UserTier.FREE` if resolution throws) and returns **before** `createOrResetProcessing`, so a lapsed user's saved recordings and protected rolling segments no longer each enqueue a worker that buys a guaranteed server-side 403. The primary documentation home for the transcription entitlement is the transcription / monetization section; it is noted here because the choke point lives in `RecordingService`.
+
 ## Kill tracking
 
 `OsKillSentinel` writes lifecycle markers (`markStandbyStarted`, `markRecordingStarted`, `markServiceStopped`) so that if the service is torn down while `RECORDING` or `STANDBY`, `RecordingService.onDestroy` records a typed kill event to Crashlytics. This is how OEM-specific background kills surface in reporting.
+
+`onDestroy`'s emergency finalize is launched `serviceScope.launch(start = CoroutineStart.UNDISPATCHED)`, so its body **begins** synchronously (up to the first suspension inside `finalizeCurrentSegment`, by which point it is already inside `NonCancellable`) before the `serviceScope.cancel()` later in the same Main message. A plain `launch` only queued the block, and the cancel dropped it before it ran — `NonCancellable` protects a block that is already running, not one that never began — so the in-progress segment was lost on every service destroy.
+
+When no emergency finalize ran (the state was not `RECORDING` / `PAUSED`), `onDestroy` now **stops** the recorder first — a bounded `runBlocking { withTimeoutOrNull(2_000L) { recorder.stop() } }` — before `releaseActiveRecorder()`. `WavRecorder.release()` alone leaves its `drainJob` alive, and a `read()` on the released `AudioRecord` looks like a mic glitch, so the loop "self-heals" by allocating a new `AudioRecord` and re-acquiring the microphone for the rest of the process lifetime; AAC leaks differently, abandoning the MP4 `moov` atom and leaving the segment unplayable. The two paths are guarded so only one acts.
 
 On the next process start, `App.recoverInterruptedRecording(finalizedDuringShutdown)` runs the WAV-header patch and dangling-session finalize, then writes an `Outcome` to `RecordingInterruptedState` (`RECOVERED` or `FAILED`). `V2App` observes the flow and shows `V2RecordingInterruptedSheet`, which uses `reopenAfterUnlock = true` so it waits out the App Lock overlay. See [Interruption handling](/rollingrecord/app/recording/interruption-recovery).

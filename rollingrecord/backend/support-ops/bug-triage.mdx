@@ -1,0 +1,134 @@
+---
+title: "Bug Report Triage"
+description: "The two support-ops that work the bug queue behind RRSupport's Bugs tab — get_bug_reports and set_bug_status — plus the closed_at retention clock and the stale sweeper."
+---
+
+Two operations behind RRSupport's Bugs tab work the `bug_reports` queue: `get_bug_reports` (`functions/support-ops/operations/get-bug-reports.ts`) reads it, and `set_bug_status` (`functions/support-ops/operations/set-bug-status.ts`) moves one report through triage. Both are registered in `functions/support-ops/operations/registry.ts` and both declare `requiredPermission: "can_view_user_data"` — a bug description *is* text the user wrote, so reading or working the queue is reading user data, and the permission that gates pulling an account gates this too.
+
+The `bug_reports` table itself is created in migration `20260817120000_bug_reports.sql` (documented on the [bug-report submit function](/rollingrecord/backend/edge-functions/bug-report) and the database pages). This page covers only the triage-side ops and the two lifecycle migrations that layer retention and staleness on top of that table: `20260817160000_bug_report_triage.sql` (the `closed_at` stamp plus its sweeper) and `20260817200000_bug_report_stale_status.sql` (the `stale` status plus its cron).
+
+## `get_bug_reports`
+
+An `OperationDef` with `name: "get_bug_reports"`, `isReadOnly: true`, `requiredPermission: "can_view_user_data"`, and its handler in `get-bug-reports.ts`. One op serves two shapes:
+
+- **No `target_auth_user_id`** → the GLOBAL queue, newest report first — what the Bugs tab opens on.
+- **`target_auth_user_id` set** → just that user's reports, for the account screen.
+
+It is read-only. It computes an audit `targetAuthUserId` only when scoped to a user (`targetId ?? null`) — the global queue is not about anybody in particular, so the audit row for a global read carries no target.
+
+### Parameters
+
+| Param | Type | Effect |
+| --- | --- | --- |
+| `bug_report_id` | UUID | Single-report fetch; WINS over every other filter; returns the FULL description |
+| `target_auth_user_id` | string | Scope to one user's reports; absent → the global queue |
+| `statuses` | `string[]` | Multi-select status filter, applied via `.in`; validated against `STATUSES`; an empty array is rejected |
+| `areas` | `string[]` | Multi-select area filter, applied via `.in`; validated against `BUG_AREAS`; an empty array is rejected |
+| `before_created_at` | string | Keyset cursor — applied via `.lt` on `created_at` |
+| `limit` | number | Page size; default `DEFAULT_LIMIT` = 25, clamped to `1..MAX_LIMIT` (100) |
+
+`bug_report_id`, `target_auth_user_id`, and `status` values are applied with `.eq` / `.in`; `before_created_at` with `.lt`.
+
+### Keyset pagination
+
+Pagination is KEYSET, not OFFSET. An offset re-counts from the top on every page, so a report filed while an operator is scrolling shifts everything down one — they would see a row twice and miss another. The cursor is `before_created_at`: the `created_at` of the last row the caller already holds. Rows are ordered `created_at DESC` with `.limit(limit)`.
+
+The response returns `next_before_created_at` = the last row's `created_at` when the page filled (`rows.length === limit`), else `null` — which is also the end-of-list signal.
+
+### Filters
+
+`statuses[]` and `areas[]` are multi-select arrays so an operator can ask for "New AND Triaged" in one view, which a single value cannot express. Both are validated by `validateWireArray`, which rejects a non-array, an EMPTY array, or any element outside the allowed set — returning `AppError.VALIDATION_FAILED`. An empty array is *not* treated as "all": silently widening it would show more than the caller asked for without saying so.
+
+| Set | Allowed values | Source |
+| --- | --- | --- |
+| `STATUSES` | `new`, `stale`, `triaged`, `in_progress`, `resolved`, `wont_fix` | mirrors the `bug_reports.status` CHECK |
+| `BUG_AREAS` | `recording`, `playback`, `library`, `transcription`, `contexts_ai`, `cloud_sync`, `account_billing`, `app_lock`, `other` | `functions/_shared/bugreport/sanitize.ts` |
+
+A `bug_report_id` (UUID) is a single-report fetch that wins over every other filter — the detail screen asks for one known row and must get it regardless of what status or area it holds.
+
+### Excerpts
+
+List rows ship a `description` truncated to `EXCERPT_CHARS` = 240 characters plus a boolean `description_truncated` (true only when `!bug_report_id` and `description.length > 240`). A single `bug_report_id` fetch returns the full text — the excerpt exists so a page of 25 rows is not 300 KB of text nobody reads, and the detail screen is the one caller that needs all of it.
+
+Each entry row carries:
+
+| Field | Notes |
+| --- | --- |
+| `bug_report_id` | the row PK |
+| `auth_user_id` | the reporter |
+| `area` | one of `BUG_AREAS` |
+| `status` | one of `STATUSES` |
+| `created_at` | filed time; also the keyset cursor source |
+| `closed_at` | terminal-status stamp, or `null` while open |
+| `description` | excerpt (list) or full text (single-id fetch) |
+| `description_truncated` | whether opening the row reveals more |
+| `client_metadata` | app / device / tier context stored as JSONB |
+| `log_storage_path` | raw Storage path — enough for the console to request a signed download without a second round-trip |
+| `log_bytes` | attached-log size |
+| `admin_notes` | operator notes |
+
+### `status_counts`
+
+The response includes `status_counts`, one count per `STATUS`, computed for the CURRENT scope — it respects the `target_auth_user_id` and `areas` filters but deliberately IGNORES the status filter, so selecting "New" does not zero out the other chips and lose the operator sight of the queue. Each count is a `head: true` `count: "exact"` query; a failed count is swallowed to 0 (non-fatal — the rows are the point, the chip badge is decoration).
+
+The full response body is `{ count, next_before_created_at, status_counts, total, entries }`, where `total` is the sum of the per-status counts.
+
+## `set_bug_status`
+
+An `OperationDef` with `name: "set_bug_status"`, `requiredPermission: "can_view_user_data"`, and `isReadOnly: true`. The read-only flag is in the DISPATCHER's sense — no dry-run, no preview — the same treatment `link_audit_ticket` gets: triage means many status flips per sitting, and a two-phase confirm on each would make the queue painful to work. The worst outcome is a wrong label, fixed by another tap, and the dispatcher audits every call to `l_admin_audit` regardless, so who changed what is never in question.
+
+| Param | Type | Notes |
+| --- | --- | --- |
+| `bug_report_id` | UUID | required |
+| `status` | string | required; must be in `STATUSES` |
+| `admin_notes` | string | optional; capped at `MAX_NOTES_CHARS` = 4000 |
+
+### The `closed_at` lifecycle
+
+`TERMINAL_STATUSES` = `['resolved', 'wont_fix']` — the only states `prune_closed_bug_reports()` ever deletes. `closed_at` is the retention clock, so it moves only on a real transition:
+
+| Transition | `closed_at` |
+| --- | --- |
+| non-terminal → terminal | stamp `now` |
+| terminal → non-terminal (reopen) | clear to `null` — otherwise the sweeper would still see an aged timestamp and delete a report that is open again |
+| terminal → terminal (`resolved` ⇄ `wont_fix`) | keep the ORIGINAL stamp — relabelling a closed report does not buy it a fresh retention window |
+
+`stale` is accepted as a target so a caller can move a report OUT of it (and so the value round-trips), even though the console never offers it as a target — it is an observation derived from a timestamp, not a decision anyone makes.
+
+### Read-first
+
+The handler selects the existing row with `maybeSingle` before updating, for two reasons: a bad id returns `AppError.NOT_FOUND` instead of a silent zero-row update that looks like success, and the audit row can record `previous_status`. When `admin_notes` is provided it is written through `sanitizeDbTextOrNull` (`functions/_shared/text/db-text.ts`), which strips unstorable and deceptive bytes and yields `null` for anything that ends up empty.
+
+The response body is `{ bug_report_id, previous_status, status, closed_at, notes_updated }`. The audit row is attributed to the REPORTER (`targetAuthUserId = row.auth_user_id`) so the change shows up on that user's history alongside the report it concerns.
+
+## Lifecycle, retention & the stale sweeper
+
+Two migrations layer the report lifecycle on top of the base `bug_reports` table.
+
+### `20260817160000_bug_report_triage.sql`
+
+- Adds the nullable `bug_reports.closed_at` column plus the partial index `index_bug_reports_closed_at` `WHERE closed_at IS NOT NULL` — the sweeper only ever scans closed rows, so leaving open rows out keeps the index small no matter how long the queue grows.
+- Inserts the `server_config` row `bug_report_retention_days` = 90.
+- Creates the `SECURITY DEFINER` function `prune_closed_bug_reports()`, which DELETEs rows with `status IN ('resolved', 'wont_fix') AND closed_at IS NOT NULL AND closed_at < now() - retention_days`. Open reports (`new` / `stale` / `triaged` / `in_progress`) are never touched at any age. The retention value falls back to 90 if the config row is missing or `<= 0`, so a misconfigured value can never widen the sweep into open reports.
+- Scheduled nightly via `pg_cron` at 03:30 UTC.
+
+The AFTER DELETE trigger `trg_bug_reports_delete_log_object` (from `20260817120000`) removes each row's object from the `bug-logs` bucket, so the sweep also reclaims Storage automatically.
+
+### `20260817200000_bug_report_stale_status.sql`
+
+- Widens the `bug_reports_status_check` constraint to admit `stale`.
+- Inserts the `server_config` row `bug_report_stale_days` = 60.
+- Adds the partial index `index_bug_reports_new_created_at` `WHERE status = 'new'`.
+- Creates the `SECURITY DEFINER` function `mark_stale_bug_reports()`, which UPDATEs `status` from `new` to `stale` for rows older than `stale_days`. Only `new` rows are affected — a report that reached any other status has been read by someone. `updated_at` is deliberately left untouched: this is a derived observation, not someone handling the report, and moving the timestamp would make an untouched row look freshly handled in every listing that sorts by it. The value falls back to 60 if the config is missing or `<= 0`.
+- Scheduled nightly at 03:35 UTC — five minutes after the retention sweep so the two never contend on the same table.
+
+`stale` is NOT terminal: a stale report is still open work, so it has no `closed_at` and is never swept, no matter how old it gets. It is also NOT operator-assignable — it is an observation about our own neglect, derived from `created_at`, so letting someone set it by hand would only let them mislabel a report they had in fact just read. See [cron sweepers](/rollingrecord/backend/database/cron-sweepers).
+
+## Where to go next
+
+- [Operations catalog](/rollingrecord/backend/support-ops/operations-catalog) — every support-op and the permission it declares.
+- [Admin permissions](/rollingrecord/backend/support-ops/permissions) — the `can_view_user_data` gate both ops share.
+- [Dry-run & audit](/rollingrecord/backend/support-ops/dry-run-and-audit) — why `set_bug_status` skips the preview flow.
+- [Bug-report submit function](/rollingrecord/backend/edge-functions/bug-report) — the user-facing side that writes the rows.
+- [Storage buckets](/rollingrecord/backend/storage/buckets) — the `bug-logs` bucket the sweeper reclaims.
+- [Cron sweepers](/rollingrecord/backend/database/cron-sweepers) — the nightly `prune_closed_bug_reports()` and `mark_stale_bug_reports()` jobs.

@@ -32,11 +32,13 @@ Representative coverage across the mirrored tree:
 | Area | Test files (`tests/`) |
 |---|---|
 | Error registry | `_shared/errors_test.ts` — no duplicate codes, size parity, snake_case, 4xx/5xx status, non-empty descriptions |
-| Cost math | `_shared/ai/pricing_test.ts`, `_shared/transcribe/pricing_test.ts` |
+| Cost math / AI failover | `_shared/ai/pricing_test.ts`, `_shared/transcribe/pricing_test.ts`, `_shared/ai/providers/failover_test.ts` — `shouldFailOver` classification (a `401` auth error must fail over to the next provider; request-shaped `400` / `404` / `413` must not) |
 | Sync transforms | `_shared/sync/*_test.ts`, `sync-pull/*`, `sync-push/*` — cursor encode/decode, entity/group mapping, request/response shaping |
 | Extraction logic | `_shared/extraction/*_test.ts` — accumulator, billing, context-budget, job-status, messages, runner-classify, runner-plan |
-| Crypto / OTP / email / billing / db | `_shared/crypto/*`, `_shared/otp/*`, `_shared/email/otp-email_test.ts`, `_shared/billing/entitlements_test.ts`, `_shared/db/*_test.ts` (credit-ceiling, metered-ops, storage-quota, usage-caps) |
-| Per-function pure logic | `ai-engine/*`, `support-ops/operations/*`, `indexing/bundle-requests_test.ts`, `storage-janitor/buckets_test.ts`, `storage-orphan-lister/predicates_test.ts`, `set-user-pin/pin-settings_test.ts`, `analytics/validation_test.ts` |
+| Text / DB-write sanitization | `_shared/text/db_text_test.ts` — `sanitizeDbText` strips NUL / C0 controls at the TEXT-column write boundary (an unstripped `U+0000` fails the whole INSERT); `_shared/bugreport/sanitize_test.ts` — bug-report description / area normalize + client-metadata sanitize |
+| Health probes | `_shared/gates/health_test.ts` — `shouldRunProbe` gate short-circuit + `buildHealthResponse` shaping (`200` ok / `503` degraded, no labels leaked); `_shared/db/health-checks_test.ts` — the pure `db*HealthResult` interpreters (the `requires both / all three` rule) |
+| Crypto / OTP / email / billing / db | `_shared/crypto/*`, `_shared/otp/*`, `_shared/email/otp-email_test.ts`, `_shared/billing/entitlements_test.ts`, `_shared/billing/revenuecat_test.ts` (`decideCacheUse` entitlement cache-bypass throttle), `_shared/db/*_test.ts` (credit-ceiling, metered-ops, storage-quota, usage-caps, `admin_credit_budget_test.ts` operator per-rolling-30-day grant ceiling) |
+| Per-function pure logic | `ai-engine/*`, `support-ops/operations/*`, `notifications/cloud-wipe-warning_test.ts`, `indexing/bundle-requests_test.ts`, `storage-janitor/buckets_test.ts`, `storage-orphan-lister/predicates_test.ts`, `set-user-pin/pin-settings_test.ts`, `analytics/validation_test.ts` |
 
 ## Layer 2 — Gate-chain smoke tests
 
@@ -46,9 +48,13 @@ Representative coverage across the mirrored tree:
 cd smoketest && ./gradlew test
 ```
 
-The suite has 60-plus `*SmokeTest.kt` classes (`AiEngine*`, `Sync*`, `Extract*`, `SupportOps*`, `Bundle*`, `DeleteUser*`, `RateLimit*`, `Search`, `Indexing`, tier-gate enforcement, and more). Each drives the operation under test through the real Edge Function HTTP surface so the whole admission chain — App Check, Clerk JWT, entitlement, rate limit, structural validation, RPC — executes for real.
+The suite has 60-plus `*SmokeTest.kt` classes (`AiEngine*`, `Sync*`, `Extract*`, `SupportOps*`, `Bundle*`, `DeleteUser*`, `RateLimit*`, `CloudResetSmokeTest`, `Search`, `Indexing`, tier-gate enforcement, and more). Each drives the operation under test through the real Edge Function HTTP surface so the whole admission chain — App Check, Clerk JWT, entitlement, rate limit, structural validation, RPC — executes for real. `CloudResetSmokeTest` (added this commit) is a good example: it drives the new `cloud_reset` sync-pull status — the signal that stops a resubscribing device from deleting content the user never deleted — with a real `POST` to `sync-pull` through the full gate chain, and reads back internal state with the service-role client only to assert.
 
 The service-role key exists in the harness for **preconditioning** state (seeding `user_storage_usage` near a cap, `usage` rows near a limit, specific ciphertext for a trigger) and for **assertion reads** against internal tables the response body doesn't expose. It must never execute the operation under test — that would bypass every enforcement layer and test only the SQL layer. The `c_recordings` crypto-integrity rule applies here too: smoke tests never raw-`DELETE` `c_recordings` or null its crypto columns for real-user-flow rows; teardown routes through the matching Edge Function, and only synthetic throwaway rows may be REST-deleted.
+
+<Note>
+The harness signs in with `+clerk_test` fixture accounts (e.g. `canary_a+clerk_test@gmail.com`), which receive the fixed OTP `424242` when the dev-only `CLERK_TEST_EMAILS_ENABLED` toggle is set — see [Environment Variables & Secrets](/rollingrecord/backend/operations/env-and-secrets). This is a runtime toggle plus a fixture email convention, not a schema change; there is no migration behind it.
+</Note>
 
 ## Classifying new server code
 

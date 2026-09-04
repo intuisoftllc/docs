@@ -7,11 +7,13 @@ The entitlement stage resolves the caller's effective tier and whether they hold
 
 ## Fetching the effective set
 
-`fetchEffectiveEntitlements(authUserId)` in `functions/_shared/gates/entitlement.ts` resolves both dev-bypass status and the effective entitlement set, on two paths:
+`fetchEffectiveEntitlements(authUserId, opts: EntitlementFetchOptions = {})` in `functions/_shared/gates/entitlement.ts` resolves both dev-bypass status and the effective entitlement set, on two paths:
 
 1. **`isDeveloperAccount()` first** (`functions/_shared/billing/developer.ts`) — always hits the DB, never cached, with a 3-attempt retry (`[50, 150]`ms backoff). It reads `lifetime_entitlements` for a non-revoked `developer` row and fails closed to `false`.
 2. **If dev** → the set is synthesized locally by `devEntitlementSet()` (`{ developer, pro_cloud_ai, pro_cloud, pro }`), skipping RevenueCat entirely. Dev bypass therefore survives RC outages, webhook drift, and customer-id mismatches.
-3. **If non-dev** → `getEffectiveEntitlementKeys(authUserId)` (`functions/_shared/billing/revenuecat.ts`), RC-backed with a 5-minute per-customer cache and the tier cascade applied. An RC failure for a non-dev caller fails **closed** with `502 entitlement_check_failed`.
+3. **If non-dev** → `getEffectiveEntitlementKeys(authUserId, opts)` (`functions/_shared/billing/revenuecat.ts`), RC-backed with a 5-minute per-customer cache and the tier cascade applied. An RC failure for a non-dev caller fails **closed** with `502 entitlement_check_failed`.
+
+`runGates` sets `opts.bypassCache` from the `X-Entitlement-Refresh: 1` request header, so a client that just purchased or restored gets a live RC read instead of a stale cached "no". The header only chooses cache-vs-RC — RevenueCat stays the sole authority — and the RC layer throttles the bypass (an age floor bounding it to roughly 3 calls/min/account), so the header cannot be abused.
 
 ## The at-least-one-of check
 
@@ -25,11 +27,15 @@ When the entitlement check fails **and** the config set `allowGracePeriodRead: t
 
 | Condition | Source | Notes |
 | --- | --- | --- |
-| `subscription_lapsed_at IS NOT NULL` | `canonical_users` | the user actually lapsed under a tracked tier |
-| `NOW() - subscription_lapsed_at < 30 days` | `GRACE_WINDOW_MS` | also refuses future-dated writes (`ageMs < 0`) |
-| `subscription_lapsed_tier` satisfies `required` (cascade over `pro` → `pro_cloud` → `pro_cloud_ai`) | `canonical_users` | a higher-lapsed user admits to a lower endpoint; a lower-lapsed user cannot admit to a higher one |
+| `cloud_grace_started_at IS NOT NULL` | `canonical_users` | the user actually lapsed under a tracked tier |
+| `NOW() - cloud_grace_started_at < graceWindowMs()` | `server_config.cloud_grace_days` | also refuses future-dated writes (`ageMs < 0`) |
+| `cloud_grace_tier` satisfies `required` (cascade over `pro` → `pro_cloud` → `pro_cloud_ai`) | `canonical_users` | a higher-lapsed user admits to a lower endpoint; a lower-lapsed user cannot admit to a higher one |
 
-`GRACE_WINDOW_MS` is `30 * 24 * 60 * 60 * 1000`, mirroring the daily `subscription_lapse_cleanup` sweeper's cutoff. The tier match uses the **same cascade** as active entitlements — without it, a `pro_cloud_ai`-lapsed user would be denied at a `pro_cloud` endpoint (sync-pull's requirement) and the whole grace policy would be unreachable for them. An empty `required` array admits nothing.
+The window length is no longer a hard-coded constant. `graceWindowMs()` in `grace.ts` reads `server_config.cloud_grace_days` via `getInt('cloud_grace_days', DEFAULT_GRACE_DAYS)` at call time — the fallback constant `DEFAULT_GRACE_DAYS = 30` is used only when `server_config` is unreadable. This one dial is what the sweeper, the warning emails, and the client banner all read, so they can never disagree about when a recording is deleted. The tier match uses the **same cascade** as active entitlements — without it, a `pro_cloud_ai`-lapsed user would be denied at a `pro_cloud` endpoint (sync-pull's requirement) and the whole grace policy would be unreachable for them. An empty `required` array admits nothing.
+
+<Note>
+Earlier notes describing a `GRACE_WINDOW_MS` constant exported from `gates/grace.ts` are stale — that constant no longer exists. The exported symbol is the async `graceWindowMs()`.
+</Note>
 
 ## Grace is opt-in and read-only
 
@@ -45,7 +51,9 @@ Grace is enabled per endpoint and only on reads — the lapsed user is rescuing 
 
 ## Defense in depth
 
-Only the RC webhook writes `subscription_lapsed_at` / `subscription_lapsed_tier`, filtered to `pro_cloud` / `pro_cloud_ai` EXPIRATION events, and it clears both columns on renewal / uncancellation / initial purchase / product change so resubscribed users never hit the grace branch. The daily sweeper clears rows older than 30 days, and CHECK constraints keep the two columns paired, restrict the tier to `pro_cloud` / `pro_cloud_ai`, and forbid future-dated lapse timestamps.
+Only the RC webhook writes `cloud_grace_started_at` / `cloud_grace_tier`, filtered to `pro_cloud` / `pro_cloud_ai` lapses, and it clears both columns on renewal / uncancellation / initial purchase / product change so resubscribed users never hit the grace branch. The daily `subscription_lapse_cleanup` sweeper clears rows older than `server_config.cloud_grace_days` (no longer a hard-coded 30), and three CHECK constraints — `canonical_users_cloud_grace_paired`, `canonical_users_cloud_grace_started_at_in_past`, and `canonical_users_cloud_grace_tier_values` — keep the two columns paired, restrict the tier to `pro_cloud` / `pro_cloud_ai`, and forbid future-dated grace timestamps.
+
+The lapse sweeper now HARD-DELETEs the lapsed user's 13 `c_*` tables plus `user_blueprints` (migration `20260824120000_lapse_cloud_reset.sql`) rather than tombstoning — a tombstone would propagate to the user's devices and destroy their local library if they merely stopped paying. It stamps a new, never-cleared `canonical_users.cloud_wiped_at` instead, which `sync-pull` surfaces as a `cloud_reset` status so a returning device re-uploads its content. See [sync-pull](/rollingrecord/backend/sync/pull) and the [cron sweepers](/rollingrecord/backend/database/cron-sweepers) for the full treatment.
 
 ## Related
 

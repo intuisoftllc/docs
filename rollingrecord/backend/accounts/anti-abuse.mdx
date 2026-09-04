@@ -37,6 +37,10 @@ The table has **no FK** to `canonical_users` and `auth_user_id` is nullable (pre
 | `AdminPermissionDenied` | `admin_permission_denied` | 1 |
 | `RateLimitHit` | `rate_limit_hit` | 1 |
 | `NearLimitApproach` | `near_limit_approach` | 2 |
+| `BugReportFlood` | `bug_report_flood` | 1 |
+| `FrozenUserClerkDeletion` | `frozen_user_clerk_deletion` | 10 |
+
+`bug_report_flood` sits at the **floor** weight of 1: a caller who hit the bug-report submission ceiling (10/hour) is a soft signal that — by design — must never on its own push an account up the top-offenders list. The likely explanation is a user who found several things wrong and filed them all, so it is useful only in aggregate (the same account tripping it every hour for a day is worth a look; one hit is worth nothing). `frozen_user_clerk_deletion` sits at the **ceiling** weight of 10: a FROZEN account (`canonical_users.frozen_at` set) that was deleted out-of-band via Clerk, logged as a deliberate evidence-destruction signal (see [Account-freeze gate](#account-freeze-gate) below).
 
 ### Admin reads
 
@@ -44,6 +48,10 @@ Two helpers back support-ops operations, both gated by `can_read_user_audit`:
 
 - `getUserAbuseSignals()` — recent events for one user, newest first (limit default 50, cap 500, optional `since`).
 - `getAbuseTopOffenders()` — ranks callers by `SUM(weight)` DESC over a window (default 24h). The aggregation runs in **application code** (an in-memory group-by over a 20k-row scan cap), not a SQL RPC or view, to keep the surface additive. It returns `totalWeight`, `eventCount`, `distinctTypes`, and `lastSeenAt`.
+
+<Note>
+Caller-supplied strings written to Postgres `TEXT` columns pass through the pure sanitizer `sanitizeDbText()` / `sanitizeDbTextOrNull()` (`functions/_shared/text/db-text.ts`) at the write boundary — it strips U+0000 and the rest of the C0 controls (keeping `\t` / `\n`), removes bidi overrides, and normalizes CRLF to LF, so an unstorable NUL can't fail an insert and a bidi trick can't make a stored value read one way in the console and another in the row. On the admin-audit surface it guards `l_admin_audit.ticket_ref` (sanitized, then sliced to 64 chars in support-ops). See [support-ops operations](/rollingrecord/backend/support-ops/operations-catalog) for that field.
+</Note>
 
 ## Re-signup carryover
 
@@ -65,7 +73,7 @@ Both writes take the MAX of any existing and incoming values (`upsertWithMax()` 
 
 - **Fails open** — a DB read error or a missing row admits the request rather than locking every user out on a transient glitch.
 - **No bypass** — there is no `skipFrozenCheck` option and no admin / super-admin exemption; freeze that could self-lift is not freeze.
-- **Not abuse-logged** — a frozen account being turned away is the freeze working, not a signal worth recording.
+- **Not abuse-logged for the ordinary turn-away** — a frozen account being rejected on a normal request is the freeze working, not a signal worth recording. One frozen path is different: [`clerk-webhook`](/rollingrecord/backend/edge-functions/webhooks)'s `user.deleted` handler QUARANTINES a frozen user rather than wiping — no data touched, a `200` so Svix stops retrying — and logs the ceiling-weight `frozen_user_clerk_deletion` event. Reaching an out-of-band deletion path while frozen is the recorded signal, not the ordinary turn-away.
 
 `frozen_at` (`TIMESTAMPTZ`) and `frozen_reason` (`TEXT`) live on `canonical_users`, with a partial index `idx_canonical_users_frozen WHERE frozen_at IS NOT NULL`. They are set and cleared by the support-ops `freeze_user_account` / unfreeze operations. See [Account-Freeze Gate](/rollingrecord/backend/gates/account-frozen) for the full gate semantics.
 

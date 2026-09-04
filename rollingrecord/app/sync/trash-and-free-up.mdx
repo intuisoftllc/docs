@@ -50,6 +50,8 @@ The screen has a full inline preview player (`PreviewPlayerController` in `FULL`
 
 `previewBlockReason` mirrors the prefetch eligibility query exactly so the snackbar's "restore to recover" promise stays truthful.
 
+Every mutating trash action stops the preview player first. `V2TrashViewModel` has a private `stopPreviewForMutation()` (just `preview.stop()`) invoked at the top of `restore`, `permanentlyDelete` (the confirm-delete path), and `emptyTrash` — **before** the `viewModelScope.launch(Dispatchers.IO)` repository call. It is called by *every* mutating action (not by their callers) and is unconditional on purpose, so a new entry point can't forget it and no screen has to re-derive per-id / segment-id reasoning. This fixes the bug where restoring or deleting a recording while previewing it left the audio playing after the row was gone: the preview player owns its own `MediaPlayer` and knows nothing about the list, so nothing stopped it and there was no row left to press pause on.
+
 ## Free Up Space
 
 `V2FreeUpSpaceViewModel` (`ui/v2/screens/accountsettings/freeup/V2FreeUpSpaceViewModel.kt`) builds one unified, size-ranked list of the heaviest cloud-backed items across three types (`FreeUpItemType.RECORDING`, `SESSION`, `CONTEXT`), capped at `FREE_UP_MAX_ITEMS = 1000`. It supports text search (`libraryNameMatches`), `FreeUpSort` (`LARGEST` / `SMALLEST` / `DATE`), and optional semantic search (gated Pro+Cloud and up). `V2FreeUpSpaceSheet` renders it as a multi-select bottom sheet with a Keep-on-device / Delete action bar and a selected summary (count + bytes).
