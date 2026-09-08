@@ -92,7 +92,7 @@ Scheduled recordings turn the microphone on by themselves, so a lapsed subscript
 
 `ScheduledRecordingRepository.disableAllForLapse()` (`data/repository/ScheduledRecordingRepository.kt`) is that durable third guard: on a **confirmed** lapse it flips OFF every enabled schedule and enqueues each for sync, returning the count flipped. It is:
 
-- **Keyed on `CustomerInfo?.isSubscriptionLapsed()`**, not `tier < PRO` (see below).
+- **Unconditional itself** — the repository method holds no predicate. The lapse decision lives one level up, in `App.disableSchedulesIfLapsed()` (`App.kt`), which gates on `CustomerInfo?.isSubscriptionLapsed()` rather than `tier < PRO` (see below). That caller first checks the RevenueCat snapshot belongs to the active session (`rc.appUserId != null && rc.appUserId == userSessionManager.sessionIdFlow.value`) and returns early otherwise, so a snapshot left over from another account — or the signed-out `ANONYMOUS_DIR` session, which no RC `appUserId` can match — can never disable a schedule.
 - **Idempotent** — the DAO `UPDATE` matches only enabled rows, so repeat calls flip and enqueue nothing. That matters because the caller observes a frequently re-emitting flow.
 - **Not reversed on re-upgrade** — silently re-arming a batch of schedules the instant a payment clears would start recordings the user never asked for in this billing period.
 - **Durable** — it survives a reinstall, a restore from backup, and any future code path that arms alarms without consulting tier.

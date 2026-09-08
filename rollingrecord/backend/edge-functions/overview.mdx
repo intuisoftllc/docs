@@ -1,13 +1,13 @@
 ---
 title: "Edge Function Catalog & Conventions"
-description: "The 33 function directories, their auth modes and rate-limit buckets, and the shared runGates() admission chain every HTTP function scaffolds with."
+description: "The 34 function directories, their auth modes and rate-limit buckets, and the shared runGates() admission chain every HTTP function scaffolds with."
 ---
 
-The backend is a set of Deno Edge Functions under `supabase/functions/`. There are 33 directories; 32 are HTTP endpoints registered in `config.toml`, and every one of those shares a single admission-chain entry point — `runGates()` — so authentication, App Check, and rate limiting always run in the same fixed order.
+The backend is a set of Deno Edge Functions under `supabase/functions/`. There are 34 directories; 33 are HTTP endpoints registered in `config.toml`, and every one of those shares a single admission-chain entry point — `runGates()` — so authentication, App Check, and rate limiting always run in the same fixed order.
 
 ## Function count vs. registered endpoints
 
-There are **33 directories** under `supabase/functions/` (excluding `_shared/`), but `config.toml` declares **32** `[functions.<name>]` blocks. One directory is intentionally unregistered:
+There are **34 directories** under `supabase/functions/` (excluding `_shared/`), but `config.toml` declares **33** `[functions.<name>]` blocks. One directory is intentionally unregistered:
 
 | Directory | Why it is not in `config.toml` |
 | --- | --- |
@@ -67,6 +67,7 @@ Every `error` string returned to a client comes from the canonical registry in `
 | `ai-engine` | Jwt | POST | `ai_engine` (in-handler) | Single POST proxy for every synchronous AI operation; dispatches by `operation` field |
 | `resolve-identity` | Jwt | POST | `resolve_identity` (sugar) | Upserts `canonical_users` on every launch; anti-abuse carryover |
 | `get-user-usage` | Jwt | GET | none | Current-period counters + caps + credits + storage for the usage UI |
+| `get-bundle-catalog` | Jwt | GET | none | Purchasable add-on bundles and what each grants THIS caller — grants are tier-adjusted server-side, and no price is returned |
 | `get-user-key` | Jwt | POST | `user_key_get` (in-handler, + audit) | Unwraps/provisions the caller's DEK (+ App Lock PIN verifier) |
 | `delete-user` | Jwt | POST | `delete_user` (in-handler) | User-initiated GDPR account wipe |
 | `set-user-pin` | Jwt | POST | — | App Lock PIN verifier write (RR-492) |
@@ -107,6 +108,7 @@ Several functions front many logical operations behind one endpoint and switch o
 - [ai-engine](/rollingrecord/backend/edge-functions/ai-engine) — the operation registry, per-op dispatch gates, and the single `ai_engine` rate limit.
 - [analytics](/rollingrecord/backend/edge-functions/analytics) — the content-free eval-run ingest endpoint.
 - [get-user-key](/rollingrecord/backend/edge-functions/get-user-key) — the one place a plaintext DEK crosses the wire.
+- [get-bundle-catalog](/rollingrecord/backend/edge-functions/get-bundle-catalog) — the read side of `bundle_config`, tier-adjusted per caller.
 - [get-user-usage](/rollingrecord/backend/edge-functions/get-user-usage) — the usage-screen read: counters, caps, credits, storage.
 - [resolve-identity](/rollingrecord/backend/edge-functions/resolve-identity) — the launch-time `canonical_users` upsert + anti-abuse carryover.
 - [server-config](/rollingrecord/backend/edge-functions/server-config) — the public bootstrap endpoint and its `skipAppVersion` opt-out.

@@ -5,7 +5,7 @@ description: "The Choose-a-Plan paywall, the Your-Plan management screen, the sh
 
 Two V2 screens cover buying and managing a subscription: the "Choose a Plan" paywall for a first purchase, and the "Your Plan" screen for changing, resubscribing, or cancelling. Both read a shared static plan catalog, price it live from RevenueCat, and render the same full-screen result overlay after a transaction.
 
-**Theming.** `V2UpgradeScreen`, `V2ManageSubscriptionScreen`, and the shared `PlanResultOverlay` (`PlanResultOverlays.kt`) were converted to dark mode by swapping hard-coded palette constants (`Gray500` / `Gray800` / `Gray900`, `Red50`, `Gray200`, `Blue50`) for `V2Theme.colors.*` tokens (`strongText`, `secondaryText`, `chatErrorBg`, `cardOutline`). This is purely a theming pass — behavior, the `ManagePlanKind` state machine, and the `PlanResult` states and overlays are unchanged, so every table on this page stays accurate.
+**Theming.** `V2UpgradeScreen`, `V2ManageSubscriptionScreen`, and the shared `PlanResultOverlay` (`PlanResultOverlays.kt`) were converted to dark mode by swapping hard-coded palette constants (`Gray500` / `Gray800` / `Gray900`, `Red50`, `Gray200`, `Blue50`) for `V2Theme.colors.*` tokens (`strongText`, `secondaryText`, `chatErrorBg`, `cardOutline`). This was purely a theming pass — behavior, the `ManagePlanKind` state machine, and the `PlanResult` states themselves were unchanged by it. (`PlanResultOverlay` has since gained a `headerTitleRes` parameter so the bundle flow can reuse its error state — see "Transaction results" below.)
 
 ## `PlanCatalog`
 
@@ -44,7 +44,7 @@ The same file provides the functions that bridge live RC packages to the catalog
 
 ## The management screen — `V2ManageSubscriptionScreen`
 
-`V2ManageSubscriptionScreen` (`ui/v2/screens/subscription/V2ManageSubscriptionScreen.kt`) is the "Your Plan" surface — a current-plan card, a change-plan sheet, and resubscribe/cancel/restore actions, with `PlanResultOverlay` for transaction results. It is backed by `ManageSubscriptionViewModel` (`ui/v2/screens/subscription/ManageSubscriptionViewModel.kt`), which derives its whole state from live RC `CustomerInfo`.
+`V2ManageSubscriptionScreen(onNavigateBack, onNavigateToUpgrade, onNavigateToBundles)` (`ui/v2/screens/subscription/V2ManageSubscriptionScreen.kt`) is the "Your Plan" surface — a current-plan card, a change-plan sheet, and resubscribe/cancel/restore actions, with `PlanResultOverlay` for transaction results. It is backed by `ManageSubscriptionViewModel` (`ui/v2/screens/subscription/ManageSubscriptionViewModel.kt`), which derives its whole state from live RC `CustomerInfo`.
 
 `ManagePlanKind` classifies the current state, and the derivation checks Developer and lifetime cases before the ordinary recurring path:
 
@@ -67,9 +67,35 @@ The supporting data types are `CurrentPlan` (summary card, with `isLifetime` / `
 
 The error overlay's "Try Again" replays the last attempted purchase via `retry(activity)`; `dismissResult()` clears the overlay and any pending action.
 
+### "Purchase a bundle" — `PurchaseBundleRow`
+
+`onNavigateToBundles` is passed down as `onPurchaseBundle` into `SubscribedStateBody`, `LifetimeStateBody`, and `CancelledStateBody`, each of which renders `PurchaseBundleRow(tier, onClick)` — under "Change plan" in SUBSCRIBED (above Cancel), under the upgrade row in LIFETIME, and under "Resubscribe" in CANCELLED. It is rendered through `ActionRow(iconRes = R.drawable.ic_plus, …, enabled = eligible)`, where `eligible = tier != null && tier.atLeast(UserTier.PRO_CLOUD)`; `ActionRow`'s `enabled` flag greys the icon/title/subtitle to `onSurfaceVariant`, disables the click, and omits the trailing chevron entirely.
+
+The row is **always rendered, never hidden**. The other three routes into the bundle catalog only appear once the user has already hit a wall, so someone who never runs out would never learn bundles exist; Your Plan is the one screen people visit deliberately. Below Pro+Cloud it is disabled rather than absent — a greyed row that says why is information, a missing row is not.
+
+| Tier | Row state | Subtitle string |
+| --- | --- | --- |
+| Below Pro+Cloud | Disabled | `your_plan_bundle_subtitle_locked` — "Upgrade to purchase a bundle" |
+| `PRO_CLOUD` | Enabled | `your_plan_bundle_subtitle_cloud` — "Top up your transcription hours" |
+| `PRO_CLOUD_AI` | Enabled | `your_plan_bundle_subtitle_cloud_ai` — "Top up transcription hours and chat credits" |
+
+The CANCELLED case is deliberate: a cancellation stops the renewal but does not revoke the entitlement, so the row is gated on the tier the user actually holds right now rather than on the cancelled flag. Someone still on Pro+Cloud with a month left can buy hours, and the expiry warning directly above is what tells them the plan is ending.
+
 ## Transaction results — `PlanResultOverlay`
 
-`PlanResult` and `PlanResultOverlay` both live in `ui/v2/screens/upgrade/PlanResultOverlays.kt` and are shared by both flows. The sealed `PlanResult` has four states rendered full-screen over the originating screen:
+`PlanResult` and `PlanResultOverlay` both live in `ui/v2/screens/upgrade/PlanResultOverlays.kt`:
+
+```kotlin
+fun PlanResultOverlay(
+    result: PlanResult,
+    onDone: () -> Unit,
+    onTryAgain: () -> Unit,
+    onBack: () -> Unit,
+    @StringRes headerTitleRes: Int = R.string.your_plan_title,
+)
+```
+
+The sealed `PlanResult` has four states rendered full-screen over the originating screen:
 
 | `PlanResult` state | Rendered as |
 | --- | --- |
@@ -79,6 +105,15 @@ The error overlay's "Try Again" replays the last attempted purchase via `retry(a
 | `Error(reason)` | The charge failed; the plan is unchanged. Offers Try Again / Back. |
 
 A user backing out of the store sheet maps to null (no overlay), not to a distinct state.
+
+`headerTitleRes` names the screen the overlay is sitting on top of, and is passed through to `PlanSuccessScreen` / `PlanErrorScreen` as `ResultHeader(titleRes = headerTitleRes, …)`; `PlanProcessingScreen()` has no header and takes no title. It defaults to `R.string.your_plan_title` because that is where subscription purchases start:
+
+| Caller | `headerTitleRes` | Header reads |
+| --- | --- | --- |
+| `V2UpgradeScreen` / `V2ManageSubscriptionScreen` | omitted (default) | "Your Plan" |
+| `V2BundlesScreen` | `R.string.bundles_title` | "Add Hours" |
+
+The overlay is therefore shared by three flows, not two — but the bundle catalog reuses only the **error** state. It has its own `BundleSuccessScreen` and `BundleProcessingScreen`, because a bundle's success state has to show post-webhook credit balances the plan overlay knows nothing about. See [Add-On Bundles](/rollingrecord/app/monetization/bundles).
 
 ## `RevenueCatManager` purchase surface
 
@@ -100,10 +135,15 @@ The server caches its RevenueCat read for ~5 minutes per customer, so a user who
 
 ## Add-on bundles — `V2BundlesScreen`
 
-`V2BundlesScreen` (`ui/v2/screens/bundles/V2BundlesScreen.kt`) is an explicit non-functional placeholder for the future add-on bundles screen (extra transcription / AI credits) — its KDoc labels it a "STAGE 5 stub" / "coming soon placeholder." It renders a centered empty-state (a faint cart glyph, heading, and a short blurb about buying extra transcription hours / AI queries) above a full-width **disabled** "Coming Soon" button; the trailing overflow affordance is inert too. There is no purchase flow yet — per its KDoc, "The real add-on purchase flow lands in a later ticket." It is reached from the Usage screen's "Get More" CTA (`onNavigateToBundles`), which the Usage screen shows for `tier.atLeast(UserTier.PRO_CLOUD)`.
+Subscriptions are not the only purchase surface. `V2BundlesScreen` (`ui/v2/screens/bundles/V2BundlesScreen.kt`) is the "Add Hours" catalog: one-time top-ups of transcription hours (and, on Cloud+AI, KB queries) that stack on the monthly allotment and never expire. It is a fully implemented flow — a usage summary card above a two-column priced grid, a confirm sheet, a Play purchase, and a success screen that polls for the credit the RevenueCat webhook applies server-side.
+
+Four surfaces navigate to it: the Usage screen's "Get More" CTA (`V2UsageScreen.onNavigateToBundles`, shown for `tier.atLeast(UserTier.PRO_CLOUD)`), the playback transcription-cap sheet's "Get More Hours" (`V2PlaybackScreen.onNavigateToBundles`), the KB chat's monthly-AI-limit banner (`onUpgrade`), and Your Plan's `PurchaseBundleRow` — the only one of the four that is visible before the user hits a wall.
+
+See [Add-On Bundles](/rollingrecord/app/monetization/bundles) for the catalog join, the purchase phases, and the credit poll in full.
 
 ## Related pages
 
+- [Add-On Bundles](/rollingrecord/app/monetization/bundles) — the "Add Hours" catalog and one-time purchase flow.
 - [Entitlements & RevenueCat](/rollingrecord/app/monetization/entitlements-revenuecat) — the entitlement taxonomy and `RevenueCatManager` in full.
 - [User Tiers & Feature Map](/rollingrecord/app/monetization/tiers) — the tiers the catalog maps to.
 - [Usage Metering & Caps](/rollingrecord/app/monetization/usage-metering) — the Usage screen and the "Get More" entry point.

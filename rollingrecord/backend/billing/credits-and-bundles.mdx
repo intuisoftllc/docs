@@ -14,7 +14,7 @@ Credits are bonus resource beyond a user's monthly cap. They live in `user_credi
 | Credit type | Written by | Helper |
 | --- | --- | --- |
 | `manual` | support-ops admin grants | `adjustManualCreditBalance` (hardcoded to the manual row) |
-| `bundle` | RC `NON_SUBSCRIPTION_PURCHASE` webhook + support-op recovery | `creditBundle` (keyed on `purchase_token`) |
+| `bundle` | RC `NON_RENEWING_PURCHASE` webhook branch — the only caller | `creditBundle` (keyed on `purchase_token`) |
 
 `adjustManualCreditBalance` is hardcoded to `credit_type = 'manual'` and never touches the bundle row — the "support staff edit manual, not bundle" integrity boundary is enforced at the data layer. It clamps at zero (`clampedToZero`), writes an `l_credit_log` audit row with `source = 'support_op_manual'` and `consumed_by = 'admin:<id>'`, and returns an `AdjustResult` of `{previousBalance, newBalance, appliedDelta, clampedToZero}`.
 
@@ -33,9 +33,43 @@ The reconciliation invariant is `SUM(deltas) GROUP BY (auth_user_id, credit_type
 
 ## Bundle grants and refunds
 
-`creditBundle` is shared by the webhook and the support-op recovery path (`source` ∈ `{rc_webhook, support_op_recovery}`). Step 1 INSERTs the `l_credit_log` row keyed on `purchase_token`; a `23505` unique violation means the other path already credited, so it returns `outcome: 'already_credited'` as a no-op. Step 2 UPSERTs the bundle row's balances. Tier-aware grant amounts are the caller's responsibility — the webhook reads the buyer's tier at webhook time and passes minutes-only for Pro+Cloud, full grants for Cloud+AI.
+`creditBundle` has exactly one caller: `handleNonSubscriptionPurchase` in `functions/revenuecat-webhook/index.ts`, which passes `source: 'rc_webhook'`. Step 1 INSERTs the `l_credit_log` row keyed on `purchase_token`; a `23505` unique violation means that token was already credited (RevenueCat retries the same event id), so it returns `outcome: 'already_credited'` as a no-op. Step 2 UPSERTs the bundle row's balances. Tier-aware grant amounts are the caller's responsibility — the webhook reads the buyer's tier at webhook time and passes the deltas.
 
-`refundBundle` (`source` ∈ `{rc_refund, support_op_refund}`) looks up the grant by `purchase_token`, computes per-resource clawback **clamped at the current balance** (the user keeps whatever they consumed before the refund), INSERTs a negative-delta row keyed on `refund_of_token`, and decrements the bundle row. Its `outcome` is `refunded`, `already_refunded`, or `no_grant_found`. Bundle SKU definitions live in `bundle_config` (`sku` PK, `minutes_granted`, `queries_granted`, `extraction_minutes_granted`, `active` soft-disable, `price_usd` reference-only — Google Play is the authoritative price).
+<Note>
+`creditBundle`'s `source` parameter is typed `'rc_webhook' | 'support_op_recovery'`, and the doc comment describes it as "shared by the RC webhook and the support-op recovery path." **That second path does not exist.** No operation in `support-ops/operations/` calls `creditBundle` — the only support-ops credit writer is `grant-manual-credit.ts`, hardcoded to the `manual` row. `support_op_recovery` is a valid `l_credit_log.source` value the CHECK constraint accepts (and that `refundBundle` and the ledger-reader ops match on), but nothing writes it today, so `rc_webhook` is the only bundle-grant source in practice.
+</Note>
+
+That tier read is `fetchEffectiveEntitlements(authUserId, { bypassCache: true })` (`_shared/gates/entitlement.ts`) compared against `TIER.PRO_CLOUD_AI` — the **same** authority the gate chain reads, not the raw RC key set. A plain `getActiveEntitlementKeys(...).has("pro_cloud_ai")` silently answered false for everyone entitled by something other than that exact key — a `developer` account, or a `lifetime_pro_cloud_ai` holder. They were charged the full bundle price and credited transcription minutes only. `bypassCache` is set because a bundle purchase is a one-shot money event: the entitlement set is cached for five minutes, and a stale empty set here under-credits a real purchase with nothing to retry it.
+
+| Buyer's effective tier | `transcriptionMsDelta` | `aiQueriesDelta` | `extractionMsDelta` |
+| --- | --- | --- | --- |
+| `pro_cloud_ai` in the effective set (incl. `developer`, `lifetime_pro_cloud_ai`) | `minutes_granted * 60_000` | `queries_granted` | `extraction_minutes_granted * 60_000` |
+| Below Cloud+AI (Free / Pro / Pro+Cloud) | `minutes_granted * 60_000` | `0` | `0` |
+| Tier lookup unavailable — the gate returned a `Response` (RC down), or the call threw | `minutes_granted * 60_000` | `0` | `0` |
+
+The degraded row is an explicit branch, not a catch-all: the handler logs `tier lookup unavailable` / `tier lookup threw` and still credits the headline transcription grant, so the buyer keeps the value they paid for and the shortfall is left to a support top-up rather than failing the whole credit.
+
+`refundBundle` is likewise called only from the webhook — `handleBundleRefund`, with `source: 'rc_refund'`. It looks up the grant by `purchase_token` (restricted to grant sources, `.in("source", ["rc_webhook", "support_op_recovery"])`), computes per-resource clawback **clamped at the current balance** (the user keeps whatever they consumed before the refund), INSERTs a negative-delta row keyed on `refund_of_token`, and decrements the bundle row. Its `outcome` is `refunded`, `already_refunded`, or `no_grant_found`.
+
+<Warning>
+`refundBundle`'s `source` parameter is typed `'rc_refund' | 'support_op_refund'`, but `support_op_refund` is **not insertable**. `l_credit_log_source_check` allows only `{rc_webhook, support_op_recovery, support_op_manual, consumption, rc_refund}` — the list above — so an INSERT carrying it would be rejected by the CHECK constraint. The double-clawback guard would not cover it either: `idx_l_credit_log_unique_refund_of_token` is scoped `WHERE source = 'rc_refund'`. The TypeScript union is ahead of the schema; only `rc_refund` works.
+</Warning>
+
+## `bundle_config` and SKU normalization
+
+Bundle SKU definitions live in `bundle_config` (`migrations/20260508000000_baseline.sql`): `sku` PK, `display_name`, `minutes_granted`, `queries_granted`, `extraction_minutes_granted` (renamed from `extractions_granted`), `price_usd` `numeric(10,2)` reference-only — Google Play is the authoritative price — plus the `active` soft-disable flag, `description`, and `updated_at`. It has **two** readers today: the RC webhook (which decides the grant) and the [`get-bundle-catalog`](/rollingrecord/backend/edge-functions/get-bundle-catalog) Edge Function (which advertises it, applying the identical Cloud+AI zeroing rule so the two can't disagree).
+
+The lookup key is **not** the raw store product id. `normalizeBundleSku(productId)` (`_shared/billing/bundle-sku.ts`) splits at the first `:` and keeps the prefix, and the webhook applies it to `event.product_id` before the `bundle_config` lookup. Stores qualify a product id with a sub-identifier when one exists — Google appends the base plan for subscriptions, and the purchase option for the newer one-time product model, as `product_id:sub_id` — and RevenueCat forwards whatever the store gave it. Normalizing is a no-op on an already-bare id, so it is applied unconditionally: a lookup miss in the purchase handler means a buyer was charged and credited nothing, and the only trace is one "unknown SKU" line in the function log.
+
+| Input `product_id` | Normalized SKU | Why |
+| --- | --- | --- |
+| `bundle_transcription_1hr` | `bundle_transcription_1hr` | bare id passes through unchanged |
+| `bundle_transcription_1hr:base` | `bundle_transcription_1hr` | Google's one-time product model, `product_id:purchase_option_id` |
+| `bundle_transcription_3hr:monthly` | `bundle_transcription_3hr` | same shape subscriptions use for the base plan |
+| `sku:a:b` | `sku` | only the first segment is kept |
+| `""` / `:base` | `""` | degenerate input does not throw — the empty SKU simply misses the lookup and is logged, better than throwing inside a webhook RC would then retry forever |
+
+All five rows are pinned by `supabase/tests/_shared/billing/bundle-sku_test.ts`. The client applies the identical rule when joining RevenueCat packages against the catalog (`product.id.substringBefore(':')`), so both sides agree on what a product id means. The `sku` stored on the `l_credit_log` row is the **normalized** value, so refunds (which look the grant up by `purchase_token`) and the ledger-reader support ops both see a consistent id.
 
 ## Drain order
 
@@ -82,6 +116,8 @@ Neither `user_credits` nor `l_credit_log` has an FK to `canonical_users`, so CAS
 ## Related pages
 
 - [RevenueCat integration](/rollingrecord/backend/billing/revenuecat) — the webhook that calls `creditBundle` / `refundBundle`.
+- [get-bundle-catalog](/rollingrecord/backend/edge-functions/get-bundle-catalog) — the read side of `bundle_config`, serving the same grants the webhook credits.
+- [Inbound webhooks](/rollingrecord/backend/edge-functions/webhooks) — where the bundle branch sits in the dispatch order.
 - [Per-user financials](/rollingrecord/backend/billing/financials) — where bundle revenue is recorded.
 - [Entitlement taxonomy](/rollingrecord/backend/billing/entitlements) — the tiers that gate credit consumption.
 - [Support-ops operations catalog](/rollingrecord/backend/support-ops/operations-catalog) and [permissions](/rollingrecord/backend/support-ops/permissions).

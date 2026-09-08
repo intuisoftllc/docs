@@ -45,13 +45,19 @@ The setters are `flagRecoveryNeeded()`, `flagFatalError(code, message)`, `flagDe
 
 A **hung** DEK fetch lands in the same recoverable branch, not the wipe path. `buildAppDatabaseForSession` bounds its inline `SessionDekHolder.requireDek()` self-heal at 45s (`INLINE_DEK_FETCH_TIMEOUT_MS`); a timeout leaves `persisted == null`, which routes to the recoverable `DekUnavailable` state and is structurally never `classifyOpenFailure` / `handleKeyMismatch`. The `DekUnavailable` throw also emits a deduped Crashlytics non-fatal carrying structured cross-account diagnostics (`dek.crossAccount`, the owner fingerprints, the KEK version). `flagDekUnavailable(reason)` still receives only the `reason` string — the diagnostics map goes to Crashlytics, not the `RecoveryState` — so the `RecoveryState` shape above is unchanged.
 
-## The three root surfaces
+## The four root surfaces
 
 `V2App` (`ui/v2/V2App.kt`) collects `DatabaseRecoveryState.state` and branches:
 
 - **`FatalError`** replaces the surface with `V2FatalDbErrorScreen` (`ui/v2/screens/recovery/V2FatalDbErrorScreen.kt`). It has **no reset/wipe button** — only an error-code box, Contact support (`mailto:support@rollingrecord.ai`), Copy error, and an Export-recordings-to-zip bailout (`RecordingsZipExporter`), plus a reinstall reminder.
 - **`DekUnavailable`** shows `V2DekUnavailableScreen` (`ui/v2/screens/recovery/V2DekUnavailableScreen.kt`); Retry re-resolves the DEK and, on success, calls `clearRecovery()` and recreates the activity. The screen also takes an `onSignOut` param — a **Sign out** action (`recovery_dek_sign_out`) rendered as an understated secondary control below Retry, disabled while `isRetrying`. It was added because the screen was otherwise a dead end: an account whose key can't resolve on **this** device previously stranded the whole app behind a Retry that never succeeds, even though a different account would open fine. In `V2App` the handler calls `AuthRepository.signOut()` (which rebuilds the user session scope), then `DatabaseRecoveryState.clearRecovery()`, then recreates the activity. It does **not** delete the local database — the state is scoped to one account and the data stays on disk for a later successful resolve.
 - **`KeyMismatchWiped`** overlays `V2DatabaseRecoveryDialog` (`ui/v2/screens/recovery/V2DatabaseRecoveryDialog.kt`) over the nav host (the data is recoverable, unlike the fatal path). The dialog is a non-dismissable 4-state flow (Scanning → Results → Importing → Done) that re-imports orphaned audio, reusing the UI-agnostic V1 `DatabaseRecoveryViewModel` + `RecoveryUiState` — only the V2 surface is restyled.
+
+The fourth surface is the **open still in flight**. Independently of `RecoveryState`, `V2App` collects `SessionDatabaseState.readySessionId` (`states/SessionDatabaseState.kt`) and renders `V2SessionLoadingScreen` (`ui/v2/screens/startup/V2SessionLoadingScreen.kt`) in place of `V2MainNavHost` until `readySessionId == sessionId` — the readiness gate that keeps Main out of a cold `AppDatabase` factory (see [DEK & Database Key Lifecycle](/rollingrecord/app/security/dek-and-db-key)).
+
+<Note>
+`V2SessionLoadingScreen` has **no failure branch, by design**. Every way the open can fail already raises a `DatabaseRecoveryState` state — `FatalError`, `DekUnavailable`, or `KeyMismatchWiped` — and the root handles those *above* this point with their own dedicated surfaces. `SessionDatabaseState.markReady` is called only on a successful build, so a throw simply leaves the loading surface up while the recovery branch takes over the root. If the user is looking at this screen, the open is genuinely still in progress.
+</Note>
 
 ## Where to go next
 

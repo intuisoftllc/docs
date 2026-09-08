@@ -13,11 +13,11 @@ App Lock (RR-492) draws a full-screen unlock overlay over the entire app wheneve
 | --- | --- | --- |
 | `UNLOCKED` | Signed out, disabled, or unlocked this session | Normal app, fully interactive |
 | `RESOLVING` | Active session, cold-start settings snapshot still loading | Blocking frosted scrim (no keypad) — fail-closed, content blurred |
-| `LOCKED` | Signed-in + enabled + hasPin, triggered by lifecycle or cold start | `V2LockOverlay` (keypad / biometric / lockout countdown) |
+| `LOCKED` | Signed-in + enabled, triggered by lifecycle or cold start | `V2LockOverlay` (keypad / biometric / lockout countdown) |
 
 `RESOLVING` is the fail-closed window: a fast tap can't reach the local, no-auth content before the lock decision lands. The initial phase is seeded synchronously from `AppLockArmedCache` so a cold start never flashes interactive content.
 
-The controller is fed by the session and settings layers through: `onUserSignedIn(authUserId)`, `onFreshLogin()`, `onUserSignedOut()`, `updateSettings(enabled, autoLockMs)`, and `onUnlocked()`. Lifecycle hooks are `start()` / `stop()`, `onActivityStopped()` / `onActivityStarted()`, plus a `ProcessLifecycleOwner` observer and a `SCREEN_ON` / `SCREEN_OFF` `BroadcastReceiver`.
+The controller is fed by the session and settings layers through: `onUserSignedIn(authUserId)`, `onFreshLogin()`, `onUserSignedOut()`, `updateSettings(enabled, autoLockMs)`, and `onUnlocked()`. Four of those — everything except `onUnlocked()` — are driven from `App.observeAuthForAppLock` (`App.kt`), which collects `authRepository.authState` on `Dispatchers.Main.immediate`. `onUnlocked()` comes from the UI layer instead: `V2LockOverlayViewModel` on a correct PIN or a successful biometric, and `V2App`'s forgot-PIN exit (`V2ForgotPinFlow`'s `onExitToApp`). `onUserSignedIn` fires for **both** a login and a restored session — which is exactly why a second signal is needed to tell them apart (see below). Lifecycle hooks are `start()` / `stop()`, `onActivityStopped()` / `onActivityStarted()`, plus a `ProcessLifecycleOwner` observer and a `SCREEN_ON` / `SCREEN_OFF` `BroadcastReceiver`.
 
 ## Lifecycle-driven locking
 
@@ -25,10 +25,34 @@ The lock timer conceptually starts on login: a fresh sign-in never immediately l
 
 Two things make this robust:
 
-- **Cold-start re-lock.** A force-quit + relaunch or a restored session re-locks unconditionally when the account is armed (the `coldStart` flag), so quitting the app can't bypass the lock. `onFreshLogin()` exempts a genuine interactive login.
+- **Cold-start re-lock.** A force-quit + relaunch or a restored session re-locks unconditionally when the account is armed. `updateSettings` resolves `coldStart && signedIn && enabled` straight to `LOCKED` (logging `"app lock: locked on cold start"`), so quitting the app can't bypass the lock. Note that this branch does **not** consult `autoLockMs` — the delay governs lifecycle transitions, not cold start. `onFreshLogin()` exempts a genuine interactive login.
 - **Never mid-use.** The `coldStart` flag is consumed by the first settings snapshot of a session, so a later mid-session change — first-time PIN setup, or the server sync flipping `enabled` on — can never trigger the cold-start re-lock. Enabling App Lock while actively using the app arms the *next* background/foreground cycle; it doesn't slam the lock over the settings page the user is standing on.
 
-The lock decision gates on `enabled` only. App Lock is "enabled" only when a PIN is set, so `enabled` implies a PIN; the PIN verifier (which syncs from the server and can lag) is used solely to verify an entered PIN, never to decide whether to show the lock.
+The lock decision gates on `enabled` only. App Lock is "enabled" only when a PIN is set, so `enabled` implies a PIN; the PIN verifier (which syncs from the server and can lag) is used solely to verify an entered PIN, never to decide whether to show the lock. There is no `hasPin` term anywhere in the decision — the runtime gate for the background/foreground hooks is `shouldGuard() = signedIn && enabled && !locked && !autoLockSuppressed`, and gating on the verifier is what once let a cold start slip through while it was still loading.
+
+### Restored session vs interactive login
+
+Both a force-quit relaunch and a person who just typed an OTP surface as the same `AuthState.SignedIn` emission, so the difference has to be recorded where it is actually known. `App.observeAuthForAppLock` makes the call on one line:
+
+```kotlin
+if (authRepository.consumeInteractiveSignIn() || hasBeenSignedOut) {
+    appLockController.onFreshLogin()
+    hasBeenSignedOut = false
+}
+```
+
+| Signal | Written by | When | Effect |
+| --- | --- | --- | --- |
+| `AuthRepository.interactiveSignIn` | `markInteractiveSignIn()`, the **first** statement of `verifySignInOtpV2`, `verifySignUpOtpV2`, and `signInWithGoogle` | Before the credential attempt | `consumeInteractiveSignIn()` reads-and-clears it → `onFreshLogin()`, never locks |
+| `hasBeenSignedOut` | `App.observeAuthForAppLock`, only when a `SignedOut` follows a confirmed `SignedIn` (`hasBeenSignedIn`) | An in-process logout | `onFreshLogin()` |
+| Neither | — | A restored session | `coldStart` stays `true`; the first `updateSettings` snapshot re-locks if the account is armed |
+
+Two details are load-bearing:
+
+- **The flag is written before the credential attempt, not after.** Clerk flips its user flow the instant `attemptFirstFactor` / `attemptVerification` / `signInWithOAuth` succeeds, so a flag set afterwards can lose the race with the observer already collecting that emission. A failed attempt leaves it set, which is harmless — it is only ever read when a sign-in actually lands.
+- **The in-process sign-out alone is not enough.** Launching straight to the login screen — the normal case after a clean sign-out, and every fresh install — never sets `hasBeenSignedOut`, because the `SignedOut` that arrives is Clerk's cold-start-init transient, which `hasBeenSignedIn` deliberately ignores. Without the interactive flag an ordinary login was read as a restored session and met with the lock screen the moment the account's settings loaded, seconds after the user authenticated — and regardless of the auto-lock delay, since the cold-start re-lock does not consult it.
+
+The ordering per sign-in is: `AuthState.SignedIn` → `onUserSignedIn(authUserId)` (phase → `RESOLVING`) → the classification above → optionally `onFreshLogin()` (phase → `UNLOCKED`, `coldStart` cleared) → later, the first `updateSettings` snapshot resolves `RESOLVING` into `LOCKED` or `UNLOCKED`.
 
 ### `MainActivity` drives the controller directly
 
@@ -37,6 +61,20 @@ The lock decision gates on `enabled` only. App Lock is "enabled" only when a PIN
 ## `AppLockArmedCache`
 
 `AppLockArmedCache` (`data/applock/AppLockArmedCache.kt`) is a per-account, synchronously-readable `SharedPreferences` cache (`app_lock_armed_prefs`) of whether an account has App Lock **armed** (enabled + PIN). It is the only App Lock state available before the async per-user DataStore snapshot loads, so the controller seeds its initial `LockPhase` from it. `seedLocked()` returns the fail-closed initial phase; `setActiveUser` / `clearActiveUser` maintain a `last_active_user` pointer (the user isn't known at process construction), and `setArmed(userId, armed)` caches each account's armed state independently.
+
+## Server sync — how a PIN set on another device activates here
+
+`AppLockRepository.refreshFromServer(forceRefresh = false)` (`data/applock/AppLockRepository.kt`) is the last-write-wins reconcile against `user_crypto`. It runs under a `refreshMutex`, and it reads the server state through `dekHolder.fetchUserKey(forceRefresh)` — i.e. through the app-scoped `UserKeyProvider` — so the App Lock PIN sync, the sign-in DEK provision, and the recovery-code presence check all ride **one** `get-user-key` round-trip. See [DEK & Database Key Lifecycle](/rollingrecord/app/security/dek-and-db-key) for that single-flight.
+
+A thrown fetch (offline, or App Check / DEK not ready during a fresh-install "setting up your account") or a non-`Success` result returns `false` — a **retryable miss**, not a failure. `lastRefreshSuccessMs` is stamped only on success, so a failed refresh keeps retrying on every subsequent trigger; `REFRESH_THROTTLE_MS = 60_000L` skips re-fetches within a minute of the last success, and a pending local push bypasses the throttle entirely (this reconcile is the path that pushes it up, so it must never be starved).
+
+| Trigger | Call | Notes |
+| --- | --- | --- |
+| Sign-in | `refreshFromServer()` in a bounded retry loop | `APP_LOCK_SYNC_MAX_ATTEMPTS = 6` × `APP_LOCK_SYNC_RETRY_DELAY_MS = 5_000L` (`App.kt`) — ~30s of coverage, stopping the moment the pull succeeds. The retry budget exists because the first attempt on a fresh install races account setup. |
+| Connectivity restore | `refreshFromServer(forceRefresh = true)` | `forceRefresh` bypasses **both** the `UserKeyProvider` and `SessionDekHolder` 5-minute TTLs, so a reconnect observes a PIN changed on another device rather than a cached snapshot. |
+| Settings write | `setAutoLockMs` / `setPin` push | Pushes the local verifier + `auto_lock_ms` up; the server assigns the fresh LWW stamp other devices adopt. |
+
+The two `refreshFromServer` triggers live inside `observeAuthForAppLock`'s session-scope gate: a `launch(Dispatchers.IO)` child that collects `userSessionManager.sessionIdFlow` and only resolves `userSession().get<AppLockRepository>()` once the session id matches the signed-in `authUserId`. (That same gated block also hosts the `combine(isEnabled, autoLockMs)` collector that feeds `AppLockController.updateSettings` — a settings *read*, not the push below.) The settings **write** is not in there at all: `setAutoLockMs` / `setPin` are called from the user-facing UI — `V2SecurityViewModel` and `V2ForgotPinViewModel` — on the session-scoped repository those screens already hold, and both route to `pushToServer`. Resolving earlier grabbed the **anonymous** scope's repository — wired to `anonymous.preferences_pb` — so the controller watched the wrong file all session and a first-time PIN setup never armed the lock until a process restart.
 
 ## Auto-lock delay presets
 
@@ -90,5 +128,7 @@ Any surface that renders in its own window can react to the same signal via `App
 ## Where to go next
 
 - [PIN & Biometrics](/rollingrecord/app/security/pin-and-biometrics) — the DEK-sealed verifier, biometric gate, and lockout backoff
+- [DEK & Database Key Lifecycle](/rollingrecord/app/security/dek-and-db-key) — the `UserKeyProvider` single-flight the PIN sync rides
+- [Clerk authentication](/rollingrecord/app/auth/clerk) — `markInteractiveSignIn`'s three call sites and the DEK provisioning gate
 - [Forgot PIN / PIN Reset](/rollingrecord/app/security/forgot-pin) — the reset flow reached from the overlay
 - [Security & Encryption Overview](/rollingrecord/app/security/overview) — where App Lock sits in the wider subsystem

@@ -59,6 +59,8 @@ The legacy function previously had **no** `[functions.recovery-code-generate]` b
 
 Once `recovery_code_hash` is set, neither function will issue another — the user is expected to keep the code they were given at first sign-up. The only replacement path is the support-ops Tier-3 `regenerate_recovery_code` escape hatch; the user cannot rotate the code themselves.
 
+The complement holds too: an account whose `recovery_code_hash` is still NULL is not stranded. The server surfaces that state to the client as `has_recovery_code` on the [get-user-key](/rollingrecord/backend/edge-functions/get-user-key) response, which the client already fetches every session — so an account that missed the sign-up window (onboarding skipped, a crash mid-flow, a second device) gets re-prompted to run `generate` / `acknowledge` on a later session instead of silently never having a code. The server, not a device-local flag, is the authority on whether the code exists.
+
 <Note>
 Neither `/recovery-code` nor `/recovery-code-generate` reads, wraps, or rewraps the DEK. They only manage `recovery_code_hash` / `recovery_code_pending`. Any DEK-rewrap-on-recovery behavior lives in the support-ops account-recovery operations and [key management](/rollingrecord/backend/storage/key-management), not here.
 </Note>

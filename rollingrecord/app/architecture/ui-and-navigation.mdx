@@ -3,11 +3,11 @@ title: "UI & Navigation"
 description: "The V2 Jetpack Compose surface: the V2App composition root, the login and main NavHosts, the bottom-nav tabs, theming, and tier gating."
 ---
 
-The active UI is 100% Jetpack Compose under `ui/v2`, rooted at `V2App`. `V2App` wraps everything in the V2 theme, observes auth state to drive session switching, and branches on the session id between the anonymous login flow and the signed-in main graph — stacking recovery, onboarding, permissions, App-Lock, and version-gate overlays above whichever nav host is mounted.
+The active UI is 100% Jetpack Compose under `ui/v2`, rooted at `V2App`. `V2App` wraps everything in the V2 theme, observes auth state to drive session switching, and branches three ways on the session id and the database-readiness signal — the anonymous login flow, a session-loading surface, or the signed-in main graph — stacking recovery, onboarding, permissions, App-Lock, and version-gate overlays above whichever nav host is mounted.
 
 ## `V2App` — the composition root
 
-`V2App` (`ui/v2/V2App.kt`) is the top-level `@Composable`. Its parameters are the one-shot nav latches threaded from `MainActivity` (`navigateToScheduleList` / `navigateToRecording` / `navigateToAllRecordings` / `navigateToUpgrade`, `externalAudioUri`, and their `onConsumed` callbacks). It reads `DeviceSettingsDataSource.darkMode` (an app-wide device setting, not the user-scoped `SettingsRepository`) and drives `RollingRecordV2Theme`.
+`V2App` (`ui/v2/V2App.kt`) is the top-level `@Composable`. Its parameters are the one-shot nav latches threaded from `MainActivity` (`navigateToScheduleList` / `navigateToRecording` / `navigateToAllRecordings` / `navigateToUpgrade`, `externalAudioUri`, and their `onConsumed` callbacks). The theme comes from `koinInject<ThemePreference>()` — an app-level indirection (`data/repository/ThemePreference.kt`) whose `darkMode` flow re-resolves the session-scoped `UserSettingsDataSource` on every `sessionIdFlow` emission, so the theme follows the **account** while still being readable from a composable that outlives every session and also wraps the pre-sign-in login flow. Signing out falls back to `UserSettingsDataSource.DEFAULT_DARK_MODE` (`"system"`), which is what stops the login screen inheriting the last user's colors. The flow is `flowOn(Dispatchers.IO)` precisely so that scope resolution never lands on Main. The collected value drives `RollingRecordV2Theme`.
 
 Inside, a `LaunchedEffect` collects `AuthRepository.authState` and drives session switching:
 
@@ -19,7 +19,21 @@ Inside, a `LaunchedEffect` collects `AuthRepository.authState` and drives sessio
 The auth-state observer that calls `UserSessionManager.switchTo` lives here in `V2App.kt` for the V2 surface — **not** in `AppNavHost`. `UserSessionManager`'s own KDoc still references `AppNavHost`; that describes the legacy V1 path.
 </Note>
 
-Below the overlays, the body branches on the session id: `sessionId == AuthUserStore.ANONYMOUS_DIR` mounts `V2LoginNavHost`, otherwise `V2MainNavHost` (wrapped in `Modifier.blur(20.dp)` while the App-Lock overlay is up or the lock decision is still resolving).
+Below the overlays, the body is a **three-way branch**:
+
+| Condition | Mounted |
+| --- | --- |
+| `sessionId == AuthUserStore.ANONYMOUS_DIR` | `V2LoginNavHost` |
+| signed in, `SessionDatabaseState.readySessionId != sessionId` | `V2SessionLoadingScreen` |
+| signed in and DB-ready | `V2MainNavHost` (wrapped in `Modifier.blur(20.dp)` while the App-Lock overlay is up or the lock decision is still resolving) |
+
+### The session-database readiness gate
+
+`V2MainNavHost` resolves five session-scoped repositories during composition — i.e. on Main — and each resolution runs the `AppDatabase` Koin factory synchronously under the session scope's `ScopedInstanceFactory` lock, a factory that can spend tens of seconds on the inline per-user DEK fetch. Composing the nav host before that database exists parks Main for the whole open and ANRs the app.
+
+So `V2App` does two things. A `LaunchedEffect(sessionId)` warms the database off the main thread — `withContext(Dispatchers.IO) { sessionManager.currentScope.get<AppDatabase>() }`, skipped for the anonymous session and wrapped in `runCatching` (every way the open can fail already raises a `DatabaseRecoveryState`, and those surfaces own the retry). And the branch above withholds `V2MainNavHost` until `SessionDatabaseState.readySessionId` (`states/SessionDatabaseState.kt`) equals the current `sessionId`, showing `V2SessionLoadingScreen` (`ui/v2/screens/startup/V2SessionLoadingScreen.kt`) in the meantime. By the time the nav host composes, every one of those resolutions is a cheap read of an already-constructed instance.
+
+`V2SessionLoadingScreen` is deliberately minimal — a `CircularProgressIndicator` plus `R.string.startup_unlocking_library` — and has **no failure branch**: a failed open surfaces through `DatabaseRecoveryState`'s dedicated screens above this point, so if this screen is what the user sees, the open is genuinely still in flight.
 
 ### Overlays stacked above the nav host
 
@@ -37,9 +51,21 @@ Below the overlays, the body branches on the session id: `sessionId == AuthUserS
 | `V2RecordingInterruptedSheet` | `RecordingInterruptedState` | Post-kill recovery sheet; waits out the lock. |
 | `V2BlockingUpdateScreen` | `AppVersionGate.State.NeedsUpdate` | Hard version-floor block, drawn last. |
 
+`V2SessionLoadingScreen` is **not** in this list. It is a branch of the nav-host selection above, not an overlay drawn on top of one — nothing is mounted underneath it, which is the entire point: the surfaces it replaces are exactly the ones whose composition would resolve user-scoped dependencies on Main.
+
 ### The onboarding overlay slot
 
 `V2OnboardingOverlay` (`ui/v2/screens/onboarding/`) is a sealed type for the single `pendingOverlay` slot. Its one variant today is `RecoveryCode(code, email, isError)`, which renders `V2RecoveryCodeSaveScreen` and defers the session swap until the user acknowledges the code via `RecoveryCodeApiClient.generateRecoveryCode` / `acknowledgeRecoveryCode`. Adding a new onboarding moment is a new sealed-class variant plus a render branch.
+
+The `SignedIn` observer enqueues that overlay when **any** of three triggers fires:
+
+| Trigger | Source | Covers |
+| --- | --- | --- |
+| `V2OnboardingSignals.nextSignInIsNewAccount` | set by `V2LoginViewModel` before OTP verify | A brand-new account completing sign-up on this device. |
+| `DeviceSettingsDataSource.pendingRecoveryAckUserId` matches the signing-in user | persisted before the generate call | An acknowledgement interrupted by a kill, dead battery, or network failure. |
+| `V2OnboardingSignals.serverSaysNoRecoveryCode` | `get-user-key`'s `has_recovery_code == false`, read during the sign-in DEK fetch | An account that missed the sign-up window entirely — onboarding skipped, a crash mid-flow, a fresh device. |
+
+The first and third are `@Volatile` flags read-and-cleared on every `SignedIn` arrival, so a stale value can't re-trigger a later session. `serverSaysNoRecoveryCode` is the server-authoritative backstop: the other two are only ever written on the device that ran sign-up, and a recovery code is the only way back into an account, so the authority for "do you have one" has to be the server. It defaults `false` so a fetch that never ran cannot fabricate a blocking prompt.
 
 ## `V2LoginNavHost` — the anonymous flow
 

@@ -11,7 +11,7 @@ There is no client "DEK rewrap on recovery" path. The DEK is unwrapped server-si
 
 ## The onboarding screen
 
-`V2RecoveryCodeSaveScreen` (`ui/v2/screens/onboarding/V2RecoveryCodeSaveScreen.kt`) is shown once per account, as a non-dismissible overlay immediately after the first sign-in for a fresh account — there is no back button and the system back is intercepted (`BackHandler`). Two states are driven by `code`: `null` shows a loading spinner with Continue disabled; non-null shows the full UI; `isError` shows a retry state. The 16-digit code renders as a monospace two-row block. The user can copy it to the clipboard or save it as a markdown file to Downloads (`saveMarkdownToDownloads` via `MediaStore.Downloads`, API 29+; API `< 29` returns false and the user falls back to Copy). An always-expanded warning card and an acknowledge checkbox gate the Continue button, which calls `onAcknowledged(displayCode)`.
+`V2RecoveryCodeSaveScreen` (`ui/v2/screens/onboarding/V2RecoveryCodeSaveScreen.kt`) is a non-dismissible overlay — there is no back button and the system back is intercepted (`BackHandler`). It is normally shown immediately after the first sign-in for a fresh account, but it is **not** a once-per-account screen: it is re-presented on any session where the server reports the account has no acknowledged recovery code (see the host section below). Two states are driven by `code`: `null` shows a loading spinner with Continue disabled; non-null shows the full UI; `isError` shows a retry state. The 16-digit code renders as a monospace two-row block. The user can copy it to the clipboard or save it as a markdown file to Downloads (`saveMarkdownToDownloads` via `MediaStore.Downloads`, API 29+; API `< 29` returns false and the user falls back to Copy). An always-expanded warning card and an acknowledge checkbox gate the Continue button, which calls `onAcknowledged(displayCode)`.
 
 ## Two-phase generate → acknowledge
 
@@ -42,7 +42,59 @@ The request and response DTOs (`data/remote/recoverycode/model/`):
 
 ## Onboarding host in `V2App`
 
-`V2App` (`ui/v2/V2App.kt`) renders `V2RecoveryCodeSaveScreen` for the `V2OnboardingOverlay.RecoveryCode` variant. `onRetry` re-calls `generateRecoveryCode` (resetting to the loading state first). `onAcknowledged` calls `acknowledgeRecoveryCode`, treats `Success` **or** `NotPending` (already acknowledged server-side) as safe to proceed, then clears the DataStore flag via `deviceSettings.clearPendingRecoveryAckUserId()` and switches the user session with `sessionManager.switchTo(authUserId)`. Any other result is a genuine failure and leaves the overlay up so the user can tap Continue again.
+`V2App` (`ui/v2/V2App.kt`) renders `V2RecoveryCodeSaveScreen` for the `V2OnboardingOverlay.RecoveryCode` variant. On every `AuthState.SignedIn` emission it evaluates three independent triggers and mounts the overlay if **any** is true. Each is read-and-cleared as it is evaluated (`nextSignInIsNewAccount = false`, `consumeServerSaysNoRecoveryCode()`), so a later session cannot re-fire on a stale value; the DataStore pending-ack flag is deliberately durable — it is re-persisted the moment the overlay mounts and cleared only by a successful acknowledge (or an `AlreadyExists` generate), because surviving a killed process is the whole reason it exists:
+
+| Trigger | Source | Covers |
+| --- | --- | --- |
+| `isNewAccount` | `V2OnboardingSignals.nextSignInIsNewAccount` — the class's one remaining `@Volatile` flag, set by `V2LoginViewModel` before OTP verify | The normal fresh-sign-up hand-off |
+| `hasInterruptedAck` | `deviceSettings.pendingRecoveryAckUserId` matching this `authUserId` | App killed mid-overlay, phone died, acknowledge that never completed |
+| `serverSaysMissing` | `V2OnboardingSignals.serverSaysNoRecoveryCode`, a `StateFlow<Boolean?>` written by `UserKeyApiClient.fetch` on **every** `get-user-key` response | Any account that has no code, however it got there |
+
+The third trigger is the server-authoritative backstop, and it exists because the first two are **device-local**: both are written on the device that ran sign-up. An account that missed that one window — onboarding skipped, a crash mid-flow, a second device — ended up with no recovery code and nothing left to notice the gap. Since a recovery code is the only way back into an account, the authority for "do you have one" has to be the server, not a flag that can be lost.
+
+## The `serverSaysNoRecoveryCode` signal
+
+`V2OnboardingSignals` (`ui/v2/screens/onboarding/V2OnboardingSignals.kt`) backs the answer with `private val _serverSaysNoRecoveryCode = MutableStateFlow<Boolean?>(null)`, exposed as `serverSaysNoRecoveryCode: StateFlow<Boolean?>`. `setServerSaysNoRecoveryCode(missing)` writes it; `consumeServerSaysNoRecoveryCode()` resets it to `null` once `V2App` has acted, so it cannot re-fire.
+
+| Value | Meaning | Effect |
+| --- | --- | --- |
+| `null` | Not answered yet | Never mounts the screen |
+| `false` | Server says the account has a code | Never mounts the screen |
+| `true` | Server says none | Blocking save screen |
+
+`null` — not `false` — is the initial state precisely so "not answered yet" is distinguishable from "answered: they have one". Only an explicit `true` ever mounts the blocking screen, and both the wire field (`has_recovery_code`) and the client models (`GetUserKeyResponse.hasRecoveryCode`, `UserKeyFetchResult.Success.hasRecoveryCode`) default to "has one" at every layer, so an older server or a fetch that never ran cannot fabricate a prompt.
+
+It is a **flow rather than a read-once flag** because of *when* it is written. `verifySignInOtpV2` establishes the Clerk session with `attemptFirstFactor` — which makes Clerk emit `SignedIn` immediately — and only *then* runs `provisionDekOrThrow()`, the call that fetches the answer. A read-once flag is therefore read by `V2App`'s auth observer **before** it is written, and the prompt never appears. Observing the flow instead means the overlay mounts whenever the answer lands: before, during, or after the `SignedIn` emission. A `null` at observer time means "unknown", not "has one".
+
+The write lives in `UserKeyApiClient.fetch` (`data/remote/userkey/UserKeyApiClient.kt`), not at any call site: on every `ApiResult.Success` it calls `onboardingSignalsProvider().setServerSaysNoRecoveryCode(!decoded.hasRecoveryCode)`. The comment at that line is explicit — *"Record recovery-code presence on EVERY fetch, whoever called."* Recording there rather than per-caller is what makes the check work without a sign-out: a returning user whose DEK is already persisted still gets an answer, because the App Lock sync fetches regardless. `AuthRepository.fetchAndPersistDek` no longer writes the signal at all; it only logs a `save = true` warning when the account has none.
+
+`V2OnboardingSignals` is a `UserScopedCache`; `clearForUserSwitch()` resets `nextSignInIsNewAccount` **and** `_serverSaysNoRecoveryCode.value = null`, since a per-account answer carried across a switch would either show the next account a screen it doesn't need or hide one it does.
+
+### The per-launch presence check
+
+A `LaunchedEffect(sessionId)` in `V2App` guarantees an answer exists for the live session on **every launch**, not only when one is created. It returns early for `AuthUserStore.ANONYMOUS_DIR` and for a session that already has an answer (`serverSaysNoRecoveryCode.value != null`), then on `Dispatchers.IO` calls `userKeyProvider.fetch(sessionId)` — `V2App` injects the root-scope `UserKeyProvider`, the only `get-user-key` route a composable can reach. A failure is non-fatal and logged (`"recovery code: presence check failed — …"`): no answer means no prompt this launch, and the next one asks again.
+
+Sign-out is not a viable trigger for this. Production sessions last ~180 days, so waiting for the next sign-in could leave an account without a recovery code for half a year — and support cannot act on such an account.
+
+The check is usually a no-op: the sign-in DEK provision and the App Lock sync both fetch and both record presence. It only covers the case where neither has run yet — a returning user whose DEK is already persisted and whose App Lock sync is throttled or still retrying — and it asks directly rather than waiting out that retry schedule, which is what previously made the screen appear long after sign-in. Because it routes through `UserKeyProvider` keyed by `sessionId` (which *is* the `authUserId`), when it does fire alongside the other two at sign-in all three coalesce into one `get-user-key` call.
+
+| Source of the answer | Runs | Notes |
+| --- | --- | --- |
+| Sign-in DEK provision (`AuthRepository.fetchAndPersistDek`) | Interactive sign-in only | Lands after `SignedIn` is emitted |
+| `AppLockRepository.refreshFromServer` | Every launch | 60s-throttled, bounded 6 × 5s retry loop |
+| `V2App`'s `LaunchedEffect(sessionId)` presence check | Every launch | Skipped when an answer already exists |
+
+### The late-answer watcher
+
+A second `LaunchedEffect(sessionId)` collects `onboardingSignals.serverSaysNoRecoveryCode.filter { it == true }`. On an emission it consumes the signal **first** (so a re-emission can't double-present), skips if `pendingOverlay != null` (the `SignedIn` observer already got there), resolves `authRepository.currentAuthState() as? AuthState.SignedIn`, logs `"recovery code: server reported none — presenting save screen"` with `save = true`, and calls `presentRecoveryCodeOverlay(...)`.
+
+It is keyed on `sessionId`, **not** on the answer itself. Keying on the answer is self-cancelling: consuming the signal flips it to `null`, which changes the key, so Compose kills the effect part-way through `generateRecoveryCode()` — the screen mounts and then spins forever because the call that fetches the code never completes.
+
+Mounting after the session swap still blocks the user: the overlay draws above the nav host and the save screen no-ops the back button. The user may see Home for a moment first, which is the cost of not missing the prompt.
+
+## Acknowledging
+
+`onRetry` re-calls `generateRecoveryCode` (resetting to the loading state first). `onAcknowledged` calls `acknowledgeRecoveryCode`, treats `Success` **or** `NotPending` (already acknowledged server-side) as safe to proceed, then clears the DataStore flag via `deviceSettings.clearPendingRecoveryAckUserId()` and switches the user session with `sessionManager.switchTo(authUserId)`. Any other result is a genuine failure and leaves the overlay up so the user can tap Continue again.
 
 ## Server hashing primitive
 
@@ -50,6 +102,9 @@ For accuracy, the argon2id hashing happens **server-side** in `recovery_code.ts`
 
 ## Where to go next
 
+- [get-user-key](/rollingrecord/backend/edge-functions/get-user-key) — the `has_recovery_code` read and its fail-open default
+- [DEK & Database Key Lifecycle](/rollingrecord/app/security/dek-and-db-key) — `UserKeyProvider`, the single-flight the presence check rides
+- [App Lock](/rollingrecord/app/security/app-lock) — `AppLockRepository.refreshFromServer`, the every-launch fetch that also records the answer
 - [Security & Encryption Overview](/rollingrecord/app/security/overview) — the actual DEK key model this credential is distinct from
 - [PIN & Biometrics](/rollingrecord/app/security/pin-and-biometrics) — the App-Lock secret, a separate on-device credential
 - [Forgot PIN / PIN Reset](/rollingrecord/app/security/forgot-pin) — the email-OTP flow (also not the recovery code)

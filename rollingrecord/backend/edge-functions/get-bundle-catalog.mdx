@@ -1,0 +1,127 @@
+---
+title: "get-bundle-catalog"
+description: "The JWT-authenticated GET that serves the purchasable add-on bundles from bundle_config with grants already adjusted for the caller's tier — and deliberately without prices."
+---
+
+`get-bundle-catalog` (`functions/get-bundle-catalog/index.ts`) is a `Deno.serve` GET endpoint that returns the active add-on bundles and exactly what each one would credit **this** caller. It is one of two readers of `bundle_config`; the other is the [`revenuecat-webhook`](/rollingrecord/backend/billing/revenuecat), which reads the same rows to decide what a purchase credits. Nothing in the Edge Functions **writes** `bundle_config` — it is migration-seeded admin config (`20260508000000_baseline.sql`, retuned by `20260612010000_update_bundle_prices.sql` and `20260622200000_update_bundle_query_grants.sql`).
+
+## Why it exists
+
+`bundle_config` is the single authority on how much a SKU credits — the RC webhook reads it on a bundle purchase to decide the grant. Until this endpoint, nothing else could read it, so the client hard-coded the same numbers to render a card, and any change to a grant left the app advertising one figure while the server credited another. The endpoint closes that gap: what the response says is what a purchase would credit.
+
+## Gate chain
+
+The handler opens with `runGates(req, { method: HttpMethod.Get, auth: AuthMode.Jwt })` and returns `ctx.response` if the chain rejected. It takes the fixed admission order unmodified — no opt-outs, no entitlement requirement, no rate-limit bucket.
+
+| Gate | Configuration |
+| --- | --- |
+| HTTP method | `HttpMethod.Get` — GET only |
+| App Check | **enforced** (no `skipAppCheck`) |
+| App-version floor | **enforced** (no `skipAppVersion`) |
+| Auth | `AuthMode.Jwt` — Clerk Bearer token |
+| Entitlement fetch | runs automatically for JWT callers; honors `X-Entitlement-Refresh: 1` |
+| Entitlement check | **none** — deliberate |
+| Rate limit | **none** |
+
+There is no entitlement requirement because a Pro user seeing the catalog is how they learn bundles exist. The purchase itself is gated by the store and the webhook, not by reading a price list.
+
+## Tier adjustment
+
+The handler reads the effective entitlement set the gate chain already resolved:
+
+```ts
+const { activeEntitlements: entitlementKeys } = ctx
+const isCloudAi = new Set(entitlementKeys ?? []).has("pro_cloud_ai")
+```
+
+That set comes from `fetchEffectiveEntitlements` (`functions/_shared/gates/entitlement.ts`) at step 5 of the chain, which is either a dev-synthesized set or RC keys run through the tier cascade — so the literal `has("pro_cloud_ai")` is a read of the **effective** set, not the raw RC key list. A `developer` or `lifetime_pro_cloud_ai` holder cascades to `pro_cloud_ai` and correctly sees full grants.
+
+| Effective entitlements | `minutes_granted` | `queries_granted` | `extraction_minutes_granted` |
+| --- | --- | --- | --- |
+| Contains `pro_cloud_ai` (Cloud+AI, `developer`, `lifetime_pro_cloud_ai`) | as stored | as stored | as stored |
+| Free / Pro / Pro+Cloud | as stored | `0` | `0` |
+
+<Warning>
+The zeroing rule is a deliberate duplicate of `handleNonSubscriptionPurchase` in `functions/revenuecat-webhook/index.ts` (`aiQueriesDelta = isCloudAi ? cfg.queries_granted : 0`). If that rule ever changes, both sides must change together or the app will promise a grant the webhook will not make. Note the unit difference: the catalog returns **minutes**; the webhook multiplies by `60_000` to milliseconds before calling `creditBundle`.
+</Warning>
+
+## The `bundle_config` read
+
+```ts
+getServiceClient()
+  .from("bundle_config")
+  .select("sku, display_name, minutes_granted, queries_granted, extraction_minutes_granted, description")
+  .eq("active", true)
+  .order("minutes_granted", { ascending: true })
+```
+
+`getServiceClient()` (`functions/_shared/db/client.ts`) is used because `bundle_config` is admin-authored config, not user-scoped data. Three things about the query matter:
+
+- **`price_usd`, `updated_at` and `active` are not selected.** Prices are absent on purpose — see below.
+- **Retired SKUs are filtered out** with `.eq("active", true)`, because the webhook refuses to credit an inactive SKU. Offering one would be a purchase that grants nothing.
+- **Ordering is `minutes_granted ASC`**, giving the response a stable smallest-to-largest order. The Android client does not depend on it: `V2BundlesViewModel.rebuild()` iterates the RevenueCat package list and re-sorts the joined pairs with `.sortedBy { (_, grant) -> grant.minutesGranted }`, so the server's order is discarded by the join.
+
+## Response shape
+
+`BundleCatalogResponse` is `{ bundles: BundleCatalogEntry[] }`. Both interfaces are local to `index.ts`, and the `json()` helper (`JSON.stringify` + `Content-Type: application/json`) serializes both the 200 and the error body.
+
+| Field | Type | Source column | Tier-adjusted? |
+| --- | --- | --- | --- |
+| `sku` | `string` | `bundle_config.sku` | no — the RevenueCat / Play product id the client joins packages on |
+| `display_name` | `string` | `bundle_config.display_name` | no |
+| `minutes_granted` | `number` | `bundle_config.minutes_granted` | no — always present, this is the bundle's point |
+| `queries_granted` | `number` | `bundle_config.queries_granted` | **yes** — `0` below Cloud+AI |
+| `extraction_minutes_granted` | `number` | `bundle_config.extraction_minutes_granted` | **yes** — `0` below Cloud+AI |
+| `description` | `string \| null` | `bundle_config.description` | no |
+
+There is **no price field.** `bundle_config.price_usd` is reference-only, Google Play is the payment processor, and RevenueCat serves the localized price the user is actually charged. Returning `price_usd` would invite a client to display a number Play may disagree with.
+
+## Responses
+
+| Status | Body | When |
+| --- | --- | --- |
+| `200` | `{ bundles: [...] }` | success; an empty array is a valid answer |
+| `500` | `{ error: "database_error" }` | the `bundle_config` read failed — logged as `get-bundle-catalog: bundle_config read failed:` |
+
+`database_error` is `AppError.DATABASE_ERROR` from the shared registry (`functions/_shared/errors.ts`, category `infra`), and it is the only handler-generated failure. Everything else is a standard gate rejection inherited from `runGates` — method, App Check, app-version floor, JWT, account-frozen.
+
+## The live SKUs
+
+Four bundles are seeded in `bundle_config` and pinned by `BundlePurchasesSmokeTest`. `extraction_minutes_granted` is granted 1:1 with `minutes_granted` (migration `20260625130000_rename_extractions_to_extraction_minutes.sql` set it that way when the column was renamed from `extractions_granted`).
+
+| `sku` | `minutes_granted` | `queries_granted` | `extraction_minutes_granted` | `price_usd` (not served) |
+| --- | --- | --- | --- | --- |
+| `bundle_transcription_1hr` | 60 | 10 | 60 | 3.49 |
+| `bundle_transcription_3hr` | 180 | 25 | 180 | 6.99 |
+| `bundle_transcription_5hr` | 300 | 40 | 300 | 10.99 |
+| `bundle_transcription_10hr` | 600 | 80 | 600 | 16.99 |
+
+Query grants were retuned by `20260622200000_update_bundle_query_grants.sql`; prices by `20260612010000_update_bundle_prices.sql`.
+
+## The client join
+
+The Android mirror is `BundleCatalogApi` (`data/remote/bundles/BundleCatalogApi.kt`): `const val FN_GET_BUNDLE_CATALOG = "get-bundle-catalog"` drives both `@GET("functions/v1/" + FN_GET_BUNDLE_CATALOG)` and `@EdgeTag`, and the Kotlin `BundleCatalogEntry` mirrors all six JSON fields — carrying the same "no price field, deliberately" note. Only the four snake_case fields carry an `@SerialName` (`display_name`, `minutes_granted`, `queries_granted`, `extraction_minutes_granted`); `sku` and `description` are declared bare and match on the property name.
+
+`V2BundlesViewModel` (`ui/v2/screens/bundles/V2BundlesViewModel.kt`) joins the server catalog against the RevenueCat offering on the bare SKU. `Package.storeProductId()` is `product.id.substringBefore(':')` — the client-side twin of the server's `normalizeBundleSku` (`functions/_shared/billing/bundle-sku.ts`), since Google qualifies a product id as `product_id:sub_id`. `toOption(pkg, grant)` then renders the **server's** grant figures (`grant.minutesGranted`, `grant.queriesGranted.takeIf { it > 0 }`) with the **store's** localized `pkg.product.price`.
+
+<Note>
+A failed join is silent — both sides can be healthy and share no product id, and every card drops so the catalog just looks empty. The ViewModel logs both id sets (`rc=[…] server=[…]`) when the join produces nothing, so the mismatch is readable rather than inferred.
+</Note>
+
+## Tier freshness
+
+This endpoint does not pass `bypassCache` itself; it inherits whatever the gate chain resolved, and the entitlement set is cached per customer for five minutes. The app can force a live read with the `X-Entitlement-Refresh: 1` header — which is what it sends right after a purchase or restore. The webhook's own tier read, by contrast, hard-codes `bypassCache: true`, because a stale set there under-credits a real purchase with nothing to retry it.
+
+## Deployment
+
+`config.toml` declares `[functions.get-bundle-catalog]` with `verify_jwt = false` and its own rationale comment — the function runs its own Clerk-JWT check via `runGates`, so Supabase's built-in check must stay off or it would reject the Clerk token. See [Function deployment](/rollingrecord/backend/operations/config-toml).
+
+## Related pages
+
+- [Credits & bundles](/rollingrecord/backend/billing/credits-and-bundles) — `bundle_config`, `creditBundle`, and what a purchase actually writes.
+- [RevenueCat integration](/rollingrecord/backend/billing/revenuecat) — the webhook branch that credits the purchase this catalog advertises.
+- [Inbound webhooks](/rollingrecord/backend/edge-functions/webhooks) — `revenuecat-webhook` dispatch order.
+- [Entitlement taxonomy](/rollingrecord/backend/billing/entitlements) — the `pro_cloud_ai` tier key and the cascade.
+- [runGates](/rollingrecord/backend/gates/run-gates) — the fixed admission order this function uses unmodified.
+- [Entitlement & grace gate](/rollingrecord/backend/gates/entitlement-and-grace) — `fetchEffectiveEntitlements` and `X-Entitlement-Refresh`.
+- [Edge Function catalog](/rollingrecord/backend/edge-functions/overview) and the [error-code registry](/rollingrecord/backend/operations/error-registry).

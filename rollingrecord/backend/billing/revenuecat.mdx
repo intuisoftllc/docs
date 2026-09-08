@@ -41,14 +41,16 @@ After the gate, the handler parses the envelope (`INVALID_BODY` on bad JSON, `MI
 
 | RC event type | Action |
 | --- | --- |
-| `INITIAL_PURCHASE` / `NON_RENEWING_PURCHASE` / `TEMPORARY_ENTITLEMENT_GRANT` (mirrored key) | `handleLifetimeGrant` → UPSERT `lifetime_entitlements` |
+| `INITIAL_PURCHASE` / `NON_RENEWING_PURCHASE` / `TEMPORARY_ENTITLEMENT_GRANT` (mirrored key present) | `handleLifetimeGrant` → UPSERT `lifetime_entitlements` |
 | `INITIAL_PURCHASE` / `RENEWAL` (recurring sub key, fresh) | `handleRecurringSubRevenue` → `revenue_micros += usdToMicros(price)` |
 | Any recurring-sub event (`EXPIRATION` / `RENEWAL` / `PRODUCT_CHANGE` / `UNCANCELLATION` / `CANCELLATION` / dashboard revoke) | `handleRecurringSubEvent` re-reads the authoritative set live from RC and diffs it against the stored `last_known_entitlements` key snapshot; opens/clears the cloud grace window on the transition |
 | `CANCELLATION` (mirrored lifetime key) | `handleLifetimeRevocation` with lowercased `cancel_reason` |
 | `EXPIRATION` (mirrored lifetime key) | `handleLifetimeRevocation` fallback, reason `rc_expiration` |
-| `NON_SUBSCRIPTION_PURCHASE` | `handleNonSubscriptionPurchase` → `creditBundle` + `revenue_micros` |
-| `CANCELLATION` (product_id, no mirrored key) | `handleBundleRefund` → `refundBundle` clawback |
+| `NON_RENEWING_PURCHASE` — alias `NON_SUBSCRIPTION_PURCHASE` — (`product_id`, no mirrored key) | `handleNonSubscriptionPurchase` → `creditBundle` + `revenue_micros` |
+| `CANCELLATION` (`product_id`, no mirrored key) | `handleBundleRefund` → `refundBundle` clawback |
 | `SUBSCRIBER_ALIAS` / `TRANSFER` / `BILLING_ISSUE` / `SUBSCRIPTION_PAUSED` | `l_entitlement_events` audit only |
+
+The two `NON_RENEWING_PURCHASE` rows are mutually exclusive, and the empty-`mirroredMetas` guard is what separates them: a founders-edition lifetime arrives as the same type but carries an entitlement key, so it skips the bundle branch and lands on `handleLifetimeGrant`. RC does **not** emit `NON_SUBSCRIPTION_PURCHASE` — that name is kept only as an accepted alias for deliveries already in flight, because the bundle branch originally matched it alone and silently dropped every real purchase.
 
 ## Lifetime mirroring
 
@@ -84,7 +86,30 @@ Every route out of cloud collapses into the open-window case: expiry, a deferred
 
 ## Bundle purchases and refunds
 
-`handleNonSubscriptionPurchase` handles one-time IAP bundles. It reads `bundle_config` by `product_id` (an `active = false` SKU is refused), computes tier-aware grants (Cloud+AI gets minutes + queries + extraction ms; other tiers get minutes only), and calls `creditBundle()` keyed on `event.id` as the `purchase_token` — idempotent via the `l_credit_log` unique index. On `outcome === 'credited'` with a positive `event.price`, it records `revenue_micros`. `handleBundleRefund` runs when a `CANCELLATION` carries a `product_id` but no mirrored entitlement key: it hands `event.id` to `refundBundle({purchaseToken, source: 'rc_refund'})`, which is idempotent via a `refund_of_token` unique index and always 2xx's on `no_grant_found` / `already_refunded`. Both bundle helpers live in `_shared/db/user-credits.ts` — see [Credits & bundles](/rollingrecord/backend/billing/credits-and-bundles).
+`handleNonSubscriptionPurchase` handles one-time IAP bundles. It reads `bundle_config` by **`normalizeBundleSku(event.product_id)`**, not the raw product id: `_shared/billing/bundle-sku.ts` splits at the first `:` and keeps the prefix, because stores qualify a product id with a sub-identifier when one exists — Google appends the base plan for subscriptions and the purchase option for the newer one-time product model, as `product_id:sub_id`, and RC forwards whatever the store gave it. Normalizing is a no-op on an already-bare id, so it is applied unconditionally; the store-qualified form would otherwise miss the row and credit a charged buyer nothing. `supabase/tests/_shared/billing/bundle-sku_test.ts` pins the behavior (bare passthrough, `sku:option` reduction, only-first-segment, and degenerate input returning `""` rather than throwing inside a webhook RC would retry forever).
+
+A `cfgError` throws (500 → RC retries); an unknown SKU or an `active = false` row logs and returns without crediting. Then it computes tier-aware grants, calls `creditBundle()` keyed on `event.id` as the `purchase_token` — idempotent via the `l_credit_log` unique index — and on `outcome === 'credited'` with a positive `event.price` records `revenue_micros`. If RC ever omits `event.id`, the token falls back to the deterministic `rc_${authUserId}_${productId}_${event.purchased_at_ms ?? "0"}`, built from the **normalized** product id.
+
+### Resolving the buyer's tier
+
+The tier check is `fetchEffectiveEntitlements(authUserId, { bypassCache: true })` (`_shared/gates/entitlement.ts`) compared against `TIER.PRO_CLOUD_AI` — the same authority `runGates` reads at step 5, so the purchase-time grant and the runtime entitlement check can no longer disagree. `bypassCache` is set because this is a one-shot money event: the per-customer set is cached for `ENTITLEMENT_CACHE_TTL_MS` (5 minutes), and a stale empty set here under-credits a real purchase with nothing to retry it.
+
+| Tier source | Who it misses |
+| --- | --- |
+| Old: `getActiveEntitlementKeys(...).has("pro_cloud_ai")` — the **literal** RC key set | `developer` and `lifetime_pro_cloud_ai` holders. Both cascade to `pro_cloud_ai` but hold a different literal key, so the check answered false: they were charged the full bundle price and credited transcription minutes only. |
+| Now: `fetchEffectiveEntitlements(...)` — the **effective** set (dev synthesis, or RC + tier cascade) | nobody; `getEffectiveEntitlementKeys` adds every tier at-or-below the highest one held. |
+
+`fetchEffectiveEntitlements` returns a gate `Response` on RC failure rather than throwing, so the degraded path is an explicit branch:
+
+| Outcome | Handler behavior |
+| --- | --- |
+| `ent.response === null` | `isCloudAi = ent.activeEntitlements.has(TIER.PRO_CLOUD_AI)` — full tier-aware grant |
+| gate returned a `Response` (RC down → 502 `entitlement_check_failed`) | warn `tier lookup unavailable … crediting minutes only` |
+| unexpected throw | warn `tier lookup threw … crediting minutes only` |
+
+In every case the transcription grant is still credited, so the buyer keeps the value they paid for and the shortfall is left to a support top-up rather than failing the whole credit.
+
+`handleBundleRefund` runs when a `CANCELLATION` carries a `product_id` but no mirrored entitlement key: it hands `event.id` to `refundBundle({purchaseToken, source: 'rc_refund'})`, which is idempotent via a `refund_of_token` unique index and always 2xx's on `no_grant_found` / `already_refunded`. Both bundle helpers live in `_shared/db/user-credits.ts` — see [Credits & bundles](/rollingrecord/backend/billing/credits-and-bundles). The webhook only **reads** `bundle_config` (a `.select(...).eq("sku", productId).maybeSingle()` on the normalized SKU) — its write side is `l_credit_log` and `user_credits`. `bundle_config` itself is migration-seeded admin config that no Edge Function mutates; [get-bundle-catalog](/rollingrecord/backend/edge-functions/get-bundle-catalog) is the other reader and mirrors the per-tier zeroing rule exactly.
 
 ## The `RevenueCatEvent` shape
 
@@ -94,6 +119,8 @@ The webhook reads a small envelope. Key fields on `RevenueCatEvent`: `type`, `ap
 
 - [Entitlement taxonomy](/rollingrecord/backend/billing/entitlements) — the tier cascade and the mirrored-keys set.
 - [Credits & bundles](/rollingrecord/backend/billing/credits-and-bundles) — `creditBundle` / `refundBundle` internals.
+- [get-bundle-catalog](/rollingrecord/backend/edge-functions/get-bundle-catalog) — serves the same `bundle_config` rows with the same tier rule.
+- [Inbound webhooks](/rollingrecord/backend/edge-functions/webhooks) — dispatch order and the two `NON_RENEWING_PURCHASE` shapes.
 - [Per-user financials](/rollingrecord/backend/billing/financials) — where `revenue_micros` lands.
 - [Webhook secret gate](/rollingrecord/backend/gates/webhook-secret) and [Entitlement & grace gate](/rollingrecord/backend/gates/entitlement-and-grace).
 - [delete-user](/rollingrecord/backend/accounts/delete-user) — calls `deleteRcCustomer`.

@@ -5,6 +5,8 @@ description: "The RcEntitlement taxonomy, effective-tier resolution, the develop
 
 RevenueCat is the entitlement authority. A single enum defines every entitlement the client understands, a thin manager wraps the process-wide SDK singleton, and a session-scoped repository turns entitlements into an effective tier while guarding against the SDK reporting a different user's purchases.
 
+That authority covers *entitlements*. For the one-time add-on bundle SKUs, RevenueCat owns only purchasability and price — the resource grant is owned by the server (`bundle_config`, served by `get-bundle-catalog`) and applied by the webhook, so a client purchase callback is not evidence that credits exist yet.
+
 ## `RcEntitlement`
 
 `RcEntitlement` (`data/billing/RcEntitlement.kt`) is the single source of truth for the RC entitlement taxonomy on Android and a mirror of `supabase/functions/_shared/billing/entitlements.ts` — when one changes, the other must too. Every reference to an RC entitlement `lookupKey` goes through this enum; no entitlement key is string-literalled anywhere else. Each member carries `lookupKey`, `displayName`, `tier`, `kind`, `hasSku`, `description`, and `bypassesCaps` (default false).
@@ -30,14 +32,29 @@ RevenueCat is the entitlement authority. A single enum defines every entitlement
 
 ### Subscription-lapse detection
 
-`CustomerInfo?.isSubscriptionLapsed()` (`data/billing/RcEntitlement.kt`) is the shared SUBSCRIPTION_LAPSED predicate — one definition used by both the account-health roll-up and the scheduled-recording lapse guard so the two can never drift apart. Its `internal` pure core `isSubscriptionLapsed(activeKeys: Set<String>, allKeysActive: Map<String, Boolean>)` is split from the SDK types so it unit-tests without constructing a `CustomerInfo`.
+`CustomerInfo?.isSubscriptionLapsed()` (`data/billing/RcEntitlement.kt`) is the SUBSCRIPTION_LAPSED predicate behind the scheduled-recording lapse guard — its **only** consumer. Its `internal` pure core `isSubscriptionLapsed(activeKeys: Set<String>, allKeysActive: Map<String, Boolean>)` is split from the SDK types so it unit-tests without constructing a `CustomerInfo`.
 
 RevenueCat exposes every entitlement the user has ever held in `entitlements.all` and only the currently-valid ones in `entitlements.active`. A lapse is a known `RcEntitlement` key that appears in `entitlements.all` but is no longer active **and** no currently-active recognized entitlement. The two clauses matter:
 
 - Never-subscribed `FREE` users have an empty `entitlements.all`, so they never trip it.
 - A null `CustomerInfo` (signed out, or RC mid-fetch) is **not** lapsed. Asserting "there was a subscription and it is gone" is the whole point — a plain `tier < PRO` test cannot tell that apart from "we don't know yet", which is why it is unsafe to destroy user state on.
 
-This predicate is consumed by `ScheduledRecordingRepository.disableAllForLapse()` (see [Feature Gating & Upsell](/rollingrecord/app/monetization/feature-gating)) and the [Account Health](/rollingrecord/app/auth/account-health) roll-up.
+#### The one call site
+
+The predicate is applied in `App.disableSchedulesIfLapsed()` (`App.kt`), not inside the repository it ends up calling. `ScheduledRecordingRepository.disableAllForLapse()` takes no decision — it unconditionally flips every enabled schedule off, enqueues each for sync, and returns the count. Two things have to be true before it is reached:
+
+1. **The RC owner check** — `rc.appUserId != null && rc.appUserId == userSessionManager.sessionIdFlow.value`. RC's customer info carries the `appUserID` it belongs to, and the SDK's identity can lag a session switch; acting on info owned by a *different* user would switch off this user's schedules on the strength of the previous account's billing state. Signed out, the session id is `ANONYMOUS_DIR`, which no RC `appUserId` can match, so the same guard covers that case. A mismatch logs and returns.
+2. **The lapse assertion** — `if (!rc.info.isSubscriptionLapsed()) return`.
+
+Only then does `scheduleRepository.disableAllForLapse()` run. See [Feature Gating & Upsell](/rollingrecord/app/monetization/feature-gating) for why the guard is keyed on this predicate rather than `tier < PRO`.
+
+#### Not the account-health signal
+
+Account health deliberately does **not** use this predicate. `AccountHealthProvider` documents the reason on its `identityRepository` param: RevenueCat never removes an expired entitlement from `entitlements.all`, so `isSubscriptionLapsed()` stays true **forever** after a single cancellation — a status dot driven by it would announce "your subscription has ended" for the rest of the account's life, long after there was anything to act on. The roll-up's SUBSCRIPTION_LAPSED input is `identityRepository.graceState.map { it != null }` instead: the server sets the grace columns when a recurring cloud sub ends, the RC webhook clears them on resubscribe, and the daily sweeper clears them when the window expires, so a non-null value means "inside the window". See [Account Health](/rollingrecord/app/auth/account-health).
+
+<Note>
+The KDoc on `isSubscriptionLapsed()` in `RcEntitlement.kt` still calls it "shared by the account-health roll-up and the scheduled-recording lapse guard". That half is stale — it describes where the predicate lived before account health moved to the bounded grace-window signal. Everything the KDoc says about the predicate's *semantics* is accurate.
+</Note>
 
 ## Developer bypass
 
@@ -57,16 +74,28 @@ This predicate is consumed by `ScheduledRecordingRepository.disableAllForLapse()
 | `updateDisplayName(displayName)` | In-place `$displayName` update for an already-signed-in user. |
 | `logOut()` | Resets the SDK to anonymous on sign-out (clears the snapshot synchronously so no stale paid entitlement lingers). |
 | `checkPurchaseGuard()` | Cross-store double-billing guard. |
-| `getCurrentOffering()` | Fetches the current offering for a paywall / management screen. |
-| `purchase(activity, pkg, oldProductId?)` | Launches the store purchase / plan-change flow. |
+| `getCurrentOffering()` | Fetches `offerings.current` — the subscription paywall — for the plan screens. |
+| `getOffering(identifier)` | Fetches a **named** offering (e.g. the `bundle` add-on offering) rather than `offerings.current`; a missing or package-less offering maps to `Empty`, not `Error`. |
+| `purchase(activity, pkg, oldProductId?)` | Launches the store purchase / plan-change flow — also the one-time (non-subscription) bundle path, called with no `oldProductId`. |
 | `restorePurchases()` | Explicit "Restore purchases" path. |
+| `refreshCustomerInfo()` | Forces a cache-bypassing (`CacheFetchPolicy.FETCH_CURRENT`) customer-info fetch on app foreground so a mid-session lapse surfaces without a cold restart. Safe no-op when `Purchases` is not configured. |
 | `startObserving()` | Wires the `updatedCustomerInfoListener` and does the initial customer-info fetch. |
+
+### Named offerings — `getOffering` vs `getCurrentOffering`
+
+Add-on bundles live in their own RevenueCat offering so they never appear as purchasable plans on the subscription paywall, and reaching them needs a lookup by identifier. `getCurrentOffering()` feeds `ChoosePlanViewModel`; `getOffering("bundle")` feeds `V2BundlesViewModel` (see [Add-On Bundles](/rollingrecord/app/monetization/bundles)).
+
+Both return `OfferingsResult.Error("Store not ready")` when `Purchases.isConfigured` is false, but their `Empty` mappings differ: `getCurrentOffering` maps only a null `offerings.current` to `Empty`, while `getOffering` maps `offering == null || offering.availablePackages.isEmpty()` to `Empty`. An offering that has not been configured yet is an empty catalog, and "no bundles available" is a better outcome than an error banner blaming the network. It logs `getOffering($identifier): packages=N` on success and `getOffering($identifier) failed: code=…, message=…` on error.
+
+`refreshCustomerInfo()` was added for the same class of problem on the other side of the SDK: cached customer info is served for a few minutes, so a background-to-foreground within that window kept serving the pre-lapse tier and suppressed the grace banner, whose tier gate still saw Pro+Cloud.
 
 ### `onTierRaised` — the single upward-movement hook
 
 Every customer-info path — `linkToAuthUser`, `purchase`, `restorePurchases`, `logOut`, and the SDK's `updatedCustomerInfoListener` — funnels through the private `emitCustomerInfo(info)`. That method now also computes `RcEntitlement.resolveTier(info)`, tracks a `lastTier` (initialised `FREE`), and fires `onTierRaised(tier)` **only** when the tier moves up (`tier.ordinal > previous.ordinal`). Hooking it here rather than in the two purchase ViewModels catches every raise — purchase, restore, promotional grant, and cross-device sync — in one place. The call is wrapped in `runCatching { }` so a listener failure can never break the customer-info flow the whole UI reads.
 
 Downgrades and lapses deliberately do **not** fire: the server is the stricter authority, so asking it to re-read could only take access away sooner, and the stale entitlement it still has cached expires on its own. `onTierRaised` is wired in `di/DataSourceModule.kt` to `EntitlementRefreshSignal.markPurchaseCompleted` (see below).
+
+A one-time bundle purchase also flows through `emitCustomerInfo`, but it grants no entitlement — so it never raises the tier and never arms the refresh signal. That credit reaches the client through the usage snapshot instead.
 
 The `purchase()` `onError` log now emits `error.underlyingErrorMessage` and the replaced `oldProductId` alongside `error.message`: `PurchasesError.message` is a constant `code.description`, so four distinct Play Billing failures (`BILLING_UNAVAILABLE`, `ITEM_NOT_OWNED`, `FEATURE_NOT_SUPPORTED`, and RC's own non-subscription guard) all collapse into the same `PurchaseNotAllowedError` text — a log carrying only `message` cannot tell them apart.
 
@@ -120,7 +149,7 @@ There is no mutator — the tier is derived, never set. As a side effect the rep
 
 Three sealed result types model the outcomes of the RC calls:
 
-- `OfferingsResult` (`data/billing/PurchaseFlowResult.kt`) — `Success(offering)` / `Empty` (no offering marked Current — a configuration state, not an error) / `Error(message)`.
+- `OfferingsResult` (`data/billing/PurchaseFlowResult.kt`) — `Success(offering)` / `Empty` (no offering to show — either none marked Current, or the requested named offering is missing from the RC project or has no available packages; a configuration state, not an error) / `Error(message)`.
 - `PurchaseFlowResult` (`data/billing/PurchaseFlowResult.kt`) — `Success(customerInfo)` / `Cancelled` (user backed out) / `Error(message)`.
 - `PurchaseGuardResult` (`data/billing/PurchaseGuardResult.kt`) — `Offer` / `AlreadySubscribedSameStore(store)` / `BlockedByOtherStore(store)`. The last blocks a purchase when the user is already subscribed via a different store (e.g. App Store while on Android), preventing double-billing.
 
@@ -128,4 +157,6 @@ Three sealed result types model the outcomes of the RC calls:
 
 - [User Tiers & Feature Map](/rollingrecord/app/monetization/tiers) — the `UserTier` levels entitlements resolve to.
 - [Plans & Subscription Management](/rollingrecord/app/monetization/plans-and-subscription) — the paywall and management flows that call `RevenueCatManager`.
+- [Add-On Bundles](/rollingrecord/app/monetization/bundles) — the named-offering consumer: the `bundle` offering, the product-id join, and the webhook-credit poll.
 - [Feature Gating & Upsell](/rollingrecord/app/monetization/feature-gating) — how the resolved tier drives UI access.
+- [RevenueCat Integration](/rollingrecord/backend/billing/revenuecat) — `handleNonSubscriptionPurchase`, the server side of a bundle purchase.

@@ -45,7 +45,7 @@ The `pin_verifier_ct` / `pin_verifier_iv` pair (migration `20260703120000_app_lo
 - **No entitlement gate.** `runGates` enforces only POST + JWT here. The DEK now also derives the local SQLCipher DB key, so any device signing into the account needs it regardless of subscription tier.
 - **Rate limit runs manually in the handler body**, not via chain sugar. `checkRateLimit(Bucket.UserKeyGet, ...)` is called inline specifically so the rejection path can also write an `l_user_key_access` audit row — this endpoint is where a stolen JWT would go shopping for the DEK, so forensic visibility matters most here.
 
-On each call the handler calls `ensureCanonicalUserRow` (upsert with `onConflict: auth_user_id, ignoreDuplicates` — a failure is swallowed to console.error) so the FK is satisfiable, then selects the `user_crypto` row. If none exists it lazily provisions: `generateDek` → `wrapDek` → insert, handling a `23505` unique-violation race by re-selecting whichever row landed first. It unwraps with the matching KEK version, `zeroDek`s the plaintext, and returns `GetResponse`.
+On each call the handler calls `ensureCanonicalUserRow` (upsert with `onConflict: auth_user_id, ignoreDuplicates` — a failure is swallowed to console.error) so the FK is satisfiable, then selects the `user_crypto` row. Immediately after that read — and before the provisioning branch below — a second, independent select reads `canonical_users.recovery_code_hash` with `maybeSingle()` to set `has_recovery_code`; it is kept separate from the crypto read rather than joined so the INSERT branch stays untouched, and it fails open to `true` if it errors rather than withholding the DEK over a boolean. If no `user_crypto` row exists the handler lazily provisions one: `generateDek` → `wrapDek` → insert, handling a `23505` unique-violation race by re-selecting whichever row landed first. It unwraps with the matching KEK version, `zeroDek`s the plaintext, and returns `GetResponse`.
 
 ### GetResponse
 
@@ -57,6 +57,7 @@ On each call the handler calls `ensureCanonicalUserRow` (upsert with `onConflict
 | `pin_verifier_iv` | string \| null | base64 IV paired with `pin_verifier_ct` |
 | `pin_settings` | `{ auto_lock_ms? }` \| null | synced App-Lock settings |
 | `pin_updated_at` | number \| null | epoch-ms LWW marker (null on legacy rows) |
+| `has_recovery_code` | boolean | whether `canonical_users.recovery_code_hash IS NOT NULL`; read from a separate select, fails open to `true` |
 
 ## Audit logging
 

@@ -9,21 +9,60 @@ Every account has one 32-byte Data Encryption Key (DEK). It is fetched from the 
 
 `UserKeyApi` (`data/remote/userkey/UserKeyApi.kt`) is an internal Retrofit interface with a single `POST functions/v1/get-user-key` (`FN_GET_USER_KEY`) call. The body is an empty `{}` — identity comes from the Bearer JWT stamped by the shared `aiengine` OkHttp client (App Check + Bearer + app-version interceptors), which this endpoint reuses rather than duplicating transport plumbing. The endpoint lazy-provisions the `user_crypto` row on first call.
 
-`UserKeyApiClient` (`data/remote/userkey/UserKeyApiClient.kt`) wraps that call in `fetch()`, returning a `UserKeyFetchResult`: `Success(dekBase64, kekVersion, …)`, `SubscriptionRequired(entitlement)` (default `pro_cloud`), `RateLimited`, or `Transient(reason, cause)` for network / 5xx / decode failures. It holds no cache of its own — that belongs to `SessionDekHolder`.
+`UserKeyApiClient` (`data/remote/userkey/UserKeyApiClient.kt`) wraps that call in `fetch()`, returning a `UserKeyFetchResult`: `Success(dekBase64, kekVersion, …, hasRecoveryCode)`, `SubscriptionRequired(entitlement)` (default `pro_cloud`), `RateLimited`, or `Transient(reason, cause)` for network / 5xx / decode failures. It is the one-shot fetcher, with exactly one side effect: on every 200 it calls `onboardingSignalsProvider().setServerSaysNoRecoveryCode(!decoded.hasRecoveryCode)` so that *whichever* caller triggered the round-trip records the recovery-code answer. Caching is not its job — the shared cache belongs to `UserKeyProvider` (its own KDoc still points at `SessionDekHolder`; that predates the provider).
 
 `GetUserKeyResponse` (`data/remote/userkey/model/GetUserKeyResponse.kt`) is the internal `@Serializable` shape. `dek` is base64 and decodes to exactly 32 bytes; `kek_version` is informational. The same response also carries RR-492 App-Lock PIN sync fields (`pin_verifier_ct` / `pin_verifier_iv`, `pin_settings.auto_lock_ms`, `pin_updated_at`), all nullable and defaulted — the endpoint is not DEK-only. The model mirrors the `smoketest` `UserKeyResponses` type by convention.
 
+The response also carries `has_recovery_code` — the server-authoritative answer to `canonical_users.recovery_code_hash IS NOT NULL`, read by `get-user-key` (`supabase/functions/get-user-key/index.ts`) alongside the DEK because the client already makes this call on every session. It maps to `GetUserKeyResponse.hasRecoveryCode` and is carried forward as `UserKeyFetchResult.Success.hasRecoveryCode`. **Both default to `true`**, matching the server's own fallback when the `canonical_users` select errors: a missing or unreadable field must never make the client conclude the user has no recovery code and put a blocking screen in front of someone who does. The answer is recorded inside `UserKeyApiClient.fetch` rather than at any one call site, so all three callers below report it — see [Recovery Codes](/rollingrecord/app/security/recovery-codes).
+
+## `UserKeyProvider` — the app-scoped single flight
+
+`UserKeyProvider` (`data/remote/userkey/UserKeyProvider.kt`) is an app-scoped, owner-stamped, single-flight front for `UserKeyApiClient.fetch()`. It exists because at an interactive sign-in `get-user-key` is hit by **three** callers that race concurrently — its KDoc records that "server logs showed all three firing within ~225ms, every one starting before any had returned" — and they live in three different lifetimes:
+
+| Caller | File | Lifetime | Consumes |
+| --- | --- | --- | --- |
+| `AuthRepository.fetchAndPersistDek` | `data/auth/AuthRepository.kt` | App-scoped, runs **before** the `UserSessionScope` exists | `dek` / `kek_version` for the blocking sign-in DEK gate |
+| `AppLockRepository.refreshFromServer` (via `SessionDekHolder.fetchUserKey`) | `data/applock/AppLockRepository.kt` | Session-scoped | The `pin_*` verifier / auto-lock LWW reconcile |
+| `V2App`'s recovery-code presence check | `ui/v2/V2App.kt` | A composable — can only reach **root-scope** singletons | `has_recovery_code` |
+
+A session-scoped coalescer cannot dedupe those: caller 1 fires while no session scope exists and caller 3 cannot see the session scope at all. Caching the result *after* the first call returns is also too late for a concurrent burst. So the provider lives at the app level — the first caller starts the fetch, the others block on its `Mutex` and read the fresh cache. One network call instead of three, against a `Bucket.UserKeyGet` ceiling of 40 requests per hour (see [get-user-key](/rollingrecord/backend/edge-functions/get-user-key)).
+
+`fetch(authUserId, forceRefresh = false)` runs its whole body under the mutex. It serves the cache only when **all four** of these hold:
+
+| Condition | Why |
+| --- | --- |
+| `forceRefresh == false` | `forceRefresh` is the explicit "observe a cross-device change now" escape hatch |
+| `cached != null` | Only `UserKeyFetchResult.Success` is ever stored |
+| `cachedOwner == authUserId` | Owner stamp — never serve one account's key material to another |
+| `SystemClock.elapsedRealtime() - cachedAt < TTL_MS` | `TTL_MS = 5 * 60 * 1000L` (5 minutes) |
+
+A **failure is never cached**, so each caller retries on its own path rather than all inheriting one transient error — that is what lets the App Lock fresh-install retry loop eventually succeed.
+
+`cached`, `cachedOwner`, and `cachedAt` are `@Volatile` so `clearForUserSwitch()` can null them **without** taking the mutex: a user switch is on the sign-in critical path and must not block behind an in-flight fetch holding the lock for a full round-trip. Owner-stamping — not the clear — is what guarantees cross-account safety, so a best-effort clear is enough: a missed clear degrades to a cache **miss**, never a cross-account key leak. The provider is registered as a `single` in `di/NetworkModule.kt` and listed in the explicit `UserScopedCacheRegistry` in `di/UserSessionModule.kt`, so `UserSessionManager.switchTo` wipes it before opening the new session scope (see [User session scope](/rollingrecord/app/architecture/user-session-scope)).
+
+Unlike `SessionDekHolder`'s mirror, this cached copy **keeps** its `dekBase64`: a cache hit must be able to hand the DEK to the sign-in provisioning gate, which has no other source for it.
+
 ## `SessionDekHolder` — the session cache
 
-`SessionDekHolder` (`data/session/SessionDekHolder.kt`) is a `Closeable` scoped in the `UserSessionScope`. It caches the plaintext DEK in RAM for the session and resolves `requireDek()` through three tiers under a `Mutex` (so N concurrent cold-start callers collapse into a single fetch):
+`SessionDekHolder` (`data/session/SessionDekHolder.kt`) is a `Closeable` scoped in the `UserSessionScope`, constructed with `userKeyProvider` (not the API client) and the scope's `authUserId`. It caches the plaintext DEK in RAM for the session and resolves `requireDek()` through three tiers under a `Mutex`:
 
 | Tier | Source | Network? | Notes |
 | --- | --- | --- | --- |
 | 1 | In-RAM `cachedDek` | no | Populated by a prior call this session |
 | 2 | `DekKeyStore.loadDek` (Keystore-wrapped) | no | Makes the DB openable **offline** after the first fetch |
-| 3 | `UserKeyApiClient.fetch` (`get-user-key`) | yes | On success, persists via `DekKeyStore` for the next cold start |
+| 3 | `fetchUserKeyLocked(forceRefresh = false)` → `UserKeyProvider.fetch` → `UserKeyApiClient.fetch` | yes | On success, persists via `DekKeyStore` for the next cold start |
 
-`requireDek()` returns a `DekResult`: `Available(dek, kekVersion)`, `SubscriptionRequired(requiredEntitlement)` (non-cloud features stay usable), or `Unavailable(reason)` where `reason` is one of `rate_limited`, `network_error`, `decode_failed`, `invalid_dek_size`, or an upstream code. `currentDekFingerprint()` returns the `SHA-256` hex of the resolved DEK, or `null` when it can't be resolved. The holder proactively warms the DEK when a network with internet capability becomes available. `invalidate()` zero-fills the RAM copy (keeping the persisted one); `close()` zero-fills, unregisters the `ConnectivityManager` callback, and cancels the refresh scope. The plaintext DEK is never persisted in the clear or logged.
+The session mutex still collapses N concurrent cold-start callers *inside this session*, but it is no longer the single-flight owner — two of the three sign-in callers can't see the session scope, so that job moved up to `UserKeyProvider`.
+
+### The session-local response mirror
+
+`fetchUserKey(forceRefresh = false)` is the session-scoped read of the **full** `get-user-key` response (`mutex.withLock { fetchUserKeyLocked(forceRefresh) }`). `fetchUserKeyLocked` serves `cachedUserKey` while it is fresher than `USER_KEY_TTL_MS` (`5 * 60 * 1000L`, mirroring the provider's TTL); otherwise it calls `userKeyProvider.fetch(authUserId, forceRefresh)`. On a `Success` it stores the response **DEK-redacted** — `cachedUserKey = fetched.copy(dekBase64 = "")` — stamps `cachedUserKeyAt`, and calls `applyDekLocked(fetched)`. The DEK plaintext lives only as bytes in `cachedDek`; there is no reason to hold the base64 secret for the whole TTL window.
+
+So there are two cache layers with the same 5-minute window: `UserKeyProvider` (app-scoped, keeps `dekBase64`, owner-stamped) and this DEK-redacted mirror (session-scoped, so repeat in-session reads don't even re-enter the provider). `forceRefresh` bypasses **both**, which is how App Lock's connectivity-restore re-sync observes a PIN set on another device. Only `Success` is cached at either layer.
+
+`applyDekLocked(fetched)` is the one place a fetched DEK is applied: it base64-decodes, checks `decoded.size == DEK_BYTES` (32), persists via `DekKeyStore.persistDek(context, authUserId, dek, kekVersion)`, sets `cachedDek` / `cachedKekVersion`, and clears `lastDekError`. On failure it zero-fills, records `decode_failed` or `invalid_dek_size` in `lastDekError`, and leaves `cachedDek` null.
+
+`requireDek()` returns a `DekResult`: `Available(dek, kekVersion)`, `SubscriptionRequired(requiredEntitlement)` (non-cloud features stay usable), or `Unavailable(reason)` where `reason` is one of `rate_limited`, `network_error`, `decode_failed`, `invalid_dek_size`, or an upstream code. On the tier-3 `Success` branch it returns `cachedDek` if `applyDekLocked` populated it, else `Unavailable(lastDekError ?: "invalid_dek")` — the `lastDekError` field is what lets the specific decode/size failure surface even when the response itself came from cache. `currentDekFingerprint()` returns the `SHA-256` hex of the resolved DEK, or `null` when it can't be resolved. The holder proactively warms the DEK when a network with internet capability becomes available. `invalidate()` zero-fills the RAM copy (keeping the persisted one); `close()` zero-fills, unregisters the `ConnectivityManager` callback, and cancels the refresh scope. Both also drop `cachedUserKey` / `cachedUserKeyAt` / `lastDekError`, so the next read re-resolves. The plaintext DEK is never persisted in the clear or logged.
 
 ## `DekKeyStore` — Keystore-wrapped persistence
 
@@ -71,12 +110,16 @@ The signed-out (anonymous) database is never cloud-portable and has no account D
 
 The inline `SessionDekHolder.requireDek()` self-heal is **bounded at 45s** (`INLINE_DEK_FETCH_TIMEOUT_MS = 45_000L`, via `withTimeout`). It runs `runBlocking` **inside** the Koin session-scope factory, so a hung fetch would hold the session-scope lock — and therefore every thread resolving any user-scoped dependency, including Main — hostage (the ANR class of 2026-08-30). On timeout `persisted` stays `null`, which routes to the recoverable `DekUnavailable` path and never the wipe path. On the `DekUnavailable` branch, `DatabaseModule` also emits a **deduped** (one per `user` + `reason` per process) Crashlytics non-fatal via `reportDekUnavailableToCrashlytics(...)` carrying the diagnostics map.
 
+That hazard is now **structurally avoided**, not merely bounded. The `scoped<AppDatabase>` binding in `databaseModule` publishes readiness on every successful build — `buildAppDatabaseForSession(...).also { SessionDatabaseState.markReady(sessionId) }`, where `sessionId` is the Koin scope's own `id` (`UserSessionManager` creates each session scope with `scopeId = newSessionId`, so reading it here costs no I/O and can't race a re-pointed `AuthUserStore`). `SessionDatabaseState` (`states/SessionDatabaseState.kt`) exposes `readySessionId: StateFlow<String?>`, and `V2App` withholds `V2MainNavHost` — whose composition synchronously resolves five session-scoped repositories on Main — until `readySessionId == sessionId`, rendering `V2SessionLoadingScreen` (`ui/v2/screens/startup/V2SessionLoadingScreen.kt`) meanwhile while a `Dispatchers.IO` boot effect does the warm-up. Main therefore never enters a cold factory: by the time the nav host composes, every one of those resolutions is a cheap read of an already-constructed instance. `markReady` fires **only** on success (a throw must leave the root on its loading or recovery surface), and the signal is keyed by session id rather than a bare boolean so a sign-out invalidates it automatically — `UserSessionManager.switchTo` also calls `SessionDatabaseState.clear()` when it swaps the scope.
+
 ## The DEK-unavailable surface
 
 When the DEK can't be resolved, `V2DekUnavailableScreen` (`ui/v2/screens/recovery/V2DekUnavailableScreen.kt`) is rendered at the root instead of the nav host. It is recoverable: the DB is neither opened nor wiped, and `onRetry` re-attempts the open once the DEK is resolvable (the retry button is disabled while `isRetrying`). See [Database Recovery States](/rollingrecord/app/security/database-recovery) for the full routing.
 
 ## Where to go next
 
+- [get-user-key](/rollingrecord/backend/edge-functions/get-user-key) — the server side of the one call all three callers share
+- [App Lock](/rollingrecord/app/security/app-lock) — `AppLockRepository.refreshFromServer`, the second of the three callers
 - [Envelope Encryption Primitives](/rollingrecord/app/security/envelope-crypto) — the `KeyDerivation` HKDF and AES-256-GCM engines underneath
 - [Database Recovery States](/rollingrecord/app/security/database-recovery) — where a missing DEK, wrong key, or migration failure each route
 - [Backup & Restore](/rollingrecord/app/security/backup-restore) — the second key HKDF-derived from the same DEK

@@ -33,8 +33,25 @@ A missing `data.id` returns `missing_event_fields`. `wipeUser` (`functions/_shar
 1. `logEntitlementEvents` — upserts one `l_entitlement_events` row per entitlement-in-event for **every** delivery (`onConflict: "event_id,entitlement_id"`), returning `isFreshEvent` for downstream dedup.
 2. `handleRecurringSubEvent` — RR-358 / RR-328 cloud-grace tracking: maintains `canonical_users.cloud_grace_started_at` + `cloud_grace_tier` and the `last_known_entitlements` key snapshot they are derived from (see below).
 3. `handleRecurringSubRevenue` — writes `f_user_financials.revenue_micros` for `INITIAL_PURCHASE` / `RENEWAL` on `pro` / `pro_cloud` / `pro_cloud_ai`, gated on `isFreshEvent`.
-4. `NON_SUBSCRIPTION_PURCHASE` → `handleNonSubscriptionPurchase` (bundle credit); `CANCELLATION` on a non-entitlement product → `handleBundleRefund`.
-5. Lifetime grant / revoke for mirrored keys.
+4. The two bundle branches — both `return`, so the lifetime switch never runs for a bundle.
+5. `if (mirroredMetas.length === 0) return` — no lifetime entitlement attached, nothing further to do.
+6. Lifetime grant / revoke for mirrored keys.
+
+| Branch | Event type matched | Additional conditions | Handler |
+| --- | --- | --- | --- |
+| Bundle purchase | `NON_RENEWING_PURCHASE` (alias `NON_SUBSCRIPTION_PURCHASE`) | `event.product_id` present **and** `mirroredMetas.length === 0` | `handleNonSubscriptionPurchase` → bundle credit |
+| Bundle refund | `CANCELLATION` | `event.product_id` present **and** `mirroredMetas.length === 0` | `handleBundleRefund` → clawback |
+
+RevenueCat sends `NON_RENEWING_PURCHASE`; `NON_SUBSCRIPTION_PURCHASE` is a type RC does not send and is retained only as an accepted alias so a delivery already in flight cannot fall into the hole that name created — the branch originally matched only the alias, so every bundle purchase fell through to the mirrored-key gate and was dropped after the buyer had been charged. Because the branch `return`s, a mis-typed match is not a harmless no-op.
+
+The `product_id` + empty-`mirroredMetas` pair is the discriminator, **not** the type alone. Both bundle branches use the same shape:
+
+| `NON_RENEWING_PURCHASE` shape | Discriminator | Routes to |
+| --- | --- | --- |
+| Bundle IAP | carries `product_id`, no mirrored entitlement key | `handleNonSubscriptionPurchase` (step 4, returns) |
+| Founders-edition lifetime | carries `founders_edition` in `entitlement_id` / `entitlement_ids` | falls through to `handleLifetimeGrant` (step 6) |
+
+Without that guard the bundle branch would swallow the lifetime: the SKU lookup would miss, and the `return` would skip the grant entirely.
 
 Only entitlements in `WEBHOOK_MIRRORED_LOOKUP_KEYS` (lifetime + `developer`) are mirrored to the DB — recurring subs are log-only because the gate chain reads entitlements live from RC. Grants (`INITIAL_PURCHASE` / `NON_RENEWING_PURCHASE` / `TEMPORARY_ENTITLEMENT_GRANT`) insert with a `source` from `attributeSource()` (`developer` / `manual_admin` / `employee_perk` / `founders_edition_purchase`); revocations (`CANCELLATION` → `cancel_reason`, `EXPIRATION` → `rc_expiration` fallback) are idempotent via the partial `UNIQUE (email_hash, rc_entitlement) WHERE revoked_at IS NULL`.
 
@@ -48,7 +65,7 @@ Only entitlements in `WEBHOOK_MIRRORED_LOOKUP_KEYS` (lifetime + `developer`) are
 
 Every route out of cloud — expiry, a deferred plan switch landing at renewal, a refund, a chargeback, a dashboard revoke — collapses into the first case. `CANCELLATION` needs no special handling any more: RC fires it while the entitlement is still live, so the authoritative fetch still shows cloud and it lands in "has cloud". `developer`, `lifetime`, and `pro` are deliberately excluded — a hard cutoff with no grace window — because `RECURRING_CLOUD_KEYS` (`pro_cloud`, `pro_cloud_ai`) is the allowlist behind `pickHighestRecurringCloudTier`, so their removal is never a cloud transition; the `canonical_users_cloud_grace_tier_values` CHECK constraint further pins the column to `pro_cloud` / `pro_cloud_ai`. Storing KEYS rather than a resolved tier is what makes the cutoff work — `developer` and `pro_cloud_ai` resolve to the same tier but must behave differently here. See [billing → RevenueCat](/rollingrecord/backend/billing/revenuecat) and [entitlement & grace](/rollingrecord/backend/gates/entitlement-and-grace) for the full model.
 
-**Bundle IAPs** read `bundle_config` for the SKU and grant tier-aware credits via `creditBundle` (idempotent on `l_credit_log UNIQUE(purchase_token)`); refunds clamp-at-zero via `refundBundle` keyed on `refund_of_token`. The handler always returns 2xx to RC unless a transient error (`500` → RC retries).
+**Bundle IAPs** look `bundle_config` up by `normalizeBundleSku(event.product_id)` (`_shared/billing/bundle-sku.ts`) — Google qualifies a one-time product id as `sku:purchase_option`, so the raw id would miss the row and credit a charged buyer nothing. Tier is then resolved with `fetchEffectiveEntitlements(authUserId, { bypassCache: true })` against `TIER.PRO_CLOUD_AI`, not a raw RC key check, so `developer` and `lifetime_pro_cloud_ai` holders get the query + extraction half of the bundle they paid for. Credits go through `creditBundle` (idempotent on `l_credit_log UNIQUE(purchase_token)`); refunds clamp-at-zero via `refundBundle` keyed on `refund_of_token`. The handler always returns 2xx to RC unless a transient error (`500` → RC retries). The same `bundle_config` rows are served to the client, with the same per-tier rule, by [get-bundle-catalog](/rollingrecord/backend/edge-functions/get-bundle-catalog).
 
 <Warning>
 `revenuecat-webhook` records **revenue** into `f_user_financials.revenue_micros` (from `event.price` via `usdToMicros`). It never writes transcription or LLM cost. Transcription cost goes to `f_user_financials.ai_cost_micros` via `assemblyai-webhook`; LLM cost goes to the same column via the AI dispatcher (`_shared/ai/client.ts::trackTokenUsage`).
@@ -80,3 +97,5 @@ Billing uses the server-measured reservation (`opCostMs`) as the source of truth
 - [Edge Function catalog](/rollingrecord/backend/edge-functions/overview) — the shared `runGates()` chain and webhook-secret auth mode.
 - [resolve-identity](/rollingrecord/backend/edge-functions/resolve-identity) — the in-app path that mirrors `clerk-webhook`'s provisioning + carryover.
 - [ai-engine](/rollingrecord/backend/edge-functions/ai-engine) — the `transcribe_submit` operation that opens the job this webhook completes.
+- [get-bundle-catalog](/rollingrecord/backend/edge-functions/get-bundle-catalog) — the read side of the `bundle_config` rows this webhook credits against.
+- [Credits & bundles](/rollingrecord/backend/billing/credits-and-bundles) — `creditBundle` / `refundBundle` internals and SKU normalization.

@@ -31,8 +31,11 @@ It does **not** observe `AuthState` itself. In the V2 surface the observer that 
 | 1 | `WorkManager.cancelWorkForUser(old)` | Stop mid-flight workers from writing to the closing DB. |
 | 2 | cancel + join old `sessionScope`, create fresh | Let in-flight DataStore collects finish so the file lock releases. |
 | 3 | close old `UserSettingsDataSource` | Release the DataStore file lock before the new scope opens the same file. |
-| 4 | `createScope(new)` + close(old) + set `sessionIdFlow` | Swap the live Koin scope. |
-| 5 | `tryEmit(SessionSwitch)` | Recovery scans re-run against the new user's DB. |
+| 4 | `SessionDatabaseState.clear()` | Retract the DB-ready signal before the incoming scope exists. |
+| 5 | `createScope(new)` + close(old) + set `sessionIdFlow` | Swap the live Koin scope. |
+| 6 | `tryEmit(SessionSwitch)` | Recovery scans re-run against the new user's DB. |
+
+Step 4 exists because the incoming scope's database is unbuilt: a stale "ready" would send the root UI's composition straight into a cold `AppDatabase` factory on Main, which is the exact queue-behind-the-DEK-fetch that ANRs. It is belt-and-braces rather than the only guard — `SessionDatabaseState` stores the *session id* whose database is built, not a bare boolean, so the root UI's check is `readySessionId == sessionId` and a swap invalidates the old value automatically even if nobody remembers to clear it. A bare `ready = true` would have survived the sign-out.
 
 The caller (`V2App`) **must** update `AuthUserStore` before calling `switchTo` so the new scope's DB/DataStore factories see the correct user id at construction time.
 
@@ -44,9 +47,9 @@ The first step: if `RecordingService.state` is `RECORDING`/`PAUSED`, it fires `A
 
 `UserScopedCache` (`data/session/UserScopedCache.kt`) is the contract for app-level singles that hold per-user state. It has a `cacheName` (defaults to the class simple name) and a `suspend fun clearForUserSwitch()` that must be idempotent, thread-safe, and small.
 
-Implementing the interface is **necessary but not sufficient**. Clearing is a point-in-time action, and a network response already in flight when the switch happens lands *after* the clear. Any cache whose value gates a user-visible decision must ALSO stamp the owning user id at store time and drop responses whose owner no longer matches the active session. `UsageRepository` is the reference implementation — with owner-stamping, a missed clear degrades to a harmless cache miss instead of a wrong answer attributed to the wrong account.
+Implementing the interface is **necessary but not sufficient**. Clearing is a point-in-time action, and a network response already in flight when the switch happens lands *after* the clear. Any cache whose value gates a user-visible decision must ALSO stamp the owning user id at store time and drop responses whose owner no longer matches the active session. `UsageRepository` is the reference implementation — with owner-stamping, a missed clear degrades to a harmless cache miss instead of a wrong answer attributed to the wrong account. `UserKeyProvider` (below) is the sharper worked example, and says so in its own KDoc: it caches key material, so a missed clear must degrade to a cache miss rather than a cross-account key leak.
 
-`UserScopedCacheRegistry` holds the explicit `List<UserScopedCache>`; `clearAll()` clears each (failures logged and swallowed individually) and `registeredNames()` feeds `UserScopedCacheRegistryTest`. The registered caches (from `di/UserSessionModule.kt`):
+`UserScopedCacheRegistry` holds the explicit `List<UserScopedCache>`; `clearAll()` clears each (failures logged and swallowed individually). `UserScopedCacheRegistryTest` never constructs the registry — it is source-scanning: it regexes `: UserScopedCache` declarations across `src/main`, reads `di/UserSessionModule.kt` as text, and asserts the registry body contains a `get<ClassName>()` entry for each one. (`registeredNames()` exists on the registry and its KDoc claims the enforcement test uses it, but it currently has no callers.) The ten registered caches (from `di/UserSessionModule.kt`):
 
 | Cache | Notes |
 | --- | --- |
@@ -54,15 +57,36 @@ Implementing the interface is **necessary but not sufficient**. Clearing is a po
 | `SyncPreferencesRepository` | Decides which entity groups sync may push. |
 | `IdentityRepository` | RC customer id → canonical user id. |
 | `SupportTokenRepository` | Short-lived in-memory support-code cache. |
-| `DeviceSettingsDataSource` | Wipes only its per-user-segmented keys (e.g. pinned-session). |
-| `V2OnboardingSignals` | `nextSignInIsNewAccount` flag. |
+| `DeviceSettingsDataSource` | A single device-wide DataStore with **no** per-user segmentation — which is exactly why it needs the hook. `clearForUserSwitch()` touches three keys: it removes the pinned-session pair (`TILE_PINNED_SESSION_ID` / `TILE_PINNED_SESSION_NAME` — a Room row id from the previous user's DB plus that user's session name, which the QS tile renders as its label) and then *writes* `TILE_MODE = "MANUAL"`, so the tile lands on a mode valid for any account instead of "pinned to nothing". Everything else in the store is genuinely device-scoped and survives the switch. |
+| `V2OnboardingSignals` | Two signals, both reset on switch. `nextSignInIsNewAccount` is a `@Volatile var Boolean` — an aborted sign-up would otherwise mis-classify the *next* account as brand new. `serverSaysNoRecoveryCode` is a tri-state `StateFlow<Boolean?>` (`setServerSaysNoRecoveryCode(missing)` writes it, `consumeServerSaysNoRecoveryCode()` resets it): `null` means the server has not answered yet, kept deliberately distinct from `false` so the gate waits for an answer instead of assuming one, and only an explicit `true` mounts the blocking screen. It is a flow rather than a flag because Clerk emits `SignedIn` before `provisionDekOrThrow()` fetches the answer, so a read-once flag was read before it was written. Clearing it stops a per-account answer showing the next account a recovery-code screen it may not need, or hiding one it does. |
 | `RecordingAdmissionBus` | In-flight admission events. |
 | `CloudDecryptFailureStore` | Undecryptable-blob marks keyed by one user's row ids. |
 | `EntitlementRefreshSignal` | Holds one boolean — the post-purchase `X-Entitlement-Refresh` arm state. App-level so the OkHttp interceptor can read it without entering a scope; cleared on switch so a flag armed by the previous account can't fire on the next account's first call. |
+| `UserKeyProvider` | App-scoped single-flight cache of the `get-user-key` response (DEK, App Lock PIN verifier, recovery status). Owner-stamped with `cachedOwner`; 5-minute `TTL_MS`; only `Success` is cached. `clearForUserSwitch()` skips the mutex on purpose so a switch never blocks on an in-flight network call. |
+
+## `UserKeyProvider` — the app-level single-flight
+
+`UserKeyProvider` (`data/remote/userkey/UserKeyProvider.kt`) is an app-scoped, owner-stamped, single-flight front for `UserKeyApiClient.fetch`. It exists at the app level rather than inside the session scope because at an interactive sign-in `get-user-key` is hit by three callers that race concurrently in three different lifecycles:
+
+| Caller | Lifecycle | Why it can't use a session-scoped coalescer |
+| --- | --- | --- |
+| `AuthRepository.fetchAndPersistDek` (the DEK provisioning gate) | Pre-session | Runs **before** the `UserSessionScope` — and therefore `SessionDekHolder` — exists. |
+| `SessionDekHolder.fetchUserKey` (App Lock PIN + DEK path) | Session-scoped | It is the only one of the three inside the scope, so the other two are invisible to it. |
+| `V2App`'s recovery-code presence re-check | Composable at the root | Can only reach ROOT-scope singletons via `koinInject()`, never the session-scoped holder. |
+
+Server logs showed all three firing within ~225ms, every one starting before any had returned — so caching after the first returns is too late for a concurrent burst. `fetch(authUserId, forceRefresh = false)` runs the whole round-trip under a `Mutex`, so the second and third callers block and then read the fresh cache: one network call instead of three. Only `UserKeyFetchResult.Success` is cached (`cached` / `cachedOwner` / `cachedAt` set together); a failure is never cached, so each caller retries on its own path rather than all inheriting one transient failure.
+
+Session isolation is belt-and-braces. The response carries per-user secrets — the [DEK](/rollingrecord/app/security/dek-and-db-key), the [App Lock PIN verifier](/rollingrecord/app/security/app-lock), and the [recovery-code](/rollingrecord/app/security/recovery-codes) status — so the provider is **both** registered in `userScopedCacheRegistry` (wiped by `switchTo` step 0) **and** owner-stamped: a cached copy is served back only for the same `authUserId`. A response landing after a switch stamps the OLD id, the new user's read sees an owner mismatch and re-fetches — a missed clear degrades to a cache miss, never a cross-account key leak. `clearForUserSwitch()` deliberately does **not** take the mutex; the fields are `@Volatile`, and a switch sits on the sign-in critical path and must not block on an in-flight fetch holding the lock for a full network round-trip. Owner-stamping, not the clear, is what guarantees safety, so a best-effort clear is sufficient — the worst a clear/fetch race can do is force one extra fetch.
+
+The cached copy keeps its `dekBase64`, unlike `SessionDekHolder`'s redacted mirror, because a cache HIT must still be able to hand the DEK to a caller that needs to provision it.
 
 ## `SessionDekHolder`
 
-`SessionDekHolder` (`data/session/SessionDekHolder.kt`, RR-321) is the session-scoped holder of the plaintext 32-byte DEK. It caches the unwrapped DEK in RAM for the scope's lifetime; its `Mutex`-guarded `requireDek()` resolves through the full three-tier fallback (RAM → persisted Keystore-wrapped via `DekKeyStore` → network via `UserKeyApiClient`, persisting on success). It zero-fills on close (`Closeable`, auto-invoked when the scope tears down) and subscribes to `ConnectivityManager` to proactively refresh on network restore. The DEK is never written to disk, prefs, or logs. See [Room Database & SQLCipher](/rollingrecord/app/architecture/local-database) for how the DEK keys the database.
+`SessionDekHolder` (`data/session/SessionDekHolder.kt`, RR-321) is the session-scoped holder of the plaintext 32-byte DEK. It caches the unwrapped DEK in RAM for the scope's lifetime; its `Mutex`-guarded `requireDek()` resolves through the full three-tier fallback (RAM → persisted Keystore-wrapped via `DekKeyStore` → network via the app-scoped `UserKeyProvider`, which fronts `UserKeyApiClient`, persisting on success). Its constructor takes `userKeyProvider` and the scope's own `id` as `authUserId`; it no longer holds a `UserKeyApiClient` directly.
+
+That makes `get-user-key` two-layer. `fetchUserKeyLocked` serves the holder's own session-local mirror within `USER_KEY_TTL_MS` (5 minutes) and only then calls `userKeyProvider.fetch(authUserId, forceRefresh)`; on `Success` it stores a DEK-redacted copy (`cachedUserKey = fetched.copy(dekBase64 = "")` — the bytes live in `cachedDek`) and applies the DEK via `applyDekLocked`. So repeat in-session reads never even re-enter the provider, and `forceRefresh` bypasses **both** caches for triggers that must observe a cross-device change immediately, such as the App Lock re-sync on connectivity restore.
+
+It zero-fills on close (`Closeable`, auto-invoked when the scope tears down) and subscribes to `ConnectivityManager` to proactively refresh on network restore. The DEK is never written to disk, prefs, or logs. See [Room Database & SQLCipher](/rollingrecord/app/architecture/local-database) for how the DEK keys the database.
 
 `resolveDekForRecovery()` is a suspend extension used by the `V2DekUnavailableScreen` Retry: it resolves the DEK through `SessionDekHolder.requireDek` on IO and returns `true` iff it is now available (`DekResult.Available`) — a bare `recreate()` alone would loop if the persisted DEK is still missing.
 
@@ -77,6 +101,14 @@ The `data/session` package carries three distinct concerns:
 ## Enforcement
 
 `UserScopedCacheRegistryTest` is build-failing: a `UserScopedCache` implementor missing from the registry fails, and a new app-level `single {}` that isn't a `UserScopedCache` and isn't in the test's `crossUserSafe` map (with a written reason) fails. This closes the exact bug the rule exists to prevent — one account's cached quotas or entitlements being read as the next account's after a sign-out / sign-in.
+
+The rule the test encodes keys on **where per-user state is held, not what the data is about**. `BundleCatalogApi` is the clean illustration: the catalog it returns *is* per-account (grants are tier-adjusted server-side), yet the API is classified `crossUserSafe` with the reason `"stateless Retrofit interface"`, because it holds nothing — the cache lives in the session-scoped `BundleCatalogRepository` (`data/repository/BundleCatalogRepository.kt`), which writes `userSettings.setCachedBundleCatalog(...)` into the per-user DataStore and dies with the session.
+
+| Symbol | Verdict | Why |
+| --- | --- | --- |
+| `UserKeyProvider` | `UserScopedCache` + registry entry | Holds the account's DEK, PIN verifier, and recovery status at app level. |
+| `BundleCatalogApi` | `crossUserSafe` | Stateless Retrofit interface; the per-account catalog is held elsewhere. |
+| `BundleCatalogRepository` | Neither — it is a `scoped {}` binding | Session teardown handles it; the test only scans app-level singles. |
 
 ## Where to go next
 

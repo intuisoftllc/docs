@@ -3,13 +3,13 @@ title: "get-user-key"
 description: "The single endpoint where a plaintext data-encryption key crosses the wire — unwrapped from the KEK, provisioned lazily, and audit-logged on every path."
 ---
 
-`get-user-key` (`functions/get-user-key/index.ts`, RR-291) is a `Deno.serve` POST endpoint. It returns the caller's plaintext DEK, unwrapped from the KEK, so the client can populate its in-memory DEK cache at the start of a sync session. This is the **one place** a plaintext DEK crosses the wire; every `sync-push` / `sync-pull` operation stays in ciphertext. The client holds the DEK in RAM only, zeroes it when the session ends, and refetches on cold start.
+`get-user-key` (`functions/get-user-key/index.ts`, RR-291) is a `Deno.serve` POST endpoint. It returns the caller's plaintext DEK, unwrapped from the KEK, so the client can populate its in-memory DEK cache. This is the **one place** a plaintext DEK crosses the wire; every `sync-push` / `sync-pull` operation stays in ciphertext. The client holds the DEK in RAM only, zeroes it when the session ends, and refetches on cold start. The response is not DEK-only, and neither is its audience: three separate client subsystems read from one body (see [Client callers](#client-callers)).
 
 ## Gate chain
 
 The entry calls `runGates(req, { method: HttpMethod.Post, auth: AuthMode.Jwt })` — method + App Check + App Version + Clerk JWT. There is intentionally **no entitlement gate**: the DEK also derives the local SQLCipher DB key, so any device signing into the account must be able to fetch or provision it regardless of subscription tier.
 
-Rate limiting is called **manually** in the handler — `checkRateLimit(Bucket.UserKeyGet, authUserId, isDeveloper)` — rather than via chain sugar, so a `429` rejection can also write an audit row. This endpoint is where a stolen JWT would go shopping for the DEK, so forensic visibility outranks the convenience of the sugar.
+Rate limiting is called **manually** in the handler — `checkRateLimit(Bucket.UserKeyGet, authUserId, isDeveloper)` — rather than via chain sugar, so a `429` rejection can also write an audit row. This endpoint is where a stolen JWT would go shopping for the DEK, so forensic visibility outranks the convenience of the sugar. The bucket is `Bucket.UserKeyGet` (`user_key_get` on the wire, `_shared/gates/types.ts`) and its default ceiling in `_shared/gates/rate-limit.ts` is `{ max: 40, windowSec: 3600, enabled: true }` — 40 requests per hour per user. That ceiling is the concrete pressure the client's coalescing relieves.
 
 ## Lazy provisioning
 
@@ -20,13 +20,17 @@ The handler `SELECT`s the `user_crypto` row (`dek_ct`, `dek_iv`, `kek_version`, 
 3. `INSERT` `{ auth_user_id, dek_ct, dek_iv, kek_version }`.
 4. On a `23505` unique-violation (a concurrent request won the race), re-`SELECT` and use the row the other request wrote — whichever landed first is authoritative.
 
+A **second, independent** `SELECT` runs alongside the crypto read — `canonical_users.recovery_code_hash` via `.eq("auth_user_id", authUserId).maybeSingle()` — to populate `has_recovery_code`. It is deliberately a separate select rather than a join with `user_crypto`: the crypto read has an INSERT branch hanging off it, and keeping the two reads independent leaves that provisioning logic untouched.
+
+That read is **fail-open**. On error the handler logs to `console.error` and leaves `has_recovery_code` at its `true` default rather than failing the request: the DEK is what the caller actually needs, so refusing to hand it over because a boolean could not be read would turn a cosmetic gap into a locked-out account. `true` is also the non-nagging direction — a missed prompt is recoverable on the next session, whereas a false negative would put a blocking recovery-code save screen in front of someone who already has one.
+
 Because provisioning is folded in, a client just calls `get-user-key` on first sync; there is no separate init endpoint to orchestrate first (RR-295 consolidated the former dedicated `init-user-key` into this one). The crypto columns are `dek_ct` / `dek_iv` / `kek_version` — RR-320 renamed the originals `wrapped_dek` → `dek_ct` and `iv` → `dek_iv`, following the `<field>_ct` / `<field>_iv` convention.
 
 The envelope primitives live in `functions/_shared/crypto/envelope.ts` (`generateDek`, `wrapDek`, `unwrapDek`, `zeroDek`); the BYTEA ⇄ `Uint8Array` ⇄ base64 helpers in `functions/_shared/crypto/encoding.ts` (`pgByteaToBytes`, `bytesToPgBytea`, `bytesToBase64`).
 
 ## Response
 
-`GetResponse` returns the DEK plus the KEK version and the synced App Lock PIN fields (RR-492), so a device fetching its key learns the synced verifier in a single round-trip:
+`GetResponse` returns the DEK plus the KEK version, the synced App Lock PIN fields (RR-492), and the recovery-code presence flag, so a device fetching its key learns the synced verifier and whether it still owes the user a recovery code in a single round-trip:
 
 | Field | Type | Meaning |
 | --- | --- | --- |
@@ -36,8 +40,25 @@ The envelope primitives live in `functions/_shared/crypto/envelope.ts` (`generat
 | `pin_verifier_iv` | base64 string \| null | IV paired with `pin_verifier_ct` (null iff that is null) |
 | `pin_settings` | `{ auto_lock_ms? }` \| null | Synced non-encrypted App Lock settings |
 | `pin_updated_at` | epoch millis \| null | Server last-write-wins marker; null on legacy rows |
+| `has_recovery_code` | boolean | Whether `canonical_users.recovery_code_hash IS NOT NULL`; fails open to `true` |
 
 After serialization the server calls `zeroDek(dek)` as buffer hygiene.
+
+## Client callers
+
+One response body serves three unrelated subsystems, and on the Android client three separate callers reach for it — at an interactive sign-in all three fire within roughly 225ms of each other, every one starting before any had returned:
+
+| Caller | File | Lifecycle | Consumes | `forceRefresh`? |
+| --- | --- | --- | --- | --- |
+| `AuthRepository.fetchAndPersistDek` | `data/auth/AuthRepository.kt` | App-scoped; the blocking sign-in DEK gate, which runs **before** the user session scope exists | `dek`, `kek_version` | no |
+| `AppLockRepository.refreshFromServer` (via `SessionDekHolder.fetchUserKey`) | `data/applock/AppLockRepository.kt` | Session-scoped; runs on **every** launch | `pin_verifier_ct` / `pin_verifier_iv` / `pin_settings` / `pin_updated_at` for the last-write-wins reconcile | yes, on connectivity restore |
+| `V2App`'s recovery-code presence check | `ui/v2/V2App.kt` | A composable — can only reach root-scope singletons | `has_recovery_code` | no |
+
+Because those three lifetimes don't overlap, the client added an app-scoped single-flight — `UserKeyProvider` (`data/remote/userkey/UserKeyProvider.kt`) — in front of the endpoint. It is owner-stamped by `auth_user_id`, caches only successes for a 5-minute TTL, and runs the whole fetch under a mutex, so a concurrent burst collapses into **one** request instead of three. `forceRefresh` bypasses the TTL; it is used by App Lock's connectivity-restore re-sync so a PIN set on another device is observed immediately rather than read from a cached snapshot. Failures are never cached, so each caller retries on its own path.
+
+<Note>
+`has_recovery_code`'s consumer is the client's blocking recovery-code save screen: the client re-checks it on every session and re-presents the screen when it is `false`. That is why the read here is fail-open — see [Recovery Codes](/rollingrecord/app/security/recovery-codes) and [DEK & Database Key Lifecycle](/rollingrecord/app/security/dek-and-db-key).
+</Note>
 
 ## Audit logging
 
@@ -54,6 +75,9 @@ The `init` vs `get` distinction is driven by `wasProvisioned` (whether the INSER
 
 ## Related pages
 
+- [DEK & Database Key Lifecycle](/rollingrecord/app/security/dek-and-db-key) — the client's `UserKeyProvider` single-flight and `SessionDekHolder` tiers.
+- [Recovery Codes](/rollingrecord/app/security/recovery-codes) — the `has_recovery_code` consumer.
+- [App Lock](/rollingrecord/app/security/app-lock) — the `pin_verifier_ct` / `pin_settings` / `pin_updated_at` consumer.
 - [Edge Function catalog](/rollingrecord/backend/edge-functions/overview) — the shared `runGates()` chain.
 - [get-user-usage](/rollingrecord/backend/edge-functions/get-user-usage) — the other per-user read the client makes at session start.
 - [resolve-identity](/rollingrecord/backend/edge-functions/resolve-identity) — the launch-time `canonical_users` upsert this endpoint's `ensureCanonicalUserRow` also guarantees.

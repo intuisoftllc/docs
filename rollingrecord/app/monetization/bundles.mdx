@@ -1,0 +1,310 @@
+---
+title: 'Add-On Bundles ("Add Hours")'
+description: "The client bundle catalog — a join of the RevenueCat 'bundle' offering with the server's per-tier grants — the confirm/processing/success purchase phases, and the post-purchase poll that waits for the webhook's credit to land."
+---
+
+"Add Hours" sells one-time top-ups of transcription hours (and, on Cloud+AI, KB queries) that stack on the monthly allotment and never expire. The catalog is a **join of two sources** — RevenueCat owns purchasability and price, the server owns what each SKU grants this account — and a purchase is only half a client operation: the credit itself is applied server-side by the RevenueCat webhook, which the success screen polls for.
+
+## The catalog join
+
+Neither source can answer for the other, so a card needs both. `V2BundlesViewModel.rebuild()` (`ui/v2/screens/bundles/V2BundlesViewModel.kt`) joins them on the bare Play product id, and a SKU present on only one side is **dropped** — a card that names a price with no grant, or a grant with no way to buy it, is worse than a catalog with one fewer entry.
+
+| Source | Owns | Read via |
+| --- | --- | --- |
+| RevenueCat offering `bundle` | Purchasability, the localized price (`product.price.formatted`, `amountMicros`), and the store title | `RevenueCatManager.getOffering(BUNDLES_OFFERING_ID)` |
+| Server `get-bundle-catalog` | What a SKU grants **this** account, already tier-adjusted (`minutes_granted`, `queries_granted`, `extraction_minutes_granted`) | `BundleCatalogRepository.cached()`, then `.refresh()` |
+
+`BUNDLES_OFFERING_ID` is `"bundle"` — singular, matching what the RevenueCat dashboards call it. It must match the offering identifier in **both** the dev and production RC projects; a name matching neither returns no offering, which reaches the screen as an empty catalog with nothing to explain it. It is deliberately **not** the current/default offering — that one is the subscription paywall, and putting bundles in it would list them there as purchasable plans.
+
+### `storeProductId()` — the join key
+
+```kotlin
+private fun com.revenuecat.purchases.Package.storeProductId(): String =
+    product.id.substringBefore(':')
+```
+
+RevenueCat qualifies a Play product id with the sub-identifier when there is one (`productId:basePlanId` for subscriptions, and likewise for a one-time product's purchase option), so the raw `product.id` is not guaranteed to equal `bundle_config.sku`. Taking the part before the colon keeps the join working whichever shape Play returns. A failed join here is silent — every card drops and the catalog just looks empty — which is why it gets its own warn log (see [Diagnostics](#diagnostics)).
+
+## `BundleCatalogEntry` and the grants endpoint
+
+`BundleCatalogApi` (`data/remote/bundles/BundleCatalogApi.kt`) is a GET-only Retrofit interface over the `get-bundle-catalog` Edge Function, with the function name as a single constant driving both the invoke path and the `@EdgeTag`:
+
+```kotlin
+const val FN_GET_BUNDLE_CATALOG = "get-bundle-catalog"
+
+@GET("functions/v1/" + FN_GET_BUNDLE_CATALOG)
+@EdgeTag(FN_GET_BUNDLE_CATALOG)
+suspend fun getBundleCatalog(): Response<BundleCatalogResponse>
+```
+
+`BundleCatalogResponse` is `bundles: List<BundleCatalogEntry> = emptyList()`. Each entry is one purchasable bundle:
+
+| Kotlin field | Wire key (`@SerialName`) | Notes |
+| --- | --- | --- |
+| `sku` | `sku` | The join key; equals `bundle_config.sku`. |
+| `displayName` | `display_name` | The server's own name for the bundle. |
+| `minutesGranted` | `minutes_granted` | Also the catalog sort key. |
+| `queriesGranted` | `queries_granted` | `0` below Cloud+AI, which renders as no KB section on the card. |
+| `extractionMinutesGranted` | `extraction_minutes_granted` | Credited alongside the others; not surfaced on the card. |
+| `description` | `description` | Nullable. |
+
+Grants arrive **already tier-adjusted**: the server applies the same per-tier rule the RevenueCat webhook credits with, so the client renders what it is given rather than re-deriving it. Re-deriving the rule client-side is exactly what kept the two sides from agreeing before this endpoint existed.
+
+There is deliberately **no price field** — `bundle_config.price_usd` is reference-only, and RevenueCat serves the localized price the user is actually charged.
+
+## `BundleCatalogRepository`
+
+`BundleCatalogRepository` (`data/repository/BundleCatalogRepository.kt`) is a two-method cache-then-network wrapper:
+
+- `cached(): List<BundleCatalogEntry>?` reads `userSettings.cachedBundleCatalog.first()`.
+- `refresh(): List<BundleCatalogEntry>?` calls the API inside `runCatching`, requires `isSuccessful` plus a body, and persists the result via `setCachedBundleCatalog`.
+
+On a failed call it logs `"bundle catalog refresh failed (http=…) — serving cache"` and returns `cached()` rather than null: a transient failure must not empty a catalog the user is looking at, and a slightly stale grant figure beats a card that cannot say what it sells. An **empty list is a legitimate answer** (every SKU retired) and is cached like any other — only a failed call falls back.
+
+The cache lives in the user-scoped DataStore (`data/local/UserSettingsDataSource.kt`) under `cached_bundle_catalog_json` (String) and `cached_bundle_catalog_at` (Long epoch-ms). `cachedBundleCatalog` decodes inside `runCatching { }.getOrNull()`, so an undecodable blob reads as null. Because grants are tier-adjusted server-side, the cached copy belongs to the account that fetched it and is cleared on a user switch.
+
+## `V2BundlesViewModel`
+
+`V2BundlesViewModel` (`ui/v2/screens/bundles/V2BundlesViewModel.kt`) takes `usageRepository`, `userSettings`, `revenueCatManager`, `bundleCatalogRepository`, and `entitlementRepository`. Its public surface is `uiState: StateFlow<BundlesUiState>` plus `retryCatalog()`, `selectBundle(id)`, `confirmSelection()`, `dismissConfirm()`, `clearPhase()`, and `purchase(activity)`.
+
+`BundlesUiState` is assembled by a 7-way `combine` over `entitlementRepository.currentTier` and six private flows (`_snapshot`, `_loading`, `_selectedId`, `_catalog`, `_catalogLoading`, `_phase`), shared with `SharingStarted.WhileSubscribed(STOP_TIMEOUT_MS)` where `STOP_TIMEOUT_MS = 5_000L` — matched to the Usage screen's subscribe timeout so both survive a configuration change.
+
+```kotlin
+data class BundlesUiState(
+    val tier: UserTier = UserTier.FREE,
+    val usage: BundleUsageSummary? = null,
+    val bundles: List<BundleOption> = emptyList(),
+    val selectedId: String? = null,
+    val loadingUsage: Boolean = true,
+    val loadingCatalog: Boolean = true,
+    val phase: BundlePurchasePhase = BundlePurchasePhase.Idle,
+)
+```
+
+Both loading flags are derived rather than raw: `loadingUsage = loading && snapshot == null` and `loadingCatalog = catalogLoading && catalog.isEmpty()`. The second separates "still loading" from "loaded and there is nothing" — identical on screen, opposite in meaning, and only the second deserves a retry.
+
+### Load order
+
+`init` runs two things in parallel:
+
+1. **Usage** — paints `userSettings.cachedUsageSnapshot` if nothing is shown yet, then `usageRepository.getUsage(forceRefresh = false)`. A `UsageResult.Fresh` writes through to `setCachedUsageSnapshot`; a `Cached` result just paints; a failure keeps whatever is already painted, because stale numbers still tell the user roughly where they stand.
+2. **Catalog** — `loadCatalog()` sets `_catalogLoading = true` and clears it in a `finally` (a thrown load would otherwise spin forever *and* latch the retry guard for the whole session). `loadCatalogInner()` paints `bundleCatalogRepository.cached()` first, then `refresh()`; if the refresh result `isNullOrEmpty()` it logs and returns, leaving whatever the cache painted.
+
+`retryCatalog()` no-ops while `_catalogLoading.value` is true so repeated taps cannot stack fetches, and otherwise re-runs `loadCatalog()` — **both** halves, because an empty catalog can come from the server call, from RevenueCat, or from the two disagreeing about product ids, and the user has no way to know which.
+
+### `rebuild()` outcomes
+
+`rebuild(grants)` builds `val bySku = grants.associateBy { it.sku }` and then branches on the `OfferingsResult`:
+
+| `OfferingsResult` | Effect |
+| --- | --- |
+| `Success` | Rebuilds `packagesById` and the sorted catalog; logs both id sets if the join produced nothing. |
+| `Empty` | Clears `packagesById` and `_catalog`, logs the missing/empty offering. |
+| `Error` | Leaves the existing catalog alone — a transient offerings failure must not empty a catalog the user is reading. |
+
+Sorting is `.sortedBy { (_, grant) -> grant.minutesGranted }` — smallest first, so the grid reads 1hr top-left to the largest bottom-right. Keyed on granted minutes rather than price: it is the quantity being sold and needs no currency parsing. RevenueCat's own package order is whatever the dashboard happens to list, which had the catalog opening on the most expensive option.
+
+### Formatting a card
+
+`toOption(pkg, grant)` produces a `BundleOption`:
+
+- `hours = grant.minutesGranted / 60.0`; `title = formatBundleTitle(hours)` ("1 hour" / "N hours", via `roundToInt`).
+- `storeName = storeName(pkg, fallback = title)` — the store's own product title, with a trailing parenthetical dropped via `raw.substringBeforeLast('(')` because Google appends the app name ("1hr Bundle (RollingRecord)"). Falls back to the raw title, then to the derived label.
+- `price = pkg.product.price.formatted` — RevenueCat's localized string, never reformatted.
+- `perHourRate = String.format("%.2f", price.amountMicros / 1_000_000.0 / hours)`, or `""` when `hours <= 0`.
+- `transcriptionGrant = formatGrantLabel(hours)` ("1 hr" / "N hrs").
+- `kbQueries = grant.queriesGranted.takeIf { it > 0 }` — zero becomes null, which renders as no KB section at all rather than "+0".
+
+### The usage meters
+
+`toSummary(snapshot, tier)` builds both meters off `snapshot.effectiveCapForCounter(...)` (base allotment plus purchased credits), matching the Usage screen. A base-cap denominator would push the bar past 100% the moment usage starts draining credits and read as an overrun when the user is fine.
+
+The AI-queries meter is built **only** when `tier == UserTier.PRO_CLOUD_AI`. Pro+Cloud has no query allowance at all, so the meter is absent rather than zeroed — a 0/0 bar would claim an allowance of none, when the correct statement is that this tier does not have one.
+
+Two helpers guard the display: `formatHours(ms)` prints a rounded whole number at 10 hours or more (or on an exact hour) and one decimal otherwise, and `fractionOf(used, cap)` returns `0f` when `cap <= 0` (a divide-by-zero NaN would be an invalid bar width) and coerces into `0..1`.
+
+## Display models
+
+`BundleModels.kt` (`ui/v2/screens/bundles/BundleModels.kt`) holds the three pre-formatted render types. Nothing in them is a number the UI does arithmetic on — a locale that formats currency differently is never re-parsed at render time.
+
+| Type | Fields | Notes |
+| --- | --- | --- |
+| `BundleOption` | `id`, `title`, `storeName`, `price`, `perHourRate`, `transcriptionGrant`, `kbQueries` | `id` is the RC product id **and** the selection key. `title` ("3 hours") is derived from the grant so it reads as a size; `storeName` ("3hr Bundle") is the store's own name and is what the confirm sheet shows, because that is the last screen before a charge and must match the receipt. `perHourRate` is the bare figure ("2.99") — the `bundles_per_hour` string adds "/ %1$s per hr". `kbQueries` is null on Pro+Cloud. |
+| `BundleUsageSummary` | `transcription: UsageMeter`, `aiQueries: UsageMeter?` | Two meters, not one: a Cloud+AI bundle grants queries as well as hours, so showing only hours would ask the user to judge half a purchase. `aiQueries` is null on Pro+Cloud, where that half genuinely does not exist. |
+| `UsageMeter` | `used`, `total`, `fraction` | Pre-formatted strings plus a `0f..1f` track value. Mirrors what the Usage screen shows for the same counter. |
+
+## The screen — `V2BundlesScreen`
+
+`V2BundlesScreen` (`ui/v2/screens/bundles/V2BundlesScreen.kt`) is stateless — every value it renders is a parameter:
+
+```kotlin
+fun V2BundlesScreen(
+    tier: UserTier,
+    usage: BundleUsageSummary?,
+    bundles: List<BundleOption>,
+    selectedId: String?,
+    loadingCatalog: Boolean,
+    phase: BundlePurchasePhase,
+    onSelectBundle: (String) -> Unit,
+    onSelect: () -> Unit,
+    onRetryCatalog: () -> Unit,
+    onConfirmPurchase: () -> Unit,
+    onDismissConfirm: () -> Unit,
+    onDismissResult: () -> Unit,
+    onViewUsage: () -> Unit,
+    onNavigateBack: () -> Unit,
+)
+```
+
+It draws `BundlesCatalogBody` inside a `Box` and layers the phase surface on top, so the catalog stays mounted underneath — which is what lets a cancelled purchase drop straight back to it with the selection intact.
+
+The body is a header, a scrolling column (`ThisMonthCard` → `CatalogHeader` → grid → `NeverExpiresBanner`), and a pinned CTA. Notable details:
+
+- **`ThisMonthCard`** renders the tier badge (`V2TierBadge`) plus one or two `UsageMeterRow`s, and is withheld entirely while `usage == null`. A 0-of-0 meter is a claim about the account, and a wrong one.
+- **`BundleCatalog`** is a two-column grid built from `bundles.chunked(2)` Rows, **not** a `LazyVerticalGrid` — the screen already scrolls vertically, and nesting a lazy grid inside a `verticalScroll` is an infinite-height measure crash. A lone trailing card keeps half width via a `Spacer(Modifier.weight(1f))`.
+- **`BundleCard`** animates selection as border colour (`strongText` vs `cardOutline`) and width (2.dp vs 1.dp, `spring()`) — never as a fill, which would fight the price for attention.
+- **The CTA** is disabled until a bundle is selected, at which point its label carries the price: `bundles_cta_select` ("Select") becomes `bundles_cta_buy` ("Buy For %1$s") with RevenueCat's own price string. The label *is* the confirmation of what is about to be charged, so it never reads "Buy" without a figure attached.
+
+Layout constants: `CARD_GAP = 12.dp`, and `METER_HEIGHT = 4.dp` / `METER_RADIUS = 2.dp` matched to `UsageMeterBar` in `V2UsageScreen.kt` so the same counters read as the same kind of measurement on both screens. `CatalogLoading` reserves a `140.dp`-tall box so the never-expires banner does not jump when the grid lands.
+
+### Catalog empty-state branches
+
+| Condition | Renders |
+| --- | --- |
+| `bundles.isEmpty() && loadingCatalog` | `CatalogLoading` — a spinner in the reserved 140.dp box. |
+| `bundles.isEmpty()` | `CatalogUnavailable` — `bundles_load_failed_title` / `_body` / `_retry`, wired to `retryCatalog()`. |
+| otherwise | `BundleCatalog` — the two-column grid. |
+
+The failure copy names no cause on purpose. An empty catalog can come from the network, the store, or the two disagreeing about product ids, and the user can act on none of those distinctions — only on trying again.
+
+### `V2BundlesRoute`
+
+`V2BundlesRoute(onNavigateBack, onNavigateToUsage)` (`ui/v2/screens/bundles/V2BundlesRoute.kt`) is the stateful wrapper: it resolves `V2BundlesViewModel` via `koinViewModel()`, collects `uiState` with `collectAsStateWithLifecycle`, and resolves the hosting Activity from `LocalContext` because Play's billing flow needs an Activity, not a Context — `onConfirmPurchase = { (context as? Activity)?.let(viewModel::purchase) }`.
+
+`onViewUsage` calls `viewModel.clearPhase()` **before** navigating, so the success overlay is not restored over the catalog on the way back.
+
+## Purchase phases
+
+`BundlePurchasePhase` (`ui/v2/screens/bundles/BundlePurchasePhase.kt`) is one sealed interface rather than a set of booleans: the states are mutually exclusive and each carries different data (a confirm sheet needs the bundle, a success screen needs the resulting balances).
+
+| State | Data | Surface |
+| --- | --- | --- |
+| `Idle` | — | The catalog. |
+| `Confirming(bundle)` | The bundle awaiting confirmation | `BundleConfirmSheet` — nothing has been charged yet. |
+| `Processing` | — | `BundleProcessingScreen` — full-screen, no dismiss. |
+| `Success(grantedLabel, includesQueries, balances)` | The grant, whether queries were part of it, and the balance state | `BundleSuccessScreen`. |
+| `Error(message)` | The store's failure message | The shared `PlanResultOverlay` with `headerTitleRes = R.string.bundles_title`. |
+
+A user backing out of the Play sheet returns to `Idle`, **not** `Error` — a cancellation is not a failure, and the selection stays intact.
+
+`Success.includesQueries` is a fact about the *purchased bundle*, not about what has arrived. It decides whether there will be a second balance row and also sizes the loading placeholder, so the card is the same height before and after the numbers land.
+
+### The surfaces
+
+All three live in `ui/v2/screens/bundles/BundlePurchaseSurfaces.kt`.
+
+- **`BundleConfirmSheet(bundle, onConfirm, onDismiss)`** — a `V2ModalBottomSheet` with `rememberModalBottomSheetState(skipPartiallyExpanded = true)`. It itemises the charge before any money moves: Bundle (`bundle.storeName`), Transcription (`bundles_confirm_added_hours`, "+%1$s added"), AI queries (only when `bundle.kbQueries != null`), Expires ("Never — carries forward"), and an emphasised Total that is the **same** RevenueCat price string the CTA shows. Buttons are `PrimaryButton` (Buy, with the price) and `SecondaryButton` (Cancel).
+- **`BundleProcessingScreen()`** — a full-screen spinner plus `bundles_processing` ("Processing purchase…"). It offers no way out on purpose: Play may already have taken the money, and a dismiss control would leave the user unsure whether it went through.
+- **`BundleSuccessScreen(phase, onDone, onViewUsage)`** — a green check disc, `bundles_success_title` ("Hours Added"), `bundles_success_body` interpolating `phase.grantedLabel`, then one balance slot driven by `phase.balances`, then `PrimaryButton` "Done" and `SecondaryButton` "View Usage".
+
+`PrimaryButton` and `SecondaryButton` are `internal` composables in the same file. The secondary stays a **light** button in both themes, so its border (`Gray200`) and label (`Gray800`) are fixed values rather than theme tokens — reading them from the theme would turn the text near-white on a white button.
+
+## Waiting for the webhook credit
+
+`RevenueCatManager.purchase(activity, pkg)` succeeding means only that **Play took the money**. The credit is applied server-side: RevenueCat delivers a `NON_RENEWING_PURCHASE` webhook, and `revenuecat-webhook`'s `handleNonSubscriptionPurchase` reads `bundle_config` and credits `user_credits`. So the success screen re-reads usage rather than trusting a number computed on the client.
+
+`NON_RENEWING_PURCHASE` is the type RevenueCat actually sends for a one-time product, and the type alone is **not** the discriminator: the dispatch branch also requires `event.product_id` to be present **and** `mirroredMetas.length === 0` (no mirrored entitlement key on the event). A Founders Edition lifetime arrives as `NON_RENEWING_PURCHASE` too but carries an entitlement key, so that guard is what keeps the bundle branch from swallowing it. `NON_SUBSCRIPTION_PURCHASE` — a type RC does **not** send — survives only as an accepted alias for deliveries already in flight: the branch originally matched that name alone, so every bundle purchase fell through to the entitlement gate and was dropped, and the buyer was charged and credited nothing.
+
+<Note>
+The KDoc on `V2BundlesViewModel.purchase()` still names the handler "the `revenuecat-webhook` NON_SUBSCRIPTION_PURCHASE handler". That comment is stale in the same way the branch was; the server now matches `NON_RENEWING_PURCHASE` first. Everything else the KDoc says — that credits are not applied by the client call, and that the success screen refreshes usage rather than computing a balance — is accurate.
+</Note>
+
+Before announcing success, `purchase()` captures a baseline:
+
+```kotlin
+val baselineMs = _snapshot.value
+    ?.creditBalanceForCounter(UserUsageSnapshot.CounterKey.TRANSCRIPTION_MS)
+    ?: 0L
+```
+
+Without a baseline, a user with leftover credits satisfies a naive "balance is greater than zero" on the first poll and the card shows their **old** total as if it were the new one.
+
+`awaitCreditedBalances(baselineMs, bundle)` then polls on a bounded schedule:
+
+| Constant | Value | Effect |
+| --- | --- | --- |
+| `FIRST_POLL_DELAY_MS` | `1_500L` | Delay before attempt 0. |
+| `CREDIT_POLL_INTERVAL_MS` | `3_000L` | Delay before attempts 1–4. |
+| `CREDIT_POLL_ATTEMPTS` | `5` | Total budget: 1.5s + 4 × 3s = 13.5s of delay. |
+
+Each attempt calls `usageRepository.getUsage(forceRefresh = true)`, keeps only a `UsageResult.Fresh`, writes the snapshot through to `userSettings.setCachedUsageSnapshot`, and reads `creditBalanceForCounter(TRANSCRIPTION_MS)`. The key rule is `if (creditedMs <= baselineMs) return@repeat` — it waits for the balance to **move past** the captured baseline.
+
+On movement it emits `BundleBalanceState.Ready` in **one** update: a bundle credits every resource in a single write, so the moment transcription rises the queries are already there too. That is what lets both land together instead of the card growing a row mid-read.
+
+### `BundleBalanceState`
+
+| State | Meaning | Renders as |
+| --- | --- | --- |
+| `Loading` | The webhook credit has not been observed yet. | A spinner in a box of `TWO_ROW_CARD` (105.dp) or `ONE_ROW_CARD` (56.dp) height, chosen by `includesQueries`, so nothing shifts when it resolves. |
+| `Ready(transcription, queries?)` | Observed and final. | "Transcription balance" (`bundles_success_hours_value`, "%1$s hours") plus, when `queries` is non-null, "AI queries remaining". A null `queries` is an **absent** row, not a zero. |
+| `Unavailable` | The credit did not land inside the poll budget. | Nothing — the card is dropped entirely. |
+
+`Unavailable` drops the card rather than spinning forever or printing a stale number. The purchase is real either way — Play has the money and the webhook retries — so it must never read as a failure.
+
+## Entry points
+
+Four navigations target the `V2Bundles` route (`ui/v2/navigation/V2MainRoutes.kt`), wired in `ui/v2/navigation/V2MainNavHost.kt`:
+
+| Surface | Callback | Gate |
+| --- | --- | --- |
+| Usage screen "Get More" | `V2UsageScreen.onNavigateToBundles` | Shown for `tier.atLeast(UserTier.PRO_CLOUD)`. |
+| Playback transcription-cap sheet "Get More Hours" | `V2PlaybackScreen.onNavigateToBundles` | Appears once the cap is hit. |
+| KB chat monthly-AI-limit banner | `onUpgrade` | Appears once the cap is hit. |
+| Your Plan "Purchase a bundle" row | `PurchaseBundleRow` | Always rendered; **disabled** below Pro+Cloud. |
+
+`PurchaseBundleRow` (`ui/v2/screens/subscription/V2ManageSubscriptionScreen.kt`) is the discoverability entry point: the other three only surface after the user has already hit a wall, so someone who never runs out would never learn bundles exist. It appears in the SUBSCRIBED, LIFETIME, and CANCELLED bodies, uses `R.drawable.ic_plus` (no cart/bundle drawable exists), and below Pro+Cloud it is a greyed row with no chevron rather than an absent one — a greyed row that says why is information; a missing row is not. See [Plans & Subscription Management](/rollingrecord/app/monetization/plans-and-subscription).
+
+"View Usage" after a purchase **replaces** the catalog rather than stacking on it:
+
+```kotlin
+navController.navigate(V2Usage(expandStorage = false)) {
+    popUpTo<V2Bundles> { inclusive = true }
+}
+```
+
+The purchase is done, so there is nothing to come back to.
+
+<Note>
+The KDoc on `object V2Bundles` still describes a "STAGE 5 stub" — a coming-soon placeholder with a cart glyph and a disabled CTA, reachable only from the KB chat banner. That comment is stale; the screen described on this page is the shipped implementation. The route object itself is accurate: `@Serializable object V2Bundles`, no parameters.
+</Note>
+
+## Diagnostics
+
+An empty catalog has several causes that look identical on screen, so each failure branch gets a distinct **warn** log. The one exception is the purchase-started line, which is an **info** log because nothing has gone wrong — it is the anchor of the webhook-credit timeline, so a reader filtering the shared file for warnings alone would lose the start of that story. All of them are `save = true`, so every row below reaches the shareable log file.
+
+| Log | Level | Means |
+| --- | --- | --- |
+| `bundle catalog refresh failed (http=…) — serving cache` | `w` | `BundleCatalogRepository` — the server call failed; the cache is being served instead. |
+| `bundles: no grants from server (null=…) — catalog empty` | `w` | The call succeeded and returned nothing — `bundle_config` has no active rows on this environment. |
+| `bundles: join produced nothing — rc=[…] server=[…]` | `w` | Both sides healthy but sharing no product id. Logs both id sets, since product ids are store identifiers and not user content. |
+| `bundles: offering 'bundle' missing or empty in this RevenueCat project — catalog empty` | `w` | The named offering is absent or has no available packages. |
+| `bundles offering unavailable` | `w` | A transient `OfferingsResult.Error`; the existing catalog is left in place. |
+| `bundle purchase ok sku=… — awaiting webhook credit` | `i` | Play accepted the charge; the credit poll has started. |
+| `bundle purchase failed sku=…: <msg>` | `w` | The store returned an error (not a cancellation). |
+| `bundle credit not observed within poll budget sku=…` | `w` | 13.5s elapsed without the balance moving; the balance card is dropped. |
+
+## Wiring
+
+- `BundleCatalogApi` is an app-level `single` in `di/NetworkModule.kt`, created from `get<Retrofit>(named("aiengine"))` — the same JWT-authed Edge Function stack (apikey + App Check + Bearer JWT) the usage and ai-engine clients use.
+- `BundleCatalogRepository` is `scoped` in the user session in `di/RepositoryModule.kt`, per-account because grants are tier-adjusted.
+- `V2BundlesViewModel` is a `viewModel { }` in `di/V2Module.kt` resolving `usageRepository`, `userSettings`, `bundleCatalogRepository`, and `entitlementRepository` from `userScope()`, and `revenueCatManager` from the app scope. It reads the **same three usage sources** as `V2UsageViewModel` by design, so the two screens can never disagree about a number the user sees in both places within one session.
+
+## Related pages
+
+- [Plans & Subscription Management](/rollingrecord/app/monetization/plans-and-subscription) — the subscription paywall, Your Plan, and the shared `PlanResultOverlay` this screen reuses for failures.
+- [Entitlements & RevenueCat](/rollingrecord/app/monetization/entitlements-revenuecat) — `RevenueCatManager.getOffering`, `OfferingsResult`, `PurchaseFlowResult`, and the tier this screen reads.
+- [Usage Metering & Caps](/rollingrecord/app/monetization/usage-metering) — `UserUsageSnapshot`, `creditBalanceForCounter`, `effectiveCapForCounter`, and the Usage screen the success state navigates to.
+- [User Tiers & Feature Map](/rollingrecord/app/monetization/tiers) — the Pro+Cloud vs Cloud+AI split that decides whether a bundle carries KB queries.
+- [Credits & Bundles](/rollingrecord/backend/billing/credits-and-bundles) — `bundle_config`, `user_credits`, `creditBundle` / `refundBundle`, and the credit ledger.
+- [RevenueCat Integration](/rollingrecord/backend/billing/revenuecat) — `handleNonSubscriptionPurchase`, the handler that actually applies the credit this screen polls for.
+- [Webhooks](/rollingrecord/backend/edge-functions/webhooks) — the `revenuecat-webhook` entry point.

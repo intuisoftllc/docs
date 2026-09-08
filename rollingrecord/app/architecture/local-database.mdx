@@ -48,6 +48,12 @@ Two key paths:
 
 `DatabaseKeyTransition` (`data/local/security/DatabaseKeyTransition.kt`) returns `Result.Ready(passphrase)` or `Result.DekUnavailable(reason)`. RR-489 removed the legacy v1→v2 in-place re-key, so a non-v2 file now fails safe to the recovery surface rather than the wipe path.
 
+### Publishing readiness
+
+The `scoped<AppDatabase>` binding wraps the build in `.also { SessionDatabaseState.markReady(sessionId) }`, so readiness is published on **every** successful build path — the anonymous path, the DEK-derived path, and the `handleKeyMismatch` rebuild all funnel through the same single call site rather than each of `buildAppDatabaseForSession`'s several return points, so no future path can forget it. Equally deliberate: it never fires on a throw. A `DekUnavailableException` or a fatal open must leave the root UI on its loading or recovery surface, not wave Main into a cold factory.
+
+The `sessionId` it publishes comes from the Koin scope's own `id`, not from re-reading `AuthUserStore`. The scope's id **is** the session id (`UserSessionManager` creates every session scope with `scopeId = newSessionId`), which makes the read both free of I/O and free of the race where the store has already been re-pointed at the incoming user while this factory is still building the outgoing one's database.
+
 ## Open-failure routing
 
 `openVerifiedOrRecover` verifies `writableDatabase` (exercising the `DevFlags.forceFatalDbErrorOnOpen` synthetic-failure hook), and on failure `classifyOpenFailure(e)` string-matches the cause chain into a `DbOpenFailure`:
@@ -91,6 +97,8 @@ Every migration is validated by an instrumented `MigrationTestHelper` test, back
 ## Recovery state
 
 `DatabaseRecoveryState` (`states/DatabaseRecoveryState.kt`) is the process-static flag consumed by `V2App`/`MainActivity`. `RecoveryState` variants: `FatalError(errorCode, message)`, `DekUnavailable(reason)`, `KeyMismatchWiped`. The `flagFatalError` / `flagDekUnavailable` / `flagRecoveryNeeded` / `clearRecovery` calls drive the matching recovery screens (see [UI & Navigation](/rollingrecord/app/architecture/ui-and-navigation)).
+
+`SessionDatabaseState` (`states/SessionDatabaseState.kt`) is its structurally identical sibling — deliberately so, since both are root-UI signals raised from deep inside the DB layer and keeping them the same shape means one place to look when the root surface misbehaves. It exposes `readySessionId: StateFlow<String?>` (the session whose database is built and resolvable, or `null`), `markReady(sessionId)` called by the `AppDatabase` factory on a successful build, and `clear()` called by `UserSessionManager.switchTo` at the scope swap. It reports the happy path rather than a failure: `readySessionId == sessionId` is the root UI's "a synchronous user-scoped Koin resolution is now cheap" signal.
 
 ## Where to go next
 

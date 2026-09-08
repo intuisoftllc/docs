@@ -126,6 +126,7 @@
               {
                 "group": "Monetization",
                 "pages": [
+                  "rollingrecord/app/monetization/bundles",
                   "rollingrecord/app/monetization/entitlements-revenuecat",
                   "rollingrecord/app/monetization/feature-gating",
                   "rollingrecord/app/monetization/plans-and-subscription",
@@ -209,6 +210,7 @@
                   "rollingrecord/backend/edge-functions/ai-engine",
                   "rollingrecord/backend/edge-functions/analytics",
                   "rollingrecord/backend/edge-functions/bug-report",
+                  "rollingrecord/backend/edge-functions/get-bundle-catalog",
                   "rollingrecord/backend/edge-functions/get-user-key",
                   "rollingrecord/backend/edge-functions/get-user-usage",
                   "rollingrecord/backend/edge-functions/notifications",

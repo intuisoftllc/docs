@@ -1,9 +1,9 @@
 ---
 title: "Onboarding & Permissions"
-description: "The post-sign-up recovery-code onboarding overlay and the one-time V2 permission-setup screen, both mounted by V2App above the active nav host."
+description: "The recovery-code onboarding overlay and the one-time V2 permission-setup screen, both mounted by V2App above the active nav host."
 ---
 
-`V2App` can mount exactly one onboarding overlay above the nav host — today the post-sign-**up** recovery-code save flow, which defers the Clerk session swap until the user acknowledges their recovery code. Separately, once signed in with no overlay pending, the device flag `permissions_setup_done` gates the one-time permission-setup screen. Neither is a feature tour.
+`V2App` can mount exactly one onboarding overlay above the nav host — today the recovery-code save flow, which defers the Clerk session swap until the user acknowledges their recovery code. It is no longer sign-up-only: the `get-user-key` Edge Function reports whether the account already has an acknowledged code on every interactive sign-in, so an account that missed the sign-up window gets the same blocking screen on its next session. Separately, once signed in with no overlay pending, the device flag `permissions_setup_done` gates the one-time permission-setup screen. Neither is a feature tour.
 
 ## The onboarding overlay
 
@@ -13,11 +13,11 @@ The overlay's defining property is that the session swap is **deferred**: the ov
 
 ## `V2OnboardingSignals`
 
-`ui/v2/screens/onboarding/V2OnboardingSignals.kt` is a tiny cross-tree singleton (a `UserScopedCache`) with a `@Volatile var nextSignInIsNewAccount`. `V2LoginViewModel` sets it before OTP verify; `V2App` reads and resets it on the next Clerk `SignedIn`. Because the flag is genuinely cross-tree — the login ViewModel is disposed on session swap before `V2App` could read its state — a navigation argument or shared scope wouldn't work. `clearForUserSwitch` resets it so an aborted sign-in can't mis-flag the next account as new.
+`ui/v2/screens/onboarding/V2OnboardingSignals.kt` is a tiny cross-tree singleton (a `UserScopedCache`) carrying two `@Volatile` flags: `nextSignInIsNewAccount`, which `V2LoginViewModel` sets before OTP verify, and `serverSaysNoRecoveryCode`, which `AuthRepository.fetchAndPersistDek` sets from the server's `has_recovery_code` answer (it defaults `false`, so a fetch that never ran can't fabricate a blocking prompt). `V2App` reads and resets both on the next Clerk `SignedIn`. Because the signals are genuinely cross-tree — the login ViewModel is disposed on session swap before `V2App` could read its state — a navigation argument or shared scope wouldn't work. `clearForUserSwitch` resets both: an aborted sign-in can't mis-flag the next account as new, and the recovery-code answer is per-account, so carrying it across a switch would show the next user a screen they don't need or hide one they do.
 
 ## `V2App` wiring
 
-`ui/v2/V2App.kt` observes Clerk auth state. On a new-account `SignedIn` (or an interrupted-acknowledgment flow recovered from `pendingRecoveryAckUserId`), it sets `pendingOverlay = V2OnboardingOverlay.RecoveryCode` in loading mode, persists the pending-ack flag *before* the network call, and calls `recoveryCodeClient.generateRecoveryCode()`; the session swap is deferred to the Continue path. A returning user with an already-acknowledged code swaps immediately. Separately, once `sessionId` is not anonymous, `pendingOverlay == null`, and `!permissionsSetupDone` (from `DeviceSettingsDataSource.permissionsSetupDone`), `V2App` renders `V2PermissionsScreen` over Home.
+`ui/v2/V2App.kt` observes Clerk auth state. The overlay triggers on a `SignedIn` where **any** of three conditions hold — a new account (`nextSignInIsNewAccount`), an interrupted acknowledgment recovered from `pendingRecoveryAckUserId`, or the server-authoritative `serverSaysNoRecoveryCode` (consumed on read, so a later session can't re-trigger on a stale value). On any of the three it sets `pendingOverlay = V2OnboardingOverlay.RecoveryCode` in loading mode, persists the pending-ack flag *before* the network call, and calls `recoveryCodeClient.generateRecoveryCode()`; the session swap is deferred to the Continue path. A returning user with an already-acknowledged code swaps immediately. Separately, once `sessionId` is not anonymous, `pendingOverlay == null`, and `!permissionsSetupDone` (from `DeviceSettingsDataSource.permissionsSetupDone`), `V2App` renders `V2PermissionsScreen` over Home.
 
 ## `V2PermissionsScreen`
 

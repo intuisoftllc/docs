@@ -12,6 +12,10 @@ DI is Koin, started in `App.onCreate` with twelve modules. Bindings split by lif
 
 Koin merges the `scope<UserSessionScope> { ... }` blocks contributed across `databaseModule`, `daoModule`, `dataSourceModule`, `repositoryModule`, `serviceModule`, and `userSessionModule` into a single scope. See [Per-User Session Scope](/rollingrecord/app/architecture/user-session-scope).
 
+<Warning>
+Resolving **any** user-scoped dependency on the main thread is fatal while the `AppDatabase` factory holds the session scope's `ScopedInstanceFactory` lock — that factory keeps the lock across a bounded inline DEK fetch (up to 45s), and every other resolution in the scope, including a ViewModel being constructed on Main, queues behind it and ANRs at 5s. The lock is not the bug; Main ever waiting on it is. The root UI's `SessionDatabaseState` gate exists to guarantee the 53 `viewModel { }` factories in `v2Module` (31) and `viewModelModule` (22) only ever resolve into an already-warm scope.
+</Warning>
+
 ## Binding lifetime by module
 
 | Module | App-level `single {}` | Per-user `scoped {}` (`UserSessionScope`) |
@@ -21,22 +25,47 @@ Koin merges the `scope<UserSessionScope> { ... }` blocks contributed across `dat
 | `databaseModule` | — | `AppDatabase` |
 | `daoModule` | — | 19 DAOs (`get<AppDatabase>().xDao()`) |
 | `dataSourceModule` | `DeviceSettingsDataSource`, `RevenueCatManager`, `ThemePreference`, `ServerConfigDataSource`, `ServerConfigManager`, `CloudUploadErrorBus`, `ConnectivityMonitor`, `CloudDecryptFailureStore` | `RecordingLocalDataSource`, `CategoryLocalDataSource`, `UserSettingsDataSource`, `InMemoryTranscribeUploadCache` |
-| `repositoryModule` | `IdentityRepository`, `BlueprintModerationService`, `SupportTokenRepository`, `AccountHealthRepository`, `KnownAccountsRepository`, transcribe-queue observer | the per-user repositories (`RecordingRepository`, `CategoryRepository`, `ContextRepository`, `ContextCardRepository`, `NoteRepository`, `TranscriptRepository`, `ScheduledRecordingRepository`, `BlueprintRepository`, `SearchThreadRepository`, `SettingsRepository`, `EntitlementRepository`, `ProfileCache`, `RecordingSemanticSearchEngine`, `ContextSearchRanker`, `ExtractionJobRepository`, …) |
+| `repositoryModule` | `IdentityRepository`, `BlueprintModerationService`, `SupportTokenRepository`, `AccountHealthRepository`, `KnownAccountsRepository`, transcribe-queue observer | the per-user repositories (`RecordingRepository`, `CategoryRepository`, `ContextRepository`, `ContextCardRepository`, `NoteRepository`, `TranscriptRepository`, `ScheduledRecordingRepository`, `BlueprintRepository`, `SearchThreadRepository`, `SettingsRepository`, `EntitlementRepository`, `BundleCatalogRepository`, `ProfileCache`, `RecordingSemanticSearchEngine`, `ContextSearchRanker`, `ExtractionJobRepository`, …) |
 | `serviceModule` | `RecordingController`, `BusyGuard`, `PlaybackCoordinator`, `RecordingAdmissionBus`, `RecordingGatekeeper`, `AppLockController` | `StorageManager`, `RecordingImporter` |
-| `networkModule` | OkHttp clients, Retrofit APIs, `AppCheckWarmup`, `RateLimitCoordinator`, `UsageRepository`, `EntitlementRefreshSignal`, `BugReportApi` / `BugReportApiClient` | — |
-| `viewModelModule` | `Dispatchers.IO`, `V2BugReportViewModel` | — (VMs route via `userScope()`) |
+| `networkModule` | OkHttp clients, Retrofit APIs (incl. `BundleCatalogApi`), `AppCheckWarmup`, `RateLimitCoordinator`, `UsageRepository`, `EntitlementRefreshSignal`, `UserKeyProvider`, `BugReportApi` / `BugReportApiClient` | — |
+| `viewModelModule` | `Dispatchers.IO` — the module's only `single {}`; everything else is a `viewModel {}` factory | — (VMs route via `userScope()`) |
 | `v2Module` | `V2OnboardingSignals` | — (VMs route via `userScope()`) |
 | `workerModule` | `WorkManager` + schedulers | — |
 | `analyticsModule` | `AnalyticsTracker`, analytics client | — |
 
 ## Module notes
 
-- **`authModule`** — app-level `AuthRepository` (wraps the Clerk SDK; its `userKeyApiClientProvider` is a lazy `{ get() }` to break a DI cycle) and `AccountDeletionCoordinator`.
-- **`userSessionModule`** — binds `UserSessionManager` and the `UserScopedCacheRegistry` (now a nine-entry list — `EntitlementRefreshSignal` is the ninth), plus a large `scope<UserSessionScope>` block that wires the entire sync engine (`SyncEngine`, `WireTransform`, `ReconcileEngine`, `AudioCloudRepository`) and `SessionDekHolder`. See [the session page](/rollingrecord/app/architecture/user-session-scope).
-- **`databaseModule`** — `scoped<AppDatabase> { buildAppDatabaseForSession(androidContext(), this) }` — the encrypted per-user Room DB. Also owns `allMigrations` and the open-failure classifier. See [Room Database & SQLCipher](/rollingrecord/app/architecture/local-database).
+- **`authModule`** — app-level `AuthRepository` (wraps the Clerk SDK) and `AccountDeletionCoordinator`. `AuthRepository` takes two **lazy** `{ get() }` providers rather than direct `get()`s: `userKeyProviderProvider` and `onboardingSignalsProvider`. The first is the cycle break — `UserKeyProvider` fronts `UserKeyApiClient`, which pulls in the shared OkHttp client whose auth interceptor depends on `AuthRepository`; resolving it at construction would be an unbreakable cycle. Deferring to call time (`provisionDekOrThrow`, post sign-in) resolves against the already-built `AuthRepository` single.
+- **`userSessionModule`** — binds `UserSessionManager` and the `UserScopedCacheRegistry` (now a ten-entry list — `UserKeyProvider` is the tenth), plus a large `scope<UserSessionScope>` block that wires the entire sync engine (`SyncEngine`, `WireTransform`, `ReconcileEngine`, `AudioCloudRepository`) and `SessionDekHolder` (constructed with `userKeyProvider = get()` and `authUserId = id`, the scope's own id). See [the session page](/rollingrecord/app/architecture/user-session-scope).
+- **`databaseModule`** — the encrypted per-user Room DB. The binding reads the scope's own `id` as the session id and publishes readiness on success:
+
+  ```kotlin
+  scoped<AppDatabase> {
+      val sessionId = id
+      buildAppDatabaseForSession(androidContext(), this).also {
+          SessionDatabaseState.markReady(sessionId)
+      }
+  }
+  ```
+
+  Also owns `allMigrations` and the open-failure classifier. See [Room Database & SQLCipher](/rollingrecord/app/architecture/local-database).
 - **`daoModule`** — 19 `scoped { get<AppDatabase>().xDao() }` bindings (recording, recordingSession, category, note, scheduledRecording, transcript, context, contextRecording, contextSession, contextCard, actionItem, blueprint, searchThread, searchMessage, analytics, keywordIndex, embedding, syncOutbox, pendingPullApply).
-- **`networkModule`** — the three named OkHttp clients (`supabase`, `audio_signed_url`, `aiengine`), the Retrofit APIs (`SupabaseApi`, `SyncApi`, `AudioSyncApi`, `AiEngineApi`, `UsageApi`, `RecoveryCodeApi`, `SyncPreferencesApi`, `UserKeyApi`, `SetUserPinApi`, `AccountOtpApi`, `SearchApi`, `ExtractionJobsApi`, `BugReportApi`), `AppCheckWarmup`, `RateLimitCoordinator`, and `UsageRepository` — an app-level single that is a `UserScopedCache` and owner-stamps each snapshot. No scoped bindings. Two additions this commit: the `aiengine` and sync OkHttp clients each add `EntitlementRefreshInterceptor` to their chain (the post-purchase cache-skip hint), reading `EntitlementRefreshSignal` — a new app-level single that is itself a `UserScopedCache` (registered in `userSessionModule`); and `BugReportApiClient`, which uses a **bare** `OkHttpClient` (2-minute call timeout, no interceptors) for the signed Storage log upload so it carries no `Authorization` / App Check headers. `RevenueCatManager` (bound in `dataSourceModule`) is now constructed with an `onTierRaised` lambda that calls `EntitlementRefreshSignal.markPurchaseCompleted(...)` + `UsageRepository.invalidate()` so a fresh purchase isn't denied against a stale free-tier snapshot.
-- **`v2Module`** — V2 ViewModels plus `single { V2OnboardingSignals() }`. Each VM factory does `val s = userScope()` then mixes `s.get()` (per-user) with `get()` (app singles). Kept separate from `viewModelModule` so V1 can be deleted as a unit.
+- **`networkModule`** — the three named OkHttp clients (`supabase`, `audio_signed_url`, `aiengine`), the Retrofit APIs (`SupabaseApi`, `SyncApi`, `AudioSyncApi`, `AiEngineApi`, `UsageApi`, `BundleCatalogApi`, `RecoveryCodeApi`, `SyncPreferencesApi`, `UserKeyApi`, `SetUserPinApi`, `AccountOtpApi`, `SearchApi`, `ExtractionJobsApi`, `BugReportApi`), `AppCheckWarmup`, `RateLimitCoordinator`, and `UsageRepository` — an app-level single that is a `UserScopedCache` and owner-stamps each snapshot. No scoped bindings. The `aiengine` and sync OkHttp clients each carry `EntitlementRefreshInterceptor` (the post-purchase cache-skip hint), reading `EntitlementRefreshSignal` — an app-level single that is itself a `UserScopedCache` (registered in `userSessionModule`); `BugReportApiClient` uses a **bare** `OkHttpClient` (2-minute call timeout, no interceptors) for the signed Storage log upload so it carries no `Authorization` / App Check headers. `RevenueCatManager` (bound in `dataSourceModule`) is constructed with an `onTierRaised` lambda that calls `EntitlementRefreshSignal.markPurchaseCompleted(...)` + `UsageRepository.invalidate()` so a fresh purchase isn't denied against a stale free-tier snapshot.
+
+  Two more app-level singles ride the same [`aiengine` Retrofit stack](/rollingrecord/app/platform/networking):
+
+  ```kotlin
+  // Bundle catalog + per-tier grants. Same Retrofit/OkHttp stack as the other
+  // JWT-authed Edge Function clients.
+  single<BundleCatalogApi> {
+      get<Retrofit>(named("aiengine")).create(BundleCatalogApi::class.java)
+  }
+
+  single<UserKeyProvider> { UserKeyProvider(apiClient = get()) }
+  ```
+
+  `UserKeyProvider` is app-scoped on purpose: all three sign-in-time `get-user-key` callers — the DEK provision gate in `AuthRepository`, the `SessionDekHolder` App Lock / DEK path, and `V2App`'s recovery-code re-check — route through it, so a concurrent burst collapses to one network call. Because it caches per-user key material it is a `UserScopedCache`, registered in `userScopedCacheRegistry` **and** owner-stamped. `UserKeyApiClient` (which it fronts) also gained an `onboardingSignalsProvider = { get() }` so every fetch records recovery-code presence.
+- **`v2Module`** — V2 ViewModels plus `single { V2OnboardingSignals() }`. Each VM factory does `val s = userScope()` then mixes `s.get()` (per-user) with `get()` (app singles). `V2BundlesViewModel` is the textbook shape — `usageRepository`, `userSettings`, `bundleCatalogRepository`, and `entitlementRepository` come from `s.get()`, while `revenueCatManager` comes from the root `get()`. It reads the same three sources as `V2UsageViewModel` deliberately: both screens show the [same counters](/rollingrecord/app/monetization/usage-metering), and a second source would let them disagree about a number the user can see in both. Kept separate from `viewModelModule` so V1 can be deleted as a unit.
 
 ## The `userScope()` helper
 
@@ -48,13 +77,24 @@ internal fun Scope.userScope(): Scope = get<UserSessionManager>().currentScope
 
 ViewModels resolve per-user deps through it (`= UserSessionManager.currentScope`) rather than injecting scoped types at the app root. A root `get()` can't see scoped definitions, but a scope `get()` falls through to app singles — so a VM factory can freely mix both. Composables outside a VM factory use the `@Composable` `userScopedInject<T>()` instead (remember-keyed on `sessionIdFlow`), which is how `V2MainNavHost` reads `EntitlementRepository` and `ContextRepository`.
 
-The exception is `V2BugReportViewModel` (in `viewModelModule`): its factory takes only app singles — `application`, `client` (`BugReportApiClient`), and `userSessionManager` — with **no** `userScope()`, because bug reporting is Free on every tier and it resolves the caller's tier lazily at submit time rather than pinning a session-scoped dep at construction.
+Not every factory needs it. Five of `viewModelModule`'s 22 factories take only app-level singles and never call the helper: `V2BugReportViewModel`, `UsageViewModel` (the app-scoped `UsageRepository`), `AccountsListViewModel` and `AccountDetailViewModel` (RR-297 / RR-298 — app-scoped on purpose, so they survive a sign-out and can describe an account other than the signed-in one), and `SupportTokenSheetViewModel` (holds nothing itself; delegates to the app-scoped repo).
+
+`V2BugReportViewModel` is the clearest case: its factory takes `application`, `client` (`BugReportApiClient`), and `userSessionManager` with **no** `userScope()`, because bug reporting is Free on every tier and it resolves the caller's tier lazily at submit time rather than pinning a session-scoped dep at construction — which would fail for a user whose session scope is mid-rebuild.
 
 ## Cross-user-safety enforcement
 
 `UserScopedCacheRegistry` (registered in `userSessionModule`) holds an **explicit** list of every app-level single that caches per-user state — `switchTo()` clears all of them before opening the new scope. Registration is a hand-written list, not a reflective `getAll<UserScopedCache>()` sweep, because reflection silently picks up whatever is on the graph and says nothing when something is missing.
 
-`UserScopedCacheRegistryTest` fails the build when a `UserScopedCache` implementor is missing from the registry, or when a new app-level `single {}` is neither a `UserScopedCache` nor listed in the test's `crossUserSafe` map with a written reason. This commit's new singles split both ways: `EntitlementRefreshSignal` is a genuine `UserScopedCache` added to the registry, while `ThemePreference`, `BugReportApi`, and `BugReportApiClient` are each added to `crossUserSafe` with a written reason (they cache no per-user state — `ThemePreference` resolves the live session's store per emission; the bug-report pair is stateless and resolves tier + logs per submit). See [Per-User Session Scope](/rollingrecord/app/architecture/user-session-scope) for the registered caches and the owner-stamping pattern.
+`UserScopedCacheRegistryTest` fails the build when a `UserScopedCache` implementor is missing from the registry, or when a new app-level `single {}` is neither a `UserScopedCache` nor listed in the test's `crossUserSafe` map with a written reason. Earlier singles split both ways: `EntitlementRefreshSignal` is a genuine `UserScopedCache` in the registry, while `ThemePreference`, `BugReportApi`, and `BugReportApiClient` sit in `crossUserSafe` with a written reason (they cache no per-user state — `ThemePreference` resolves the live session's store per emission; the bug-report pair is stateless and resolves tier + logs per submit).
+
+The two newest app-level singles land on opposite sides, and together they show what the classification actually keys on — **where per-user state is held, not what the data is about**:
+
+| New app-level single | Classification | Where its state lives |
+| --- | --- | --- |
+| `UserKeyProvider` | `UserScopedCache`, registered in `userScopedCacheRegistry` | In the provider itself — `cached` / `cachedOwner` / `cachedAt`, owner-stamped, 5-minute `TTL_MS`. |
+| `BundleCatalogApi` | `crossUserSafe`, reason `"stateless Retrofit interface"` | Nowhere in the API. The catalog IS per-account (grants are tier-adjusted server-side), but it is cached by the session-scoped `BundleCatalogRepository` into the per-user DataStore, which dies with the session. |
+
+The test's scanners are source-regex based (`findAppLevelSingles`, `simpleTypeName`), and `simpleTypeName` takes the last dot-segment that starts uppercase — which is why the two fully-qualified new bindings are still caught as `BundleCatalogApi` and `UserKeyProvider` rather than slipping past the check. See [Per-User Session Scope](/rollingrecord/app/architecture/user-session-scope) for the registered caches and the owner-stamping pattern.
 
 ## Where to go next
 
