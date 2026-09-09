@@ -1,17 +1,61 @@
 ---
 title: "Operation Catalog"
-description: "How support-ops operations are registered, plus the read-only and mutating op inventory."
+description: "How support-ops operations are registered, plus the read-only and mutating op inventory — including the change_email primary-email replacement."
 ---
 
 Support-ops exposes a registry of individually-declared operations — each with its own permission requirement, validation, and read-only vs. mutating classification.
 
 ## What this covers
 
-- **How operations are registered:** each is an `OperationDef` (`operations/handler.ts`) declaring `name`, `isReadOnly`, `requiredPermission`, `validateParams`, and `handler`; all are collected in `operations/registry.ts` and resolved by `findOperation(body.operation)`.
-- **Read-only diagnostics:** `lookup_user_by_email`, `search_users`, `get_user_overview`, `get_user_state`, `get_clerk_metadata`, `get_user_rate_limits`, `get_admin_audit`, `get_user_audit`, `get_abuse_top_offenders`, `get_user_transcribe_history`, `get_user_credit_ledger`, `get_user_credits`, `get_user_timeline`, `get_tombstone_report`, `get_storage_drift`, `whoami`.
-- **Mutating ops (dry-run → commit):** `set_account_password`, `freeze_user_account`, `grant_manual_credit`, `restore_tombstones`, `clear_app_lock_pin`, `reset_extraction`, `reset_transcription`, and the irreversible `delete_user_account` (guarded by server-side email confirmation); hybrids `verify_support_token` / `validate_recovery_code`; light metadata write `link_audit_ticket`.
-- **Error contract:** handlers throw `OperationError(code, httpStatus, extra)` for clean coded rejections (e.g. `credit_ceiling_exceeded`), otherwise collapse to a generic `handler_threw` 500.
+- **How operations are registered:** each is an `OperationDef` (`operations/handler.ts`) declaring `name`, `isReadOnly`, `requiredPermission`, `validateParams`, and `handler`; all are collected in `operations/registry.ts` and resolved by `findOperation(body.operation)`. The registry currently holds 31 operations — 9 mutating and 22 read-only.
+- **Read-only diagnostics:** `lookup_user_by_email`, `search_users`, `get_user_overview`, `get_user_state`, `get_clerk_metadata`, `user_rate_limits` (note the wire name drops the `get_` prefix every other op carries), `get_admin_audit`, `get_user_audit`, `link_audit_ticket`, `get_abuse_top_offenders`, `get_bug_reports`, `set_bug_status`, `get_user_transcribe_history`, `get_user_credit_ledger`, `get_my_grant_budget`, `get_user_credits`, `get_user_timeline`, `get_tombstone_report`, `get_storage_drift`, `verify_support_token`, `validate_recovery_code`, `whoami`.
+- **Mutating ops (dry-run → commit):** `set_account_password`, `change_email`, `freeze_user_account`, `grant_manual_credit`, `restore_tombstones`, `clear_app_lock_pin`, `reset_extraction`, `reset_transcription`, and the irreversible `delete_user_account` (guarded by server-side email confirmation); hybrids `verify_support_token` / `validate_recovery_code`; light metadata writes `link_audit_ticket` and `set_bug_status`.
+- **Dry-run is the default:** the dispatcher reads `const dryRun = body.dry_run !== false` (`support-ops/index.ts`), so omitting the flag PREVIEWS rather than commits. Committing takes `dry_run: false` plus the `preview_id` returned by a matching dry-run.
+- **Error contract:** handlers throw `OperationError(code, httpStatus, extra)` for clean coded rejections (e.g. `credit_ceiling_exceeded`, `email_unchanged`), otherwise collapse to a generic `handler_threw` 500.
+
+## `change_email` — replacing a primary sign-in email
+
+`change_email` (`operations/change-email.ts`) is for the support case where the customer can no longer reach the address on file. It creates the new address admin-verified, promotes it to primary, and deletes every previously-existing address, so the account ends with exactly one email. It is mutating, gated on `can_change_email`, and super-admin target-protected.
+
+| Field | Required | Notes |
+| --- | --- | --- |
+| `operation` | yes | `"change_email"` |
+| `params.target_auth_user_id` | yes | The Clerk user id (`user_xxxxx`), matched against `/^[A-Za-z0-9_-]{1,128}$/`. Not a UUID |
+| `params.new_email` | yes | Trimmed, at most 254 chars, must match `/^[^\s@]+@[^\s@]+\.[^\s@]+$/`. Structural check only — the provider does the authoritative validation |
+| `dry_run` | no | Defaults to `true`; omit it and you get a preview |
+| `preview_id` | to commit | The `preview_id` from a matching dry-run, at most 15 minutes old |
+| `ticket_ref` | no | Top-level metadata (trimmed, sliced to 64 chars), deliberately kept OUT of the params hash |
+
+The flow is: send `dry_run: true`, read the preview (`target_auth_user_id`, `current_email`, `new_email`, `target_email`, and a `summary` spelling out the from → to), confirm both the identity and the address, then re-send with `dry_run: false` and the `preview_id` inside the 15-minute window. `validateDryRunPreview` matches the admin, the operation, and a canonical-JSON SHA-256 hash of the params, so the address that commits is byte-identical to the one previewed.
+
+| Outcome | HTTP | Payload |
+| --- | --- | --- |
+| Preview | 200 | `preview_id` + the preview summary |
+| New address is already the account's primary | 409 `email_unchanged` | `{ email }` — nothing to do |
+| Provider refused the new address | 400 `email_change_rejected` | `{ clerk_code, detail }` — usually the address belongs to another account. Pick a different one. The primary email is unchanged either way: a refusal at the create step touches nothing, and a refusal at the promote step triggers a best-effort rollback of the address just created — if that delete also fails, a stray admin-verified non-primary address is left on the account to sweep by hand |
+| Target is a super-admin and you are not | 403 `super_admin_protected` | `{ operation, target_auth_user_id }` |
+| No such user at the provider | 500 `handler_threw` | The audit row records `target Clerk user not found: <id>` |
+| Committed | 200 | `{ previous_email, new_email, old_email_deleted, deleted_count, note }` |
+
+After a commit, check `old_email_deleted`. When it is `false`, the sign-in email changed successfully but a stray old address survived the cleanup sweep — `deleted_count` reports how many were removed, and the response `note` tells you to delete the leftover address by hand.
+
+## Surface coverage
+
+| Surface | `change_email` |
+| --- | --- |
+| `support-ops` dispatcher | Yes — registered in `OPERATIONS` |
+| `support_ops.py` CLI | No — `OP_HANDLERS` has no `change-email` entry and there is no `--new-email` flag |
+| Console | Governed by `whoami`: `can_change_email` appears in the permissions map and `change_email` in `allowed_operations`, so a client can show the action only to operators who hold it |
+
+Until the CLI catches up, the op is issued as a signed request straight against the dispatcher — `X-Admin-Secret`, an HMAC-SHA256 of `timestamp + "." + body`, and a Clerk JWT, exactly the envelope `support_ops.py`'s `do_dry_run` / `do_commit` build — or from the console client.
 
 <Note>
-Scaffold generated from the codebase map — expand with full detail, examples, and specifics. (Cross-check the authoritative op list against the deployed dispatcher — the CLI and registry drifted slightly in the mapped repo state.)
+The CLI and the registry have drifted in both directions. `support_ops.py`'s `OP_HANDLERS` has no wrapper for `change_email`, and it still ships `resolve-storage-drift`, `grant-bundle`, and `refund-bundle` wrappers that call server ops (`resolve_storage_drift`, `grant_bundle_purchase`, `refund_bundle_purchase`) which are not in `OPERATIONS` at all.
 </Note>
+
+## Where to go next
+
+- [Permissions & audit log](/rrsupport/permissions-and-audit) — `can_change_email` and the audit rows `change_email` writes.
+- [support_ops.py — Admin CLI](/rrsupport/cli) — the CLI that does not yet wrap this op.
+- [Support-ops operations](/rollingrecord/backend/support-ops/operations-catalog) — the full backend registry entry, including the provider call sequence.
+- [Dry-run & audit](/rollingrecord/backend/support-ops/dry-run-and-audit) — `preview_id` mechanics.

@@ -7,15 +7,21 @@ Deleting a user must leave nothing behind: no orphaned rows in any table, no orp
 
 ## The shared `wipeUser()` module
 
-`wipeUser(authUserId, options)` is the single delete ladder. Its `WipeUserResult` reports per-table row counts and per-bucket status so callers can surface exactly what was removed. Best-effort steps (snapshot, RC delete, lifetime revoke, storage wipe, table wipe, Clerk delete) log and continue — a partial failure never blocks a user's right to erasure. Only the `canonical_users` delete failing is fatal: it throws `CanonicalUserDeleteFailedError` carrying the partial result.
+`wipeUser(authUserId, options)` is the single delete ladder. Its `WipeUserResult` reports per-table row counts and per-bucket status so callers can surface exactly what was removed. Best-effort steps (snapshot, RC delete, lifetime revoke, storage wipe, table wipe, Clerk delete) log and continue — a partial failure never blocks a user's right to erasure. Three failure modes are fatal instead, and each throws rather than returning a result:
+
+| Thrown | When |
+| --- | --- |
+| `ActiveSubscriptionError` | step 1 — the caller holds an active recurring sub and `skipSubscriptionCheck` was not set; nothing has been touched yet |
+| `IdentityLookupFailedError` | step 2 — the `canonical_users` SELECT itself errored (network / RLS / DB). It short-circuits before any wipe step runs, and is deliberately distinct from "no row, the user is already gone," which is the clean `status: "not_found"` result |
+| `CanonicalUserDeleteFailedError` | step 9 — the `canonical_users` DELETE failed *after* dependents were wiped; carries the partial `WipeUserResult` so the caller can report what was removed |
 
 The ladder runs in a fixed order:
 
 | Step | Action |
 | --- | --- |
 | 1 | Subscription check (unless `skipSubscriptionCheck`) — an active recurring sub throws `ActiveSubscriptionError` |
-| 2 | `canonical_users` lookup — missing row returns a clean `status: "not_found"` (idempotent) |
-| 3 | Snapshot usage → `l_deleted_identity` (anti-abuse carryover, best-effort) |
+| 2 | `canonical_users` lookup — missing row returns a clean `status: "not_found"` (idempotent); a *failed* lookup throws `IdentityLookupFailedError` |
+| 3 | Record the deletion in `l_deleted_identity` — every deletion, counters zero if there was no `usage` row (best-effort) |
 | 4 | Delete the RevenueCat customer (`deleteRcCustomer`) |
 | 5 | Revoke lifetime entitlements locally (belt-and-suspenders) |
 | 6 | Wipe Storage buckets (`BUCKETS_TO_WIPE`, `{bucket}/{auth_user_id}/`) |
@@ -28,7 +34,7 @@ The final auth-row deletion targets the **Clerk** user, not Supabase Auth — th
 
 ## Mechanism 1 — FK cascade
 
-Twenty-six user-data tables reference `canonical_users(auth_user_id)` with `ON DELETE CASCADE` in the baseline schema (`migrations/20260508000000_baseline.sql`); later migrations add more — `transcription_queue`, `f_user_financials`, `h_extraction_charge`, `account_otp`, the extraction-jobs tables, `embedding_bundle_catalog`, and a storage-drift table — so the current FK-backed count is past 30. When step 9 deletes the `canonical_users` row, those cascades fire and take the child rows with it. The baseline FK-backed set spans `admin_permissions`, `support_tokens`, `user_crypto`, `l_user_key_access`, `l_entitlement_events`, `h_ai_engine_sessions`, `h_transcribe_history`, `transcribe_jobs`, `transcribe_results`, `user_blueprints` (the renamed `user_extraction_templates`), `user_storage_usage`, `user_sync_preferences`, and all 14 `c_*` sync tables. Note that `transcription_queue` and `f_user_financials` are both FK-backed **and** listed in `TABLES_TO_WIPE` (belt-and-suspenders plus per-table counts) — being in the wipe list does not mean a table lacks an FK.
+Twenty-six user-data tables reference `canonical_users(auth_user_id)` with `ON DELETE CASCADE` in the baseline schema (`migrations/20260508000000_baseline.sql`); later migrations add more — `transcription_queue`, `f_user_financials`, `h_extraction_charge`, `account_otp`, the extraction-jobs tables, `embedding_bundles` (created by `migrations/20260722130000_embedding_bundle_catalog.sql` — the catalog table's name is not the migration's), and a storage-drift table — so the current FK-backed count is past 30. When step 9 deletes the `canonical_users` row, those cascades fire and take the child rows with it. The baseline FK-backed set spans `admin_permissions`, `support_tokens`, `user_crypto`, `l_user_key_access`, `l_entitlement_events`, `h_ai_engine_sessions`, `h_transcribe_history`, `transcribe_jobs`, `transcribe_results`, `user_blueprints` (the renamed `user_extraction_templates`), `user_storage_usage`, `user_sync_preferences`, and all 14 `c_*` sync tables. Note that `transcription_queue` and `f_user_financials` are both FK-backed **and** listed in `TABLES_TO_WIPE` (belt-and-suspenders plus per-table counts) — being in the wipe list does not mean a table lacks an FK.
 
 `auth_user_id TEXT NOT NULL` with an FK + `ON DELETE CASCADE` is required on every user-data table — it is what makes deleting one `canonical_users` row erase the user everywhere.
 
@@ -51,19 +57,33 @@ The wipe list lives in the shared `functions/_shared/users/wipe.ts`, not in `del
 
 ## Storage objects never cascade
 
-A row delete does nothing to Storage. Every user file therefore lives under a `{bucket}/{auth_user_id}/` prefix, and `BUCKETS_TO_WIPE` enumerates and removes it:
+A row delete does nothing to Storage. Every user file therefore lives under a `{bucket}/{auth_user_id}/` prefix, and `BUCKETS_TO_WIPE` — four buckets — enumerates and removes it:
 
 | Bucket | Contents |
 | --- | --- |
 | `transcribe-inbox` | transcribe source audio |
 | `audio-storage` | envelope-encrypted cloud audio blobs (renamed from `audio-backups`, RR-304) |
-| `embedding-storage` | encrypted embedding-bundle blobs |
+| `embedding-storage` | encrypted embedding-bundle blobs, flat under the user prefix as `{owner_kind}-{owner_id}.bin` |
+| `bug-logs` | merged app logs attached to bug reports, at `{auth_user_id}/{bug_report_id}.txt` (private, `text/plain`, 25 MiB ceiling). `bug_reports` rows are FK-backed and an AFTER DELETE trigger on that table drops each row's own log object; the folder wipe is the belt-and-braces that also catches objects whose row was purged earlier, or an upload whose submit never landed |
 
 `wipeBucketFolder()` wipes every object under `{bucket}/{authUserId}/` at any depth. `collectStorageObjectPaths()` walks recursively and paginated (`STORAGE_LIST_PAGE_SIZE = 1000`, `STORAGE_MAX_DEPTH = 8`), collecting object paths before deleting so mid-walk removals can't shift the listing offsets; `remove()` then runs in batches (`STORAGE_REMOVE_BATCH_SIZE = 500`). It returns `ok` only when enumeration was complete *and* every batch was removed — a partial enumeration returns `failed` rather than a false clean-wipe. Losing an `audio-storage` object's owning `c_recordings` crypto columns makes the ciphertext permanently un-decryptable, so this bucket wipe is the only thing that removes those blobs. See [`c_recordings` integrity](/rollingrecord/backend/database/c-recordings-integrity).
 
-## Anti-abuse snapshot before the wipe
+## Deletion record and anti-abuse snapshot
 
-Step 3 snapshots the user's `usage` counters into `l_deleted_identity`, keyed by `email_hash + period`, via `snapshotUsageForDeletion()` (`functions/_shared/users/deleted-identity-history.ts`). If the same email re-signs up in the same calendar month, `carryForwardOnResignup()` restores those counters onto the new account — closing the delete-and-resignup cap-reset hole. This is why `usage` is deleted separately at step 8, after the snapshot has read it.
+Step 3 writes one `l_deleted_identity` row per deletion via `snapshotUsageForDeletion()` (`functions/_shared/users/deleted-identity-history.ts`), keyed by `email_hash + period`. It writes for **every** deletion, regardless of tier, usage, or history: the function reads the current-period `usage` row, and when there is none it inserts `emptyCounters()` — all eleven counters at zero — rather than bailing out. That makes the table a deletion metric ("which accounts were deleted, when") layered on top of the anti-abuse carryover it was built for.
+
+The carryover half is unchanged. If the same email re-signs up in the same calendar month, `carryForwardOnResignup()` MAX-merges those counters onto the new account, closing the delete-and-resignup cap-reset hole. An all-zero row carries nothing forward — `Math.max(0, existing)` is `existing` — and is then consumed like any other, so recording zero-activity deletions costs anti-abuse nothing. This is still why `usage` is deleted separately at step 8, after the snapshot has read it. See [anti-abuse and re-signup carryover](/rollingrecord/backend/accounts/anti-abuse) for the column set and the consumption lifecycle.
+
+`WipeUserResult.snapshotWritten` — surfaced as `snapshot_written` on the `delete-user` response and on its `502` partial-failure body — reports whether the **write succeeded**, not whether there was any usage to snapshot:
+
+| `snapshot_written` | When |
+| --- | --- |
+| `true` | The row was written: an INSERT, or `upsertWithMax()` after an `(email_hash, period)` PK conflict — a re-delete in the same period, which MAX-merges the counters and refreshes `deleted_at` |
+| `false` | `status: "not_found"` (no `canonical_users` row, so nothing ran), no resolvable email hash, or the select/insert/upsert itself failed |
+
+<Warning>
+Coverage is not total. The row is PK-keyed on the email hash, so a deletion with no resolvable hash records nothing. `wipeUser()` reads `canonical_users.email_hash` and falls back to `resolveEmailHash()` (the supplied JWT email, else a `getClerkUserEmail()` lookup); when both come up empty it logs `"wipeUser: no email hash resolvable for user; skipping anti-abuse snapshot"` and leaves `snapshotWritten` false. That happens when the Clerk user is already gone before the wipe runs — most likely on the [`clerk-webhook`](/rollingrecord/backend/edge-functions/webhooks) `user.deleted` path, which supplies no email.
+</Warning>
 
 ## The three callers
 

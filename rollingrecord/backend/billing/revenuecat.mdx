@@ -1,6 +1,6 @@
 ---
 title: "RevenueCat Integration"
-description: "The RC v2 API client (live entitlement reads, retry, caching) and the revenuecat-webhook that mirrors lifetimes, tracks recurring-sub grace, records revenue, and credits/refunds bundles."
+description: "The RC v2 API client (live entitlement reads, retry, caching) and the revenuecat-webhook that mirrors lifetimes, tracks recurring-sub grace, routes production vs sandbox revenue, and credits/refunds bundles."
 ---
 
 RevenueCat is the authoritative source for entitlement **state**, read live per request; the database only mirrors lifetimes and dev grants as an audit ledger. Two pieces make up the integration: an RC v2 API client in `_shared/billing/revenuecat.ts` and the inbound `revenuecat-webhook` Edge Function that reacts to grant, revoke, purchase, and refund events.
@@ -41,12 +41,12 @@ After the gate, the handler parses the envelope (`INVALID_BODY` on bad JSON, `MI
 
 | RC event type | Action |
 | --- | --- |
-| `INITIAL_PURCHASE` / `NON_RENEWING_PURCHASE` / `TEMPORARY_ENTITLEMENT_GRANT` (mirrored key present) | `handleLifetimeGrant` → UPSERT `lifetime_entitlements` |
-| `INITIAL_PURCHASE` / `RENEWAL` (recurring sub key, fresh) | `handleRecurringSubRevenue` → `revenue_micros += usdToMicros(price)` |
-| Any recurring-sub event (`EXPIRATION` / `RENEWAL` / `PRODUCT_CHANGE` / `UNCANCELLATION` / `CANCELLATION` / dashboard revoke) | `handleRecurringSubEvent` re-reads the authoritative set live from RC and diffs it against the stored `last_known_entitlements` key snapshot; opens/clears the cloud grace window on the transition |
+| `INITIAL_PURCHASE` / `NON_RENEWING_PURCHASE` / `TEMPORARY_ENTITLEMENT_GRANT` (mirrored key present) | `handleLifetimeGrant` → active-row existence check, then a plain INSERT into `lifetime_entitlements` (no upsert, no `onConflict`; a failed insert is logged and swallowed) |
+| `INITIAL_PURCHASE` / `RENEWAL` (recurring sub key, fresh) | `handleRecurringSubRevenue` → `revenueColumnFor(event.environment) += usdToMicros(price)` |
+| **Every** delivery — `dispatchEvent` calls it unconditionally, before any type or key filtering | `handleRecurringSubEvent` re-reads the authoritative set live from RC and diffs it against the stored `last_known_entitlements` key snapshot; opens/clears the cloud grace window on the transition |
 | `CANCELLATION` (mirrored lifetime key) | `handleLifetimeRevocation` with lowercased `cancel_reason` |
 | `EXPIRATION` (mirrored lifetime key) | `handleLifetimeRevocation` fallback, reason `rc_expiration` |
-| `NON_RENEWING_PURCHASE` — alias `NON_SUBSCRIPTION_PURCHASE` — (`product_id`, no mirrored key) | `handleNonSubscriptionPurchase` → `creditBundle` + `revenue_micros` |
+| `NON_RENEWING_PURCHASE` — alias `NON_SUBSCRIPTION_PURCHASE` — (`product_id`, no mirrored key) | `handleNonSubscriptionPurchase` → `creditBundle` + `revenueColumnFor(event.environment)` |
 | `CANCELLATION` (`product_id`, no mirrored key) | `handleBundleRefund` → `refundBundle` clawback |
 | `SUBSCRIBER_ALIAS` / `TRANSFER` / `BILLING_ISSUE` / `SUBSCRIPTION_PAUSED` | `l_entitlement_events` audit only |
 
@@ -68,7 +68,7 @@ Only `WEBHOOK_MIRRORED_LOOKUP_KEYS` (lifetimes plus `developer`) reach the lifet
 
 ## Recurring-sub grace and revenue
 
-Recurring subs are **not** mirrored into `lifetime_entitlements` — Gate 2 reads them live from RC — but the webhook is not log-only for them. `handleRecurringSubEvent` maintains the cloud grace window on `canonical_users`, keyed off a `last_known_entitlements` snapshot (an array of raw RC **keys**) and its `last_known_entitlements_at` timestamp. It is **not** a switch over event types: the webhook is now a **trigger** and RC is the **source**. On any recurring-sub event the handler re-reads the authoritative set via `getActiveEntitlementKeys(authUserId, { bypassCache: true })` and diffs it against the stored snapshot:
+Recurring subs are **not** mirrored into `lifetime_entitlements` — Gate 2 reads them live from RC — but the webhook is not log-only for them. `handleRecurringSubEvent` maintains the cloud grace window on `canonical_users`, keyed off a `last_known_entitlements` snapshot (an array of raw RC **keys**) and its `last_known_entitlements_at` timestamp. It is **not** a switch over event types: the webhook is now a **trigger** and RC is the **source**. `dispatchEvent` calls it unconditionally on **every** delivery, ahead of any type or key filtering — so an alias/transfer, a bundle purchase, and a `developer` revoke each spend a live RC call and rewrite the snapshot too, not just recurring-sub events. The handler re-reads the authoritative set via `getActiveEntitlementKeys(authUserId, { bypassCache: true })`, writes `last_known_entitlements` + `last_known_entitlements_at`, and diffs against the stored snapshot:
 
 | Transition | Action |
 | --- | --- |
@@ -82,13 +82,13 @@ Every route out of cloud collapses into the open-window case: expiry, a deferred
 
 **Developer and lifetime grants get no grace window.** `RECURRING_CLOUD_KEYS` (`{pro_cloud, pro_cloud_ai}`) is the allowlist behind `pickHighestRecurringCloudTier`, so a `developer` or `lifetime_*` key never registers as "had cloud" and its removal is never a cloud transition — a revoked internal grant is a hard cutoff with no 30-day grace, and `pro` (non-cloud) gets none for the same reason. This is exactly why `last_known_entitlements` stores **keys, not a resolved tier**: `developer` and `pro_cloud_ai` resolve to the same tier but must behave differently, and a tier snapshot would read a dev revoke as `pro_cloud_ai` → free and wrongly start deleting a colleague's data. The paired CHECK constraints back this up — `canonical_users_cloud_grace_tier_values` pins the column to `pro_cloud` / `pro_cloud_ai`, and `canonical_users_cloud_grace_paired` requires both columns NULL or both non-NULL.
 
-`handleRecurringSubRevenue` writes real revenue on a **fresh** `INITIAL_PURCHASE` / `RENEWAL` carrying a `RECURRING_SUB_KEYS` (`{pro, pro_cloud, pro_cloud_ai}`) member: `usdToMicros(event.price)` → `incrementFinancialColumn(user, 'revenue_micros', …)`. Pro is included even though it has no cloud cost, producing a correct 100%-margin row. `event.price` is documented by RC as **always USD** (developer net-of-store-fees) regardless of the customer's purchase currency; `event.currency` pairs with a separate field and is logging-only. Freshness comes from `logEntitlementEvents`, which upserts one `l_entitlement_events` row per entitlement (sentinel `(none)` for alias/transfer events) with `onConflict: 'event_id,entitlement_id'` and `ignoreDuplicates` — `isFreshEvent` is `true` only when rows actually inserted, so an RC retry never double-counts revenue. A failed log write is swallowed and returns `isFreshEvent = false`, erring toward missing revenue over double-counting.
+`handleRecurringSubRevenue(event, keys, isFreshEvent)` writes revenue on a **fresh** `INITIAL_PURCHASE` / `RENEWAL` carrying a `RECURRING_SUB_KEYS` (`{pro, pro_cloud, pro_cloud_ai}`) member and a positive `event.price`: `const revenueMicros = usdToMicros(event.price)`, `const column = revenueColumnFor(event.environment)`, then `incrementFinancialColumn(event.app_user_id, column, revenueMicros)` — `revenue_micros` for a production purchase, `sandbox_revenue_micros` otherwise (see below). Pro is included even though it has no cloud cost, producing a correct 100%-margin row. `event.price` is documented by RC as **always USD** (developer net-of-store-fees) regardless of the customer's purchase currency; `event.currency` pairs with a separate field and is logging-only. Freshness comes from `logEntitlementEvents`, which upserts one `l_entitlement_events` row per entitlement (sentinel `(none)` for alias/transfer events) with `onConflict: 'event_id,entitlement_id'` and `ignoreDuplicates` — `isFreshEvent` is `true` only when rows actually inserted, so an RC retry never double-counts revenue. A failed log write is swallowed and returns `isFreshEvent = false`, erring toward missing revenue over double-counting.
 
 ## Bundle purchases and refunds
 
 `handleNonSubscriptionPurchase` handles one-time IAP bundles. It reads `bundle_config` by **`normalizeBundleSku(event.product_id)`**, not the raw product id: `_shared/billing/bundle-sku.ts` splits at the first `:` and keeps the prefix, because stores qualify a product id with a sub-identifier when one exists — Google appends the base plan for subscriptions and the purchase option for the newer one-time product model, as `product_id:sub_id`, and RC forwards whatever the store gave it. Normalizing is a no-op on an already-bare id, so it is applied unconditionally; the store-qualified form would otherwise miss the row and credit a charged buyer nothing. `supabase/tests/_shared/billing/bundle-sku_test.ts` pins the behavior (bare passthrough, `sku:option` reduction, only-first-segment, and degenerate input returning `""` rather than throwing inside a webhook RC would retry forever).
 
-A `cfgError` throws (500 → RC retries); an unknown SKU or an `active = false` row logs and returns without crediting. Then it computes tier-aware grants, calls `creditBundle()` keyed on `event.id` as the `purchase_token` — idempotent via the `l_credit_log` unique index — and on `outcome === 'credited'` with a positive `event.price` records `revenue_micros`. If RC ever omits `event.id`, the token falls back to the deterministic `rc_${authUserId}_${productId}_${event.purchased_at_ms ?? "0"}`, built from the **normalized** product id.
+A `cfgError` throws (500 → RC retries); an unknown SKU or an `active = false` row logs and returns without crediting. Then it computes tier-aware grants, calls `creditBundle()` keyed on `event.id` as the `purchase_token` — idempotent via the `l_credit_log` unique index — and on `outcome === 'credited'` with a positive `event.price` records the environment-routed revenue column (`revenue_micros` for a production purchase, `sandbox_revenue_micros` otherwise). The credit itself is granted either way: a sandbox buyer still gets their minutes, only the revenue accounting is diverted. If RC ever omits `event.id`, the token falls back to the deterministic `rc_${authUserId}_${productId}_${event.purchased_at_ms ?? "0"}`, built from the **normalized** product id.
 
 ### Resolving the buyer's tier
 
@@ -111,9 +111,28 @@ In every case the transcription grant is still credited, so the buyer keeps the 
 
 `handleBundleRefund` runs when a `CANCELLATION` carries a `product_id` but no mirrored entitlement key: it hands `event.id` to `refundBundle({purchaseToken, source: 'rc_refund'})`, which is idempotent via a `refund_of_token` unique index and always 2xx's on `no_grant_found` / `already_refunded`. Both bundle helpers live in `_shared/db/user-credits.ts` — see [Credits & bundles](/rollingrecord/backend/billing/credits-and-bundles). The webhook only **reads** `bundle_config` (a `.select(...).eq("sku", productId).maybeSingle()` on the normalized SKU) — its write side is `l_credit_log` and `user_credits`. `bundle_config` itself is migration-seeded admin config that no Edge Function mutates; [get-bundle-catalog](/rollingrecord/backend/edge-functions/get-bundle-catalog) is the other reader and mirrors the per-tier zeroing rule exactly.
 
+## Sandbox vs production revenue
+
+Both money-writing handlers route through one decider, `revenueColumnFor(environment)` in `revenuecat-webhook/revenue-routing.ts`. The module is nothing but that function and its `RevenueColumn` string-union type (`"revenue_micros" | "sandbox_revenue_micros"`) — pure, no I/O, no DB, no RC call — kept separate precisely so the routing that keeps real income honest is pinned by a unit test rather than only exercised end-to-end. The body is a single comparison: `environment?.toUpperCase() === "PRODUCTION" ? "revenue_micros" : "sandbox_revenue_micros"`, upper-cased to match how the webhook already treats `store` in `attributeSource`.
+
+| `event.environment` | Column written | Why |
+| --- | --- | --- |
+| `"PRODUCTION"` (any case) | `revenue_micros` | genuine production purchase |
+| `"SANDBOX"` (any case) | `sandbox_revenue_micros` | test-store transaction |
+| missing / `null` / `undefined` / `""` | `sandbox_revenue_micros` | ambiguous — not provably real |
+| any unexpected value (`"PROD"`, `"staging"`, `"PRODUCTION "` with stray whitespace) | `sandbox_revenue_micros` | not an exact match |
+
+Every row after the first is the same rule: only an exact, case-insensitive `"PRODUCTION"` counts as real. The bias is deliberate — the failure we must never have is a test purchase inflating production income, so ambiguity errs toward sandbox (at worst under-reporting a real sale, which is visible and correctable, unlike fake income in the real figure).
+
+Routing is decided per-**event**, not per-user and not per-row: `revenueColumnFor` runs at each of the two call sites, so one monthly `f_user_financials` row can accumulate both real and sandbox income into its two separate columns. It is also orthogonal to the existing dedup gates — `isFreshEvent` (from the `(event_id, entitlement_id)` unique index — deliberately **non-partial** since `20260703000000_fix_entitlement_events_partial_index.sql`, because PostgREST's `onConflict` cannot match a partial index and the old `WHERE event_id IS NOT NULL` predicate threw 42P10 on every delivery) and `outcome === 'credited'` (from `l_credit_log UNIQUE(purchase_token)`) still decide **whether** to write; `revenueColumnFor` only decides **where**.
+
+`supabase/tests/revenuecat-webhook/revenue-routing_test.ts` pins all four cases above — `"PRODUCTION"`, case-insensitivity, `SANDBOX`, and the missing/unexpected bucket (`null`, `undefined`, `""`, `"PROD"`, `"PRODUCTION "`, `"staging"`). Run it with `deno task test` from `supabase/tests/`.
+
 ## The `RevenueCatEvent` shape
 
 The webhook reads a small envelope. Key fields on `RevenueCatEvent`: `type`, `app_user_id` (the Supabase Auth / Clerk UUID set via `Purchases.logIn(authUserId)`), `entitlement_id` / `entitlement_ids`, `product_id`, `store` (`PROMOTIONAL` / `PLAY_STORE` / `APP_STORE`), `cancel_reason`, `price` (always USD, developer net-of-fees), `currency` (logging only), `id` (transaction / dedup key), `purchased_at_ms`, `expiration_at_ms`, and `environment`.
+
+`environment` (`environment?: string`) is load-bearing: it is the sole input to `revenueColumnFor` and therefore decides which revenue column a purchase lands in. RC sets it to exactly `"PRODUCTION"` or `"SANDBOX"`, reflecting the **store** transaction type — RC itself has no environments. The same value is persisted on every `l_entitlement_events` row by `logEntitlementEvents` (`environment: event.environment ?? null`), which is what a future one-time reclassification of pre-split history would read.
 
 ## Related pages
 
@@ -121,6 +140,6 @@ The webhook reads a small envelope. Key fields on `RevenueCatEvent`: `type`, `ap
 - [Credits & bundles](/rollingrecord/backend/billing/credits-and-bundles) — `creditBundle` / `refundBundle` internals.
 - [get-bundle-catalog](/rollingrecord/backend/edge-functions/get-bundle-catalog) — serves the same `bundle_config` rows with the same tier rule.
 - [Inbound webhooks](/rollingrecord/backend/edge-functions/webhooks) — dispatch order and the two `NON_RENEWING_PURCHASE` shapes.
-- [Per-user financials](/rollingrecord/backend/billing/financials) — where `revenue_micros` lands.
+- [Per-user financials](/rollingrecord/backend/billing/financials) — where `revenue_micros` and `sandbox_revenue_micros` land, their `>= 0` CHECKs, and the widened `increment_financial_counter` allowlist.
 - [Webhook secret gate](/rollingrecord/backend/gates/webhook-secret) and [Entitlement & grace gate](/rollingrecord/backend/gates/entitlement-and-grace).
 - [delete-user](/rollingrecord/backend/accounts/delete-user) — calls `deleteRcCustomer`.

@@ -1,26 +1,40 @@
 ---
 title: "Per-User Financials"
-description: "f_user_financials — the per-(user, month) financial-state table in micro-USD: revenue in, AI and transcription cost, a trigger-maintained storage estimate, and cost recorded even for developer accounts."
+description: "f_user_financials — the per-(user, month) financial-state table in micro-USD: production and sandbox revenue in, AI and transcription cost, a trigger-maintained storage estimate, and cost recorded even for developer accounts."
 ---
 
 `f_user_financials` is the per-user, per-month financial ledger — revenue in, AI and transcription cost out, and a storage-cost snapshot. It is the first table to use the `f_*` prefix (sensitive, mutable financial **state** — not append-only history like `l_*` / `h_*`). It is created in `migrations/20260527100000_create_f_user_financials.sql`.
 
 ## Table shape
 
-The table is keyed per-`(user, month)`: PK `(auth_user_id, period)` where `period` is `YYYY-MM` UTC, mirroring the `usage` table so cost and consumption join cleanly per-period. A new month's first write implicitly creates the row (no rollover cron), quiet months get no row, and past rows stay queryable as a cost history. It has an FK + `ON DELETE CASCADE` to `canonical_users`, so it is GDPR-covered by the cascade — it is also belt-and-suspenders listed in `TABLES_TO_WIPE` (`_shared/users/wipe.ts`). All money is integer micro-USD (BIGINT, `>= 0` CHECKs); divide by 1e6 for dollars.
+The table is keyed per-`(user, month)`: PK `(auth_user_id, period)` where `period` is `YYYY-MM` UTC, mirroring the `usage` table so cost and consumption join cleanly per-period. A new month's first write implicitly creates the row (no rollover cron), quiet months get no row, and past rows stay queryable as a cost history. It has an FK + `ON DELETE CASCADE` to `canonical_users`, so it is GDPR-covered by the cascade — it is also belt-and-suspenders listed in `TABLES_TO_WIPE` (`_shared/users/wipe.ts`). All money is integer micro-USD (BIGINT, `>= 0` CHECKs — `f_user_financials_revenue_nonneg`, `_ai_cost_nonneg`, `_storage_cost_nonneg`, `_sandbox_revenue_nonneg`); divide by 1e6 for dollars.
 
 | Column | Type | Role | Written by |
 | --- | --- | --- | --- |
 | `auth_user_id` | TEXT | PK part 1 / cascade hook | — |
 | `period` | TEXT (`YYYY-MM` UTC) | PK part 2 | implicit on first write in month |
 | `updated_at` | TIMESTAMPTZ | lifecycle | every write |
-| `revenue_micros` | BIGINT `>= 0` | real paid inflow (accumulator) | `revenuecat-webhook` (bundles + recurring renewals) |
+| `revenue_micros` | BIGINT `>= 0` | real production paid inflow (accumulator) | `revenuecat-webhook` (bundles + recurring renewals) |
 | `ai_cost_micros` | BIGINT `>= 0` | LLM + transcription cost (accumulator) | `_shared/ai/client.ts` + `assemblyai-webhook`, via `increment_financial_counter` |
 | `storage_cost_estimate_micros` | BIGINT `>= 0` | monthly storage-cost SNAPSHOT (not accumulated) | `user_storage_usage` triggers + re-stamped by `increment_financial_counter` |
+| `sandbox_revenue_micros` | BIGINT `>= 0` | SANDBOX / test-store paid inflow (accumulator) | `revenuecat-webhook` via `increment_financial_counter` |
 
-## revenue_micros
+`sandbox_revenue_micros` is physically the **last** column: `ALTER TABLE … ADD COLUMN` appends, and it was deliberately left there rather than moved beside `revenue_micros`. It would read better next to its sibling, but a reorder-only table rebuild is banned by the User-Data Table Column Ordering rule, so the trailing position is accepted rather than paying a full round-trip for cosmetics.
 
-`revenue_micros` captures **real** paid inflows only. It is written by two `revenuecat-webhook` handlers — `handleRecurringSubRevenue` (fresh `INITIAL_PURCHASE` / `RENEWAL`) and `handleNonSubscriptionPurchase` (bundle purchases with `outcome === 'credited'`) — both calling `incrementFinancialColumn(user, 'revenue_micros', usdToMicros(event.price))`, each gated so RC retries never double-count. Free, promotional, and dev grants never write here, so revenue stays an honest figure for margin analysis. (The migration's column comment predates the shipped code and lists recurring renewals as "future"; recurring revenue is written today.)
+## The two revenue columns
+
+Revenue is split in two so a test purchase can never inflate real income. Both are ordinary accumulators with identical mechanics — same RPC, same `>= 0` CHECK, same per-`(user, period)` row — they differ only in which events land where.
+
+| Column | What lands there | Include in real income? |
+| --- | --- | --- |
+| `revenue_micros` | events whose RC `environment` is exactly `"PRODUCTION"` (case-insensitive) | yes |
+| `sandbox_revenue_micros` | `SANDBOX`, missing, empty, or any unexpected `environment` value | no — exclude from every real-income / margin figure |
+
+`revenue_micros` captures **real production** paid inflows only. It is written by two `revenuecat-webhook` handlers — `handleRecurringSubRevenue` (fresh `INITIAL_PURCHASE` / `RENEWAL`) and `handleNonSubscriptionPurchase` (bundle purchases with `outcome === 'credited'`). Neither passes a literal column name any more: each computes `const column = revenueColumnFor(event.environment)` (`revenuecat-webhook/revenue-routing.ts`) and calls `incrementFinancialColumn(user, column, usdToMicros(event.price))`, so a non-production event never touches `revenue_micros` at all. Each call site is gated so RC retries never double-count, and free, promotional, and dev grants never write to either column. The full routing rule lives on [RevenueCat integration](/rollingrecord/backend/billing/revenuecat).
+
+**Why a separate column and not a row flag.** `revenue_micros` is a per-`(user, period)` accumulator read directly by income and margin analysis. A boolean `is_sandbox` on the row cannot work — one monthly row can accrue both real and test purchases. Splitting the accumulator keeps `revenue_micros` an honest PRODUCTION-only figure while test income accrues separately and is trivially excluded from real totals.
+
+**No backfill.** Migration `20260908130000_f_user_financials_sandbox_revenue.sql` is purely additive: any sandbox income already accrued into `revenue_micros` before it ran stays in `revenue_micros`, so historical rows can still overstate real revenue. Only rows written from that migration forward are cleanly split. A separate one-time reclassification can be written later using the `environment` already recorded per-event in `l_entitlement_events`.
 
 ## ai_cost_micros
 
@@ -56,17 +70,21 @@ Two mechanisms keep the snapshot fresh:
 | --- | --- |
 | `ai_cost_micros` | yes |
 | `revenue_micros` | yes |
+| `sandbox_revenue_micros` | yes |
 | `storage_cost_estimate_micros` | no — trigger-maintained from bytes, auto-stamped as a side effect |
 
-The doc comment on `incrementFinancialColumn` still says the allowlist is "currently just `ai_cost_micros`"; that comment is stale relative to the RPC body, which allows both `ai_cost_micros` and `revenue_micros`.
+Adding an accumulator column means widening that guard in the same migration — the RPC's own comment says so, and `sandbox_revenue_micros` is the worked example: `20260908130000_f_user_financials_sandbox_revenue.sql` `CREATE OR REPLACE`s the function, and the only **behavioral** change is the widened `IN (...)` allowlist — the storage-cost stamping side effect, the dynamic-column `format(%I)` UPSERT, and the `SET search_path` hardening are all unchanged. (The migration's own risk statement calls the new body "byte-identical to its original definition"; strictly it isn't — two comment blocks were reworded alongside the allowlist — but no executable SQL other than the allowlist differs.) (`CREATE OR REPLACE` preserves existing privileges, so no re-grant is needed.) Because the re-stamp survived unchanged, a sandbox purchase also refreshes that period's storage snapshot exactly like a real one.
+
+The doc comment on `incrementFinancialColumn` still says the allowlist is "currently just `ai_cost_micros`"; that comment is stale relative to the RPC body, which allows `ai_cost_micros`, `revenue_micros`, and `sandbox_revenue_micros`.
 
 ## Cost is recorded for developer accounts
 
-Cost and revenue are recorded for developer accounts too. Dev bypass is a **quota** exception, not a cost-visibility exception: `ai_cost_micros`, `revenue_micros`, and the `usage` token analytics (`input_tokens` / `output_tokens`) are all written for devs. Only the ENFORCED quota counters (`ai_queries`, `transcription_ms`, `extraction_ms`, …) and the usage cap **check** are dev-skipped in the gate chain — a dev's real spend and token throughput are useful, harmless data. This matches the Developer Bypass Scope rule; see [Dev bypass scope](/rollingrecord/backend/gates/dev-bypass-scope).
+Cost and revenue are recorded for developer accounts too. Dev bypass is a **quota** exception, not a cost-visibility exception: `ai_cost_micros`, `revenue_micros`, `sandbox_revenue_micros` (where a dev or test purchase routes), and the `usage` token analytics (`input_tokens` / `output_tokens`) are all written for devs. Only the ENFORCED quota counters (`ai_queries`, `transcription_ms`, `extraction_ms`, …) and the usage cap **check** are dev-skipped in the gate chain — a dev's real spend and token throughput are useful, harmless data. This matches the Developer Bypass Scope rule; see [Dev bypass scope](/rollingrecord/backend/gates/dev-bypass-scope).
 
 ## Related pages
 
-- [RevenueCat integration](/rollingrecord/backend/billing/revenuecat) — the sole source of `revenue_micros`.
+- [RevenueCat integration](/rollingrecord/backend/billing/revenuecat) — the sole source of both revenue columns, and the `revenueColumnFor` production-vs-sandbox rule.
+- [Inbound webhooks](/rollingrecord/backend/edge-functions/webhooks) — the two `revenuecat-webhook` call sites and the per-webhook column map.
 - [Credits & bundles](/rollingrecord/backend/billing/credits-and-bundles) — the credit ledger sibling.
 - [Entitlement taxonomy](/rollingrecord/backend/billing/entitlements) — tiers and the developer entitlement.
 - [Transcription metering & cost](/rollingrecord/backend/transcription/metering-and-cost) and [AI providers & models](/rollingrecord/backend/ai-engine/providers-and-models).

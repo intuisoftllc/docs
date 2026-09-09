@@ -1,15 +1,16 @@
 ---
 title: "Support-Ops Operations"
-description: "The full registry of 30 support-ops operations — read-only diagnostics and dry-run-guarded mutating actions — with their permissions and behavior."
+description: "The full registry of 31 support-ops operations — read-only diagnostics and dry-run-guarded mutating actions — with their permissions and behavior."
 ---
 
-The `OPERATIONS` registry (`functions/support-ops/operations/registry.ts`) exposes 30 operations: 8 mutating ones that enforce the dry-run → commit flow, and 22 read-only ones that skip it. Each is an `OperationDef` with a snake_case wire `name`, an `isReadOnly` flag, a `requiredPermission`, a `validateParams` validator, and a `handler`. Callers send the wire name in the request body's `operation` field.
+The `OPERATIONS` registry (`functions/support-ops/operations/registry.ts`) exposes 31 operations: 9 mutating ones that enforce the dry-run → commit flow, and 22 read-only ones that skip it. Each is an `OperationDef` with a snake_case wire `name`, an `isReadOnly` flag, a `requiredPermission`, a `validateParams` validator, and a `handler`. Callers send the wire name in the request body's `operation` field.
 
 ## Full registry
 
 | Operation (wire name) | Kind | Required permission | Purpose |
 | --- | --- | --- | --- |
 | `set_account_password` | Mutating | `can_set_account_password` | Force-set a Clerk password (provided or 24-char generated) |
+| `change_email` | Mutating | `can_change_email` | Replace the primary sign-in email: create the new address verified, promote it, delete the old (single-email policy) |
 | `freeze_user_account` | Mutating | `can_freeze_account` | Toggle `frozen_at` / `frozen_reason` (freeze + unfreeze) |
 | `grant_manual_credit` | Mutating | `can_grant_credits` | Adjust the manual `user_credits` row for one resource (ceiling-checked) |
 | `restore_tombstones` | Mutating | `can_restore_tombstones` | Restore one sync group's tombstones within the grace window |
@@ -45,6 +46,7 @@ The `OPERATIONS` registry (`functions/support-ops/operations/registry.ts`) expos
 Each mutating op runs a dry-run preview (no writes) before a `preview_id`-gated commit. See [dry-run & audit](/rollingrecord/backend/support-ops/dry-run-and-audit).
 
 - **`set_account_password`** (`operations/set-account-password.ts`) — force-sets a Clerk password via `updateClerkUserPassword`. Uses a provided password (min 12 chars) or a 24-char server-generated one returned ONLY in the commit response (never in the dry-run preview, and scrubbed from the audit row). Super-admin target-protected. A weak or breached password surfaces as the typed `password_rejected` carrying `clerk_code` + `detail`.
+- **`change_email`** (`operations/change-email.ts`) — replaces the account's primary sign-in email for a customer who can no longer reach the address on file (lost mailbox, typo at sign-up, changed provider). Admin-initiated only; there is no user-facing path to it. The commit creates the new address admin-verified, promotes it to primary, and deletes every previously-existing address, so the account ends with exactly ONE email — the manual support procedure done programmatically. Super-admin target-protected, on the same footing as freeze / delete / set password: moving a super-admin's primary email moves their login and recovery identity to an address the caller controls. A new address equal to the current primary is refused as `email_unchanged` before anything is mutated — the no-op guard runs *after* the `getClerkUser` lookup and `assertMayTargetAdmin`, which are both reads; a provider refusal surfaces as `email_change_rejected` carrying `clerk_code` + `detail`. See [Primary-email replacement](#primary-email-replacement).
 - **`freeze_user_account`** (`operations/freeze-user-account.ts`) — toggles `canonical_users.frozen_at` + `frozen_reason` via a `frozen` boolean. `reason` is required on freeze, optional on unfreeze. Self-freeze is refused unconditionally (it would lock the admin out of support-ops), and only a super-admin may freeze another super-admin.
 - **`grant_manual_credit`** (`operations/grant-manual-credit.ts`) — adjusts ONLY the `manual` row of `user_credits` for one resource (wire field `credit_type` ∈ `transcription_ms` / `ai_queries` / `extraction_ms`). Positive amounts grant, negative revoke (clamp-to-zero). Per-grant caps apply (360M ms / 10k queries) plus an account credit ceiling (`credit_ceiling_exceeded`). Bundle credits are never touched — those are authored exclusively by the RevenueCat webhook.
 - **`restore_tombstones`** (`operations/restore-tombstones.ts`) — restores all tombstoned (`deleted_at IS NOT NULL`) rows in one sync group within `cloud_tombstone_grace_days`. For the recordings group it storage-quota-checks under a row lock (`quota_insufficient`) before mutating. The UPDATEs run inside the SQL function `support_ops_restore_tombstones` for transactional atomicity; the whole group is restored (the server is encryption-blind and cannot pick a single recording).
@@ -52,6 +54,30 @@ Each mutating op runs a dry-run preview (no writes) before a `preview_id`-gated 
 - **`reset_extraction`** (`operations/reset-extraction.ts`) — deletes the user's one stuck `extraction_jobs` row; the extract-runner and the client each self-heal to their "job is gone" terminal paths.
 - **`reset_transcription`** (`operations/reset-transcription.ts`) — cancels a stuck transcription by moving the active job row to the terminal `cancelled` state (`cancelled`, not `failed` — an operator's intentional stop is an outcome, not an error; it does NOT delete the row — a deleted row makes the client spin) and nulls `assemblyai_transcript_id` so a late webhook can't commit the metered reservation. Frees the single-flight-per-user slot with no charge.
 - **`delete_user_account`** (`operations/delete-user-account.ts`) — irreversible full erasure via the shared `wipeUser()` (all `c_*` rows, storage buckets, usage, credits, `canonical_users`, the RevenueCat customer, and the Clerk user). Requires a server-side `confirm_email` match (case/whitespace-insensitive, the real address never echoed). Blocks self-delete (`user_delete_self`), unknown user (`user_delete_not_found`), an active subscription (`user_delete_active_subscription`), and super-admin targets. This is NOT a tombstone — `restore_tombstones` cannot undo it. See [delete-user](/rollingrecord/backend/accounts/delete-user).
+
+## Primary-email replacement
+
+`change_email` is the one mutating op whose irreversible step happens at the identity provider. `updateClerkUserPrimaryEmail` (`functions/_shared/users/clerk-admin.ts`) drives three Clerk Backend API calls in a fixed order, because an address cannot be deleted while it is primary and a primary must be verified — so the new one is created verified, promoted, and only then are the old ones removed.
+
+| Step | Call | On failure |
+| --- | --- | --- |
+| 1. Create | `POST /email_addresses` with `{ user_id, email_address, verified: true, primary: false }` — admin-set verification, so no verification email reaches the user | NOTHING on the account changed. This is the usual failure (the address already belongs to another account) and surfaces as `email_change_rejected` |
+| 2. Promote | `PATCH /users/{id}` with `{ primary_email_address_id }` | A rollback `DELETE` of the stray new address is attempted, then `email_change_rejected`. The rollback is BEST-EFFORT — its boolean result is discarded — so it leaves the account exactly as it was only when the delete succeeds; if it also fails, the account keeps an extra admin-verified, non-primary address that nothing sweeps |
+| 3. Delete old | `DELETE /email_addresses/{id}` for every prior address id except the newly-created one, counting successes into `deletedCount` | Does NOT fail the op — the primary switch already landed, so the response returns ok with `old_email_deleted: false` and a note to sweep the leftover address by hand |
+
+Step 3 is the irreversible one: once the old address is deleted it is gone, and the new one is the account's login and recovery identity. Nothing in support-ops can rewind it, which is why the op is `isReadOnly: false` and runs the full dry-run → commit path. The private `deleteClerkEmailAddress` helper backs both the step-2 rollback and the step-3 sweep: it treats a 404 as success (idempotent) and returns false on any other non-2xx. Step 3 counts that boolean into `deletedCount`, but the step-2 rollback DISCARDS it — which is what makes that rollback best-effort and unreported. `parseClerkError` turns Clerk's `{ errors: [{ code, message, long_message }] }` envelope into the `clerkCode` + `detail` pair on `EmailChangeResult`; a non-JSON body leaves both null rather than surfacing raw HTML.
+
+The dry-run preview returns `target_auth_user_id`, `current_email`, `new_email`, and a `summary` reading `Would change primary email from <current> to <new> and delete the old address (single-email policy).` — or, when `getPrimaryEmail` finds no address on the account at all, `Would set primary email to <new> (account currently has no primary on record).` The dispatcher then enriches the preview with `target_email`. Because `validateDryRunPreview` hashes canonical JSON of the params, the address that commits is byte-identical to the one previewed.
+
+| Situation | Code | HTTP | What the operator gets |
+| --- | --- | --- | --- |
+| New address equals the current primary (case-insensitive, trimmed) | `email_unchanged` | 409 | `{ email }` — the current primary. Refused in BOTH dry-run and commit, before anything is mutated. The guard sits after the `getClerkUser` read and the super-admin check, so an unreachable Clerk or a wrong target id fails first (`handler_threw`) rather than returning this |
+| Provider refused the new address (most often already in use) | `email_change_rejected` | 400 | `{ clerk_code, detail }`. The primary email is unchanged either way; a step-1 refusal touches nothing, while a step-2 refusal whose best-effort rollback also fails leaves a stray admin-verified non-primary address behind |
+| Caller is not a super-admin and the target is | `super_admin_protected` | 403 | `{ operation, target_auth_user_id }` |
+| Target does not exist in Clerk | `handler_threw` | 500 | The audit row records the message `target Clerk user not found: <id>` |
+| Committed, but an old address survived | — | 200 | `old_email_deleted: false` plus `deleted_count`, and a note to delete the leftover address manually |
+
+Params are validated by the exported pure `validate`: `target_auth_user_id` must match `AUTH_USER_ID_REGEX` (`/^[A-Za-z0-9_-]{1,128}$/` — a Clerk user id like `user_xxxxx`, not a UUID), and `new_email` must be a string that, once trimmed, is non-empty, at most `MAX_EMAIL_LEN` (254) characters, and matches `EMAIL_REGEX` (`/^[^\s@]+@[^\s@]+\.[^\s@]+$/`). That regex is a structural pre-check only — Clerk does the authoritative validation; this just avoids a provider round-trip on an obviously-malformed address. `normalizeEmail` (trim + lowercase) and `emailsEqual` (null is never equal) are the comparison the no-op guard rests on, and all three are pinned by `supabase/tests/support-ops/operations/change-email_test.ts`.
 
 ## Identity lookup
 

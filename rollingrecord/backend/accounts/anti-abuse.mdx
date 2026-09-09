@@ -1,6 +1,6 @@
 ---
 title: "Anti-Abuse & Re-signup Carryover"
-description: "How abuse-signal events are logged and weighted, how usage counters survive deletion and carry forward on same-email re-signup, and the account-freeze soft-block."
+description: "How abuse-signal events are logged and weighted, how every deletion is recorded and its usage counters carry forward on same-email re-signup, and the account-freeze soft-block."
 ---
 
 Three cooperating anti-abuse primitives sit behind the account surface: an append-only behavioral-signal log, a deletion-to-resignup usage carryover that stops delete-then-re-register from resetting monthly caps, and the account-freeze gate that turns a flagged account away before it can spend quota.
@@ -44,28 +44,45 @@ The table has **no FK** to `canonical_users` and `auth_user_id` is nullable (pre
 
 ### Admin reads
 
-Two helpers back support-ops operations, both gated by `can_read_user_audit`:
+Two helpers back support-ops operations, each behind its own permission:
 
-- `getUserAbuseSignals()` — recent events for one user, newest first (limit default 50, cap 500, optional `since`).
-- `getAbuseTopOffenders()` — ranks callers by `SUM(weight)` DESC over a window (default 24h). The aggregation runs in **application code** (an in-memory group-by over a 20k-row scan cap), not a SQL RPC or view, to keep the surface additive. It returns `totalWeight`, `eventCount`, `distinctTypes`, and `lastSeenAt`.
+- `getUserAbuseSignals()` — recent events for one user, newest first (limit default 50, cap 500, optional `since`). Backs `get_user_audit` and `get_user_timeline`, both gated by `can_read_user_audit`.
+- `getAbuseTopOffenders()` — ranks callers by `SUM(weight)` DESC over a window (default 24h). Its operation `get_abuse_top_offenders` is gated by the separate `can_triage_abuse` column (`migrations/20260812010000_add_can_triage_abuse_permission.sql`), **not** `can_read_user_audit`: a cross-customer offenders view exposes many users at once, so it is a higher, Trust-&-Safety-shaped bar than a single-customer audit read, and defaults to `false` for everyone (super admins bypass it in code). The aggregation runs in **application code** (an in-memory group-by over a 20k-row scan cap), not a SQL RPC or view, to keep the surface additive. It returns `totalWeight`, `eventCount`, `distinctTypes`, and `lastSeenAt`.
 
 <Note>
 Caller-supplied strings written to Postgres `TEXT` columns pass through the pure sanitizer `sanitizeDbText()` / `sanitizeDbTextOrNull()` (`functions/_shared/text/db-text.ts`) at the write boundary — it strips U+0000 and the rest of the C0 controls (keeping `\t` / `\n`), removes bidi overrides, and normalizes CRLF to LF, so an unstorable NUL can't fail an insert and a bidi trick can't make a stored value read one way in the console and another in the row. On the admin-audit surface it guards `l_admin_audit.ticket_ref` (sanitized, then sliced to 64 chars in support-ops). See [support-ops operations](/rollingrecord/backend/support-ops/operations-catalog) for that field.
 </Note>
 
-## Re-signup carryover
+## Deletion record & re-signup carryover
 
-`l_deleted_identity` snapshots a deleted user's current-period usage counters so a returning user can't wipe their monthly caps by deleting and re-registering. It is keyed by `(email_hash, period)` — a salted `HMAC(email)` plus the `YYYY-MM` period, **not** `auth_user_id`, because a re-signup gets a net-new `auth_user_id`. `functions/_shared/users/deleted-identity-history.ts` owns both sides of the protocol.
+`l_deleted_identity` does two jobs with one row. It stops a returning user from wiping their monthly caps by deleting and re-registering, and — because a row is written for **every** deletion, not only an active account's — it doubles as a deletion metric ("this email deleted, in this period"). It is keyed by `(email_hash, period)` — a salted `HMAC(email)` plus the `YYYY-MM` period, **not** `auth_user_id`, because a re-signup gets a net-new `auth_user_id`. `functions/_shared/users/deleted-identity-history.ts` owns both sides of the protocol.
 
 | Step | Caller | Effect |
 | --- | --- | --- |
-| delete | `delete-user` (`wipeUser` step) | `snapshotUsageForDeletion()` reads the current-period `usage` row and inserts counters into `l_deleted_identity` before `usage` is hard-deleted |
+| delete, with a current-period `usage` row | `delete-user` (`wipeUser` step) | `snapshotUsageForDeletion()` reads the row and inserts its counters into `l_deleted_identity` before `usage` is hard-deleted |
+| delete, with no `usage` row | `delete-user` (`wipeUser` step) | Still inserts — `emptyCounters()`, every counter at zero. Tier, usage and history are irrelevant to whether the deletion is recorded |
 | re-signup | `resolve-identity` | `carryForwardOnResignup()` MAX-merges the counters into the new user's `usage` row, then deletes the history row |
 | no match | `resolve-identity` | `no_history` — the normal fresh-signup path |
 
-Both writes take the MAX of any existing and incoming values (`upsertWithMax()` on a snapshot PK conflict, `Math.max` per column on carryover) so anti-abuse always keeps the worst-case cap usage. `carryForwardOnResignup()` returns `no_history`, `carried_forward`, or `failed`; the snapshot is best-effort and never blocks deletion.
+Both writes take the MAX of any existing and incoming values (`upsertWithMax()` on a snapshot PK conflict, `Math.max` per column on carryover) so anti-abuse always keeps the worst-case cap usage. `carryForwardOnResignup()` returns `no_history`, `carried_forward`, or `failed`; the snapshot is best-effort and never blocks deletion, and its boolean return means **the write succeeded** — `false` is a failure, not "there was nothing to snapshot".
 
-`USAGE_COUNTER_COLUMNS` is the authoritative runtime list of columns that participate: `transcription_ms`, `ai_queries`, `syntheses`, `deep_reasoning_syntheses`, `keywords_count`, `context_summary_count`, `thread_naming_count`, `template_moderation_count`, `save_user_template_count`, `list_user_templates_count`, and `delete_user_template_count`. Any new usage counter must be added both here and to the `l_deleted_identity` schema, or it silently drops out of the snapshot/carryover.
+Logging zero-activity deletions leaves anti-abuse behaviour untouched, and the code says why: an all-zero row carries nothing forward (`carryForwardOnResignup` computes `Math.max(0, existing)`, which is `existing`) and is then consumed like any other. The one visible consequence is at the other end of the protocol — a same-period re-signup for an account that used to produce `no_history` now returns `carried_forward` with zero counters.
+
+<Warning>
+One deletion class is still not recorded. Because the row is PK-keyed on the email hash, `wipeUser()` skips the write when it cannot resolve one — no `canonical_users.email_hash`, no supplied JWT email, and no Clerk lookup — logging `"wipeUser: no email hash resolvable for user; skipping anti-abuse snapshot"` and leaving `snapshotWritten` false. An idempotent `status: "not_found"` call writes nothing either. See [the deletion cascade](/rollingrecord/backend/architecture/deletion-cascade) for where the step sits in the wipe ladder.
+</Warning>
+
+| Column | Type | Notes |
+| --- | --- | --- |
+| `email_hash` | `text NOT NULL` | Salted `HMAC(email)`; first half of the PK |
+| `period` | `text NOT NULL` | `currentPeriod()` — the `YYYY-MM` UTC period; second half of the PK |
+| `deleted_at` | `timestamptz NOT NULL DEFAULT now()` | Indexed (`idx_deleted_identity_history_deleted_at`). `upsertWithMax()` restamps it, so a re-delete records the **latest** deletion for that `(email_hash, period)` rather than the first |
+| `transcription_ms` | `bigint NOT NULL DEFAULT 0` | The only `bigint` counter; the rest are `integer` |
+| the other ten counters | `integer NOT NULL DEFAULT 0` | `ai_queries`, `syntheses`, `deep_reasoning_syntheses`, and the rest of `USAGE_COUNTER_COLUMNS` |
+
+`USAGE_COUNTER_COLUMNS` is the authoritative runtime list of columns that participate: `transcription_ms`, `ai_queries`, `syntheses`, `deep_reasoning_syntheses`, `keywords_count`, `context_summary_count`, `thread_naming_count`, `template_moderation_count`, `save_user_template_count`, `list_user_templates_count`, and `delete_user_template_count`. Any new usage counter must be added both here and to the `l_deleted_identity` schema, or it silently drops out of the snapshot, the carryover, **and** the recorded deletion row.
+
+Both halves are pinned by `DeleteUserSnapshotSmokeTest` (`smoketest/.../smoke/tests/DeleteUserSnapshotSmokeTest.kt`, RR-446): `withUsage_snapshotsToLDeletedIdentity()` seeds `transcription_ms = 60_000` and asserts one row carrying it, and `withoutUsage_stillSnapshotsZeroRow()` deletes any `usage` row first and asserts exactly one row with `transcription_ms == 0`. The harness plants a known `email_hash` on the seeded `canonical_users` row so it can filter without the pepper secret.
 
 ## Account-freeze gate
 
@@ -85,5 +102,5 @@ The `account_frozen_attempt` abuse event was **retired**. `runAccountFrozenGate`
 
 - [Account-Freeze Gate](/rollingrecord/backend/gates/account-frozen) — the freeze soft-block in the gate chain.
 - [delete-user](/rollingrecord/backend/accounts/delete-user) and [resolve-identity](/rollingrecord/backend/edge-functions/resolve-identity) — the two sides of the carryover protocol.
-- [Operations catalog](/rollingrecord/backend/support-ops/operations-catalog) and [permissions](/rollingrecord/backend/support-ops/permissions) — the admin reads gated by `can_read_user_audit`.
+- [Operations catalog](/rollingrecord/backend/support-ops/operations-catalog) and [permissions](/rollingrecord/backend/support-ops/permissions) — the per-user abuse reads gated by `can_read_user_audit`, and the cross-customer top-offenders view gated by `can_triage_abuse`.
 - [Usage table](/rollingrecord/backend/database/usage-table) and [table-naming conventions](/rollingrecord/backend/database/table-naming-conventions).

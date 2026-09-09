@@ -11,7 +11,7 @@ Neither source can answer for the other, so a card needs both. `V2BundlesViewMod
 
 | Source | Owns | Read via |
 | --- | --- | --- |
-| RevenueCat offering `bundle` | Purchasability, the localized price (`product.price.formatted`, `amountMicros`), and the store title | `RevenueCatManager.getOffering(BUNDLES_OFFERING_ID)` |
+| RevenueCat offering `bundle` | Purchasability, the localized price (`product.price.formatted`, `amountMicros`), and the bare store product name (`product.name`) | `RevenueCatManager.getOffering(BUNDLES_OFFERING_ID)` |
 | Server `get-bundle-catalog` | What a SKU grants **this** account, already tier-adjusted (`minutes_granted`, `queries_granted`, `extraction_minutes_granted`) | `BundleCatalogRepository.cached()`, then `.refresh()` |
 
 `BUNDLES_OFFERING_ID` is `"bundle"` — singular, matching what the RevenueCat dashboards call it. It must match the offering identifier in **both** the dev and production RC projects; a name matching neither returns no offering, which reaches the screen as an empty catalog with nothing to explain it. It is deliberately **not** the current/default offering — that one is the subscription paywall, and putting bundles in it would list them there as purchasable plans.
@@ -109,11 +109,13 @@ Sorting is `.sortedBy { (_, grant) -> grant.minutesGranted }` — smallest first
 `toOption(pkg, grant)` produces a `BundleOption`:
 
 - `hours = grant.minutesGranted / 60.0`; `title = formatBundleTitle(hours)` ("1 hour" / "N hours", via `roundToInt`).
-- `storeName = storeName(pkg, fallback = title)` — the store's own product title, with a trailing parenthetical dropped via `raw.substringBeforeLast('(')` because Google appends the app name ("1hr Bundle (RollingRecord)"). Falls back to the raw title, then to the derived label.
+- `storeName = storeName(pkg, fallback = title)` — RevenueCat's **bare** product name, `pkg.product.name.trim()`, falling back to the derived label only if the store returns an empty string. Nothing is parsed.
 - `price = pkg.product.price.formatted` — RevenueCat's localized string, never reformatted.
 - `perHourRate = String.format("%.2f", price.amountMicros / 1_000_000.0 / hours)`, or `""` when `hours <= 0`.
 - `transcriptionGrant = formatGrantLabel(hours)` ("1 hr" / "N hrs").
 - `kbQueries = grant.queriesGranted.takeIf { it > 0 }` — zero becomes null, which renders as no KB section at all rather than "+0".
+
+`storeName()` reads `StoreProduct.name`, **not** `StoreProduct.title`. Per RevenueCat, `title` is "the subscription name AND the app name" — "1hr Bundle (RollingRecord)" — and Google further nests "(unreviewed)" onto it for a product that has not cleared review, so a pre-review product would read "1hr Bundle (RollingRecord) (unreviewed)" and a trailing-parenthetical strip would still leave the app name on the confirm sheet. `name` is the bare product name, exposed for exactly this purpose: there is no string to parse and the value stays clean whether or not the product is reviewed. `storeProductId()` above remains the one place a RevenueCat string is picked apart.
 
 ### The usage meters
 

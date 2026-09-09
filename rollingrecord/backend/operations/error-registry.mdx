@@ -27,6 +27,17 @@ Representative codes per category:
 Object and category are not identical. `batch_too_large`, `size_mismatch`, and `recovery_code_invalid_operation` are physically defined inside `USER_ERRORS` but carry category `"developer"`. Both the Kotlin mirror and the doc generator bucket by the `category` field, so these three appear under Developer errors — don't assume the enclosing object equals the category.
 </Note>
 
+Counted from the registry, the split lands differently depending on which of the two you count by:
+
+| Bucket | By enclosing object | By `category` field |
+|---|---|---|
+| user | `USER_ERRORS` 59 | 56 |
+| infra | `INFRA_ERRORS` 11 | 11 |
+| developer | `DEV_ERRORS` 88 | 91 |
+| **Total** | **158** | **158** |
+
+The three-code gap between the columns is exactly the mismatch above.
+
 ## Combined surface and lookup
 
 Three helpers close the registry:
@@ -47,7 +58,14 @@ The client mirrors the registry as `enum class AiEngineErrorCode(val code: Strin
 The Kotlin mirror's real path is `app/agentcore/src/main/kotlin/com/intuisoftllc/rollingrecord/data/remote/aiengine/AiEngineErrorCode.kt` — inside the pure-JVM `agentcore` module. The `errors.ts` header comment cites a wildcard `app/.../data/remote/aiengine/AiEngineErrorCode.kt` path; only the `CLAUDE.md` rule cites the outdated `app/app/.../AiEngineErrorCode.kt` module path. Use the `agentcore` path.
 </Warning>
 
-`AiEngineErrorCodeDriftTest` parses the TypeScript registry at test runtime and asserts exact **bidirectional** parity between the enum and `errors.ts`. Adding a code on only one side fails the build — the fix is to add it on both, never to `@Ignore` the test. This commit added four codes on **both** sides in the same change, preserving that parity: `admin_grant_budget_exceeded` (`USER_ERRORS` / `Category.USER`, HTTP 403 — the operator's own per-rolling-30-day grant ceiling, distinct from `credit_ceiling_exceeded` which bounds what a customer may hold) and the bug-report trio `bug_report_empty_description` (400), `bug_report_description_too_long` (400), and `bug_report_insert_failed` (500), all in `DEV_ERRORS` / `Category.DEVELOPER`.
+`AiEngineErrorCodeDriftTest` parses the TypeScript registry at test runtime and asserts exact **bidirectional** parity between the enum and `errors.ts` — all 158 codes, with nothing on only one side. Adding a code on only one side fails the build; the fix is to add it on both, never to `@Ignore` the test. This commit added two codes on **both** sides in the same change, for the support-ops `change_email` operation:
+
+| Code | HTTP | Category | Raised when |
+|---|---|---|---|
+| `email_unchanged` | 409 | `user` | The new email equals the account's current primary address, compared case-insensitively after trimming. The no-op is refused before any provider mutation — in dry-run and commit alike — so the operator is told plainly rather than handed a confusing "email already in use" rejection about the user's own address. The response carries `email`. |
+| `email_change_rejected` | 400 | `user` | The identity provider refused the new address: usually it already belongs to another account, or it failed a format/domain rule. Refused at the **first** step (creating the new address), so nothing on the target account changed. The response carries `clerk_code` and `detail`. |
+
+Both sit in `USER_ERRORS` with category `user` on the TypeScript side and `Category.USER` in the Kotlin enum, so a client that ever saw one would render a friendly message — but neither is client-reachable. They are thrown by `changeEmailOperation` (`functions/support-ops/operations/change-email.ts`), a mutating operator-only operation gated by `can_change_email`, and the app never triggers it. The mirror carries them regardless, because the drift test holds the enum honest across the whole registry rather than the subset the app can hit; no `AiEngineErrorMapper` variant is needed for codes that don't come from `ai-engine`.
 
 ## Registry → mirror → docs pipeline
 
@@ -66,7 +84,7 @@ python supabase/scripts/gen_error_docs.py
 ```
 
 <Warning>
-`docs/error-codes.md` is a **point-in-time snapshot regenerated on demand, not in CI** — so it can drift between regenerations. This commit regenerated it, closing most of the gap: the whole `bundle_*` purchase family (`bundle_already_credited`, `bundle_already_refunded`, `bundle_no_grant_found`, `bundle_rc_transaction_*`, `bundle_sku_unknown`) is gone from the snapshot as it already was from `errors.ts` and the Kotlin mirror, and previously-lagging codes (`password_rejected`, `super_admin_protected`, the `user_delete_*` family) that already existed in `errors.ts` were finally folded in. But the snapshot is **not** fully in sync: it reads **154** total (User-facing 52 / Infrastructure 11 / Developer 91), while `errors.ts` actually defines **156** (User-facing **54** / Infrastructure 11 / Developer 91). The two missing codes are the user-category `amount_not_integer` and `storage_cap_would_be_exceeded` — both are silently dropped by `gen_error_docs.py`, whose `ENTRY_RE` description group (`"[^"]*(?:"\s*\+\s*"[^"]*)*"`) cannot parse a description containing an escaped double-quote (`\"…\"`), which both of those definitions have. So the snapshot still trails the registry by 2 user codes until that regex is fixed. Treat `errors.ts` as authoritative and regenerate the markdown after any code change, since nothing enforces it between runs.
+`docs/error-codes.md` is a **point-in-time snapshot regenerated on demand, not in CI** — so it can drift between regenerations. This commit regenerated it: both email codes are present as rows and the summary moved from 154 to **156** (User-facing 54 / Infrastructure 11 / Developer 91). It is still **not** fully in sync, because `errors.ts` defines **158** (User-facing **56** / Infrastructure 11 / Developer 91). The two missing codes are the same pair as before — the user-category `amount_not_integer` and `storage_cap_would_be_exceeded` — silently dropped by `gen_error_docs.py`, whose `ENTRY_RE` description group (`"[^"]*(?:"\s*\+\s*"[^"]*)*"`) cannot parse a description containing an escaped double-quote (`\"…\"`), which both of those definitions have. The drift runs one way only: nothing appears in the snapshot that is absent from `errors.ts`. Treat `errors.ts` as authoritative and regenerate the markdown after any code change, since nothing enforces it between runs.
 </Warning>
 
 ## The single exception to "no inline literals"
@@ -75,6 +93,8 @@ python supabase/scripts/gen_error_docs.py
 
 ## Where to go next
 
+- [Support-ops operations catalog](/rollingrecord/backend/support-ops/operations-catalog) — `change_email`, the operation that raises `email_unchanged` and `email_change_rejected`.
+- [Support-ops permissions](/rollingrecord/backend/support-ops/permissions) — `can_change_email`, added by `migrations/20260908120000_admin_can_change_email.sql`.
 - [Function Deployment (config.toml)](/rollingrecord/backend/operations/config-toml) — the functions that emit these codes.
 - [Environment Variables & Secrets](/rollingrecord/backend/operations/env-and-secrets) — the secrets whose absence raises the `*_key_missing` codes.
 - [Testing Strategy](/rollingrecord/backend/operations/testing) — where `errors_test.ts` fits in the two-layer test model.

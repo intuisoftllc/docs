@@ -1,17 +1,72 @@
 ---
 title: "Permissions & Audit Log"
-description: "The per-operation admin permission model and the l_admin_audit trail."
+description: "The per-operation admin permission model, the can_change_email grant, and the l_admin_audit trail every mutating operation writes."
 ---
 
 Every admin gets a per-operation permission set, and every action is recorded to an append-only audit log — the two mechanisms that keep support-ops accountable.
 
 ## What this covers
 
-- **Permission model:** `supabase/functions/_shared/admin/permissions.ts` — per-op boolean columns on the `admin_permissions` table, typed by the `AdminPermissionKey` enum (`can_delete_user`, `can_validate_codes`, `can_set_account_password`, `can_view_user_data`, `can_freeze_account`, `can_grant_credits`, `can_restore_tombstones`, `can_reset_extraction`, …).
+- **Permission model:** `supabase/functions/_shared/admin/permissions.ts` — per-op boolean columns on the `admin_permissions` table, typed by the `AdminPermissionKey` string-literal union (not a TS enum). It holds exactly 15 gating keys; `can_change_email` is the newest.
 - **Evaluation:** the dispatcher fetches the row once per request via `getAdminPermissions()`, then each op checks `hasAdminPermission(row, key)`; `is_super_admin = true` bypasses every per-op check. Denials go to `l_user_abuse_event`, not the audit log.
-- **Self-introspection:** the `whoami` op is the only one with `requiredPermission: null` — it returns the caller's own grants so a UI client can hide operations it can't run.
-- **Audit trail:** every mutating/dry-run/commit writes to `l_admin_audit` (operation_type, execution_state, admin identity/IP/UA, target, redacted params/result, `preview_id`, optional `ticket_ref`); read ops store `result_json = null`. Queryable via `--op admin-audit` / `--op user-audit`.
+- **Self-introspection:** the `whoami` op returns the caller's own grants (and `get_my_grant_budget` their remaining grant allowance) so a UI client can hide operations it can't run.
+- **Audit trail:** every mutating dry-run and commit, plus every failure raised from INSIDE the handler, writes to `l_admin_audit` (`operation_type`, `execution_state`, admin identity/IP/UA, target, redacted params/result, `preview_id`, optional `ticket_ref`); read-only ops store `result_json = null`. Rejections the dispatcher returns *before* it invokes the handler are not audited at all — the insert runs after the handler call. Readable via `--op admin-audit` / `--op user-audit`.
 
-<Note>
-Scaffold generated from the codebase map — expand with full detail, examples, and specifics.
-</Note>
+## The 15 permission keys
+
+`whoami`'s `PERMISSION_KEYS` (`operations/whoami.ts`) lists them in the order a UI should present them, and reports the EFFECTIVE value — a super admin reads back all-true even with every column false.
+
+| Key | Operations gated |
+| --- | --- |
+| `can_lookup_user` | `lookup_user_by_email`, `search_users` |
+| `can_view_user_data` | `get_user_overview`, `get_user_credits`, `get_tombstone_report`, `get_bug_reports`, `set_bug_status` |
+| `can_read_user_state` | `get_user_state`, `get_clerk_metadata`, `user_rate_limits` |
+| `can_read_audit` | `get_admin_audit`, `get_storage_drift` |
+| `can_read_user_audit` | `get_user_audit`, `get_user_timeline`, `get_user_transcribe_history`, `get_user_credit_ledger`, `link_audit_ticket` |
+| `can_triage_abuse` | `get_abuse_top_offenders` |
+| `can_validate_codes` | `verify_support_token`, `validate_recovery_code` |
+| `can_set_account_password` | `set_account_password`, `clear_app_lock_pin` |
+| `can_freeze_account` | `freeze_user_account` |
+| `can_grant_credits` | `grant_manual_credit` |
+| `can_modify_accounts` | (reserved — gates no live op) |
+| `can_reset_extraction` | `reset_extraction`, `reset_transcription` |
+| `can_change_email` | `change_email` |
+| `can_restore_tombstones` | `restore_tombstones` |
+| `can_delete_user` | `delete_user_account` |
+
+`allowed_operations` is computed live from the registry, so `change_email` appears for a holder — or any super admin — with no client-side mapping to maintain. Run `whoami` and read `permissions.can_change_email` before attempting the op rather than discovering the gate by failing.
+
+## The `can_change_email` grant
+
+Migration `20260908120000_admin_can_change_email.sql` adds `can_change_email BOOLEAN NOT NULL DEFAULT FALSE` to `admin_permissions`. Two consequences on deploy: no existing operator gains authority, and every super admin can already run `change_email` because `is_super_admin` bypasses every per-op column. It is its own column rather than a reuse of the reserved `can_modify_accounts` on least-privilege grounds — an agent can be handed the email change without the broader account-modification surface. Grants are seeded manually on `admin_permissions` (service-role only, RLS enabled, PK `auth_user_id`, excluded from `delete-user`'s wipe path as an administrative fixture).
+
+## Super-admin target protection
+
+Holding the permission decides whether the CALLER may run an op; a second, orthogonal check decides whether the TARGET may be acted on. `assertMayTargetAdmin` (`_shared/admin/super-admin-guard.ts`) refuses when the target is a super-admin and the caller is not, throwing `super_admin_protected` (403) with `{ operation, target_auth_user_id }`. `change_email` calls it alongside `freeze_user_account`, `delete_user_account`, and `set_account_password` — changing a super-admin's primary email would move their login and recovery identity to an address the caller controls.
+
+## What lands in the audit row
+
+Because `change_email` is mutating, all three of its outcomes are recorded — including failures thrown from inside the handler, which is how a refused attempt stays traceable. That guarantee stops at the handler boundary: a request rejected earlier in the dispatcher (malformed params, unknown op, a missing or stale preview) returns its 4xx without an audit row, so those attempts leave no trace here.
+
+| Phase | `execution_state` | `result_json` |
+| --- | --- | --- |
+| Preview | `dry_run` | The preview summary — the from → to and the target id |
+| Commit | `committed` | `{ previous_email, new_email, old_email_deleted, deleted_count, note }` |
+| Refusal | `failed` | Null; `message` carries the failure text |
+
+`params_json` is redacted by KEY NAME only (`redactAuditJson`, whose `SENSITIVE_KEY` regex covers password / passwd / secret / any `*token`, plus a bare `code` — the same rule as RRSupport's own `AuditEventTransformer.isSecret`). `new_email` matches none of those, so it is stored verbatim — intentional, since the address IS the change being recorded. The audit trail is also the only place the OLD address survives once the provider deletes it.
+
+| Kind of rejection | Where it is recorded |
+| --- | --- |
+| Missing permission (`admin_permission_denied`, 403) | `l_user_abuse_event` via `logAbuseEvent(AdminPermissionDenied)` — pre-admission noise, never `l_admin_audit` |
+| Super-admin target (`super_admin_protected`, 403) | `l_admin_audit` with `execution_state = 'failed'`, plus the 403 |
+| `email_unchanged` / `email_change_rejected` | `l_admin_audit` with `execution_state = 'failed'` |
+| Malformed params (`validation_failed` / `missing_input`, 400) or unknown op (`invalid_operation`, 400) | NOWHERE — `op.validateParams` and the registry lookup return before the handler runs, so no audit row exists |
+| Commit with no `preview_id` (`dry_run_required`, 409), or a stale / mismatched one (`preview_expired` 410, `preview_mismatch` 409) | NOWHERE — the dry-run gate returns ahead of the handler, so a stale-preview commit attempt is not traceable in `l_admin_audit` (the original dry-run row still is) |
+
+## Where to go next
+
+- [Operation catalog](/rrsupport/operations) — the `change_email` operator flow and its error codes.
+- [Admin permissions & super-admin](/rollingrecord/backend/support-ops/permissions) — the full column model, the `is_super_admin` bypass, and the per-operator grant ceilings.
+- [Dry-run & audit](/rollingrecord/backend/support-ops/dry-run-and-audit) — the `l_admin_audit` schema and preview mechanics.
+- [Support tokens](/rrsupport/support-tokens) — identity verification before a destructive account change.
