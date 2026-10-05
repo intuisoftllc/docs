@@ -67,7 +67,26 @@ Every failure class maps to an exact user-facing message inside `run()`. The thr
 | `Upstream` | AI service is temporarily unavailable. Please try again in a moment. |
 | `Network` | Rethrown so `runCatching` wraps it as an error outcome. |
 
-`CancellationException` always propagates out of `run()`; every other throwable is caught by the outer `runCatching`, logged via `AgentLog` with `save = true` (a loop crash is the one place a tool round can die outright — persisting it makes the crash visible in an uploaded log rather than looking identical to the model simply declining to call a tool), counted as a `loop_crash` analytics event, and returned as `AgentTurnOutcome.Error`. `sanitizeResponseText(text, tools)` scrubs the final answer before it is returned: it strips leaked function-call XML (`<function_calls>`, `<invoke>`, `<parameter>`) and internal identifiers (`contextId=…`, `recordingId=…`, `insightIndex=…`, `[internal-only:…]`), and — as a Level-1 backstop for the server prompt's "never name an internal tool" rule — replaces any internal tool NAME with the literal `a lookup`. That tool-name pass builds a word-anchored, case-sensitive, longest-first alternation regex from THIS turn's tool list (`tools.map { it.name }`), so a new tool is covered automatically and camelCase names like `addNote` never collide with ordinary prose; it is a no-op when `tools` is empty.
+`CancellationException` always propagates out of `run()`; every other throwable is caught by the outer `runCatching`, logged via `AgentLog` with `save = true` (a loop crash is the one place a tool round can die outright — persisting it makes the crash visible in an uploaded log rather than looking identical to the model simply declining to call a tool), counted as a `loop_crash` analytics event, and returned as `AgentTurnOutcome.Error`. `sanitizeResponseText(text, tools)` scrubs the final answer before it is returned: it strips leaked function-call XML (`<function_calls>`, `<invoke>`, `<parameter>`) and internal identifiers (`contextId=…`, `recordingId=…`, `insightIndex=…`, `[internal-only:…]`), and — as a Level-1 backstop for the server prompt's "never name an internal tool" rule — replaces any internal tool NAME with the literal `a lookup`. That tool-name pass builds a word-anchored, case-sensitive, longest-first alternation regex from THIS turn's tool list (`tools.map { it.name }`), so a new tool is covered automatically and camelCase names like `addNote` never collide with ordinary prose; it is a no-op when `tools` is empty. The final scrub step is `stripInternalScratchMarkers(...)` — the internal-history-note backstop described in [Internal scratch markers](#internal-scratch-markers) below.
+
+## Internal scratch markers
+
+KB chat prepends an internal "scratchpad" to each stored assistant answer for the model's own conditioning on later turns — a tool-call recap, a "no tools ran" marker, or reply-context retrieval notes. None of it is meant for the user, but the rolling history re-feeds a prior answer back to the model, so the model can echo a marker verbatim into a fresh reply (it did, mid-explanation, in a real session). `stripInternalScratchMarkers(text)` — a top-level `internal fun` in `AgentMessageAssembly.kt` (`app/agentcore/.../agentcore/AgentMessageAssembly.kt`) — removes them, collapses any blank-line gap the removal opens (three or more newlines become two), and trims.
+
+| Marker | Shape stripped |
+| --- | --- |
+| Tool-call recap | `RetrievalSummaryBuilder.HEADER` (the literal `[Tool call recap]`) plus its `- tool(sig) → …` bullet lines and any trailing `- … and N more` truncation line. |
+| No tools ran | `[No tools ran in this turn — …]`. |
+| Retrieval notes | `[Retrieval notes: …]`. |
+
+Markers are matched by regex rather than shared constants because two of the three are authored app-side in `SearchThreadRepository` and are not visible to `:agentcore` as constants; the recap header is the one shared constant it references directly. Only these specific shapes match, so ordinary bracketed prose — a citation `[1]`, an aside `[see appendix]` — is left untouched.
+
+The strip runs in two places, belt-and-braces:
+
+- **Input side** — `AgentMessageAssembly.buildInitialMessages(...)` strips the markers from the prior answer before it is labelled `Results/answer shown to user:` in the turn's "Most recent exchange" slot, removing the inducement to echo them. The unstripped prefix is still fed as a normal history message, so the model's conditioning is preserved.
+- **Output side** — `AgentLoop.sanitizeResponseText(...)` runs it as the final step on every final answer, so an echoed marker can never reach the user even if the input-side strip is bypassed.
+
+`InternalMarkersTest` (`app/agentcore/src/test/.../InternalMarkersTest.kt`) pins every shape — each of the three markers stripped, a recap-plus-marker combination removed together, a clean answer left untouched, and ordinary brackets preserved.
 
 ## The seams
 

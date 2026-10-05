@@ -1,40 +1,72 @@
 ---
 title: "Per-User Financials"
-description: "f_user_financials — the per-(user, month) financial-state table in micro-USD: production and sandbox revenue in, AI and transcription cost, a trigger-maintained storage estimate, and cost recorded even for developer accounts."
+description: "f_user_financials — the per-(user, month) financial-state table in micro-USD: estimated NET revenue plus the customer's gross price, AI and transcription cost, a trigger-maintained storage estimate, refunds that can take a month negative, and cost recorded even for developer accounts."
 ---
 
-`f_user_financials` is the per-user, per-month financial ledger — revenue in, AI and transcription cost out, and a storage-cost snapshot. It is the first table to use the `f_*` prefix (sensitive, mutable financial **state** — not append-only history like `l_*` / `h_*`). It is created in `migrations/20260527100000_create_f_user_financials.sql`.
+`f_user_financials` is the per-user, per-month financial ledger — revenue in, AI and transcription cost out, and a storage-cost snapshot. It is the first table to use the `f_*` prefix (sensitive, mutable financial **state** — not append-only history like `l_*` / `h_*`). It is created in `migrations/20260527100000_create_f_user_financials.sql`. As of migration `20261004120000_net_revenue.sql`, `revenue_micros` holds estimated **NET** income (what reaches the bank after store tax, store commission, and the RevenueCat fee), and a new pair of `gross_revenue_micros` columns keeps the full price the customer paid.
 
 ## Table shape
 
-The table is keyed per-`(user, month)`: PK `(auth_user_id, period)` where `period` is `YYYY-MM` UTC, mirroring the `usage` table so cost and consumption join cleanly per-period. A new month's first write implicitly creates the row (no rollover cron), quiet months get no row, and past rows stay queryable as a cost history. It has an FK + `ON DELETE CASCADE` to `canonical_users`, so it is GDPR-covered by the cascade — it is also belt-and-suspenders listed in `TABLES_TO_WIPE` (`_shared/users/wipe.ts`). All money is integer micro-USD (BIGINT, `>= 0` CHECKs — `f_user_financials_revenue_nonneg`, `_ai_cost_nonneg`, `_storage_cost_nonneg`, `_sandbox_revenue_nonneg`); divide by 1e6 for dollars.
+The table is keyed per-`(user, month)`: PK `(auth_user_id, period)` where `period` is `YYYY-MM` UTC, mirroring the `usage` table so cost and consumption join cleanly per-period. A new month's first write implicitly creates the row (no rollover cron), quiet months get no row, and past rows stay queryable as a cost history. It has an FK + `ON DELETE CASCADE` to `canonical_users`, so it is GDPR-covered by the cascade — it is also belt-and-suspenders listed in `TABLES_TO_WIPE` (`_shared/users/wipe.ts`). All money is integer micro-USD (BIGINT); divide by 1e6 for dollars. The two cost columns keep their `>= 0` CHECKs (`f_user_financials_ai_cost_nonneg`, `_storage_cost_nonneg`), but the revenue columns no longer do: `20261004120000_net_revenue.sql` **DROPPED** `f_user_financials_revenue_nonneg` and `_sandbox_revenue_nonneg` so a refund can take a month's net (and gross) below zero. The two new gross columns were added as `BIGINT NOT NULL DEFAULT 0` with no CHECK, for the same reason.
 
 | Column | Type | Role | Written by |
 | --- | --- | --- | --- |
 | `auth_user_id` | TEXT | PK part 1 / cascade hook | — |
 | `period` | TEXT (`YYYY-MM` UTC) | PK part 2 | implicit on first write in month |
 | `updated_at` | TIMESTAMPTZ | lifecycle | every write |
-| `revenue_micros` | BIGINT `>= 0` | real production paid inflow (accumulator) | `revenuecat-webhook` (bundles + recurring renewals) |
+| `revenue_micros` | BIGINT (may be negative) | estimated NET production revenue (accumulator) | `revenuecat-webhook` (recurring renewals, bundles, founders lifetimes, refunds) |
 | `ai_cost_micros` | BIGINT `>= 0` | LLM + transcription cost (accumulator) | `_shared/ai/client.ts` + `assemblyai-webhook`, via `increment_financial_counter` |
 | `storage_cost_estimate_micros` | BIGINT `>= 0` | monthly storage-cost SNAPSHOT (not accumulated) | `user_storage_usage` triggers + re-stamped by `increment_financial_counter` |
-| `sandbox_revenue_micros` | BIGINT `>= 0` | SANDBOX / test-store paid inflow (accumulator) | `revenuecat-webhook` via `increment_financial_counter` |
+| `sandbox_revenue_micros` | BIGINT (may be negative) | estimated NET SANDBOX / test-store revenue (accumulator) | `revenuecat-webhook` via `increment_financial_counter` |
+| `gross_revenue_micros` | BIGINT (may be negative) | GROSS production price the customer paid (accumulator) | `revenuecat-webhook` via `increment_financial_counter` |
+| `sandbox_gross_revenue_micros` | BIGINT (may be negative) | GROSS SANDBOX / test-store price (accumulator) | `revenuecat-webhook` via `increment_financial_counter` |
 
-`sandbox_revenue_micros` is physically the **last** column: `ALTER TABLE … ADD COLUMN` appends, and it was deliberately left there rather than moved beside `revenue_micros`. It would read better next to its sibling, but a reorder-only table rebuild is banned by the User-Data Table Column Ordering rule, so the trailing position is accepted rather than paying a full round-trip for cosmetics.
+The last three columns are physically at the **end** of the table in the order they were appended — `sandbox_revenue_micros` (`20260908130000`), then `gross_revenue_micros` and `sandbox_gross_revenue_micros` (`20261004120000`). `ALTER TABLE … ADD COLUMN` appends, and each was deliberately left trailing rather than moved beside its sibling. They would read better grouped by net/gross, but a reorder-only table rebuild is banned by the User-Data Table Column Ordering rule, so the trailing positions are accepted rather than paying a full round-trip for cosmetics.
 
-## The two revenue columns
+## The revenue columns — net and gross
 
-Revenue is split in two so a test purchase can never inflate real income. Both are ordinary accumulators with identical mechanics — same RPC, same `>= 0` CHECK, same per-`(user, period)` row — they differ only in which events land where.
+Revenue is tracked in two dimensions at once. Along one axis, **net vs gross**: `revenue_micros` / `sandbox_revenue_micros` hold estimated NET (what actually lands), and `gross_revenue_micros` / `sandbox_gross_revenue_micros` hold the GROSS price the customer paid. Along the other axis, **production vs sandbox**: a test purchase can never inflate real income. All four are ordinary accumulators with identical mechanics — same RPC, same per-`(user, period)` row — differing only in which events land where and whether they hold net or gross.
 
-| Column | What lands there | Include in real income? |
+| Column | Holds | Include in real income? |
 | --- | --- | --- |
-| `revenue_micros` | events whose RC `environment` is exactly `"PRODUCTION"` (case-insensitive) | yes |
-| `sandbox_revenue_micros` | `SANDBOX`, missing, empty, or any unexpected `environment` value | no — exclude from every real-income / margin figure |
+| `revenue_micros` | NET, events whose RC `environment` is exactly `"PRODUCTION"` (case-insensitive) | yes |
+| `gross_revenue_micros` | GROSS, same production events | gross, not net — margin math only |
+| `sandbox_revenue_micros` | NET, `SANDBOX`, missing, empty, or any unexpected `environment` value | no — exclude from every real-income figure |
+| `sandbox_gross_revenue_micros` | GROSS, same sandbox events | no |
 
-`revenue_micros` captures **real production** paid inflows only. It is written by two `revenuecat-webhook` handlers — `handleRecurringSubRevenue` (fresh `INITIAL_PURCHASE` / `RENEWAL`) and `handleNonSubscriptionPurchase` (bundle purchases with `outcome === 'credited'`). Neither passes a literal column name any more: each computes `const column = revenueColumnFor(event.environment)` (`revenuecat-webhook/revenue-routing.ts`) and calls `incrementFinancialColumn(user, column, usdToMicros(event.price))`, so a non-production event never touches `revenue_micros` at all. Each call site is gated so RC retries never double-count, and free, promotional, and dev grants never write to either column. The full routing rule lives on [RevenueCat integration](/rollingrecord/backend/billing/revenuecat).
+Every money-moving event is booked by `recordRevenue` (`revenuecat-webhook/index.ts`), the single place an RC event turns into `f_user_financials` money. It computes one `estimateRevenue(event, rates)` and then writes the **net** into the net column (`revenue_micros` for production, `sandbox_revenue_micros` otherwise) and the **gross** into the gross column (`gross_revenue_micros` / `sandbox_gross_revenue_micros`) with two `incrementFinancialColumn` calls. Column selection is a pure decision: `revenueColumnFor(event.environment)` and `grossRevenueColumnFor(event.environment)` (`revenuecat-webhook/revenue-routing.ts`). Net and gross always route to the same environment side. The full production-vs-sandbox rule, and the paths that call `recordRevenue` (recurring renewals, bundle purchases, founders lifetimes, and refunds), live on [RevenueCat integration](/rollingrecord/backend/billing/revenuecat).
 
-**Why a separate column and not a row flag.** `revenue_micros` is a per-`(user, period)` accumulator read directly by income and margin analysis. A boolean `is_sandbox` on the row cannot work — one monthly row can accrue both real and test purchases. Splitting the accumulator keeps `revenue_micros` an honest PRODUCTION-only figure while test income accrues separately and is trivially excluded from real totals.
+**Why a separate column and not a row flag.** Each column is a per-`(user, period)` accumulator read directly by income and margin analysis. A boolean `is_sandbox` on the row cannot work — one monthly row can accrue both real and test purchases — and the same applies to a net/gross flag. Splitting the accumulators keeps `revenue_micros` an honest PRODUCTION-only NET figure while test income and the gross price accrue separately and are trivially excluded from or joined to real totals.
 
-**No backfill.** Migration `20260908130000_f_user_financials_sandbox_revenue.sql` is purely additive: any sandbox income already accrued into `revenue_micros` before it ran stays in `revenue_micros`, so historical rows can still overstate real revenue. Only rows written from that migration forward are cleanly split. A separate one-time reclassification can be written later using the `environment` already recorded per-event in `l_entitlement_events`.
+**No backfill, twice over.** Both widening migrations are purely additive. `20260908130000_f_user_financials_sandbox_revenue.sql` split sandbox out, and `20261004120000_net_revenue.sql` added the gross columns and flipped `revenue_micros` to net going forward. Rows written **before** the net migration keep GROSS in `revenue_micros` with `gross_revenue_micros = 0`, so historical rows still read as gross income — only rows written from `20261004120000` onward are cleanly net-plus-gross. A separate one-time reclassification can be written later using the `environment` and price fields already recorded per-event in `l_entitlement_events`.
+
+## The net-revenue estimate
+
+`estimateRevenue(event, rates)` in `_shared/billing/net-revenue.ts` is the single source of truth for the revenue math. It is pure (no I/O), so every formula path is pinned by `supabase/tests/_shared/billing/net-revenue_test.ts` (`deno task test` from `supabase/tests/`). Net is:
+
+```
+net = price − (price × tax) − (price × commission) − (price × revenueCatFee)
+```
+
+RevenueCat documents store proceeds as `price × (1 − tax_percentage − commission_percentage)`; the RevenueCat fee is subtracted on top of that. Components are rounded to whole micros and net is derived by subtraction, so `gross === tax + commission + revenueCatFee + net` holds exactly to the micro. The returned `RevenueEstimate` carries `grossMicros`, `taxMicros`, `commissionMicros`, `revenueCatFeeMicros`, `netMicros`, a `taxSource` / `commissionSource` (`"event"` or `"fallback"`), and `isRefund`.
+
+Inputs come from the RC webhook event: `price` (gross USD — 0 for trials, **negative** for refunds), `tax_percentage`, and `commission_percentage` (RC's own estimates, each a 0..1 share, nullable). The percentage rates fall back to private `server_config` rows seeded in the net migration:
+
+| `server_config` key | Default | Role |
+| --- | --- | --- |
+| `revenue_play_commission_fallback_pct` | `0.15` | store commission share used when the event has no `commission_percentage` (Google Play's 15% subscription rate) |
+| `revenue_tax_fallback_pct` | `0` | tax share used when the event has no `tax_percentage` (assume none withheld when unknown) |
+| `revenuecat_fee_pct` | `0.01` | RevenueCat's fee as a share of **gross**, applied to every purchase from day one |
+
+The RevenueCat fee is charged on gross (a share of `price`, not of what's left after the store) and is applied from the first dollar, ignoring RC's free tier — a worst-case product decision (2026-10-04) that builds in a cost buffer. `DEFAULT_REVENUE_RATES` mirrors these seeded values as the cold-start fallback; the webhook's `loadRevenueRates()` reads the live rows via `getNumber` and falls back to those defaults.
+
+Guards keep bad data from corrupting the figure: `normalizeShare` rejects a percentage that is missing, non-finite, negative, or above 1 (the fallback then applies); if an event's `tax + commission > 1` the estimate falls back on **both** rather than book negative income; a sale's net is floored at 0 (the fee can never push it below zero), and the fee is re-derived after the floor so the parts still sum to gross; and `estimateRevenue` returns `null` — booking nothing — when there is no money movement (price missing, non-finite, or exactly 0, e.g. a free trial).
+
+## Refunds take a month negative
+
+RevenueCat reports a store refund as a `CANCELLATION` with a **negative** `price` (subscriptions, bundles, and lifetimes alike). `estimateRevenue` sets `isRefund = true` and returns negative `grossMicros` / `taxMicros` / `commissionMicros` / `netMicros`, reversing the store's tax and commission (the store returns its cut). The RevenueCat fee is treated as **not** returned — worst case, the fee on the original sale stays a cost — so a refund's `revenueCatFeeMicros` is 0 and its net is `−(gross − tax − commission)`. A sale followed by a full refund therefore nets to exactly `−(RevenueCat fee)`: the original sale's fee is the residual loss.
+
+`handleRefundRevenue` (`revenuecat-webhook/index.ts`) books the refund in the month it **arrives**, into both the net and gross columns, which is why the `>= 0` CHECKs on the revenue columns were dropped. Dropping those CHECKs removes a rule, not data — a month that sees more refunds than sales legitimately shows negative revenue. See [RevenueCat integration](/rollingrecord/backend/billing/revenuecat) for the refund-handling path and its idempotency gate.
 
 ## ai_cost_micros
 
@@ -64,27 +96,29 @@ Two mechanisms keep the snapshot fresh:
 
 ## The write allowlist
 
-`increment_financial_counter(p_auth_user_id, p_column, p_amount)` derives the current period internally and does an `INSERT … ON CONFLICT DO UPDATE` that adds `p_amount` to the target column **and** re-stamps `storage_cost_estimate_micros`. It guards `p_column` against an explicit allowlist and RAISEs otherwise; `p_amount = 0` is a no-op.
+`increment_financial_counter(p_auth_user_id, p_column, p_amount)` derives the current period internally and does an `INSERT … ON CONFLICT DO UPDATE` that adds `p_amount` to the target column **and** re-stamps `storage_cost_estimate_micros`. It guards `p_column` against an explicit allowlist and RAISEs otherwise; `p_amount = 0` is a no-op. The function comment now notes that "Revenue amounts may be negative (refunds)."
 
 | Column | Increment-writable via RPC? |
 | --- | --- |
 | `ai_cost_micros` | yes |
 | `revenue_micros` | yes |
 | `sandbox_revenue_micros` | yes |
+| `gross_revenue_micros` | yes |
+| `sandbox_gross_revenue_micros` | yes |
 | `storage_cost_estimate_micros` | no — trigger-maintained from bytes, auto-stamped as a side effect |
 
-Adding an accumulator column means widening that guard in the same migration — the RPC's own comment says so, and `sandbox_revenue_micros` is the worked example: `20260908130000_f_user_financials_sandbox_revenue.sql` `CREATE OR REPLACE`s the function, and the only **behavioral** change is the widened `IN (...)` allowlist — the storage-cost stamping side effect, the dynamic-column `format(%I)` UPSERT, and the `SET search_path` hardening are all unchanged. (The migration's own risk statement calls the new body "byte-identical to its original definition"; strictly it isn't — two comment blocks were reworded alongside the allowlist — but no executable SQL other than the allowlist differs.) (`CREATE OR REPLACE` preserves existing privileges, so no re-grant is needed.) Because the re-stamp survived unchanged, a sandbox purchase also refreshes that period's storage snapshot exactly like a real one.
+Adding an accumulator column means widening that guard in the same migration — the RPC's own comment says so. The net migration is the latest worked example: `20261004120000_net_revenue.sql` `CREATE OR REPLACE`s the function, and the only **behavioral** change is the `IN (...)` allowlist growing by `gross_revenue_micros` and `sandbox_gross_revenue_micros` (the migration states the body is otherwise byte-identical to `20260908130000`, which had itself added `sandbox_revenue_micros`). The storage-cost stamping side effect, the dynamic-column `format(%I)` UPSERT, and the `SET search_path` hardening are all unchanged — so a sandbox or refund write still refreshes that period's storage snapshot exactly like a production sale. (`CREATE OR REPLACE` preserves existing privileges, so no re-grant is needed.)
 
-The doc comment on `incrementFinancialColumn` still says the allowlist is "currently just `ai_cost_micros`"; that comment is stale relative to the RPC body, which allows `ai_cost_micros`, `revenue_micros`, and `sandbox_revenue_micros`.
+The doc comment on `incrementFinancialColumn` still says the allowlist is "currently just `ai_cost_micros`"; that comment is stale relative to the RPC body, which now allows `ai_cost_micros`, `revenue_micros`, `sandbox_revenue_micros`, `gross_revenue_micros`, and `sandbox_gross_revenue_micros`.
 
 ## Cost is recorded for developer accounts
 
-Cost and revenue are recorded for developer accounts too. Dev bypass is a **quota** exception, not a cost-visibility exception: `ai_cost_micros`, `revenue_micros`, `sandbox_revenue_micros` (where a dev or test purchase routes), and the `usage` token analytics (`input_tokens` / `output_tokens`) are all written for devs. Only the ENFORCED quota counters (`ai_queries`, `transcription_ms`, `extraction_ms`, …) and the usage cap **check** are dev-skipped in the gate chain — a dev's real spend and token throughput are useful, harmless data. This matches the Developer Bypass Scope rule; see [Dev bypass scope](/rollingrecord/backend/gates/dev-bypass-scope).
+Cost and revenue are recorded for developer accounts too. Dev bypass is a **quota** exception, not a cost-visibility exception: `ai_cost_micros`, the revenue and gross columns (where a dev or test purchase routes), and the `usage` token analytics (`input_tokens` / `output_tokens`) are all written for devs. Only the ENFORCED quota counters (`ai_queries`, `transcription_ms`, `extraction_ms`, …) and the usage cap **check** are dev-skipped in the gate chain — a dev's real spend and token throughput are useful, harmless data. This matches the Developer Bypass Scope rule; see [Dev bypass scope](/rollingrecord/backend/gates/dev-bypass-scope).
 
 ## Related pages
 
-- [RevenueCat integration](/rollingrecord/backend/billing/revenuecat) — the sole source of both revenue columns, and the `revenueColumnFor` production-vs-sandbox rule.
-- [Inbound webhooks](/rollingrecord/backend/edge-functions/webhooks) — the two `revenuecat-webhook` call sites and the per-webhook column map.
+- [RevenueCat integration](/rollingrecord/backend/billing/revenuecat) — the sole source of all four revenue columns, `recordRevenue` / `estimateRevenue`, refund handling, and the production-vs-sandbox routing rule.
+- [Inbound webhooks](/rollingrecord/backend/edge-functions/webhooks) — the `revenuecat-webhook` call sites and the per-webhook column map.
 - [Credits & bundles](/rollingrecord/backend/billing/credits-and-bundles) — the credit ledger sibling.
 - [Entitlement taxonomy](/rollingrecord/backend/billing/entitlements) — tiers and the developer entitlement.
 - [Transcription metering & cost](/rollingrecord/backend/transcription/metering-and-cost) and [AI providers & models](/rollingrecord/backend/ai-engine/providers-and-models).

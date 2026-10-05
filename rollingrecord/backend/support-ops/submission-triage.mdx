@@ -1,0 +1,123 @@
+---
+title: "Submission Triage"
+description: "The two support-ops that work both the bug-report and feature-request queues — get_submissions and set_submission_status, each selecting a table by a required kind — plus the shared status vocabulary and the per-table retention and stale sweepers."
+---
+
+Two operations behind RRSupport's "Bugs & Features" tab work the feedback queues: `get_submissions` (`functions/support-ops/operations/get-submissions.ts`) reads one, and `set_submission_status` (`functions/support-ops/operations/set-submission-status.ts`) moves one submission through triage. Both replace the old bug-only `get_bug_reports` / `set_bug_status` pair and now serve **both kinds** — bug reports and feature requests — selected by a required `kind` parameter. Both are registered in `functions/support-ops/operations/registry.ts` and both declare `requiredPermission: "can_view_user_data"`: a description *is* text the user wrote, so reading or working a queue is reading user data, and the permission that gates pulling an account gates this too.
+
+## The `kind` dimension
+
+`kind` selects which table the op reads or writes. `normalizeKind` and `SUBMISSION_TABLES` (`functions/_shared/submissions/sanitize.ts`) map it:
+
+| `kind` | Table | Id column | Log columns |
+| --- | --- | --- | --- |
+| `bug` | `bug_reports` | `bug_report_id` | `log_storage_path`, `log_bytes` |
+| `feature` | `feature_requests` | `feature_request_id` | none |
+
+`kind` is **required and strict** on both ops — omitting it cannot mean "both", because the two kinds live in different tables with different columns and a merged page could not be paginated coherently. An unknown kind returns `validation_failed`. One op per kind was rejected in favor of one parameterized op: the console already parameterizes the whole screen on `auth_user_id` to serve the global and per-account queues from the same code, so `kind` is the same kind of parameter, and a forked copy would be two of every validator, mapper, and pagination rule to keep in step.
+
+The row shape is kept uniform across kinds. `selectColumns(kind)` appends `log_storage_path` / `log_bytes` only when `acceptsLogAttachment(kind)` is true — asking for them against `feature_requests` is a PostgREST error, not an empty column — but the wire row always emits those keys (`null` for a feature request), so the console reads `log_storage_path != null` with no kind check. The wire id is the neutral `submission_id`, so the console has one row model for both kinds rather than a discriminated union to unpack at every call site.
+
+## Shared status vocabulary
+
+Both tables' `status` CHECK constraints use the same six values, imported from `SUBMISSION_STATUSES` rather than redeclared — both ops used to hold local copies of the six strings, which is the exact shape of drift that silently dropped the Stale count for a year.
+
+| Status | Meaning (bug) | Meaning (feature) | Terminal |
+| --- | --- | --- | --- |
+| `new` | just filed | just filed | no |
+| `stale` | untouched past the stale window | untouched past the stale window | no |
+| `triaged` | read and categorized | read and categorized | no |
+| `in_progress` | being worked | being worked | no |
+| `resolved` | fixed | shipped | **yes** |
+| `wont_fix` | declined | declined | **yes** |
+
+The wire values are bug-flavoured on purpose: `resolved` and `wont_fix` carry different operator-facing LABELS per kind (the console renders them "Shipped" / "Declined" for a feature request), but only the label differs. One vocabulary means one status enum, one CHECK shape, one filter UI, and one set of triage operations instead of two that drift. `TERMINAL_STATUSES` is `['resolved', 'wont_fix']` — the only states that stamp `closed_at` and bring a row within reach of the retention sweeper.
+
+## `get_submissions`
+
+An `OperationDef` with `name: "get_submissions"`, `isReadOnly: true`, `requiredPermission: "can_view_user_data"`. One op serves three shapes:
+
+- **`kind` alone** → the GLOBAL queue for that kind, newest first — what the tab opens on.
+- **`kind` + `target_auth_user_id`** → just that user's rows, for the account screen.
+- **`kind` + `submission_id`** → exactly one row, with its FULL description.
+
+It computes an audit `targetAuthUserId` only when scoped to a user (`targetId ?? null`) — the global queue is not about anybody in particular.
+
+### Parameters
+
+| Param | Type | Effect |
+| --- | --- | --- |
+| `kind` | string | **Required**; `bug` or `feature`; selects the table |
+| `submission_id` | UUID | Single-row fetch; WINS over every other filter; returns the FULL description |
+| `target_auth_user_id` | string | Scope to one user's rows; absent → the global queue |
+| `statuses` | `string[]` | Multi-select status filter (`.in`); validated against `SUBMISSION_STATUSES`; an empty array is rejected |
+| `areas` | `string[]` | Multi-select area filter (`.in`); validated against `SUBMISSION_AREAS`; an empty array is rejected |
+| `before_created_at` | string | Keyset cursor — applied via `.lt` on `created_at` |
+| `limit` | number | Page size; default `DEFAULT_LIMIT` = 25, clamped to `1..MAX_LIMIT` (100) |
+
+Multi-select arrays are validated by `validateWireArray`, which rejects a non-array, an EMPTY array, or any element outside the allowed set (`validation_failed`). An empty array is *not* treated as "all" — silently widening it would show more than the caller asked for without saying so.
+
+### Keyset pagination
+
+Pagination is KEYSET, not OFFSET. An offset re-counts from the top on every page, so a row filed while an operator is scrolling shifts everything down one — they would see a row twice and miss another. The cursor is `before_created_at` (the `created_at` of the last row the caller already holds); rows are ordered `created_at DESC` with `.limit(limit)`. The response returns `next_before_created_at` = the last row's `created_at` when the page filled (`rows.length === limit`), else `null`, which is also the end-of-list signal.
+
+### Excerpts
+
+List rows ship a `description` truncated to `EXCERPT_CHARS` = 240 characters plus a boolean `description_truncated` (true only when `!submission_id` and `description.length > 240`). A single `submission_id` fetch returns the full text — the excerpt exists so a page of 25 rows is not 300 KB of text nobody reads, and the detail screen is the one caller that needs all of it. Each entry carries `submission_id`, `kind`, `auth_user_id`, `area`, `status`, `created_at`, `closed_at`, `description`, `description_truncated`, `client_metadata`, `log_storage_path`, `log_bytes`, and `admin_notes`.
+
+### `status_counts`
+
+The response includes `status_counts`, one count per `SUBMISSION_STATUSES` value (including `stale`), computed for the CURRENT scope — it respects the `target_auth_user_id` and `areas` filters but deliberately IGNORES the status filter, so selecting "New" does not zero out the other chips and lose the operator sight of the queue. Each count is a `head: true` `count: "exact"` query; a failed count is swallowed to `0` (non-fatal — the rows are the point, the chip badge is decoration). The full body is `` `{ kind, count, next_before_created_at, status_counts, total, entries }` ``, where `total` is the sum of the per-status counts.
+
+## `set_submission_status`
+
+An `OperationDef` with `name: "set_submission_status"`, `requiredPermission: "can_view_user_data"`, and `isReadOnly: true`. The read-only flag is in the DISPATCHER's sense — no dry-run, no preview — the same treatment `link_audit_ticket` gets: triage means many status flips per sitting, and a two-phase confirm on each would make the queue painful to work. The worst outcome is a wrong label, fixed by another tap, and the dispatcher audits every call to `l_admin_audit` regardless.
+
+| Param | Type | Notes |
+| --- | --- | --- |
+| `kind` | string | **Required**; `bug` or `feature`; selects the table |
+| `submission_id` | UUID | required |
+| `status` | string | required; must be in `SUBMISSION_STATUSES` |
+| `admin_notes` | string | optional; capped at `MAX_NOTES_CHARS` = 4000 |
+
+`kind` being required and strict matters here beyond routing: writing a status into the wrong table would either silently no-op (id not found there) or hit an unrelated row that happened to share a UUID.
+
+### The `closed_at` lifecycle
+
+`closed_at` is the retention clock, so it moves only on a real transition:
+
+| Transition | `closed_at` |
+| --- | --- |
+| non-terminal → terminal | stamp `now` |
+| terminal → non-terminal (reopen) | clear to `null` — otherwise the sweeper would still see an aged timestamp and delete a row that is open again |
+| terminal → terminal (`resolved` ⇄ `wont_fix`) | keep the ORIGINAL stamp — relabelling a closed row does not buy it a fresh retention window |
+
+Both tables carry their own `closed_at` and their own sweeper reading their own window (feature requests on double the bug clock), but the transition rule is identical. `stale` is accepted as a target so a caller can move a row OUT of it (and so the value round-trips), even though the console never offers it as a target — it is an observation derived from a timestamp, not a decision anyone makes.
+
+### Read-first
+
+The handler selects the existing row with `maybeSingle` before updating, for two reasons: a bad id returns `not_found` instead of a silent zero-row update that looks like success, and the audit row can record `previous_status`. When `admin_notes` is provided it is written through `sanitizeDbTextOrNull` (`functions/_shared/text/db-text.ts`). The response body is `` `{ submission_id, kind, previous_status, status, closed_at, notes_updated }` ``, and the audit row is attributed to the SUBMITTER (`targetAuthUserId = row.auth_user_id`) so the change shows up on that user's history alongside the submission it concerns.
+
+## Retention & the stale sweeper
+
+Each table has its own retention and staleness sweepers, with feature-request windows set to **double** the bug ones (a bug is reproducible now or not and goes cold fast; a feature request is a standing ask that stays valid months later).
+
+| Table | Retention sweeper | Window (`server_config`) | Stale sweeper | Window (`server_config`) |
+| --- | --- | --- | --- | --- |
+| `bug_reports` | `prune_closed_bug_reports()` @ 03:30 UTC | `bug_report_retention_days` = 90 | `mark_stale_bug_reports()` @ 03:35 UTC | `bug_report_stale_days` = 60 |
+| `feature_requests` | `prune_closed_feature_requests()` @ 03:40 UTC | `feature_request_retention_days` = 180 | `mark_stale_feature_requests()` @ 03:42 UTC | `feature_request_stale_days` = 120 |
+
+Both retention sweepers DELETE only rows with `status IN ('resolved', 'wont_fix') AND closed_at IS NOT NULL AND closed_at < now() - retention_days`; open rows (`new` / `stale` / `triaged` / `in_progress`) are never touched at any age, and a missing or non-positive config value falls back to the seed default rather than to zero, so a misconfiguration can never widen the sweep into open rows. Both stale sweepers UPDATE `status` from `new` to `stale` for rows older than the stale window, leaving `updated_at` untouched (a derived observation, not someone handling the row) — `stale` is NOT terminal, so a stale row has no `closed_at` and is never swept no matter how old. The `bug_reports` retention sweep also reclaims Storage automatically through the `trg_bug_reports_delete_log_object` trigger; `feature_requests` has no log object. The two `server_config` windows are seeded `public = FALSE` (server-only sweeper inputs). See [cron sweepers](/rollingrecord/backend/database/cron-sweepers).
+
+<Note>
+The `feature_requests` migration (`20260925120000_feature_requests.sql`) is additive and left the existing `bug_reports` table, its lifecycle migrations (`20260817160000_bug_report_triage.sql`, `20260817200000_bug_report_stale_status.sql`), and the base sweepers untouched. It added the second table, its two sweepers (03:40 / 03:42 cron slots), two `server_config` rows, and one `rate_limit_config` row.
+</Note>
+
+## Where to go next
+
+- [feedback endpoint](/rollingrecord/backend/edge-functions/feedback) — the user-facing side that writes both tables' rows.
+- [Operations catalog](/rollingrecord/backend/support-ops/operations-catalog) — every support-op and the permission it declares.
+- [Admin permissions](/rollingrecord/backend/support-ops/permissions) — the `can_view_user_data` gate both ops share.
+- [Dry-run & audit](/rollingrecord/backend/support-ops/dry-run-and-audit) — why `set_submission_status` skips the preview flow.
+- [Storage buckets](/rollingrecord/backend/storage/buckets) — the `bug-logs` bucket the bug sweeper reclaims.
+- [Cron sweepers](/rollingrecord/backend/database/cron-sweepers) — the four nightly prune / stale jobs.

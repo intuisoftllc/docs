@@ -5,7 +5,7 @@ description: "The l_ / h_ / f_ / c_ table prefixes that encode retention class a
 
 A table's prefix encodes what it is and how long its rows live. Four prefixes carry meaning — `l_` (long-retention log), `h_` (short-retention history), `f_` (financial state), and `c_` (cloud-synced content) — while state, counter, config, queue, and lifecycle work-item tables take no prefix. The prefixes also cluster related tables together in Supabase Studio's alphabetical list.
 
-A table with a *lifecycle* — a row updated in place as it moves through states — is a work-item table, not an event log, and takes no prefix. `bug_reports` (`supabase/migrations/20260817120000_bug_reports.sql`) is deliberately un-prefixed for exactly this reason: a report moves `new` → `stale` → `triaged` → `in_progress` → `resolved`/`wont_fix`, which the convention groups with `transcribe_jobs`, not with the write-once `l_*` / `h_*` event rows swept on a retention clock.
+A table with a *lifecycle* — a row updated in place as it moves through states — is a work-item table, not an event log, and takes no prefix. `bug_reports` (`supabase/migrations/20260817120000_bug_reports.sql`), the BUG-kind submission table, is deliberately un-prefixed for exactly this reason: a report moves `new` → `stale` → `triaged` → `in_progress` → `resolved`/`wont_fix`, which the convention groups with `transcribe_jobs`, not with the write-once `l_*` / `h_*` event rows swept on a retention clock. `feature_requests` (`supabase/migrations/20260925120000_feature_requests.sql`) is the un-prefixed sibling for the FEATURE kind: same six-value status vocabulary and same lifecycle, under the shared `feedback` endpoint, but a separate table (a bug carries a merged app log; a feature request never will) with retention/staleness windows deliberately double the bug ones (`feature_request_retention_days` 180, `feature_request_stale_days` 120). `bug_reports` is retained unchanged as the BUG-kind table.
 
 ## The prefixes
 
@@ -37,15 +37,16 @@ Append-only rows that may be referenced months or years later — compliance/leg
 
 ## `h_*` — short-retention history
 
-Recent activity for live support cases and "what just happened" debugging, where an escalation past ~90 days would route to a different system. Retained for `server_config.support_history_retention_days` (default 90). `prune_h_tables()` sweeps `h_transcribe_history` (by `completed_at`), `h_ai_engine_sessions` (by `ended_at`), and `h_extraction_charge` (by `charged_at`).
+Recent activity for live support cases and "what just happened" debugging, where an escalation past ~90 days would route to a different system. Retained for `server_config.support_history_retention_days` (default 90). `prune_h_tables()` sweeps `h_transcribe_history` (by `completed_at`), `h_ai_engine_sessions` (by `ended_at`), `h_extraction_charge` (by `charged_at`), and `h_extraction_job_timing` (by `recorded_at`, added in `supabase/migrations/20261003120000_latency_timestamps.sql`).
 
 | Table | What it records | Sweep key |
 | --- | --- | --- |
 | `h_ai_engine_sessions` | One row per ai-engine session (`op_type` = `kb_query`/`extract`/`synthesis`, an `outcome` enum) | `ended_at` |
 | `h_transcribe_history` | One row per transcribe job outcome | `completed_at` |
 | `h_extraction_charge` | Idempotency ledger for minute-based extraction billing (one row per `auth_user_id` + `run_id`) | `charged_at` |
+| `h_extraction_job_timing` | Content-free latency history of extraction jobs (ids, status, chunk count, and the `created_at`/`started_at`/`finished_at`/`acked_at` stamps), written by `trg_extraction_jobs_stamp_times` so timing outlives the 48h `extraction_jobs` TTL | `recorded_at` |
 
-All three have FK + CASCADE to `canonical_users`.
+All four have FK + CASCADE to `canonical_users`. `h_extraction_job_timing` correctly takes the `h_` prefix: it is short-retention operational history (latency debugging), not a long-lived audit or financial record.
 
 ## `f_*` — financial state
 
@@ -57,7 +58,7 @@ The 14 cloud-synced user-content tables, all with FK + CASCADE: `c_recordings`, 
 
 ## Picking a prefix
 
-Ask: *"Could a user dispute this 6+ months later, and would we need this row to investigate?"* Yes → `l_*` (money, legal, compliance, abuse forensics). No → `h_*` (recent operational debugging only). If genuinely unsure, default to `l_*` — over-retention is recoverable, under-retention is not. Rows that represent *current state* rather than *events* take no history prefix; financial current state takes `f_*`; cloud-synced content takes `c_*`. When adding a history table, extend the matching sweeper (`prune_log_tables()` for `l_*`, `prune_h_tables()` for `h_*`) in the same commit.
+Ask: *"Could a user dispute this 6+ months later, and would we need this row to investigate?"* Yes → `l_*` (money, legal, compliance, abuse forensics). No → `h_*` (recent operational debugging only). If genuinely unsure, default to `l_*` — over-retention is recoverable, under-retention is not. Rows that represent *current state* rather than *events* take no history prefix; financial current state takes `f_*`; cloud-synced content takes `c_*`. Counter tables (mutable aggregates) also take no prefix — `platform_stats_daily` (`supabase/migrations/20261001120000_platform_stats.sql`), the anonymous platform-usage counters, sits with `usage` and `rate_limit_counters` because none of `l_` / `h_` / `f_` applies to a mutable aggregate. When adding a history table, extend the matching sweeper (`prune_log_tables()` for `l_*`, `prune_h_tables()` for `h_*`) in the same commit.
 
 ## Related pages
 

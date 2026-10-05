@@ -3,7 +3,7 @@ title: "Support Tokens"
 description: "The short-lived 6-digit code a user reads to a support agent, its return-existing semantics and abuse defenses, and the admin-side verify."
 ---
 
-`functions/generate-support-token/index.ts` (RR-313) mints a 6-digit numeric code a user reads back to a support agent to prove their identity during a call. The code is valid 60 minutes, single-use, and displayed **in-app** — there is no email delivery. It runs a JWT gate chain with no entitlement gate (support is available to every tier), and the [account-freeze gate](/rollingrecord/backend/gates/account-frozen) applies automatically, so frozen users get a `403`.
+`functions/generate-support-token/index.ts` (RR-313) mints a 6-digit numeric code a user reads back to a support agent to prove their identity during a call. The code's validity window comes from `server_config.support_code_ttl_minutes` (public row, default 60); it is single-use and displayed **in-app** — there is no email delivery. It runs a JWT gate chain with no entitlement gate (support is available to every tier), and the [account-freeze gate](/rollingrecord/backend/gates/account-frozen) applies automatically, so frozen users get a `403`.
 
 ## Return-existing semantics
 
@@ -15,7 +15,7 @@ If the caller already has an **active** row (not consumed, not expired) the func
 | `expires_at` | ISO 8601; the client renders a countdown against it |
 | `reused` | true when an existing active code was returned, false when freshly minted (UX identical) |
 
-`TOKEN_TTL_MS` is 60 minutes — long enough to cover the gap between the user tapping the button and the agent reading the code back, short enough that a live 6-digit code isn't a standing risk. The code is stored **raw** by design: hashing adds nothing for a 60-minute, one-in-a-million code.
+The TTL is no longer a hardcoded constant. The function reads `support_code_ttl_minutes` via `getInt()` (`_shared/db/server-config.ts`) with an in-code fallback of `DEFAULT_SUPPORT_CODE_TTL_MINUTES = 60`, then converts minutes to the stored `expires_at` (× 60 × 1000). The value is stored in minutes so it reads cleanly in the table editor. Because the row is `public = TRUE`, the **same** value is mirrored to the client in `ServerConfig.kt` (`supportCodeTtlMinutes` / `KEY_SUPPORT_CODE_TTL_MINUTES`, cold-start fallback 60) and drives the "expires in N minutes" copy on the support-code sheet — so the number the user reads is exactly the window the server enforces, and the two cannot drift. Raising the row lengthens the window on the next mint and on the client's next config fetch. The code is stored **raw** by design: hashing adds nothing for a short-lived, one-in-a-million code.
 
 ## support_tokens table
 
@@ -24,14 +24,14 @@ If the caller already has an **active** row (not consumed, not expired) the func
 | `auth_user_id` | `text NOT NULL PK` | one active row per user |
 | `code` | `text NOT NULL` | CHECK `code ~ '^[0-9]{6}$'`; stored raw |
 | `created_at` | `timestamptz NOT NULL DEFAULT now()` | |
-| `expires_at` | `timestamptz NOT NULL` | `now() + 60 min` |
+| `expires_at` | `timestamptz NOT NULL` | `now() + support_code_ttl_minutes` (default 60) |
 | `consumed_at` | `timestamptz` (nullable) | set by `verify_support_token` on match |
 
 ## Two lifetimes: consumable vs recognisable
 
 `prune_support_tokens()` (`migrations/20260811180000_support_token_expired_retention.sql`, hourly pg_cron) splits two windows that were once collapsed:
 
-- **Consumable** — how long `verify_support_token` can mark a code verified. 60 minutes; consumed rows are deleted promptly once spent.
+- **Consumable** — how long `verify_support_token` can mark a code verified. `support_code_ttl_minutes` (default 60); consumed rows are deleted promptly once spent.
 - **Recognisable** — how long an operator can still see that an expired code was validly generated. Expired-but-unconsumed rows are retained until older than `server_config.support_token_expired_retention_sec` (default 4h), so verify can still return `reason=expired` as identity evidence well after the code stops being usable.
 
 One row per user means a retained expired row is simply overwritten the moment the user generates a new code, so retention adds no bloat.

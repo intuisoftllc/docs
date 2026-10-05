@@ -1,6 +1,6 @@
 ---
 title: "Transcript UI"
-description: "The V2 playback transcription surface: the ic_ai entry icon that tints and pulses by status, the status-driven V2TranscriptionSheet, the word-synced V2SyncedTranscriptView panel, and the disclaimer / re-transcribe / export dialogs."
+description: "The V2 playback transcription surface: the ic_ai entry icon that tints and pulses by status, the status-driven V2TranscriptionSheet, the word-synced V2SyncedTranscriptView panel, the full-screen V2TranscriptExpandedSheet reader, and the disclaimer / re-transcribe / export dialogs."
 ---
 
 The V2 transcription UI hangs off the playback screen. A single AI icon opens a status-driven bottom sheet; from its `DONE` state the user reveals an in-card, word-synced transcript panel. Everything binds to flows on `V2PlaybackViewModel` (`ui/v2/screens/playback/V2PlaybackViewModel.kt`).
@@ -50,7 +50,9 @@ Three dialogs live in the same file:
 
 ## `V2SyncedTranscriptView`
 
-When the user taps "Show transcript" in the `DONE` state, the screen flips `showTranscriptView` and animates the in-card `V2SyncedTranscriptView` (`ui/v2/screens/playback/V2SyncedTranscriptView.kt`) in over the waveform region via the `V2TranscriptCardOverlay` wrapper. The panel and the notes panel are mutually exclusive. It is a word-synced, tap-to-seek, diarized view.
+When the user taps "Show transcript" in the `DONE` state, the screen flips `showTranscriptView` and animates the in-card `V2SyncedTranscriptView` (`ui/v2/screens/playback/V2SyncedTranscriptView.kt`) in over the waveform region via the `V2TranscriptCardOverlay` wrapper. The panel and the notes panel are mutually exclusive. It is a word-synced, tap-to-seek, diarized view. The overlay's top-right cluster carries an expand icon (`R.drawable.ic_expand`, `accessibility_playback_transcript_expand`) beside the close X that promotes the panel to the full-screen [`V2TranscriptExpandedSheet`](#v2transcriptexpandedsheet).
+
+The composable takes a `TranscriptViewStyle` — `Card` in the in-card overlay, `Expanded` in the sheet. The two styles differ only in sizing and follow behavior: `Card` renders at body 14sp / header 14sp and always auto-follows the play head; `Expanded` renders larger (body 17sp, line-height 26sp, header 15sp) and sets `pauseFollowOnScroll = true`, so a manual drag stops auto-follow and surfaces a "Jump to current" pill (`JumpToCurrentPill`, `R.string.playback_transcript_jump_to_current`) to resume it. Tapping any line always re-enables following (an explicit "play from here").
 
 | `lines` value | Rendered as |
 | --- | --- |
@@ -59,6 +61,18 @@ When the user taps "Show transcript" in the `DONE` state, the screen flips `show
 | non-empty | `LazyColumn` of speaker headers + tap-to-seek body lines, auto-scrolled to the active line |
 
 It computes `activeIndex` (the last line at/behind the play head) and `activeRunStart` (the start of that line's speaker run, so the whole turn stays highlighted). `isSeeking` freezes the highlight while the user scrubs — only the waveform tracks the drag live — then jumps to the settled position. Speaker-run headers (`[dot] Name [dot] M:SS`) render only when `showDiarization` is true; long-pressing one opens a rename dialog capped at 30 characters, which persists via `TranscriptRepository.updateSpeakerNames` → `speakerNamesJson` and is decoded back into `V2PlaybackViewModel.speakerNames`.
+
+## `V2TranscriptExpandedSheet`
+
+`V2TranscriptExpandedSheet` (`ui/v2/screens/playback/V2TranscriptExpandedSheet.kt`) is the full-screen transcript reader, opened from the expand icon on the in-card overlay. `V2PlaybackScreen` gates it behind its own `showExpandedTranscript` flag — deliberately distinct from `showTranscriptSheet` (the transcription STATUS sheet) — flipped true by the overlay's `onExpand` and false on dismiss.
+
+It is a single `V2ModalBottomSheet` (`skipPartiallyExpanded = true`, `containerColor = surface`, `NotesSheetHandle()` drag handle). Chrome mirrors `V2NotesBottomSheet` — surface fill, centered 20sp title (`R.string.playback_transcript_sheet_title`) — but fills the whole screen instead of capping at 75%, and adds a close X (`R.drawable.ic_cancel`) because a full-height sheet leaves little scrim to tap.
+
+The body is the same `V2SyncedTranscriptView` the card uses, rendered in `TranscriptViewStyle.Expanded` (larger reading type, the "Jump to current" pill, long-press-to-rename all come from that shared view — see above). Top and bottom edge-fade gradients soften where lines meet the header and the pinned player; they are non-interactive, so taps fall through to the lines beneath.
+
+A pinned mini player keeps playback controllable without closing the sheet: a `HorizontalDivider` then a `PlayButton` (48dp) plus the shared `PlaybackSeekBar`. The sheet reads the SAME `positionMs` / `durationMs` / `isPlaying` as the screen, so closing it lands the card exactly where the reader left off. A sheet-local `isSeeking` flag (set from the mini seek bar's `onSeekingChange`) freezes the highlighted line while the user scrubs — exactly as the screen does for its own seek bar — then jumps to the settled position.
+
+`V2PlaybackScreen` wires its actions straight to `V2PlaybackViewModel`: `onSeekTo = seekToAndPlay`, `onSeek = seekTo`, `onPlayPause = togglePlayPause`, `onRenameSpeaker = updateSpeakerName`, with `lines = transcriptLines`, `transcriptText = transcript?.text`, `speakerNames`, `showDiarization = diarizationEnabled`, and `formatTime = formatClock`.
 
 ## Shared V1 parser
 

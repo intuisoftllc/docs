@@ -60,6 +60,8 @@ When the budget is hit with work remaining and none of the terminal conditions a
 
 `finalize` builds the results blob (`version`, `context_id`, `recording_ids` from `processedRecordingIds`, `sections` each with `embedding: null`, `tasks`, `calibration_input_tokens`), seals it, and `markTerminal` `DONE` — writing `results_ct`/`results_iv` and nulling `payload_ct`/`payload_iv` in one `UPDATE`. Vectors are deliberately **not** produced here: every section ships with `embedding: null`, and the client's `EmbeddingReconcileWorker` owns section vectors. It keys them by the local row id (which the server cannot know for a new section) and re-embeds only sections whose source text changed — dropping the results blob roughly 95% versus shipping 1024-dim vectors as JSON.
 
+The same `markTerminal` `DONE` write also stamps `insights_added` — the count of sections + tasks this run **added** relative to the card it started from (`insightsAdded(insightsBaseline, countCardInsights(accumulator))`, `functions/_shared/analytics/platform-stats.ts`), or `0` for a developer run. The baseline is captured from the payload's `prior_state` at job open, not from the loaded accumulator (which on a resumed job already holds earlier chunks' work). A database trigger folds it into the anonymous `insights_extracted` platform counter **only on the transition into `DONE`**, so a re-finalize never double-counts. `markTerminal` retries the write once without `insights_added` if that column is missing (deploy-order safety against migration `20261001120000`) — the job completing always outranks a platform stat. See [analytics / platform stats](/rollingrecord/backend/edge-functions/analytics).
+
 ## The extraction engine
 
 `ExtractHandler` was formerly the ai-engine `extract` operation; that synchronous op is retired and the runner is now its only driver, importing and calling it directly (no network hop, no second gate chain). The handler owns:
@@ -71,6 +73,21 @@ When the budget is hit with work remaining and none of the terminal conditions a
 ## Two error lanes
 
 `classifyRunnerError` (`functions/_shared/extraction/runner-classify.ts`) splits caught errors into two lanes with opposite handling. A `JobPoisonError` — thrown by `poisonGuard` at every deterministic decrypt / unwrap / `JSON.parse` / null-column site — is **poison**: the runner catches it and marks the job `FAILED(extraction_undecryptable)` immediately, because retrying is deterministic and would burn all four requeue ticks. Everything else is **retryable**: the runner lets it throw without a terminal write, the heartbeat goes stale, and the sweeper requeues. Defaulting the unknown case to retryable is the safe bias — at worst it burns `extraction_max_attempts` ticks rather than wrongly failing a recoverable job.
+
+## Latency timestamps
+
+Migration `20261003120000_latency_timestamps.sql` adds three nullable observability stamps to `extraction_jobs` — `started_at`, `finished_at`, `acked_at` — alongside the pre-existing `created_at`. Together they decompose a job's wall time:
+
+| Stamp | Set when | Interval it opens |
+| --- | --- | --- |
+| `created_at` | job submitted | — |
+| `started_at` | first entry into `RUNNING` (runner claimed it) | `created_at` → `started_at` = queue wait |
+| `finished_at` | first reaches `DONE` / `FAILED` / `CANCELLED` | `started_at` → `finished_at` = run time |
+| `acked_at` | first reaches `ACKED` (the phone confirmed receipt) | `created_at` → `acked_at` = server-side time-to-phone |
+
+The runner itself does **not** write these. A single `BEFORE INSERT OR UPDATE OF status` trigger (`_extraction_jobs_stamp_times` / `trg_extraction_jobs_stamp_times`) stamps each one the **first** time the job enters that state and never moves it again, so a requeued job keeps its original start time. One trigger catches every write path — the claim RPC, finalize, extract-submit, the ack path, and the SQL sweepers — which stamping at each call site would be easy to miss in one. (It is a `BEFORE` trigger because it sets columns; the separate `AFTER` `trg_platform_stats_extraction_done` can't.)
+
+Because `extraction_jobs` rows are swept 48h after they finish (they carry the encrypted payload), the same trigger copies the timing into a content-free history table, `h_extraction_job_timing`, keyed per `job_id` and upserted so a later ack fills `acked_at` on the same row. That table holds only ids, status, `chunks_total`, `is_rebuild`, and the four timestamps — no content — with an FK + `ON DELETE CASCADE` to `canonical_users`, RLS on, and the usual `h_*` retention (`prune_h_tables()`, 90 days default). The history write is wrapped so a failure there can never block the status change. Tracking starts at deploy; rows created earlier keep `NULL` with no backfill.
 
 ## Where to go next
 

@@ -9,7 +9,7 @@ Two V2 screens cover buying and managing a subscription: the "Choose a Plan" pay
 
 ## `PlanCatalog`
 
-`PlanCatalog` (`ui/v2/screens/upgrade/PlanCatalog.kt`) is an internal enum shared by both flows. Names, descriptions, feature lists, and icons are fixed design content (string/array/drawable res IDs); prices come live from RevenueCat, matched to these product IDs. Each entry carries its `RcEntitlement`, monthly + annual store product IDs, res IDs, and a `staticBadge`.
+`PlanCatalog` (`ui/v2/screens/upgrade/PlanCatalog.kt`) is an internal enum shared by both flows. Names, descriptions, benefit checklists, and icons are fixed design content (string/drawable res IDs); prices come live from RevenueCat, matched to these product IDs. Each entry carries its `RcEntitlement`, monthly + annual store product IDs, res IDs, a `staticBadge`, and its benefit checklist as a `benefits: List<PlanBenefit>` drawn from `PlanBenefits` (see below).
 
 | Catalog entry | Monthly product id | Annual product id | Static badge |
 | --- | --- | --- | --- |
@@ -29,6 +29,44 @@ The same file provides the functions that bridge live RC packages to the catalog
 - `monthlyTimesTwelve(packages, catKey)` computes the struck-through "if you paid monthly for a year" full price shown next to an annual price.
 - `annualDiscountPercent(packages, catKey)` computes the percent saved versus monthly×12, returning null when the annual price is not actually cheaper (no point advertising a non-discount).
 
+## `PlanBenefits` — the single source for benefit checklists
+
+`PlanBenefits` (`ui/v2/screens/upgrade/PlanBenefits.kt`) is the one place every "what you get" checklist is defined. Each `PlanCatalog` entry's `benefits` field points at the matching list here, and every benefit-rendering surface — the paywall card, the initial-purchase confirm sheet, the change/upgrade confirm sheet, and the Manage "View benefits" sheet — renders through the shared `PlanIncludesList` composable (`ui/v2/components/PlanIncludesList.kt`). Wording lives in `strings.xml` (`choose_plan_benefit_*`); `PlanBenefits.kt` owns only the **order**, **tier membership**, and **allowance tags**.
+
+A line is a `PlanBenefit`:
+
+```kotlin
+data class PlanBenefit(
+    @StringRes val textRes: Int,
+    val allowance: PlanAllowance? = null,   // TRANSCRIPTION or CLOUD_STORAGE
+)
+```
+
+`allowance` is set only on lines that state a metered number ("8 hrs/mo", "15 GB"). It drives the stacking rule below. The object declares one list per plan:
+
+| List | Represents |
+| --- | --- |
+| `FREE` | Manual recording, categories, favorites, trash, share, App Lock, local backup, themes, block-calls. |
+| `FOUNDERS` | The lifetime Founders Edition summary (Pro for life, future updates, stays yours, separate subs). |
+| `PRO` | Rolling mode, **no ads**, scheduled, trim, notes, import, advanced settings, continue, bookmarks, tiles, segments. |
+| `PRO_CLOUD` | Cloud backup, cross-device sync, cloud transcription (`TRANSCRIPTION`), Medical Mode, cloud storage (`CLOUD_STORAGE`), include/exclude. |
+| `CLOUD_AI` | Context cards, KB chat, semantic search, coaching, blueprints, tasks, export, raised transcription (`TRANSCRIPTION`), raised cloud storage (`CLOUD_STORAGE`). |
+
+### Benefit stacking — `inheritedBenefits`
+
+Because each tier is a strict superset of the one below it, a plan's displayed list is its own benefits plus everything it inherits. `inheritedBenefits(own, lowerTiers)` (same file) builds the inherited tail, and `PlanCatalog.inheritedBenefitsFor(tier, own)` supplies the lower-tier lists ordered highest-first with `FREE` last. Two rules keep the merged list clean:
+
+- **Allowance replacement** — an inherited line whose `allowance` a higher list already stated is dropped, so the checklist never shows two different numbers for transcription or cloud storage (Cloud+AI's "20 hrs/mo" replaces Pro+Cloud's "8 hrs/mo" rather than listing both). Allowances are claimed per tier *after* that tier is walked, so a tier's own two allowance lines never knock each other out — only a higher tier replaces a lower one.
+- **Exact-duplicate drop** — a `textRes` already seen is skipped.
+
+`PlanIncludesList` renders the own list immediately and appends the inherited tail behind a "View all benefits" toggle (`appendedBenefits`), and uses `everythingInNameRes` to switch its header from the plain "Includes:" to the cumulative "Everything in [previous tier], plus" framing.
+
+| Surface | Where it calls `PlanIncludesList` |
+| --- | --- |
+| Paywall card | `V2UpgradeScreen` renders `PlanIncludesList(benefits = card.benefits, …)`; `PlanCard.benefits` is filled from the catalog by `ChoosePlanViewModel`. |
+| Confirm / change-plan sheets | The purchase and change/upgrade confirm sheets render the same list for the plan being bought. |
+| Manage "View benefits" | `V2ManageSubscriptionScreen` renders the current plan's `benefits` with the inherited tail from `ManageSubscriptionViewModel.inheritedBenefits` (built via `PlanCatalog.inheritedBenefitsFor`), plus the Founders summary where it applies. |
+
 ## The paywall — `V2UpgradeScreen`
 
 `V2UpgradeScreen` (`ui/v2/screens/upgrade/V2UpgradeScreen.kt`) is the "Choose a Plan" surface, backed by `ChoosePlanViewModel` (`ui/v2/screens/upgrade/ChoosePlanViewModel.kt`). It renders one `PlanCard` per tier, a Monthly/Annual toggle with a "Save N%" floor badge, a pinned subscribe CTA, and a Restore-purchases action; a non-null `result` draws the `PlanResultOverlay` on top.
@@ -40,7 +78,7 @@ The same file provides the functions that bridge live RC packages to the catalog
 - `purchase(activity)` sets `PlanResult.Processing`, calls `RevenueCatManager.purchase()`, and maps the outcome to `SuccessNew` / null (user cancelled) / `Error`.
 - `restore()` emits the one-shot `ChoosePlanEvent.RestoredNothing` (a lightweight toast) when a restore finds no active entitlements; a restore that finds entitlements reuses the `SuccessNew` overlay.
 
-`PlanCard` is the per-card render state (`key`, `iconRes`, `nameRes`, `descRes`, `featuresRes`, `badge`, `priceText`, `periodSuffixRes`, `strikeText`, `discountPercent`, `isCurrent`, `purchasable`). `ChoosePlanUiState` carries `loading`, `error`, `billingPeriod`, `cards`, `selectedKey`, `ctaPriceText`, `annualSavePercent`, and `purchaseInProgress`. `ChoosePlanEvent` is a sealed interface whose only member is `RestoredNothing`.
+`PlanCard` is the per-card render state (`key`, `iconRes`, `nameRes`, `descRes`, `benefits`, `badge`, `priceText`, `periodSuffixRes`, `strikeText`, `discountPercent`, `isCurrent`, `purchasable`, `countdownEndsAtMs`, `everythingInNameRes`) — its `benefits` is the `PlanBenefits` list for the tier, not a flat array res. `ChoosePlanUiState` carries `loading`, `error`, `billingPeriod`, `cards`, `selectedKey`, `ctaPriceText`, `annualSavePercent`, and `purchaseInProgress`. `ChoosePlanEvent` is a sealed interface whose only member is `RestoredNothing`.
 
 ## The management screen — `V2ManageSubscriptionScreen`
 

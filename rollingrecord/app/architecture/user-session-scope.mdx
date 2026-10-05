@@ -1,6 +1,6 @@
 ---
 title: "Per-User Session Scope"
-description: "How UserSessionManager rebuilds UserSessionScope on every sign-in/out, and the UserScopedCache + owner-stamping pattern that prevents cross-account leakage."
+description: "How UserSessionManager rebuilds UserSessionScope on every sign-in/out, the UserScopedCache + owner-stamping pattern that prevents cross-account leakage, and the SessionCoroutineScope for work that must outlive a ViewModel but stop on sign-out."
 ---
 
 Every account runs in its own Koin scope (`UserSessionScope`), created at startup against the cached user id and replaced on every auth change by `UserSessionManager.switchTo`. App-level singles that must cache per-user data implement `UserScopedCache` and register in a registry that `switchTo` clears — and any cache gating a user-visible decision also owner-stamps its snapshot so a late in-flight response degrades to a cache miss, not a wrong answer.
@@ -89,6 +89,20 @@ That makes `get-user-key` two-layer. `fetchUserKeyLocked` serves the holder's ow
 It zero-fills on close (`Closeable`, auto-invoked when the scope tears down) and subscribes to `ConnectivityManager` to proactively refresh on network restore. The DEK is never written to disk, prefs, or logs. See [Room Database & SQLCipher](/rollingrecord/app/architecture/local-database) for how the DEK keys the database.
 
 `resolveDekForRecovery()` is a suspend extension used by the `V2DekUnavailableScreen` Retry: it resolves the DEK through `SessionDekHolder.requireDek` on IO and returns `true` iff it is now available (`DekResult.Available`) — a bare `recreate()` alone would loop if the persisted DEK is still missing.
+
+## `SessionCoroutineScope`
+
+`SessionCoroutineScope` (`data/session/SessionCoroutineScope.kt`) is a reusable `CoroutineScope` tied to the user-session lifetime — for work that must OUTLIVE a ViewModel but still be cancelled when the account changes. It exposes a single `scope: CoroutineScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)`: a `SupervisorJob` so one failed child never cancels the others, IO-dispatched by default (callers needing another dispatcher pass it to `launch` / `withContext`).
+
+The motivating case is a KB-chat turn (the AI request plus persisting its answer) launched on `viewModelScope`: it is cancelled the moment the user navigates away from the chat, silently losing the reply. Launching on `scope` instead lets the turn finish and write its result to the session's DB, so returning to the thread shows the answer in place. It is deliberately generic — any repository or ViewModel with the same "keep going after the screen is gone, stop on sign-out" need can inject it.
+
+Lifetime is enforced by Koin, not by hand. It is bound `scoped { SessionCoroutineScope() }` in the `UserSessionScope` block of `di/UserSessionModule.kt`, and because it implements `Closeable`, Koin auto-invokes `close()` when `switchTo` closes the outgoing scope — `close()` logs a `save = true` line and calls `scope.cancel()`. A signed-out or switched session therefore tears down every in-flight job here.
+
+This is distinct from `UserSessionManager.sessionScope` (above): that one is an app-level scope the manager owns and recreates in `switchTo` step 2, which `App`'s recovery scans launch from without entering the Koin scope. `SessionCoroutineScope` is the DI-injectable `scoped {}` binding that repositories and ViewModels resolve to launch session-surviving work.
+
+<Warning>
+A job launched on `scope` keeps whatever it captures (e.g. a ViewModel) alive until it completes. That is intended for short, self-terminating work (a bounded network turn); do not launch unbounded loops here without their own stop condition.
+</Warning>
 
 ## Session-scoped resolution helpers
 

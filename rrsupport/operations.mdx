@@ -8,8 +8,8 @@ Support-ops exposes a registry of individually-declared operations — each with
 ## What this covers
 
 - **How operations are registered:** each is an `OperationDef` (`operations/handler.ts`) declaring `name`, `isReadOnly`, `requiredPermission`, `validateParams`, and `handler`; all are collected in `operations/registry.ts` and resolved by `findOperation(body.operation)`. The registry currently holds 31 operations — 9 mutating and 22 read-only.
-- **Read-only diagnostics:** `lookup_user_by_email`, `search_users`, `get_user_overview`, `get_user_state`, `get_clerk_metadata`, `user_rate_limits` (note the wire name drops the `get_` prefix every other op carries), `get_admin_audit`, `get_user_audit`, `link_audit_ticket`, `get_abuse_top_offenders`, `get_bug_reports`, `set_bug_status`, `get_user_transcribe_history`, `get_user_credit_ledger`, `get_my_grant_budget`, `get_user_credits`, `get_user_timeline`, `get_tombstone_report`, `get_storage_drift`, `verify_support_token`, `validate_recovery_code`, `whoami`.
-- **Mutating ops (dry-run → commit):** `set_account_password`, `change_email`, `freeze_user_account`, `grant_manual_credit`, `restore_tombstones`, `clear_app_lock_pin`, `reset_extraction`, `reset_transcription`, and the irreversible `delete_user_account` (guarded by server-side email confirmation); hybrids `verify_support_token` / `validate_recovery_code`; light metadata writes `link_audit_ticket` and `set_bug_status`.
+- **Read-only diagnostics:** `lookup_user_by_email`, `search_users`, `get_user_overview`, `get_user_state`, `get_clerk_metadata`, `user_rate_limits` (note the wire name drops the `get_` prefix every other op carries), `get_admin_audit`, `get_user_audit`, `link_audit_ticket`, `get_abuse_top_offenders`, `get_submissions`, `set_submission_status`, `get_user_transcribe_history`, `get_user_credit_ledger`, `get_my_grant_budget`, `get_user_credits`, `get_user_timeline`, `get_tombstone_report`, `get_storage_drift`, `verify_support_token`, `validate_recovery_code`, `whoami`.
+- **Mutating ops (dry-run → commit):** `set_account_password`, `change_email`, `freeze_user_account`, `grant_manual_credit`, `restore_tombstones`, `clear_app_lock_pin`, `reset_extraction`, `reset_transcription`, and the irreversible `delete_user_account` (guarded by server-side email confirmation); hybrids `verify_support_token` / `validate_recovery_code`; light metadata writes `link_audit_ticket` and `set_submission_status`.
 - **Dry-run is the default:** the dispatcher reads `const dryRun = body.dry_run !== false` (`support-ops/index.ts`), so omitting the flag PREVIEWS rather than commits. Committing takes `dry_run: false` plus the `preview_id` returned by a matching dry-run.
 - **Error contract:** handlers throw `OperationError(code, httpStatus, extra)` for clean coded rejections (e.g. `credit_ceiling_exceeded`, `email_unchanged`), otherwise collapse to a generic `handler_threw` 500.
 
@@ -52,6 +52,37 @@ Until the CLI catches up, the op is issued as a signed request straight against 
 <Note>
 The CLI and the registry have drifted in both directions. `support_ops.py`'s `OP_HANDLERS` has no wrapper for `change_email`, and it still ships `resolve-storage-drift`, `grant-bundle`, and `refund-bundle` wrappers that call server ops (`resolve_storage_drift`, `grant_bundle_purchase`, `refund_bundle_purchase`) which are not in `OPERATIONS` at all.
 </Note>
+
+## Submission triage — `get_submissions` and `set_submission_status`
+
+The feedback-triage ops used to be `get_bug_reports` and `set_bug_status`; they are now `get_submissions` (`operations/get-submissions.ts`) and `set_submission_status` (`operations/set-submission-status.ts`), and each serves BOTH bug reports and feature requests from one op. Which one is chosen by a required `kind` param — `"bug"` or `"feature"` (`SUBMISSION_KINDS` in `_shared/submissions/sanitize.ts`), validated through `normalizeKind()`. `kind` has no default: the two kinds live in separate tables (`SUBMISSION_TABLES` maps `bug` → `bug_reports` / `bug_report_id` and `feature` → `feature_requests` / `feature_request_id`), so omitting it is a `validation_failed`, never an implicit "both".
+
+Both are read-only in the dispatcher's sense (no dry-run preview) and gated on `can_view_user_data` — a submission is text the user wrote, so reading or triaging the queue is reading user data.
+
+### `get_submissions`
+
+| Field | Required | Notes |
+| --- | --- | --- |
+| `params.kind` | yes | `"bug"` or `"feature"`; strict, no default |
+| `params.target_auth_user_id` | no | Scope to one user's rows (the account screen); omit for the global queue |
+| `params.submission_id` | no | One row by UUID, returned with its FULL description; wins over every other filter |
+| `params.statuses` | no | Multi-select array over `SUBMISSION_STATUSES`; an empty array is rejected, not read as "all" |
+| `params.areas` | no | Multi-select array over `SUBMISSION_AREAS` |
+| `params.before_created_at` | no | Keyset cursor — the `created_at` of the last row already held |
+| `params.limit` | no | 1–100, default 25 |
+
+List rows carry a 240-char description excerpt plus a `description_truncated` flag; a single-`submission_id` fetch returns the full text. The response also includes `status_counts` (every status in `SUBMISSION_STATUSES`, computed for the current user/area scope but ignoring the status filter), `total`, and `next_before_created_at` for the next page. The log columns `log_storage_path` / `log_bytes` are always on the wire but null for `feature` — only bugs carry a merged app log (`acceptsLogAttachment()`).
+
+### `set_submission_status`
+
+| Field | Required | Notes |
+| --- | --- | --- |
+| `params.kind` | yes | `"bug"` or `"feature"`; selects the table |
+| `params.submission_id` | yes | UUID of the row to move |
+| `params.status` | yes | One of `SUBMISSION_STATUSES` (`new`, `stale`, `triaged`, `in_progress`, `resolved`, `wont_fix`) |
+| `params.admin_notes` | no | At most 4,000 chars; sanitized before store |
+
+Moving into a terminal status (`resolved` / `wont_fix`, from `TERMINAL_STATUSES`) stamps `closed_at` (the retention clock); reopening clears it; a terminal → terminal relabel keeps the original stamp so a closed row doesn't buy a fresh retention window. A bad `submission_id` returns `not_found` rather than a silent zero-row update. Neither op is wrapped by `support_ops.py` — there is no `--kind` flag or submission command in the CLI's `OP_HANDLERS` — so the triage queue is driven from the RRSupport console.
 
 ## Where to go next
 

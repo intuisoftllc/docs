@@ -3,18 +3,18 @@ title: "Server-Side Embeddings"
 description: "The stateless query embedder, the batch indexing embedder, and the embedding-bundle cache — the server turns text into Cohere vectors but stores none and matches none."
 ---
 
-Two Edge Functions back semantic search. `search` embeds one query string; `indexing` embeds a batch of document chunks and also fronts the embedding-bundle cache. Both use Cohere v2 and both gate at entitlement `[ProCloud, ProCloudAi]` (which excludes plain Pro and founders). The crucial architectural fact: the **server holds no vectors and does no cosine matching**. It sees the transient text, returns vectors, and the client does the similarity match on-device against its own local document vectors.
+Two Edge Functions back semantic search. `search` embeds one query string; `indexing` embeds a batch of document chunks and also fronts the embedding-bundle cache. They gate at **different** entitlements: `search` is `[ProCloudAi]` — **Cloud+AI only** (RR-487) — while `indexing` is `[ProCloud, ProCloudAi]` (Pro+Cloud and up). Both exclude plain Pro and founders, and both use Cohere v2. The crucial architectural fact: the **server holds no vectors and does no cosine matching**. It sees the transient text, returns vectors, and the client does the similarity match on-device against its own local document vectors.
 
 ## search vs indexing
 
-| Function | Operations | Rate-limit bucket(s) | Input caps | Returns |
-| --- | --- | --- | --- | --- |
-| `search` | embed one query | `Bucket.Search` (chain sugar; 300/hr in-code, 600/hr live) | query ≤ 2000 chars | `{ vector, model_version }` |
-| `indexing` | `embed` / `get_bundles` / `put_bundle` | `embed` → `Bucket.Indexing` (150/hr in-code); bundle ops → `Bucket.EmbeddingCache` (300/hr in-code, 600/hr live) | texts array 1–96, each ≤ 8000 chars; want ≤ 100; sealed ≤ 5 MiB | `{ vectors, model_version }` or bundle hits/misses |
+| Function | Entitlement | Operations | Rate-limit bucket(s) | Input caps | Returns |
+| --- | --- | --- | --- | --- | --- |
+| `search` | `[ProCloudAi]` (Cloud+AI only) | embed one query | `Bucket.Search` (chain sugar; 300/hr in-code, 600/hr live) | query ≤ 2000 chars | `{ vector, model_version }` |
+| `indexing` | `[ProCloud, ProCloudAi]` (Pro+Cloud and up) | `embed` / `get_bundles` / `put_bundle` | `embed` → `Bucket.Indexing` (150/hr in-code); bundle ops → `Bucket.EmbeddingCache` (300/hr in-code, 600/hr live) | texts array 1–96, each ≤ 8000 chars; want ≤ 100; sealed ≤ 5 MiB | `{ vectors, model_version }` or bundle hits/misses |
 
 ### search
 
-`functions/search/index.ts` validates the query (string, non-empty, `MAX_QUERY_CHARS` = 2000), checks the `isSemanticSearchEnabled` kill switch, then calls `embed([query], "query")` and returns `{ vector, model_version }`. Its header states the posture plainly: the server "holds no vectors and never sees results — it sees only the transient query string, embeds it, and returns the vector."
+`functions/search/index.ts` admits only Cloud+AI callers — its `runGates` entitlement is `[Entitlement.ProCloudAi]` (RR-487), tightened from the earlier Pro+Cloud intent, with the effective-entitlement cascade also admitting `lifetime_pro_cloud_ai` / `developer` and excluding Pro+Cloud, plain Pro, and founders. It validates the query (string, non-empty, `MAX_QUERY_CHARS` = 2000), checks the `isSemanticSearchEnabled` kill switch, then calls `embed([query], "query")` and returns `{ vector, model_version }`. Its header states the posture plainly: the server "holds no vectors and never sees results — it sees only the transient query string, embeds it, and returns the vector."
 
 ### indexing
 

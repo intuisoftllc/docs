@@ -1,0 +1,104 @@
+---
+title: "AdMob Ads (Free Tier)"
+description: "The three Free-tier ad formats, the confirmed-free owner-stamp gate, consent/personalization, and the dormant go-live switch."
+---
+
+RollingRecord shows AdMob ads only on the Free tier (RR-521). Every tier above Free removes all of them. The subsystem lives in `com.intuisoftllc.rollingrecord.ads` and ships three formats — a thin anchored banner, a post-recording interstitial, and an app-open ad — all held behind a single tier authority that requires *positive* confirmation of a signed-in free account before anything is shown, never while recording or playing back, and never more than one full-screen ad per shared interval. The real production ad units are wired but dormant behind a one-line build switch.
+
+## Ad formats
+
+Three formats, each in its own file under `ads/`. The banner is inline content; the interstitial and app-open ad are full-screen and share one pacing clock and one cross-format mutex.
+
+| Format | Type | Shown where |
+| --- | --- | --- |
+| Anchored banner | Inline adaptive banner | `AnchoredAdBanner` (`ads/AnchoredAdBanner.kt`), rendered by `V2MainNavHost` (`ui/v2/navigation/V2MainNavHost.kt`) inside the shared Scaffold `bottomBar`, directly above the bottom nav — Free tier only, and only on Home and Library. |
+| Post-recording interstitial | Full-screen | `InterstitialAds` (`ads/InterstitialAds.kt`), requested after a recording is **saved** (never discarded), shown once the user is back on a main tab. |
+| App-open ad | Full-screen | `AppOpenAds` (`ads/AppOpenAds.kt`), shown on cold start at the loading→Home transition and on a genuine return to the foreground. |
+
+The banner uses an anchored *adaptive* banner (`AdSize.getCurrentOrientationAnchoredAdaptiveBannerAdSize`) sized to the screen width — Google's recommended format, ~50-90dp tall. Because it is placed inside the Scaffold `bottomBar`, its height is auto-reserved as content bottom-padding, so it can never overlap screen content, and it stays anchored while Library scrolls. The `AdView` is created once and destroyed on `onDispose` (upgrade to a paid tier, or leaving the tab). It needs no full-screen gate — it is naturally absent from the recording, playback, and upgrade surfaces because those are not Home or Library.
+
+The interstitial exposes `pendingShow: StateFlow<Boolean>`. `requestAfterRecording()` flags it from the recording save funnel; `V2MainNavHost` consumes it on the next main tab via `consumePendingShow(activity, personalized)` — the `showBottomBar` check keeps it off the full-screen record screen. The app-open ad is an `Application.ActivityLifecycleCallbacks` + `ProcessLifecycleOwner` observer installed once from `App.kt`; `showOnColdStart()` gives the launch ad a brief bounded window (`COLD_START_MAX_WAIT_MS`, 2.5s) to be ready before falling through to Home ad-free, and warm returns are armed only after a genuine departure.
+
+## The ad gate — `AdsGate` and the confirmed-free owner stamp
+
+`AdsGate` (`ads/AdsGate.kt`) is the app-scoped authority both full-screen formats consult. Its central member is not a boolean but an owner stamp:
+
+```kotlin
+@Volatile
+var adsAllowedForUser: () -> String? = { null }
+```
+
+It returns the `authUserId` ads are **confirmed** allowed for, or `null` when they are not allowed *or* the tier simply isn't known yet. Returning an id rather than a `Boolean` is deliberate: the id is an owner stamp. A show is only safe if the user it was authorized for is still the signed-in user when the ad actually goes up, so each format re-reads `adsAllowedForUser()` immediately before `show()` and aborts if the id changed or went null (`AppOpenAds.maybeShow`, `InterstitialAds.consumePendingShow`).
+
+It is backed by `EntitlementRepository.adsConfirmedFreeUserId` (`data/repository/EntitlementRepository.kt`) — a `StateFlow<String?>` combining auth state, RevenueCat `customerInfo`, and the `DevFlags.tierOverride`. It resolves to the user id only when **all** of these hold: signed in, RevenueCat hydrated for *that exact* user (`rc.appUserId == userId`), and `RcEntitlement.resolveTier(rc.info) == UserTier.FREE`. Every ambiguous state returns `null`, with no cache fallback (a cache cannot tell "this user is free" from "we have never seen this user"). `App.kt` wires `adsAllowedForUser` to read `.value` off the live session's `EntitlementRepository`.
+
+<Warning>
+Ads cannot read the ordinary `EntitlementRepository.currentTier`. That flow resolves to `FREE` whenever the tier is **unknown** — signed out, auth loading, RevenueCat still identified as a prior account, RC not hydrated — which is the correct safe floor for *feature* gating ("deny paid features until proven"). Ads invert the polarity: the same `FREE` now means "show ads until proven otherwise", so the safe floor becomes an unsafe ceiling. That inversion once let a Cloud+AI user see an app-open ad seconds after signing in with Google, while RevenueCat still pointed at the previously signed-in free account. `adsConfirmedFreeUserId` exists to require positive confirmation and close that bug.
+</Warning>
+
+The app-open eligibility also checks that nothing is mid-flow: `AppOpenAds.eligibilityProvider` (set by `App.kt`) refuses while a recording is `RECORDING`/`PAUSED` (`RecordingService.state`) or while `AudioPlaybackState.isPlaying`.
+
+## Full-screen pacing and suppression
+
+All full-screen pacing lives on `AdsGate` and is shared across both formats, so an app-open ad and an interstitial cannot land back-to-back.
+
+| Mechanism | Member | Behavior |
+| --- | --- | --- |
+| Per-session interstitial cap | `ServerConfig.interstitialsPerSession` | At most N interstitials per app session (`shownThisSession` counter, resets on process restart). |
+| Min gap between any two full-screen ads | `AdsGate.minFullScreenIntervalMs` | `ServerConfig.fullScreenAdMinIntervalSec * 1000`; `fullScreenGapElapsed()` compares against the shared `lastFullScreenShownElapsedMs` clock. |
+| Cross-format mutex | `AdsGate.fullScreenAdShowing` | Set right before `show()`, cleared on dismiss/fail; neither format starts while it is set. |
+| First-run suppression | `AdsGate.firstRunAdsSuppressed` | No full-screen ad during a brand-new account's first run (onboarding → permissions → auto-upgrade). Flipped on/off by `V2App` (`ui/v2/V2App.kt`). |
+| Per-screen block | `AdsGate.fullScreenAdsBlocked` | A reference count incremented by `BlockFullScreenAdsWhileVisible()` (`ads/BlockFullScreenAds.kt`) — drop that one-liner into any screen (e.g. the upgrade screen) that must not be covered. |
+| App Lock | `AdsGate.lockBlocksAds` | Reads `AppLockController.phase`; blocks while locked or resolving. The app-open ad **defers** and re-arms via `onAppUnlocked()`; the interstitial just stays pending. |
+| Interactive sign-in | `AdsGate.authFlowInProgress` | A browser-OAuth sign-in in a Custom Tab fires `onUserLeaveHint` like a real departure; this flag makes `AppOpenAds` refuse to arm *and* refuse to show across the round trip. |
+
+Two server keys tune the pacing. Both are public `server_config` rows mirrored in `ServerConfig` (`app/agentcore/.../config/ServerConfig.kt`):
+
+| Key | `ServerConfig` field | On-device default |
+| --- | --- | --- |
+| `interstitials_per_session` | `interstitialsPerSession` | `1` |
+| `full_screen_ad_min_interval_sec` | `fullScreenAdMinIntervalSec` | `240` |
+
+Both formats buffer several preloaded ads (`BUFFER_TARGET` for app-open; `bufferTarget()` = remaining allowed shows for the interstitial) so a user cannot dodge an ad by briefly killing wifi — buffered ads stay showable offline within their validity window (`AD_TTL_MS`: ~4h for app-open, ~1h for the interstitial). Loads are one-at-a-time, never a request burst.
+
+## Consent and personalization — `AdConsent`
+
+`AdConsent.buildAdRequest(personalized)` (`ads/AdConsent.kt`) applies the user's per-user "Personalized ads" choice to every request. Personalization is **opt-in** — the default is off:
+
+- **Personalized off (default):** the request's network-extras bundle sets `npa = "1"` (non-personalized, contextual only) and `rdp = 1` (Restricted Data Processing, Google's CCPA/CPRA "do not sell or share" signal).
+- **Personalized on:** a plain request with no restriction.
+
+The toggle lives in Privacy settings and on the sign-up screen. The app-open ad is **always** non-personalized regardless of the toggle (a broad-reach launch surface takes the privacy-safe path); the banner and interstitial honor the per-user choice. Where Google's UMP consent applies (EEA/UK) it is authoritative and forces non-personalized ads; UMP is deferred for the US-only launch (RR-522), so this toggle is the US opt-out lever.
+
+## Ad unit IDs and the go-live switch — `AdIds` + `admobLive`
+
+`AdIds` (`ads/AdIds.kt`) resolves the three ad-unit IDs through `BuildConfig`, which `app/app/build.gradle.kts` sets per variant:
+
+- **debug** and **releaseDev** always use Google's official **test** unit IDs, so non-prod builds never request live ads on the real AdMob account.
+- **release** uses the production units only once the `admobLive` switch at the top of `build.gradle.kts` is flipped to `true`; until then the release build keeps the same test IDs as debug, so **no live ads serve**.
+
+```kotlin
+// app/app/build.gradle.kts — DORMANT until flipped
+val admobLive = false
+val admobProdAppId = "ca-app-pub-...~..."
+val admobProdBanner = "ca-app-pub-.../..."
+val admobProdInterstitial = "ca-app-pub-.../..."
+val admobProdAppOpen = "ca-app-pub-.../..."
+```
+
+The AdMob **app ID** is a `manifestPlaceholder` (`admobAppId`) read by the required `<meta-data android:name="com.google.android.gms.ads.APPLICATION_ID">` in `AndroidManifest.xml`; the three **unit** IDs are `buildConfigField` strings (`ADMOB_BANNER_UNIT_ID`, `ADMOB_INTERSTITIAL_UNIT_ID`, `ADMOB_APP_OPEN_UNIT_ID`). The release block swaps all four to the `admobProd*` values when `admobLive` is true. The SDK is pulled in via `libs.play.services.ads`.
+
+`AdIds.TEST_DEVICE_IDS` is a list of hashed test-device IDs; when non-empty, `App.kt` applies it via `MobileAds.setRequestConfiguration(...)` at startup so those devices are served test ads even against the real production units — the safe way to verify a live release without generating invalid traffic. `MobileAds.initialize(...)` fires `AppOpenAds.onSdkInitialized()`, which kicks the first preload (an ad request before init completes silently fails).
+
+## Session isolation
+
+Both full-screen objects implement a `clearForUserSwitch()` that `UserSessionManager` (`data/session/UserSessionManager.kt`) calls on every sign-in/out:
+
+- The preloaded **buffers** are cleared — those ads were requested under the previous user's personalization consent, so serving them to whoever signs in next would apply one user's choice to another.
+- The interstitial's **`pendingShow`** flag is cleared — it means "this user just saved a recording", per-user intent that, as a process-level object, would otherwise survive sign-out.
+- The shared pacing clock (`AdsGate.lastFullScreenShownElapsedMs`) is deliberately **kept** — resetting it would let a sign-out/sign-in cycle show *more* ads, the one place where carrying state over is the conservative choice.
+
+## Related pages
+
+- [User Tiers & Feature Map](/rollingrecord/app/monetization/tiers) — ads as a concrete Free-vs-Pro differentiator.
+- [Entitlements & RevenueCat](/rollingrecord/app/monetization/entitlements-revenuecat) — how `EntitlementRepository` resolves the tier the ad gate confirms against.

@@ -27,8 +27,8 @@ The `OPERATIONS` registry (`functions/support-ops/operations/registry.ts`) expos
 | `get_admin_audit` | Read | `can_read_audit` | Recent `l_admin_audit` (meta-audit) |
 | `get_user_audit` | Read | `can_read_user_audit` | Per-user `l_admin_audit` + abuse events + `l_notification_sent` merged |
 | `link_audit_ticket` | Read (metadata write, no preview) | `can_read_user_audit` | Attach a `ticket_ref` to a past audit row |
-| `get_bug_reports` | Read | `can_view_user_data` | Bug triage queue — global list OR one user's reports (keyset paginated, multi-select status/area filters, 240-char excerpts) |
-| `set_bug_status` | Read (metadata write, no preview) | `can_view_user_data` | Move one bug report through triage; stamps / clears `closed_at` on terminal statuses |
+| `get_submissions` | Read | `can_view_user_data` | Feedback triage queue — bug reports OR feature requests (required `kind`); global list OR one user's rows (keyset paginated, multi-select status/area filters, 240-char excerpts) |
+| `set_submission_status` | Read (metadata write, no preview) | `can_view_user_data` | Move one submission through triage (required `kind` selects bug / feature); stamps / clears `closed_at` on terminal statuses |
 | `get_my_grant_budget` | Read | null (any admin row) | Caller's own remaining monthly credit-grant allowance (per-resource ceiling vs spend) |
 | `get_abuse_top_offenders` | Read | `can_triage_abuse` | Cross-customer `SUM(weight)` offenders leaderboard |
 | `get_user_transcribe_history` | Read | `can_read_user_audit` | `h_transcribe_history` with billed ms / credits |

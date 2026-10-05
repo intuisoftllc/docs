@@ -62,6 +62,14 @@ Output is capped at `kb_chat_max_output_tokens` (default 540). A whitespace-only
 
 `recordAiEngineSession` (`functions/_shared/db/support-history.ts`) writes an `h_ai_engine_sessions` row at every terminal exit — `is_final` success, natural end (`stop_reason != "tool_use"`), `cap_reached`, `rounds_exhausted`, or an upstream error. Non-terminal continuation rounds skip the write.
 
+### Whole-chat latency
+
+The terminal row carries two start stamps (migration `20261003120000_latency_timestamps.sql`). `started_at` is only the **final** round's start (a fresh `new Date()` at the top of each round). `session_started_at` is when the **whole chat's first round** reached the server: on a continuation round the handler reads it from the session record's `created_at` (`query_sessions.created_at`, surfaced through `ConsumeResult.record.createdAt`); on a first round it equals `started_at`. So `ended_at - session_started_at` measures the entire multi-round chat server-side — every round plus the phone's tool time between them — while `ended_at - started_at` would only ever show the last round. The column is `NULL` for single-call ops (`extract` / `synthesis`) and for rows written before the migration; the ai-engine retries the write without the column if it is missing, so deploy order doesn't matter.
+
+### `ai_questions_answered` platform stat
+
+On the same terminal exit, `kb_query` bumps the anonymous `ai_questions_answered` platform counter once per answered question via `recordPlatformStat(PlatformMetric.AiQuestionsAnswered, 1, { isDeveloper })` (fire-and-forget, never blocking the response). Two exclusions keep the number honest: developer accounts never count, and a first round that is also client-`is_final` is skipped — those are the client's one-shot `expandQuery` / `hydeSearch` search-preprocessing calls, not a question the user asked. See [analytics / platform stats](/rollingrecord/backend/edge-functions/analytics).
+
 Round-budget and provider error codes (`functions/_shared/errors.ts`): `max_rounds_exceeded` (user, 429), `session_expired` (user, 410), `session_check_failed` (developer, 502), `cap_reached` (user, 429), `all_providers_failed` (infra, 503), `provider_rate_limited` (infra, 429), `ai_call_failed` (infra, 502).
 
 ## Where to go next

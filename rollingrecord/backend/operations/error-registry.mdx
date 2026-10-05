@@ -21,7 +21,7 @@ Representative codes per category:
 |---|---|
 | `user` | `cap_reached`, `subscription_required`, `moderation_failed`, `step_up_required`, `backup_quota_exceeded`, `semantic_search_disabled`, `admin_grant_budget_exceeded` |
 | `infra` | `all_providers_failed`, `rate_limited`, `provider_rate_limited`, `database_error`, `fk_violation`, `embedding_failed` |
-| `developer` | `invalid_jwt`, `handler_threw`, `missing_operation`, `model_not_allowed`, `extraction_undecryptable`, `admin_hmac_mismatch`, `bug_report_insert_failed` |
+| `developer` | `invalid_jwt`, `handler_threw`, `missing_operation`, `model_not_allowed`, `extraction_undecryptable`, `admin_hmac_mismatch`, `feedback_insert_failed` |
 
 <Note>
 Object and category are not identical. `batch_too_large`, `size_mismatch`, and `recovery_code_invalid_operation` are physically defined inside `USER_ERRORS` but carry category `"developer"`. Both the Kotlin mirror and the doc generator bucket by the `category` field, so these three appear under Developer errors — don't assume the enclosing object equals the category.
@@ -33,10 +33,12 @@ Counted from the registry, the split lands differently depending on which of the
 |---|---|---|
 | user | `USER_ERRORS` 59 | 56 |
 | infra | `INFRA_ERRORS` 11 | 11 |
-| developer | `DEV_ERRORS` 88 | 91 |
-| **Total** | **158** | **158** |
+| developer | `DEV_ERRORS` 89 | 92 |
+| **Total** | **159** | **159** |
 
 The three-code gap between the columns is exactly the mismatch above.
+
+The bug-report endpoint became the two-kind [`feedback` endpoint](/rollingrecord/backend/edge-functions/feedback): the three `bug_report_*` developer codes were removed and four `feedback_*` developer codes added (`feedback_invalid_kind`, `feedback_empty_description`, `feedback_description_too_long`, `feedback_insert_failed`), a net `+1` developer code that moved the developer column from 91 to 92 and the total from 158 to 159.
 
 ## Combined surface and lookup
 
@@ -58,7 +60,7 @@ The client mirrors the registry as `enum class AiEngineErrorCode(val code: Strin
 The Kotlin mirror's real path is `app/agentcore/src/main/kotlin/com/intuisoftllc/rollingrecord/data/remote/aiengine/AiEngineErrorCode.kt` — inside the pure-JVM `agentcore` module. The `errors.ts` header comment cites a wildcard `app/.../data/remote/aiengine/AiEngineErrorCode.kt` path; only the `CLAUDE.md` rule cites the outdated `app/app/.../AiEngineErrorCode.kt` module path. Use the `agentcore` path.
 </Warning>
 
-`AiEngineErrorCodeDriftTest` parses the TypeScript registry at test runtime and asserts exact **bidirectional** parity between the enum and `errors.ts` — all 158 codes, with nothing on only one side. Adding a code on only one side fails the build; the fix is to add it on both, never to `@Ignore` the test. This commit added two codes on **both** sides in the same change, for the support-ops `change_email` operation:
+`AiEngineErrorCodeDriftTest` parses the TypeScript registry at test runtime and asserts exact **bidirectional** parity between the enum and `errors.ts` — all 159 codes, with nothing on only one side. Adding a code on only one side fails the build; the fix is to add it on both, never to `@Ignore` the test. Codes are always added or removed on **both** sides in the same change — the bug-report → `feedback` rename, for instance, dropped three `bug_report_*` developer codes and added four `feedback_*` ones in lockstep. For a worked example, the support-ops `change_email` operation added two codes at once:
 
 | Code | HTTP | Category | Raised when |
 |---|---|---|---|
@@ -84,7 +86,7 @@ python supabase/scripts/gen_error_docs.py
 ```
 
 <Warning>
-`docs/error-codes.md` is a **point-in-time snapshot regenerated on demand, not in CI** — so it can drift between regenerations. This commit regenerated it: both email codes are present as rows and the summary moved from 154 to **156** (User-facing 54 / Infrastructure 11 / Developer 91). It is still **not** fully in sync, because `errors.ts` defines **158** (User-facing **56** / Infrastructure 11 / Developer 91). The two missing codes are the same pair as before — the user-category `amount_not_integer` and `storage_cap_would_be_exceeded` — silently dropped by `gen_error_docs.py`, whose `ENTRY_RE` description group (`"[^"]*(?:"\s*\+\s*"[^"]*)*"`) cannot parse a description containing an escaped double-quote (`\"…\"`), which both of those definitions have. The drift runs one way only: nothing appears in the snapshot that is absent from `errors.ts`. Treat `errors.ts` as authoritative and regenerate the markdown after any code change, since nothing enforces it between runs.
+`docs/error-codes.md` is a **point-in-time snapshot regenerated on demand, not in CI** — so it can drift between regenerations. Its summary currently reads **157** (User-facing 54 / Infrastructure 11 / Developer 92) — the `feedback_*` codes are present and the `bug_report_*` ones are gone. It is still **not** fully in sync, because `errors.ts` defines **159** (User-facing **56** / Infrastructure 11 / Developer 92). The two missing codes are the same pair as before — the user-category `amount_not_integer` and `storage_cap_would_be_exceeded` — silently dropped by `gen_error_docs.py`, whose `ENTRY_RE` description group (`"[^"]*(?:"\s*\+\s*"[^"]*)*"`) cannot parse a description containing an escaped double-quote (`\"…\"`), which both of those definitions have. The drift runs one way only: nothing appears in the snapshot that is absent from `errors.ts`. Treat `errors.ts` as authoritative and regenerate the markdown after any code change, since nothing enforces it between runs.
 </Warning>
 
 ## The single exception to "no inline literals"

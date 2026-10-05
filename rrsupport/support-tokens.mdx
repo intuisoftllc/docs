@@ -1,17 +1,46 @@
 ---
 title: "Support Tokens"
-description: "User-generated 6-digit codes and how admins verify them during a support case."
+description: "User-generated 6-digit codes, their server-configured lifetime, and how admins verify them during a support case."
 ---
 
 Support tokens let a signed-in user prove account ownership to a support agent: the app mints a short-lived 6-digit code, and an admin verifies it through a read-only support-ops operation.
 
-## What this covers
+## User-side generation
 
-- **User-side generation:** `supabase/functions/generate-support-token/index.ts` (RR-313) — any signed-in user mints a 6-digit code, `TOKEN_TTL_MS = 60 * 60 * 1000` (60 min), single-use, display-only (no email). Return-existing UPSERT semantics; rate-limited by `Bucket.SupportTokenGenerate` (20/hr).
-- **App-side surface:** the code is generated from the Account Management UI — `SupportTokenBottomSheet.kt`, `SupportTokenSheetViewModel.kt`, `SupportTokenRepository.kt`, DTO `GenerateSupportTokenDto.kt` (copy-to-clipboard + countdown against `expires_at`).
-- **Admin-side verification:** the `verify_support_token` operation — `isReadOnly: true`, `requiredPermission: "can_validate_codes"`; stamps `consumed_at` on a match. Exposed via CLI `--op verify-token --user <uid> --code <6 digits>`.
-- **Two-axis diagnostics:** `token_state` (active / consumed / expired / none) × `reason` (verified / mismatch / already_consumed / expired / no_active_code) — e.g. `no_active_code` flags a code supplied for an account that never generated one.
+`supabase/functions/generate-support-token/index.ts` (RR-313) lets any signed-in user mint a 6-digit numeric code — single-use and display-only (returned in the response body for the app to render, no email). The gate chain is POST + `AuthMode.Jwt` + the `Bucket.SupportTokenGenerate` rate limit (20/hr per caller, `abuseEventOnReject: AbuseEventType.RateLimitHit`); there is no entitlement requirement, because support is available to every tier. The freeze gate still applies, so a frozen account cannot mint one.
 
-<Note>
-Scaffold generated from the codebase map — expand with full detail, examples, and specifics.
-</Note>
+The code itself is drawn with `crypto.getRandomValues` and rejection-sampled into `[0, 1000000)` to avoid modulo bias, then zero-padded to six digits.
+
+### Return-existing semantics
+
+Generation is an UPSERT on `support_tokens`, keyed by `auth_user_id`. The function first looks up the caller's existing row: if it is still active (`consumed_at IS NULL` and `expires_at` in the future) that same code is returned with `reused: true`, so re-fetches (sheet re-open, process restart, navigate away and back) don't churn the code. Only an expired or consumed row falls through to mint a fresh one, which overwrites the stale row. The response is `GenerateResponse` — `code`, `expires_at` (ISO 8601, the client renders a countdown against it), and the informational `reused` flag.
+
+## Configurable lifetime
+
+The code's validity window is no longer a hardcoded `60 * 60 * 1000`. It comes from the `support_code_ttl_minutes` row in `server_config` (migration `supabase/migrations/20260926120000_support_code_ttl_config.sql`, RR-38), read with `getInt(SUPPORT_CODE_TTL_CONFIG_KEY, DEFAULT_SUPPORT_CODE_TTL_MINUTES)`. The Edge Function converts the stored minutes to milliseconds (`× 60 × 1000`) to set the real TTL; `DEFAULT_SUPPORT_CODE_TTL_MINUTES` is `60`, matching the seeded row, so the default behavior is unchanged.
+
+The row is `public = TRUE` on purpose: the server enforces the TTL AND the Android client reads the same value (via `ServerConfig.supportCodeTtlMinutes`, mirrored as `KEY_SUPPORT_CODE_TTL_MINUTES` in `app/agentcore/.../config/ServerConfig.kt`) to render the "expires in N minutes" copy. One value drives both sides, so the number the user reads is the number the server enforces — they cannot drift. The migration is purely additive (one `INSERT ... ON CONFLICT`), and `ServerConfigDriftSmokeTest` enforces the public-row-to-mirror parity. Raising the row widens the operator's window to read a code back; the live TTL follows it on the next mint and the displayed copy on the next client config fetch.
+
+## App-side surface
+
+The code is generated from the V2 Help & Support UI — `V2SupportCodeSheet.kt` and `V2SupportCodeViewModel.kt` (`ui/v2/screens/helpsupport/`), over the shared `SupportTokenRepository.kt` and the `GenerateSupportTokenDto.kt` DTO. The sheet reads `ServerConfig.supportCodeTtlMinutes` for its copy and offers copy-to-clipboard plus a countdown against `expires_at`.
+
+## Admin-side verification
+
+An admin verifies a code with the `verify_support_token` support-ops operation — `isReadOnly: true`, `requiredPermission: "can_validate_codes"` — which stamps `consumed_at` on a match (single-use enforcement). It is exposed through the CLI as `--op verify-token --user <uid> --code <6 digits>`.
+
+Verification reports two axes so an operator can tell apart the failure modes:
+
+| `token_state` | `reason` |
+| --- | --- |
+| `active` | `verified` / `mismatch` |
+| `consumed` | `already_consumed` |
+| `expired` | `expired` |
+| `none` | `no_active_code` |
+
+`no_active_code` flags a code supplied for an account that never generated one, distinct from a wrong code (`mismatch`) against an account that did.
+
+## Where to go next
+
+- [Permissions & audit log](/rrsupport/permissions-and-audit) — `can_validate_codes` and the audit row `verify_support_token` writes.
+- [support_ops.py — Admin CLI](/rrsupport/cli) — the `verify-token` command and its flags.

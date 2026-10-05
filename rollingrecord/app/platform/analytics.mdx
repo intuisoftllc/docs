@@ -1,9 +1,9 @@
 ---
 title: "Analytics & Crash Reporting"
-description: "Content-free typed analytics events, the Firebase/Crashlytics client, and the crash and OS-kill sentinels that survive process death."
+description: "Content-free typed analytics events, the Firebase Analytics / Crashlytics / Performance Monitoring client, and the crash and OS-kill sentinels that survive process death."
 ---
 
-`AnalyticsTracker` is the single entry point: it consent-gates a local Room event log and forwards typed `AnalyticsEvent`s to an `AnalyticsClient`. The bound implementation is `SupabaseFirebaseAnalyticsClient` — Firebase Analytics events, Crashlytics breadcrumbs, and non-fatals are live; the batch upload to a future Supabase `analytics_events` table is a Phase-6 stub. Crash and OS-kill survivability come from `CrashReporter` and `OsKillSentinel`, both writing to `SharedPreferences` with `commit()` during teardown and replaying on next launch.
+`AnalyticsTracker` is the single entry point: it consent-gates a local Room event log and forwards typed `AnalyticsEvent`s to an `AnalyticsClient`. The bound implementation is `SupabaseFirebaseAnalyticsClient` — Firebase Analytics events, Crashlytics breadcrumbs, and non-fatals are live, and Firebase Performance Monitoring rides the same consent toggle; the batch upload to a future Supabase `analytics_events` table is a Phase-6 stub. Crash and OS-kill survivability come from `CrashReporter` and `OsKillSentinel`, both writing to `SharedPreferences` with `commit()` during teardown and replaying on next launch.
 
 ## `AnalyticsTracker`
 
@@ -13,7 +13,7 @@ description: "Content-free typed analytics events, the Firebase/Crashlytics clie
 
 `data/analytics/AnalyticsClient.kt` is the interface over the remote backends: `sendEvents` (batch → Supabase, Phase 6), `logEvent` (typed → Firebase), `logException` (non-fatal), `logCustomEvent`, and `logBreadcrumb`. `NoOpAnalyticsClient` is an inert fallback, but the KDoc claiming it is what's injected is stale — `di/AnalyticsModule.kt` binds `SupabaseFirebaseAnalyticsClient` as the `AnalyticsClient` single, so the Firebase and Crashlytics paths are live in production.
 
-`data/analytics/SupabaseFirebaseAnalyticsClient.kt` caches the consent flag (`analyticsEnabled`) and fails *closed* the instant a session switches, re-reading the new user's preference before re-enabling. Live behavior:
+`data/analytics/SupabaseFirebaseAnalyticsClient.kt` caches the consent flag (`analyticsEnabled`) and fails *closed* the instant a session switches, re-reading the new user's preference before re-enabling. The same session-switch handler toggles all three Firebase collectors together — `firebase.setAnalyticsCollectionEnabled(...)`, `FirebasePerformance.getInstance().isPerformanceCollectionEnabled`, and the gated Crashlytics calls — so Performance Monitoring never runs under the outgoing user's "yes" (see [Performance Monitoring](#performance-monitoring)). Live behavior:
 
 - `logEvent` maps ~14 event types to Firebase param maps (cost-metering-only events return `null` from `firebaseParams` and are skipped).
 - `logScreenView` fires a Firebase `SCREEN_VIEW`, but it is called **only** from `AppNavHost` (`ui/v1/navigation/AppNavHost.kt`) — the legacy V1 nav host. The active V2 surface (`V2LoginNavHost` / `V2MainNavHost` via `V2App`) never calls it, so `SCREEN_VIEW` does not fire on the current app surface.
@@ -22,6 +22,23 @@ description: "Content-free typed analytics events, the Firebase/Crashlytics clie
 - `sendEvents` is a Phase-6 stub that returns `true` without POSTing.
 
 There is no analytics Edge Function. The remote batch path targets a future Supabase `analytics_events` **table**, not a function, and is not yet wired.
+
+## Performance Monitoring
+
+Firebase Performance Monitoring is added via the `firebase-perf` SDK alone (`libs.firebase.perf` → `com.google.firebase:firebase-perf`, declared in `app/app/build.gradle.kts`). The compile-time perf **Gradle plugin is deliberately omitted**: its ASM bytecode transform rewrites deeply-nested Compose lambdas into class files whose paths exceed the Windows 260-character `MAX_PATH` limit, which breaks the build on this repo's dev machines. The plugin only adds automatic HTTP network-request traces and `@AddTrace`, neither of which the app needs — API latency is already logged separately — so dropping it costs nothing. The SDK alone still powers the console dashboard, automatic flagging, and alerts.
+
+Collection is **not** independently configurable: it rides the existing analytics / crash-reporting consent toggle. In `SupabaseFirebaseAnalyticsClient`, `FirebasePerformance.getInstance().isPerformanceCollectionEnabled` is set in lockstep with `setAnalyticsCollectionEnabled` — both are flipped off the instant a session switches and then re-enabled only after the new user's `analyticsTrackingEnabled` preference is read. A user who has opted out of analytics is also opted out of performance traces, and traces never carry across accounts.
+
+What it collects, all automatically from the SDK:
+
+| Signal | What it measures |
+| --- | --- |
+| App-start trace | Cold / warm start duration |
+| Foreground / background traces | Time the app spends in each state |
+| Screen-rendering traces | Per-screen slow frames and frozen frames |
+| Custom traces | Any code-defined trace the app adds (none wired today) |
+
+All of these surface in the **Firebase console** Performance dashboard; nothing is written to Supabase or the local Room event log.
 
 ## `AnalyticsEvent`
 

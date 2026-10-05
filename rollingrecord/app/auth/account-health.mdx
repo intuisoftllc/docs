@@ -39,7 +39,7 @@ The provider also blends in a debug-only override: `DevFlags.forcedAccountHealth
 
 `AccountHealthRepository` (`data/repository/AccountHealthRepository.kt`) is **app-scoped** (a Koin `single`), backed by a DataStore file under `datastore/device/account_health`. It is app-scoped, not user-scoped, because the write side is `AccountFreezeInterceptor` — an OkHttp interceptor on the app-wide clients that fires on the dispatcher thread and must always reach a live instance.
 
-The frozen flag is **owner-stamped** (`OWNER_USER_ID`): `frozenState` only reports frozen when the persisted owner matches the signed-in `authUserId`, so a frozen flag whose owner doesn't match is treated as not-frozen. `setFrozen(reason)` is called on a 403 `account_frozen`, `clearFrozen()` on any 2xx (proving the freeze gate was passed), and `reset()` wipes the row. The repository self-observes `AuthRepository.authState` and resets on every user-identity transition, so a different account never inherits the previous account's lock. `FrozenState` is the `data class { frozen, reason? }` with a `NOT_FROZEN` sentinel.
+The frozen flag is **owner-stamped** (`OWNER_USER_ID`): `frozenState` only reports frozen when the persisted owner matches the signed-in `authUserId`, so a frozen flag whose owner doesn't match is treated as not-frozen. `setFrozen(reason)` is called on a 403 `account_frozen`, `clearFrozen()` on any 2xx (proving the freeze gate was passed), `acknowledgeFrozen()` records that the user dismissed the full-screen overlay for the current freeze episode, and `reset()` wipes the row. The repository self-observes `AuthRepository.authState` and resets on every user-identity transition, so a different account never inherits the previous account's lock. `FrozenState` is the `data class { frozen, reason?, acknowledged }` with a `NOT_FROZEN` sentinel — `acknowledged` is the per-episode overlay-dismissed flag (see [The soft frozen overlay](#the-soft-frozen-overlay)).
 
 Persisting the freeze means the dot appears on the next cold start without waiting for the first authed round-trip to re-discover the 403.
 
@@ -49,12 +49,42 @@ Persisting the freeze means the dot appears on the next cold start without waiti
 
 Both account VMs read `AccountHealthProvider.health`: `AccountUiState.accountHealth` (main screen — glance-only, no sheet) and `AccountSettingsUiState.accountHealth` + `frozenReason` (settings). On the settings screen, tapping the header card when not `HEALTHY` opens `V2AccountHealthSheet` (`ui/v2/screens/accountsettings/components/V2AccountHealthSheet.kt`). The sheet mirrors the tapped dot, shows a plain-English title + body, and offers the per-state CTA from the table above; FROZEN centers its title, leads the admin reason with a snowflake glyph, and each CTA dismisses the sheet before firing. The FROZEN "Contact support" opens a pre-filled account-access email (`sendFrozenAccountSupportEmail`) — no support token is minted.
 
+## The soft frozen overlay
+
+`V2FrozenOverlay` (`ui/v2/screens/frozen/V2FrozenOverlay.kt`) is the full-screen notice shown when a signed-in account is detected frozen **while the local database still opens** — a returning device that already holds the per-user DEK, so the user keeps full local access. `V2App` draws it above the nav host, onboarding, and the permissions gate, but below App Lock and the version kill-switch: the gate is `sessionActive && sessionDbReady && !appLocked && !resolvingLock && frozenState.frozen && !frozenState.acknowledged`, so App Lock keeps full precedence and the overlay never bypasses it.
+
+The overlay is informational, not a hard block. It paints the background opaque and consumes stray taps so nothing behind it receives input, leads with the `ic_snowflake` glyph in `StatusFrozen`, shows the generic `frozen_overlay_body` copy, and renders the admin `reason` in a muted card below **only** when the server actually sent one. Its single action is **OK**, which is deliberately disabled for the first `OK_DELAY_MS` (2000 ms) so the notice can't be dismissed reflexively, then enables. It is **not** auto-dismissed — the user still taps OK; only the button's enablement is time-gated.
+
+Tapping OK calls `AccountHealthRepository.acknowledgeFrozen()`, which sets the per-episode `acknowledged` flag in the DataStore row so a cold-start relaunch within the same freeze episode doesn't re-nag. The flag is scoped to one freeze episode: `setFrozen()` never touches it (repeated 403s during a single freeze must not un-acknowledge), while `clearFrozen()` (an unfreeze via a 2xx) and `reset()` (sign-out / account switch) both wipe it, so a later refreeze or a fresh sign-in to a still-frozen account shows the overlay again.
+
+<Note>
+The soft overlay requires a local DEK — the database has to open for the app tree to exist beneath it. A **new** device signing into a frozen account has no local DEK and the DB can't open at all; that terminal case is handled one level up by `V2AccountFrozenScreen` (Contact support / Sign out, no "OK"). See [Database Recovery States](/rollingrecord/app/security/database-recovery).
+</Note>
+
+## The account-status legend sheet
+
+`V2AccountStatusLegendSheet` (`ui/v2/screens/accountsettings/components/V2AccountStatusLegendSheet.kt`) is a reference guide to what every status dot means, opened by **long-pressing** the account header card on the [Account Settings](/rollingrecord/app/auth/account-settings) screen — at any status, including `HEALTHY`. The two gestures on the card never compete: a tap opens the current status's `V2AccountHealthSheet` (only when not `HEALTHY`), while the long-press (`onLongClick` in `V2AccountSettingsScreen.kt`) always opens this legend.
+
+It is purely explanatory — it describes the state each dot represents, not how to resolve it (the live sheet owns the resolution CTA). It draws one `StatusRow` per state, least-severe first, each rendering the real `AccountStatusDot` so the legend matches exactly what the card shows (OFFLINE renders soft, etc.):
+
+| Row | State | Dot |
+| --- | --- | --- |
+| Good standing | `HEALTHY` | hollow `Gray400` ring (the no-dot state) |
+| Offline | `OFFLINE` | `AccountStatusDot`, soft (0.45 alpha) |
+| Subscription lapsed | `SUBSCRIPTION_LAPSED` | `AccountStatusDot` |
+| Sync error | `SYNC_ERROR` | `AccountStatusDot` |
+| Frozen | `FROZEN` | `AccountStatusDot` |
+
+"Good standing" leads so the normal no-dot state is explained too; because `HEALTHY` draws no dot on the card, its row shows a hollow ring of the same size instead. The sheet uses the standard V2 chrome (`cardMuted` container, 34dp top corners, `Gray400` drag handle) and closes via a Close button or dismiss.
+
 ## Lapse, grace, and quota banners
 
 The lapse/grace/quota surfaces render on the [Account Settings](/rollingrecord/app/auth/account-settings) screen, not on the dot itself. `V2GraceBanner` and `V2QuotaBanner` (`ui/v2/screens/accountsettings/components/V2CloudPressureBanners.kt`) and `V2LapsedAccessNotice` (`ui/v2/screens/accountsettings/components/V2LapsedAccessNotice.kt`) are the cards; grace state comes from `IdentityRepository.graceState` (a `StateFlow<GraceState?>` carrying the lapse timestamp and paid tier). Exactly one lapse card shows — the cloud grace countdown wins over the quieter `SUBSCRIPTION_LAPSED` notice — and `V2QuotaBanner` opens the free-up-space sheet.
 
 ## Related pages
 
+- [Account Frozen gate](/rollingrecord/backend/gates/account-frozen) — the server 403 `account_frozen` that `AccountFreezeInterceptor` turns into the client freeze signal
+- [Database Recovery States](/rollingrecord/app/security/database-recovery) — the terminal `V2AccountFrozenScreen` for a frozen account with no local DEK
 - [Account Profile](/rollingrecord/app/auth/profile)
 - [Account Settings](/rollingrecord/app/auth/account-settings)
 - [Account Deletion](/rollingrecord/app/auth/account-deletion)

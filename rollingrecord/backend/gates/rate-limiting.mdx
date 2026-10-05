@@ -1,9 +1,9 @@
 ---
 title: "Rate Limiting & Buckets"
-description: "The atomic fixed-window rate limiter, the bucket taxonomy, the rate_limit_config table with BUCKET_DEFAULTS fallback, and chain-sugar vs standalone usage."
+description: "The atomic sustained + burst rate limiter, the bucket taxonomy, the rate_limit_config table with BUCKET_DEFAULTS fallback, burst modes, and chain-sugar vs standalone usage."
 ---
 
-Rate limiting is a standalone callable, not a fixed slot in the chain. `checkRateLimit(bucket, authUserId, isDeveloper, weight)` in `functions/_shared/gates/rate-limit.ts` reads the bucket's config, runs an atomic increment RPC, and returns a gate result the caller pattern-matches. `runGates` offers optional chain sugar around it for the common case; handlers that need per-operation or non-`authUserId` limits call it directly.
+Rate limiting is a standalone callable, not a fixed slot in the chain. `checkRateLimit(bucket, authUserId, isDeveloper, weight)` in `functions/_shared/gates/rate-limit.ts` reads the bucket's config, runs one atomic increment RPC, and returns a gate result the caller pattern-matches. Every bucket now has two windows: the long **sustained** window (e.g. 60/hour) and a short **burst** window layered on top (default 40% of the ceiling inside 60s), so a caller can no longer spend the whole hour's allowance in the first second. `runGates` offers optional chain sugar around the check for the common case; handlers that need per-operation or non-`authUserId` limits call it directly.
 
 ## The check
 
@@ -11,37 +11,115 @@ Rate limiting is a standalone callable, not a fixed slot in the chain. `checkRat
 
 - **Dev bypass** — `isDeveloper === true` admits without touching the counter (see [dev bypass scope](/rollingrecord/backend/gates/dev-bypass-scope)).
 - **Kill-switch** — a `rate_limit_config` row with `enabled = false` admits without counting, so a bucket can be disabled live without a deploy.
-- **Atomic increment** — otherwise it calls the `check_and_increment_rate_limit` RPC and returns admitted or `429 rate_limited`.
+- **Atomic increment** — otherwise it resolves the bucket's effective burst settings and calls the `check_and_increment_rate_limit_v2` RPC, which enforces **both** windows in one row-locked transaction and returns admitted or `429 rate_limited`.
 
-Windows are fixed and anchor to the first request after a reset, not to clock-hour boundaries. The optional `weight` (default 1) lets a caller consume more than one slot per call — a weighted increment that would exceed the cap is rejected as a whole, never partially admitted.
+Windows are fixed and anchor to the first request after a reset, not to clock-hour boundaries. The optional `weight` (default 1) lets a caller consume more than one slot per call — a weighted increment that would exceed the cap is rejected as a whole, never partially admitted. A refusal on **either** window consumes nothing from either.
+
+### Deploy-order fallback to v1
+
+The burst RPC ships with its migration (`20260930120000_rate_limit_burst_protection.sql`). If the Edge code deploys before the migration has run, the v2 function is absent and PostgREST returns `PGRST202` ("function not found"). `checkRateLimit` catches that one code and retries the original sustained-only `check_and_increment_rate_limit` RPC (no burst), rather than failing closed on every endpoint. This fallback is transitional — it is removed once the migration has run on both the dev and production databases.
+
+## Burst protection
+
+Burst protection is a sliding-window sub-limit evaluated alongside the sustained window. The model, inheritance, and clamping rules live in `functions/_shared/gates/burst.ts`, which is the **spec** for the SQL: `check_and_increment_rate_limit_v2` mirrors `evaluateBurst` line for line, and `supabase/tests/_shared/gates/burst_test.ts` pins the behavior. The two change together.
+
+**Sliding-window counter, not a fixed window.** A fixed short window can be gamed at its edge (spend the allowance at `0:59`, then again at `1:00`). The burst window keeps two integers per counter row — the current sub-window's weighted count and the previous one's — and estimates the last `W` seconds as `estimate = prev * (W - elapsed) / W + curr`. A request is admitted iff `estimate + weight <= burst_max`. No per-request log, no boundary double-spend.
+
+**The allowance.** For a bucket with ceiling `max` and percentage `pct`, the burst allowance is `ceil(max * pct / 100)`, floored at `min(max, 3)` (`BURST_MIN_ALLOWANCE`) and capped at `max`. The floor is why buckets with `max <= 3` (e.g. `delete_user`, `resolve_identity`) are effectively unaffected by burst.
+
+### Modes
+
+`burst_mode` selects what a breach does:
+
+| Mode | Behavior |
+| --- | --- |
+| `off` | Burst not evaluated; the burst counter columns are left untouched. |
+| `shadow` | Evaluated and logged as a would-block, but the request is **admitted**. For measuring an endpoint before enforcing on it. |
+| `enforce` | A burst breach is rejected with the standard `429`, with `reset_at_sec` set to when the burst window has room again. |
+
+A would-be block logs a `BurstLimitHit` (`burst_limit_hit`) abuse event once per `(user, bucket, burst sub-window)` — in both `enforce` and `shadow` (`details.mode` says which, `details.blocked` says whether the request was actually refused). Its `DEFAULT_WEIGHTS` entry is **0** on purpose: while the thresholds are tuned against real traffic the signal must add nothing to any top-offenders score.
+
+### Configuration columns
+
+Per-bucket overrides live on `rate_limit_config` (added by `20260930120000_rate_limit_burst_protection.sql`). All three are nullable, and `NULL` means **inherit the global default**. Out-of-range values are clamped in code, never rejected, so a typo cannot take an endpoint down.
+
+| Column | Type | Meaning |
+| --- | --- | --- |
+| `burst_mode` | `text` (`off` / `shadow` / `enforce`) | Per-bucket mode. A `CHECK` constraint (`rate_limit_config_burst_mode_check`) rejects any other string at write time. `NULL` = inherit. |
+| `burst_pct` | `smallint` | Burst allowance as a percentage of `max_requests` (clamped `1..100`). `NULL` = inherit. |
+| `burst_window_sec` | `integer` | Burst window length in seconds (clamped `1..300`). `NULL` = inherit. |
+
+The sliding-window state is four nullable columns on `rate_limit_counters` (same row as the sustained counter):
+
+| Column | Type | Meaning |
+| --- | --- | --- |
+| `burst_window_start_sec` | `bigint` | Epoch seconds the current burst sub-window opened (advances in whole windows). |
+| `burst_count` | `integer` | Weighted count admitted in the current sub-window. |
+| `burst_prev_count` | `integer` | Weighted count admitted in the previous sub-window (decays linearly in the estimate). |
+| `burst_logged_start_sec` | `bigint` | `burst_window_start_sec` of the last sub-window a `burst_limit_hit` was logged for — de-dupes the abuse log to one row per sub-window. |
+
+### Global defaults and the shadow rollout
+
+The global defaults are three **private** (`public = false`) `server_config` rows, with code fallbacks in `BURST_GLOBAL_FALLBACK`:
+
+| Key | Default | Meaning |
+| --- | --- | --- |
+| `rate_limit_burst_mode` | `enforce` | Mode a bucket inherits when its `burst_mode` is `NULL`. |
+| `rate_limit_burst_pct` | `40` | Allowance a bucket inherits (40% of `max_requests`). |
+| `rate_limit_burst_window_sec` | `60` | Window a bucket inherits (the standard per-minute secondary tier). |
+
+The global default is `enforce` on purpose: a bucket added in the future is burst-protected unless someone explicitly opts it into shadow. The launch rollout is the opposite, done per bucket — `20260930140000_rate_limit_burst_shadow_all_buckets.sql` sets `burst_mode = 'shadow'` on **every** bucket that existed at launch, so burst is measured (would-be blocks logged, requests admitted) before any endpoint actually enforces. The sustained limits are unaffected and keep enforcing. To enforce a bucket later, set its `burst_mode` to `enforce` (or back to `NULL` to inherit the global `enforce`); the `burst_pct` overrides below still apply, so shadow measures exactly what enforcement would block.
+
+### Bucket tuning
+
+With a burst window now capping how fast any bucket can be spent, `20260930130000_rate_limit_tuning.sql` raised several sustained ceilings without reopening the "blast it all in one second" hole, and gave a few security-sensitive buckets a tighter burst than the 40% default:
+
+| `bucket_key` | Sustained change | Burst |
+| --- | --- | --- |
+| `account_otp_send` | 20/hr (unchanged) | `burst_pct` 15 → 3 per 60s |
+| `sync_download_grace` | 280 → 550 per **day** | `burst_pct` 18 → 99 per 60s |
+| `ai_extraction` | 300 → 400/hr | inherits 40% → 160 per 60s |
+| `feedback` | 5 → 10/hr | inherits 40% → 4 per 60s |
+| `delete_user` | 2 → 5/hr | inherits → 3 per 60s (the `min(max, 3)` floor) |
+| `support_ops` | 100 → 250/hr | `burst_pct` 20 → 50 per 60s |
+
+`burst_pct` is a whole-number percent, so `sync_download_grace`'s "cap at ~100" lands at 99 (18% of 550). A daily bucket's burst is still measured over the 60s burst window, so without the override 40% of a daily cap would allow a fifth of the day's downloads in one minute; 18% keeps the bulk-export guard meaningful while a lapsed user can still take a full day's worth in ~6 minutes. The same migration also `DELETE`s the retired `bug_report` row (see the rename below).
+
+## The `Bucket.BugReport` → `Bucket.Feedback` rename
+
+The old `bug-report` endpoint became `feedback`, which now carries **both** bug reports and feature requests. The `Bucket.BugReport` enum member was renamed to `Bucket.Feedback` (wire string `bug_report` → `feedback`), so rate-limit lookups key off the new string. The seed row for the `feedback` bucket is inserted by `20260925120000_feature_requests.sql` (`5/hour`, later raised to `10/hour` by the tuning migration), and the dead `bug_report` row is dropped by the tuning migration. Because the two kinds share one endpoint they share one bucket — per-kind ceilings were rejected because the bucket would then depend on the body's `kind`, which the gate chain runs too early to know, which would push the limit out of the chain and leave a malformed body un-counted.
+
+The abuse event on a `feedback` rejection renamed to match: `AbuseEventType.FeedbackFlood` (`feedback_flood`), wired via `abuseEventOnReject: AbuseEventType.FeedbackFlood` in `functions/feedback/index.ts`. Its weight is the floor (1) deliberately — the likeliest cause of a feedback burst is a user who found several things wrong and filed them all, so a single hit must never push anyone up the top-offenders list.
 
 ## Configuration and fallback
 
-`getBucketConfig(bucket)` reads `rate_limit_config` (`max_requests`, `window_sec`, `enabled`) keyed on `bucket_key`, with a per-isolate `configCache`. On a missing row or DB error it falls back to the in-code `BUCKET_DEFAULTS` map — a `Record<Bucket, { max; windowSec; enabled }>` — with `enabled: true` by default, so a missing row still **enforces** at the code default rather than opening the gate.
+`getBucketConfig(bucket)` reads `rate_limit_config` (`max_requests`, `window_sec`, `enabled`, `burst_mode`, `burst_pct`, `burst_window_sec`) keyed on `bucket_key`, with a per-isolate `configCache`. On a missing row or DB error it falls back to the in-code `BUCKET_DEFAULTS` map — a `Record<Bucket, { max; windowSec; enabled }>` — with `enabled: true` and every burst override inheriting the global default, so a missing row still **enforces** at the code default rather than opening the gate.
 
-Several fallbacks are held at deliberately **half the live ceiling** so a missing-row fallback always errs below the real limit, never above it: `sync_pull` 275 vs live 550, `search` 300 vs 600, `indexing` 150 vs 300, `embedding_cache` 300 vs 600.
+Several fallbacks are held at deliberately **half the live ceiling** so a missing-row fallback always errs below the real limit, never above it: `sync_pull` 275 vs live 550, `search` 300 vs 600, `indexing` 150 vs 300, `embedding_cache` 300 vs 600. The buckets raised by the tuning migration keep the same discipline — their `BUCKET_DEFAULTS` fallbacks stay at or below the new live value (`ai_extraction` 300 vs live 400, `support_ops` 60 vs live 250, `delete_user` 2 vs live 5, `feedback` 5 vs live 10, `sync_download_grace` 100 vs live 550).
+
+The burst globals are read through `getBurstGlobals()`, which pulls the three private `server_config` rows (5-minute cached by `server-config.ts`) and falls back to `BURST_GLOBAL_FALLBACK`. `resolveBurst()` then combines a bucket's overrides with the globals, applies the clamps and the allowance floor, and hands the effective `{ mode, max, windowSec }` to the RPC.
 
 ## Fail-closed and minimal leakage
 
-An RPC error fails **closed**: `checkRateLimit` returns `500 database_error` with a `bucket` tag rather than admitting — fail-open would melt every user's limit on a single DB hiccup. On a rejection the `429` body from `rateLimitedResponseBody()` is deliberately minimal, `{ error, bucket, reset_at_sec }` — `max`, `count`, `window_sec`, and `retry_after` are all withheld so the ceiling can't be reverse-engineered.
+An RPC error fails **closed**: `checkRateLimit` returns `500 database_error` with a `bucket` tag rather than admitting — fail-open would melt every user's limit on a single DB hiccup. On a rejection the `429` body from `rateLimitedResponseBody()` is deliberately minimal: `{ error, bucket, reset_at_sec, scope }`. `max`, `count`, `window_sec`, and `retry_after` are all withheld so the ceiling can't be reverse-engineered. `scope` is a diagnostic-only field — `"burst"` or `"window"` — so a "why isn't this working?" log can tell a short-window burst trip from an exhausted hour; it reveals no ceiling or window length (a short `reset_at_sec` already implies a short window), and older clients ignore the additive key. On a burst refusal `reset_at_sec` is the burst window's much-sooner retry time rather than the sustained window's end.
 
 ## Near-limit signal
 
-The RPC also returns `near_limit_crossed` (added by migration `20260601000000_rate_limit_near_limit_flag.sql`) — `true` the first time a call crosses 90% of `max` in a window. On that crossing `checkRateLimit` fire-and-forgets a `NearLimitApproach` (`near_limit_approach`, default weight 2) abuse event; a log failure never blocks the primary request. The chain-sugar `abuseEventOnReject` path separately logs an abuse event on a *rejection* for security-sensitive buckets — `RateLimitHit` (`rate_limit_hit`, weight 1) for most, and now `BugReportFlood` (`bug_report_flood`, weight 1) for `bug-report`, which wires `abuseEventOnReject: AbuseEventType.BugReportFlood` so a rejected bug-report burst is recorded on the account's history. Its weight is the floor deliberately — the overwhelmingly likely cause is a user who just found several things wrong and filed them all, so a single hit must never push anyone up the top-offenders list.
+The RPC also returns `near_limit_crossed` (added by `20260601000000_rate_limit_near_limit_flag.sql`) — `true` the first time a call crosses 90% of `max` in a window. On that crossing `checkRateLimit` fire-and-forgets a `NearLimitApproach` (`near_limit_approach`, default weight 2) abuse event; a log failure never blocks the primary request. Separately, the v2 RPC returns `burst_would_block` + `burst_log`, which drive the once-per-sub-window `BurstLimitHit` log described above. The chain-sugar `abuseEventOnReject` path logs an abuse event on a *rejection* for security-sensitive buckets — `RateLimitHit` (`rate_limit_hit`, weight 1) for most, and `FeedbackFlood` (`feedback_flood`, weight 1) for `feedback`.
 
 ## Registered buckets
 
-Every `Bucket` enum member (`functions/_shared/gates/types.ts`) has a `bucket_key` wire value, a `BUCKET_DEFAULTS` fallback, and a seeded `rate_limit_config` row.
+Every `Bucket` enum member (`functions/_shared/gates/types.ts`) has a `bucket_key` wire value, a `BUCKET_DEFAULTS` fallback, and a seeded `rate_limit_config` row. The max / window_sec column below is the **fallback**; where the live `rate_limit_config` ceiling differs it is called out.
 
 | Bucket member | `bucket_key` | Fallback max / window_sec | Purpose |
 | --- | --- | --- | --- |
 | `AiEngine` | `ai_engine` | 60 / 3600 | ai-engine runaway guard (one counter across all ops) |
-| `BugReport` | `bug_report` | 10 / 3600 | `bug-report` submissions — free on every tier, so this ceiling is the ONLY abuse control on the endpoint (no entitlement gate behind it); it also caps Storage churn since each accepted report can carry a multi-MB log upload |
-| `AiExtraction` | `ai_extraction` | 300 / 3600 | per-chunk extraction model calls, keyed on job owner |
+| `Feedback` | `feedback` | 5 (live 10) / 3600 | `feedback` submissions — bug reports AND feature requests share this bucket; free on every tier, so this is the ONLY abuse control on the endpoint (no entitlement gate), and it caps Storage churn since a bug report can carry a multi-MB log upload |
+| `AiExtraction` | `ai_extraction` | 300 (live 400) / 3600 | per-chunk extraction model calls, keyed on job owner |
 | `ExtractionSubmit` | `extraction_submit` | 60 / 3600 | `extract-submit` + `extract-results` (~3 calls/attempt) |
 | `ExtractionStatus` | `extraction_status` | 600 / 3600 | polled `extract-results` status / cancel progress plane |
 | `ResolveIdentity` | `resolve_identity` | 10 / 3600 | `resolve-identity` |
-| `DeleteUser` | `delete_user` | 2 / 3600 | `delete-user` |
+| `DeleteUser` | `delete_user` | 2 (live 5) / 3600 | `delete-user` |
 | `SyncAudio` | `sync_audio` | 100 / 3600 | `sync-audio` |
 | `UserKeyGet` | `user_key_get` | 40 / 3600 | `get-user-key` |
 | `UserSyncPreferences` | `user_sync_preferences` | 60 / 3600 | `user-sync-preferences` |
@@ -49,16 +127,18 @@ Every `Bucket` enum member (`functions/_shared/gates/types.ts`) has a `bucket_ke
 | `SyncReserve` | `sync_reserve` | 30 / 3600 | `sync-reserve` signed-URL + DEK |
 | `SyncPush` | `sync_push` | 240 / 3600 | `sync-push` + `sync-group-exclude` |
 | `SyncReconcile` | `sync_reconcile` | 60 / 3600 | `sync-reconcile` drift handshake |
-| `SupportOps` | `support_ops` | 60 / 3600 | `support-ops` admin dispatcher (after admin gates) |
+| `SupportOps` | `support_ops` | 60 (live 250) / 3600 | `support-ops` admin dispatcher (after admin gates) |
 | `SupportTokenGenerate` | `support_token_generate` | 20 / 3600 | `generate-support-token` (email-spam guard) |
 | `RecoveryCodeGenerate` | `recovery_code_generate` | 60 / 3600 | `recovery-code-generate` (one-shot per account) |
 | `RecoveryCodeAcknowledge` | `recovery_code_acknowledge` | 60 / 3600 | recovery-code acknowledge |
 | `AccountOtpSend` | `account_otp_send` | 20 / 3600 | `account-otp` send (Forgot-PIN email) |
 | `AccountOtpVerify` | `account_otp_verify` | 30 / 3600 | `account-otp` verify |
-| `SyncDownloadGrace` | `sync_download_grace` | 100 / 86400 | lapsed-grace audio downloads (`gracePeriodBucket`) |
+| `SyncDownloadGrace` | `sync_download_grace` | 100 (live 550) / 86400 | lapsed-grace audio downloads (`gracePeriodBucket`) |
 | `Search` | `search` | 300 (live 600) / 3600 | search query embeddings |
 | `Indexing` | `indexing` | 150 (live 300) / 3600 | background reconciler / backfill embeddings |
 | `EmbeddingCache` | `embedding_cache` | 300 (live 600) / 3600 | indexing `get_bundles` / `put_bundle` cache plane |
+
+Every one of these buckets is in `burst_mode = 'shadow'` as of the launch rollout (measure-first). The buckets carrying an explicit `burst_pct` override (`account_otp_send` 15, `sync_download_grace` 18, `support_ops` 20) differ from the inherited 40%; the rest inherit the global 40% / 60s.
 
 <Note>
 `RecoveryCodeGenerate`'s enum doc-comment mentions a `5/hr` original intent, but the shipped `BUCKET_DEFAULTS` and live value are both `60/hr`.
@@ -66,19 +146,20 @@ Every `Bucket` enum member (`functions/_shared/gates/types.ts`) has a `bucket_ke
 
 ## Storage and sweeping
 
-`rate_limit_config` (one row per bucket: `bucket_key`, `max_requests > 0`, `window_sec > 0`, `enabled`, `description`, `updated_at`) is service-role only and edited live via the dashboard to tune ceilings or flip a kill-switch — it replaced per-bucket rows in `server_config` (RR-291). `rate_limit_counters` (`auth_user_id`, `bucket_key`, `window_start_sec`, `count`, PK `(auth_user_id, bucket_key)`) is written **only** by the RPC, which row-locks and uses `ON CONFLICT` for concurrency. Both are defined in `migrations/20260508000000_baseline.sql`. The `prune_rate_limit_counters` `pg_cron` sweeper (`migrations/20260628000000_prune_rate_limit_counters_cron.sql`) hard-deletes counter rows whose window started more than 86400s (24h) ago — 24h is the longest window across all buckets, so such a row is expired under every configuration.
+`rate_limit_config` (one row per bucket: `bucket_key`, `max_requests > 0`, `window_sec > 0`, `enabled`, the three nullable `burst_*` override columns, `description`, `updated_at`) is service-role only and edited live via the dashboard to tune ceilings, flip a kill-switch, or move a bucket between burst modes — it replaced per-bucket rows in `server_config` (RR-291). `rate_limit_counters` (`auth_user_id`, `bucket_key`, `window_start_sec`, `count`, plus the four `burst_*` state columns, PK `(auth_user_id, bucket_key)`) is written **only** by the RPC, which row-locks and uses `ON CONFLICT` for concurrency. Both are defined in `migrations/20260508000000_baseline.sql`; the burst columns were added by `20260930120000_rate_limit_burst_protection.sql`. The `prune_rate_limit_counters` `pg_cron` sweeper (`migrations/20260628000000_prune_rate_limit_counters_cron.sql`) hard-deletes counter rows whose window started more than 86400s (24h) ago — 24h is the longest window across all buckets, so such a row is expired under every configuration.
 
 ## Chain-sugar vs standalone
 
 | Path | When | Skipped for dev? |
 | --- | --- | --- |
-| `rateLimit: { bucket }` on the gate config | one limit, keyed on `authUserId`, after auth (resolve-identity, sync-pull / push / reserve / reconcile, sync-audio, user-sync-preferences, recovery-code-generate) | yes (chain sugar not run for dev) |
+| `rateLimit: { bucket }` on the gate config | one limit, keyed on `authUserId`, after auth (resolve-identity, sync-pull / push / reserve / reconcile, sync-audio, user-sync-preferences, recovery-code-generate, feedback) | yes (chain sugar not run for dev) |
 | standalone `checkRateLimit()` in the handler | per-op / multi-dimensional / non-`authUserId` subject (ai-engine, extract-results, indexing, account-otp, get-user-key, delete-user, support-ops) | yes (the `isDeveloper` arg short-circuits) |
 
-Adding a bucket is a three-part change in one commit: the `Bucket` enum member, a `BUCKET_DEFAULTS` entry, and a `rate_limit_config` seed-row migration.
+Adding a bucket is a three-part change in one commit: the `Bucket` enum member, a `BUCKET_DEFAULTS` entry, and a `rate_limit_config` seed-row migration. The new bucket inherits the global burst default (`enforce`) unless its seed row sets `burst_mode = 'shadow'` — set it to shadow first if you want to measure before enforcing.
 
 ## Related
 
 - [The runGates() admission chain](/rollingrecord/backend/gates/run-gates) — where the rate-limit sugar sits in the fixed order.
 - [Developer bypass scope](/rollingrecord/backend/gates/dev-bypass-scope) — how `isDeveloper` short-circuits the counter.
 - [Entitlement, dev bypass & grace](/rollingrecord/backend/gates/entitlement-and-grace) — the `gracePeriodBucket` swap.
+- [server_config & rate_limit_config](/rollingrecord/backend/database/config-tables) — the config tables' full schemas, including the burst columns and global-default rows.

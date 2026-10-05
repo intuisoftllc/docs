@@ -87,11 +87,12 @@ The recording service enters `STANDBY` from three places: the schedule UI when t
 
 ## Workers
 
-Three workers back the schedule stack:
+Two workers back the schedule stack:
 
 - **`ScheduledRecordingStartWorker`** — used when a schedule is enqueued through the WorkManager path instead of exact alarms. Checks `isActive` (skips or reschedules recurring on false), starts the service via an `Intent`, and returns `Result.success`. Present for compatibility; the primary path is the exact-alarm receiver above.
 - **`ScheduledRecordingStopWorker`** — stop counterpart.
-- **`PreStartNotificationWorker`** — WorkManager-side pre-start notification. Same considerations as `ACTION_NOTIFY`.
+
+The pre-start reminder is posted by the alarm-driven `ScheduleAlarmReceiver` (`ACTION_NOTIFY`, see above), not a worker.
 
 ## Schedule UI
 

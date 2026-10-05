@@ -28,7 +28,20 @@ Its constructor is `AgentLoop(sessionManager: KbQuerySessionManager, toolExecuto
 
 On budget exhaustion, the loop pushes a terminal user message plus a client fallback prompt (`FALLBACK_PROMPT_WRITE` when a write happened, else `FALLBACK_PROMPT_READ`) and does one final `isFinal = true` round with no tools — so the model cannot emit XML tool stubs. The server reserves one round beyond `kbChatMaxToolRounds` for this final step, so the loop consumes one extra session slot.
 
-`sanitizeResponseText(text, tools)` strips leaked function-call XML (`<function_calls>`, `<invoke>`, `<parameter>`) and internal id patterns (`contextId=` / `recordingId=` / `sectionId=` / `blueprintId=` / `insightIndex=` / `ID:` / `[internal-only:]`) from the final text. It also runs a tool-**name** backstop derived from THIS turn's tool list (`tools.map { Regex.escape(it.name) }`): case-sensitive, word-anchored (`\b`), longest-first, it replaces any tool name that leaks into user-facing prose with the literal `a lookup` — a last-resort catch for the server prompt's Level 1 "never name an internal tool" rule (the prompt is the primary defense; a tool name reached prose anyway in a real session). Both call sites — the final answer and the exhausted-rounds fallback — now pass `tools`.
+`sanitizeResponseText(text, tools)` strips leaked function-call XML (`<function_calls>`, `<invoke>`, `<parameter>`) and internal id patterns (`contextId=` / `recordingId=` / `sectionId=` / `blueprintId=` / `insightIndex=` / `ID:` / `[internal-only:]`) from the final text. It also runs a tool-**name** backstop derived from THIS turn's tool list (`tools.map { Regex.escape(it.name) }`): case-sensitive, word-anchored (`\b`), longest-first, it replaces any tool name that leaks into user-facing prose with the literal `a lookup` — a last-resort catch for the server prompt's Level 1 "never name an internal tool" rule (the prompt is the primary defense; a tool name reached prose anyway in a real session). Both call sites — the final answer and the exhausted-rounds fallback — now pass `tools`. Its final step is `stripInternalScratchMarkers` (see [Internal scratch markers](#internal-scratch-markers)) — a backstop so an echoed history marker never reaches the user.
+
+## Internal scratch markers
+
+KB chat prepends internal "scratchpad" notes to a prior assistant turn's stored text purely to condition the model: the tool-call recap (`RetrievalSummaryBuilder.HEADER` plus its `- tool(sig) → …` bullet lines and any trailing `- … and N more` line), the `[No tools ran in this turn …]` marker, and `[Retrieval notes: …]` notes. Because history re-feeds the prior answer to the model, the model can echo these verbatim into a fresh reply — so they must never be allowed to reach the user.
+
+`stripInternalScratchMarkers(text)` (`agentcore/.../agentcore/AgentMessageAssembly.kt`, a top-level `internal` function) removes them, collapses the blank-line gaps the removals open, and trims. It is applied in two places, forming a belt-and-braces defense:
+
+| Call site | What it strips | Purpose |
+| --- | --- | --- |
+| `AgentMessageAssembly.buildInitialMessages` | the prior answer before it is labelled "Results/answer shown to user" in the next turn's "Most recent exchange" block | removes the inducement — the unstripped prefix is still fed below as a normal history message, so the model's conditioning is preserved |
+| `AgentLoop.sanitizeResponseText` | the FINAL answer text, as its last step | last-resort backstop so an echoed marker can't reach the user even if the first strip is bypassed |
+
+The markers are matched by regex rather than shared constants because two of the three are authored app-side (in `SearchThreadRepository`) and are not visible to `:agentcore` as constants; only the recap header is a shared constant (`RetrievalSummaryBuilder.HEADER`). The shapes are stable.
 
 ## Round budget is server-authoritative
 
@@ -65,7 +78,7 @@ The budget default is `ServerConfig.kbChatMaxToolRounds = 3` (from `server_confi
 | `ToolExecutor` | `agentcore/.../agentcore/ToolExecutor.kt` | `fun interface { suspend execute(call: ToolCall): ToolResult }`. `ToolCall(name?, id?, input: JsonObject?)`; `ToolResult(text, isWriteOp = false, isError = false)` — `isWriteOp` ORs into `hadWriteOp`; `isError` marks a failed call and surfaces as `is_error: true` on the tool_result block. |
 | `AiEnginePort` | `agentcore/.../agentcore/AiEnginePort.kt` | `fun interface { suspend kbQuery(input: KbQueryInput, sessionToken: String?): AiEngineResult<AiPassthroughResponse> }`. App binds `AiEngineClient::kbQuery`. |
 | `KbQuerySessionManager` | `agentcore/.../session/KbQuerySessionManager.kt` | Holds the `x-query-session-token` across rounds. `start()` mints it; `continueQuery()` replays it; `isStarted`; `reset()`. |
-| `AgentMessageAssembly` | `agentcore/.../agentcore/AgentMessageAssembly.kt` | `buildInitialMessages(question, conversationHistory, replyContext, orientationSummary)` — shared so app + runner open turns identically. |
+| `AgentMessageAssembly` | `agentcore/.../agentcore/AgentMessageAssembly.kt` | `buildInitialMessages(question, conversationHistory, replyContext, orientationSummary)` — shared so app + runner open turns identically; also hosts `stripInternalScratchMarkers`, which it applies to the "Most recent exchange" answer slot. |
 | `TurnTrace` | `agentcore/.../agentcore/TurnTrace.kt` | Per-round hooks `assistantRound(...)` + `toolResult(...)`; default no-ops. App forwards to `DevChatTraceCapture`. |
 | `AgentAnalytics` | `agentcore/.../agentcore/AgentAnalytics.kt` | Minimal `chatError(kind)` hook — only the `loop_crash` event, emitted inside the loop. |
 | `RetrievalSummaryBuilder` | `agentcore/.../data/repository/RetrievalSummaryBuilder.kt` | Builds the compact per-turn `[Tool call recap]` (`MAX_LINES` 12) that re-feeds prior retrieval facts on the next turn. |

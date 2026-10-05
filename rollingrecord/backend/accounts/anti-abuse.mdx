@@ -37,10 +37,13 @@ The table has **no FK** to `canonical_users` and `auth_user_id` is nullable (pre
 | `AdminPermissionDenied` | `admin_permission_denied` | 1 |
 | `RateLimitHit` | `rate_limit_hit` | 1 |
 | `NearLimitApproach` | `near_limit_approach` | 2 |
-| `BugReportFlood` | `bug_report_flood` | 1 |
+| `FeedbackFlood` | `feedback_flood` | 1 |
+| `BurstLimitHit` | `burst_limit_hit` | 0 |
 | `FrozenUserClerkDeletion` | `frozen_user_clerk_deletion` | 10 |
 
-`bug_report_flood` sits at the **floor** weight of 1: a caller who hit the bug-report submission ceiling (10/hour) is a soft signal that — by design — must never on its own push an account up the top-offenders list. The likely explanation is a user who found several things wrong and filed them all, so it is useful only in aggregate (the same account tripping it every hour for a day is worth a look; one hit is worth nothing). `frozen_user_clerk_deletion` sits at the **ceiling** weight of 10: a FROZEN account (`canonical_users.frozen_at` set) that was deleted out-of-band via Clerk, logged as a deliberate evidence-destruction signal (see [Account-freeze gate](#account-freeze-gate) below).
+`feedback_flood` sits at the **floor** weight of 1: a caller who hit the feedback submission ceiling (10/hour, bug reports and feature requests together, on the shared `feedback` bucket) is a soft signal that — by design — must never on its own push an account up the top-offenders list. The likely explanation is a user who found several things wrong and filed them all, so it is useful only in aggregate (the same account tripping it every hour for a day is worth a look; one hit is worth nothing). It is fired through the `abuseEventOnReject` chain-sugar path when a `feedback` request is rate-limited, and earns its own slug rather than folding into `rate_limit_hit` because the two mean different things — hammering `ai_engine` burns money, hammering `feedback` writes us paragraphs. (It replaces the retired `bug_report_flood`, renamed when feature requests became a sibling kind under the `feedback` endpoint.) See the [feedback endpoint](/rollingrecord/backend/edge-functions/feedback).
+
+`burst_limit_hit` sits at weight **0** on purpose: it is logged when a caller exceeds any bucket's short BURST window (too much of the hourly allowance inside the brief sub-window — see [rate limiting](/rollingrecord/backend/gates/rate-limiting)), fired once per `(user, bucket, burst sub-window)` from `checkRateLimit` in **both** enforce and shadow mode (`details.mode` says which, and `details.blocked` whether the request was actually refused). While the burst thresholds are tuned against real field traffic it must add nothing to any top-offenders score, so the weight is raised only once the numbers are trusted. `frozen_user_clerk_deletion` sits at the **ceiling** weight of 10: a FROZEN account (`canonical_users.frozen_at` set) that was deleted out-of-band via Clerk, logged as a deliberate evidence-destruction signal (see [Account-freeze gate](#account-freeze-gate) below).
 
 ### Admin reads
 

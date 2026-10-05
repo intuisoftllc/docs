@@ -10,10 +10,20 @@ Client rate-limit handling is a transport-level circuit breaker. When the server
 The server's shared rate-limit gate answers an over-quota call with:
 
 ```json
-429 {"error":"rate_limited","reset_at_sec":<epoch>,"bucket":<name>}
+429 {"error":"rate_limited","reset_at_sec":<epoch>,"bucket":<name>,"scope":"burst"}
 ```
 
-`reset_at_sec` is the absolute epoch second the window lifts; `bucket` names the tripped server bucket. This body is decoded into `RateLimitedError` (`data/remote/api/EdgeErrorBody.kt`) — a `@Serializable` `EdgeErrorBody` whose `error` defaults to the registry `rate_limited` code, with nullable `bucket` and `@SerialName("reset_at_sec") resetAtSec`. The shared `parseErrorEnvelope` (`data/remote/api/ApiResult.kt`) picks it from the 429 body by its registry code — the same typed decode every call site uses.
+The body decodes into `RateLimitedError` (`data/remote/api/EdgeErrorBody.kt`) — a `@Serializable` `EdgeErrorBody` whose `error` defaults to the registry `rate_limited` code. Its three data fields:
+
+| Field (`RateLimitedError`) | Wire name | Meaning |
+| --- | --- | --- |
+| `resetAtSec` | `reset_at_sec` | The absolute epoch second the window lifts — the only field the client acts on. |
+| `bucket` | `bucket` | The tripped server bucket (e.g. `sync_audio`). Diagnostic only. |
+| `scope` | `scope` | `"burst"` (the short sliding burst window) or `"window"` (the sustained window). Diagnostic only; null from servers that predate burst protection. |
+
+Every 429 is handled identically regardless of `bucket` or `scope` — the client records the reset and short-circuits. The `scope` field exists so a field-log read can tell a **burst** trip (too many calls in a few seconds) from an **exhausted hour**; on the server side this is the `limitedBy` label (`"window" | "burst"` in `_shared/gates/rate-limit.ts`), serialized to the wire as `scope`. Burst 429s therefore reach the client as ordinary `rate_limited` 429s and cool the endpoint down the same way a sustained-window 429 does.
+
+The shared `parseErrorEnvelope` (`data/remote/api/ApiResult.kt`) picks `RateLimitedError` from the 429 body by its registry code — the same typed decode every call site uses.
 
 ## Endpoint identity — `@EdgeTag`
 
@@ -38,7 +48,7 @@ Dividing by user matters because server rate limits are per-user: one account's 
 `RateLimitInterceptor` (`data/remote/ratelimit/RateLimitInterceptor.kt`) is the outermost interceptor on both authed Edge clients (`supabase` + `aiengine`). Endpoint identity comes from `request.edgeFunctionName()`; a null (not an Edge invoke) passes straight through. It does two jobs:
 
 1. **Pre-call short-circuit.** If the coordinator reports the target function is still cooling down, it returns a synthetic 429 **without touching the network** — and before the inner App Check / JWT interceptors run, so no token is fetched either. This is the hard guarantee against hammering a rate-limited endpoint. The synthetic 429 is serialized from the same `RateLimitedError` type, so downstream mappers can't tell it from a real one.
-2. **Post-response record.** When a real `429` with the `rate_limited` envelope comes back, it decodes the body through `parseErrorEnvelope` and calls `coordinator.record(fn, resetAtSec)` so job (1) engages for every subsequent call to that function.
+2. **Post-response record.** When a real `429` with the `rate_limited` envelope comes back, it decodes the body through `parseErrorEnvelope` and calls `coordinator.record(fn, resetAtSec)` so job (1) engages for every subsequent call to that function. Only `resetAtSec` drives the cooldown; `bucket` and `scope` are written to the saved log line (`"rate_limited 429 from <fn> (bucket=…, scope=…)"`) so a burst trip and an exhausted hour read differently in a field diagnosis, with no user content in either.
 
 ## DI and activation
 
@@ -50,5 +60,6 @@ The audio-sync workers (`AudioSyncWorker`, `CloudPrefetchWorker`) read the coord
 
 ## Related pages
 
+- [Server Rate Limiting](/rollingrecord/backend/gates/rate-limiting) — the server gate that issues these 429s, the per-bucket ceilings, and the burst/sustained window split that produces the `scope` label.
 - [Usage Metering & Caps](/rollingrecord/app/monetization/usage-metering) — the sibling monthly-cap system.
 - [Entitlements & RevenueCat](/rollingrecord/app/monetization/entitlements-revenuecat) — the developer entitlement that bypasses server rate limits entirely.

@@ -3,20 +3,21 @@ title: "Database Recovery States"
 description: "How the app routes a database that can't be opened: narrow key-mismatch wipe, fatal error, or recoverable DEK-unavailable."
 ---
 
-When the encrypted database can't be opened, `DatabaseModule` classifies the failure and routes it to one of three observable outcomes that `V2App` renders at the root. Only a genuine key mismatch is ever safe to wipe; a missing DEK is refused before the DB is even opened; every other failure is fatal and leaves the file untouched. Audio files on disk are never touched by any path.
+When the encrypted database can't be opened, `DatabaseModule` classifies the failure and routes it to one of four observable outcomes that `V2App` renders at the root. Only a genuine key mismatch is ever safe to wipe; a missing DEK — including a server-refused key for a frozen account — is refused before the DB is even opened; every other failure is fatal and leaves the file untouched. Audio files on disk are never touched by any path.
 
-## The three recovery states
+## The recovery states
 
-`RecoveryState` (`states/DatabaseRecoveryState.kt`) is a sealed class with four cases, and `DatabaseRecoveryState` is an object exposing `state: StateFlow<RecoveryState>` plus the flag setters.
+`RecoveryState` (`states/DatabaseRecoveryState.kt`) is a sealed class with five cases, and `DatabaseRecoveryState` is an object exposing `state: StateFlow<RecoveryState>` plus the flag setters.
 
 | `RecoveryState` | Trigger | V2 surface | Data on disk |
 | --- | --- | --- | --- |
 | `KeyMismatchWiped` | SQLCipher couldn't decrypt an opened DB (genuine corruption / reinstall leftover) | `V2DatabaseRecoveryDialog` (re-import audio) | DB wiped; audio intact |
 | `FatalError(errorCode, message)` | Schema / migration / unknown open failure | `V2FatalDbErrorScreen` (no reset) | Untouched |
 | `DekUnavailable(reason)` | Per-user DEK unresolvable **before** open | `V2DekUnavailableScreen` (retry) | Untouched — not opened, not wiped |
+| `AccountFrozen(authUserId)` | Account frozen (server 403 `account_frozen`) and this device has **no** local DEK | `V2AccountFrozenScreen` (Contact support / Sign out) | Untouched — not opened, not wiped |
 | `None` | Normal | App tree | — |
 
-The setters are `flagRecoveryNeeded()`, `flagFatalError(code, message)`, `flagDekUnavailable(reason)`, and `clearRecovery()`.
+The setters are `flagRecoveryNeeded()`, `flagFatalError(code, message)`, `flagDekUnavailable(reason)`, `flagAccountFrozen(authUserId)`, and `clearRecovery()`.
 
 ## Open-failure classification
 
@@ -45,12 +46,28 @@ The setters are `flagRecoveryNeeded()`, `flagFatalError(code, message)`, `flagDe
 
 A **hung** DEK fetch lands in the same recoverable branch, not the wipe path. `buildAppDatabaseForSession` bounds its inline `SessionDekHolder.requireDek()` self-heal at 45s (`INLINE_DEK_FETCH_TIMEOUT_MS`); a timeout leaves `persisted == null`, which routes to the recoverable `DekUnavailable` state and is structurally never `classifyOpenFailure` / `handleKeyMismatch`. The `DekUnavailable` throw also emits a deduped Crashlytics non-fatal carrying structured cross-account diagnostics (`dek.crossAccount`, the owner fingerprints, the KEK version). `flagDekUnavailable(reason)` still receives only the `reason` string — the diagnostics map goes to Crashlytics, not the `RecoveryState` — so the `RecoveryState` shape above is unchanged.
 
-## The four root surfaces
+## Account frozen: terminal, no local DEK
+
+`RecoveryState.AccountFrozen(authUserId)` is the one DB-open outcome that isn't about key material being lost or corrupt — it's about the server **refusing** to hand over the key. When a **new** device signs into a frozen account there is no local DEK to fall back on, the server's key fetch returns 403 `account_frozen`, and the DB can never open. `flagAccountFrozen(authUserId)` routes this to a dedicated surface rather than the generic `DekUnavailable` retry, because the cause is known and **terminal**: retrying can't resolve a frozen account. The DB file is **neither opened nor wiped** — the data on disk is intact — and the state clears on a later successful sign-in once the account is unfrozen.
+
+The branch in `V2App` sits **above** the `DekUnavailable` branch so a known-frozen cause never falls through to the generic "can't unlock" retry. The user stays **signed in** on this surface: `authUserId` identifies the frozen session and lets the support email attach that account's log even though the database never opened.
+
+`V2AccountFrozenScreen` (`ui/v2/screens/recovery/V2AccountFrozenScreen.kt`) mirrors the soft overlay's snowflake + `StatusFrozen` + shared `frozen_overlay_body` copy so the two frozen surfaces read as one family, and shows the admin `reason` (read live from `AccountHealthRepository.frozenState`) in a muted card when present. Its two honest actions replace the overlay's "OK":
+
+- **Contact support** (`SheetPrimaryButton`) opens `sendUnlockSupportEmail` with the `recovery_frozen_support_body` template and the explicit `authUserId`, attaching the account's diagnostic log.
+- **Sign out** (an understated secondary control) is the escape hatch to the login screen (e.g. to sign into a different account). It is guarded against a double-tap and swaps the whole surface to a `recovery_frozen_signing_out` spinner, then drives the session teardown directly: `signOut()`, `AuthUserStore.clearCurrentUserId`, `UserSessionManager.switchTo(null)`, and finally `clearRecovery()`. Teardown runs **before** `clearRecovery()` on purpose — the normal auth observer that would react to `SignedOut` isn't composed while a recovery surface is up, and clearing first would re-compose the tree with the stale signed-in user, re-fire the DB warm-up JWT-less, and strand it on the generic DEK-unavailable screen. **The local database is not deleted** — the data stays on disk for a later successful (unfrozen) sign-in.
+
+<Note>
+`AccountFrozen` is the terminal, **no-DEK** counterpart to the dismissible [soft frozen overlay](/rollingrecord/app/auth/account-health) (`V2FrozenOverlay`). The overlay requires the DB to already be open (a returning device that holds the DEK), keeps full local access, and offers only an informational **OK**; this screen is for a device that can't open the DB at all, so it offers Contact support / Sign out instead. Both read the same persisted freeze signal and share the snowflake treatment.
+</Note>
+
+## The five root surfaces
 
 `V2App` (`ui/v2/V2App.kt`) collects `DatabaseRecoveryState.state` and branches:
 
 - **`FatalError`** replaces the surface with `V2FatalDbErrorScreen` (`ui/v2/screens/recovery/V2FatalDbErrorScreen.kt`). It has **no reset/wipe button** — only an error-code box, Contact support (`mailto:support@rollingrecord.ai`), Copy error, and an Export-recordings-to-zip bailout (`RecordingsZipExporter`), plus a reinstall reminder.
-- **`DekUnavailable`** shows `V2DekUnavailableScreen` (`ui/v2/screens/recovery/V2DekUnavailableScreen.kt`); Retry re-resolves the DEK and, on success, calls `clearRecovery()` and recreates the activity. The screen also takes an `onSignOut` param — a **Sign out** action (`recovery_dek_sign_out`) rendered as an understated secondary control below Retry, disabled while `isRetrying`. It was added because the screen was otherwise a dead end: an account whose key can't resolve on **this** device previously stranded the whole app behind a Retry that never succeeds, even though a different account would open fine. In `V2App` the handler calls `AuthRepository.signOut()` (which rebuilds the user session scope), then `DatabaseRecoveryState.clearRecovery()`, then recreates the activity. It does **not** delete the local database — the state is scoped to one account and the data stays on disk for a later successful resolve.
+- **`AccountFrozen`** shows `V2AccountFrozenScreen` (`ui/v2/screens/recovery/V2AccountFrozenScreen.kt`) — a new device signing into a frozen account, no local DEK. It sits **above** the `DekUnavailable` branch so a known-frozen cause never falls through to the generic retry, and offers Contact support / Sign out (no reset). The local DB is **not** deleted. See [Account frozen: terminal, no local DEK](#account-frozen-terminal-no-local-dek) above.
+- **`DekUnavailable`** shows `V2DekUnavailableScreen` (`ui/v2/screens/recovery/V2DekUnavailableScreen.kt`); Retry re-resolves the DEK and, on success, calls `clearRecovery()` and recreates the activity. The screen also takes an `onSignOut` param — a **Sign out** action (`common_sign_out`) rendered as an understated secondary control below Retry, disabled while `isRetrying`. It was added because the screen was otherwise a dead end: an account whose key can't resolve on **this** device previously stranded the whole app behind a Retry that never succeeds, even though a different account would open fine. In `V2App` the handler calls `AuthRepository.signOut()` (which rebuilds the user session scope), then `DatabaseRecoveryState.clearRecovery()`, then recreates the activity. It does **not** delete the local database — the state is scoped to one account and the data stays on disk for a later successful resolve.
 - **`KeyMismatchWiped`** overlays `V2DatabaseRecoveryDialog` (`ui/v2/screens/recovery/V2DatabaseRecoveryDialog.kt`) over the nav host (the data is recoverable, unlike the fatal path). The dialog is a non-dismissable 4-state flow (Scanning → Results → Importing → Done) that re-imports orphaned audio, reusing the UI-agnostic V1 `DatabaseRecoveryViewModel` + `RecoveryUiState` — only the V2 surface is restyled.
 
 The fourth surface is the **open still in flight**. Independently of `RecoveryState`, `V2App` collects `SessionDatabaseState.readySessionId` (`states/SessionDatabaseState.kt`) and renders `V2SessionLoadingScreen` (`ui/v2/screens/startup/V2SessionLoadingScreen.kt`) in place of `V2MainNavHost` until `readySessionId == sessionId` — the readiness gate that keeps Main out of a cold `AppDatabase` factory (see [DEK & Database Key Lifecycle](/rollingrecord/app/security/dek-and-db-key)).
@@ -65,3 +82,4 @@ The fourth surface is the **open still in flight**. Independently of `RecoverySt
 - [Backup & Restore](/rollingrecord/app/security/backup-restore) — `recoverInterruptedRestore` runs before this classification
 - [Local database](/rollingrecord/app/architecture/local-database) — the Room/SQLCipher build this recovery guards
 - [User session scope](/rollingrecord/app/architecture/user-session-scope) — the scope rebuilt on the retry path
+- [Account Health & Freeze](/rollingrecord/app/auth/account-health) — the dismissible `V2FrozenOverlay` for a frozen account whose DB still opens

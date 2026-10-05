@@ -112,6 +112,6 @@ Several functions front many logical operations behind one endpoint and switch o
 - [get-user-usage](/rollingrecord/backend/edge-functions/get-user-usage) — the usage-screen read: counters, caps, credits, storage.
 - [resolve-identity](/rollingrecord/backend/edge-functions/resolve-identity) — the launch-time `canonical_users` upsert + anti-abuse carryover.
 - [server-config](/rollingrecord/backend/edge-functions/server-config) — the public bootstrap endpoint and its `skipAppVersion` opt-out.
-- [bug-report](/rollingrecord/backend/edge-functions/bug-report) — the Free-on-every-tier bug-submit endpoint and its `bug-logs` upload flow.
+- [feedback](/rollingrecord/backend/edge-functions/feedback) — the Free-on-every-tier bug-report + feature-request endpoint and its bug-only `bug-logs` upload flow.
 - [notifications](/rollingrecord/backend/edge-functions/notifications) — the generic pg_cron-driven outbound-email dispatcher.
 - [Inbound webhooks](/rollingrecord/backend/edge-functions/webhooks) — `clerk-webhook`, `revenuecat-webhook`, and `assemblyai-webhook`.

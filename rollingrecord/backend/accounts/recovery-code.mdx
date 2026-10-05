@@ -22,11 +22,42 @@ Both operations run a JWT gate chain and read `recovery_code_hash` + `recovery_c
 
 `not_found` means `resolve-identity` hasn't created the caller's `canonical_users` row yet (sign-up just landed); the client retries once the row exists.
 
+Both operations also **fail closed** before touching the row: if `RECOVERY_CODE_PENDING_KEY` is unset or malformed, `loadPendingKey()` returns null and the function returns `server_misconfiguration` (500) rather than fall back to storing plaintext. On `acknowledge`, a pending ciphertext that exists but will not decrypt (key rotated, or not bound to this caller) returns `internal_error` (500) — deliberately *not* `recovery_code_not_pending`, because the client treats `not_pending` as "already acknowledged, proceed" and would wrongly believe a code was saved.
+
 ## The delivery guarantee
 
-`generate` writes the display-formatted plaintext to `recovery_code_pending` (guarded by atomic `IS NULL` `WHERE` clauses against races) and returns it. If the first response is lost to a network error, a retry returns the **same** stored code — no new code is minted. `acknowledge` proves delivery: the client echoes back the exact code, and on a match the server hashes it with argon2id into `recovery_code_hash` and clears `recovery_code_pending` in the same update. Only after acknowledgment is the plaintext replaced by the hash.
+`generate` seals the display-formatted code as AES-256-GCM ciphertext into `recovery_code_pending_ct` / `recovery_code_pending_iv` (guarded by atomic `IS NULL` `WHERE` clauses against races) and returns the plaintext to the caller. If the first response is lost to a network error, a retry decrypts and returns the **same** stored code — no new code is minted. `acknowledge` proves delivery: the client echoes back the exact code, the server decrypts the pending ciphertext and compares, and on a match hashes the code with argon2id into `recovery_code_hash` and clears every pending column in the same update. Only after acknowledgment is the code replaced by the hash.
 
-Storing the display plaintext in `recovery_code_pending` for the minutes between generate and acknowledge is intentional: Supabase encrypts at rest, RLS + service-role-only access blocks any direct anon-key read, and the column is cleared within minutes of a normal onboarding flow.
+The pending code is never stored as plaintext. During the window between generate and acknowledge — which an abandoned onboarding can leave open indefinitely — the code sits only as owner-bound ciphertext, keyed by a secret that lives outside the database. See [Encryption at rest](#encryption-at-rest) below.
+
+## Encryption at rest
+
+`functions/_shared/auth/recovery_code_pending.ts` holds the at-rest crypto for the pending code. It reuses the DEK-layer helpers from `functions/_shared/crypto/envelope.ts` (`encryptWithDek` / `decryptWithDek` — plain AES-256-GCM, 12-byte random IV, no AAD) with a dedicated standalone key rather than the KEK/Vault wrapping layer:
+
+| Symbol | Role |
+| --- | --- |
+| `sealPendingCode(key, authUserId, displayCode)` | Encrypts the plaintext `<authUserId>:<displayCode>`; fresh random IV per call; returns `{ ct, iv }` for the `_ct` / `_iv` columns |
+| `openPendingCode(key, authUserId, ct, iv)` | Decrypts and **verifies the owner prefix**; throws on a bad auth tag or a mismatched owner, which callers treat as "no usable pending code" |
+| `decodePendingKey(base64)` | Pure base64 decode + 32-byte size assertion (unit-testable) |
+| `loadPendingKey()` | Reads `RECOVERY_CODE_PENDING_KEY` from the environment; returns `null` when unset or malformed so the caller fails closed |
+
+**Why a dedicated key, not Vault.** The threat this closes is a reader of the database itself — SQL editor / dashboard, a leaked service-role key, or the daily off-platform backups — copying a pending code that becomes a permanent support identity proof once acknowledged. A Vault secret is readable through SQL by anyone with DB-admin access, which is exactly that reader, so the key lives in the `RECOVERY_CODE_PENDING_KEY` Edge Function secret (outside the DB). A DB read therefore yields ciphertext only. The secret is 32 random bytes, base64 (`openssl rand -base64 32`), set on both dev and prod; rotating it only strands codes pending at that exact moment, and the next `generate` treats an unopenable ciphertext as absent and mints a fresh code.
+
+**Owner binding.** The sealed plaintext is `<auth_user_id>:<display code>`, and `openPendingCode` rejects any ciphertext whose prefix is not the active caller. Someone with DB *write* access therefore cannot copy their own pending ciphertext onto another user's row to plant a code they already know.
+
+### Legacy plaintext migration
+
+`canonical_users.recovery_code_pending` (the old `TEXT` plaintext column) is intentionally left in place. The function's `readPending()` resolves a row's pending code to one of four states — `none`, `undecryptable`, `encrypted`, or `legacy` — and on `generate` a `legacy` value is re-sealed into the encrypted pair (and the plaintext nulled) on first touch, returning the **same** code so a user mid-onboarding is never handed a different one:
+
+```
+// [BACKFILL] Encrypts a code that was left pending as PLAINTEXT in the
+// legacy `recovery_code_pending` column before encryption shipped, and
+// nulls the plaintext. Returns the SAME code ... Remove this branch
+// once no row has a non-NULL recovery_code_pending and the column has
+// been dropped.
+```
+
+Dropping the legacy column is a separate, destructive migration (Rule 9 — written confirmation required); until then the `legacy` branch and the column read in `USER_COLUMNS` stay.
 
 ## Code generation & hashing
 
@@ -46,8 +77,10 @@ Storing the display plaintext in `recovery_code_pending` for the minutes between
 
 | Column | Migration | Meaning |
 | --- | --- | --- |
-| `recovery_code_hash` | `migrations/20260525230000_add_recovery_code_to_canonical_users.sql` | nullable `TEXT`; argon2id encoded hash. Set once at first sign-up |
-| `recovery_code_pending` | `migrations/20260531000000_recovery_code_pending.sql` | nullable `TEXT`; display plaintext awaiting acknowledgment. Set by `generate`, cleared by `acknowledge`. NULL for all pre-RR-315 users who completed the old one-shot flow |
+| `recovery_code_hash` | `migrations/20260525230000_add_recovery_code_to_canonical_users.sql` | nullable `TEXT`; argon2id encoded hash. Written by `acknowledge`, final resting form of the code |
+| `recovery_code_pending_ct` | `migrations/20260927120000_recovery_code_pending_encrypted.sql` | nullable `BYTEA`; AES-256-GCM ciphertext of `<auth_user_id>:<display code>`. Set by `generate`, cleared by `acknowledge` |
+| `recovery_code_pending_iv` | same migration | nullable `BYTEA`; 12-byte GCM IV. Written and cleared together with `_ct`, enforced by the pair CHECK `canonical_users_recovery_code_pending_pair` |
+| `recovery_code_pending` (legacy) | `migrations/20260531000000_recovery_code_pending.sql` | nullable `TEXT`; the pre-encryption plaintext column. Left in place but read only to migrate a still-pending legacy code (see the `[BACKFILL]` branch above); never written non-NULL |
 
 ## The superseded one-shot
 

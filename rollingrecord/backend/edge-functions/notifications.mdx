@@ -46,7 +46,13 @@ The handler reads the live grace length `getInt("cloud_grace_days", 30)` once pe
 
 1. Computes `wipeAtFor(lapsedAt, graceDays)` and `dedupeKeyFor(wipeAt, daysBefore)` = `` `${wipeAt.toISOString()}:${daysBefore}` ``, then calls `claimNotification` (below).
 2. Resolves the address server-side from Clerk via `getClerkUser` (primary email) — there is no JWT on a cron run, and the address is never client-supplied.
-3. Sends via `sendBrevoEmail` using `cloudWipeEmailSubject` / `renderCloudWipeEmailHtml` / `renderCloudWipeEmailText` (`functions/_shared/email/cloud-wipe-email.ts`) — the red-accent branded template reserved for lockout-class messages.
+3. Builds the message with `buildEmail(email, daysBefore, wipeAt, graceDays)` and sends it via `sendBrevoEmail`, using `cloudWipeEmailSubject` / `renderCloudWipeEmailHtml` / `renderCloudWipeEmailText` (`functions/_shared/email/cloud-wipe-email.ts`) — the red-accent branded template reserved for lockout-class messages.
+
+### What the email says
+
+The copy threads the **live** `graceDays` and **hedges the date**, both to keep the message from contradicting itself. `buildEmail` passes `graceDays` straight into `CloudWipeEmailParams`, so the sentence "Cloud data is kept for `{graceDays}` days after a subscription ends" (rendered by `dayCount`, which also guards the singular "1 day") moves together with the deadline instead of hardcoding "30 days" and drifting the moment the dial is turned.
+
+The date is never stated as an exact moment. The sweeper is a daily cron (04:07 UTC), so the real deletion is the first run strictly *after* the grace window closes — the printed date is a floor the user can rely on, not a promise of the day it happens. `whenPhrase(daysBefore)` renders "starting tomorrow" (1 day) or "starting in `N` days" as the single hedge behind the subject, the preheader, and both bodies (one helper, four call sites, so they cannot drift apart), and the detail panel labels the spelled-out `longDate(wipeAt)` ("1 September 2026") with "Starting". The body states both outcomes explicitly — device copies are safe, un-synced cloud-only data is lost — because `cloudOnly` is a client-side fact the server cannot see, so it cannot single out who will actually lose audio.
 
 `validateParams` rejects a `days_before` outside `1..30` with `invalid_days_before` (a static sanity check on the operator-supplied cron param, deliberately synchronous so the validator takes no DB round-trip).
 

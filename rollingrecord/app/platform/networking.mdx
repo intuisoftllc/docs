@@ -12,7 +12,7 @@ Both stacks are built in `di/NetworkModule.kt` against `BuildConfig.SUPABASE_URL
 | Koin name | Connect / Read / Write | Serves |
 | --- | --- | --- |
 | `supabase` | 30 / 60 / 60 s | `SupabaseApi`, `SyncApi`, `AudioSyncApi` |
-| `aiengine` | 30 / 120 / 120 s | `AiEngineApi`, `UsageApi`, `RecoveryCodeApi`, `SyncPreferencesApi`, `UserKeyApi`, `SetUserPinApi`, `AccountOtpApi`, `BugReportApi`, `SearchApi`, `ExtractionJobsApi` |
+| `aiengine` | 30 / 120 / 120 s | `AiEngineApi`, `UsageApi`, `RecoveryCodeApi`, `SyncPreferencesApi`, `UserKeyApi`, `SetUserPinApi`, `AccountOtpApi`, `FeedbackApi`, `SearchApi`, `ExtractionJobsApi` |
 
 The `aiengine` client uses `encodeDefaults = true` on its Retrofit `Json` converter: every request body declares `val operation: String = "<op>"` with a default, and dropping a defaulted field would strip `operation` off the wire and earn a `missing_operation` rejection.
 
@@ -20,7 +20,7 @@ The `aiengine` client uses `encodeDefaults = true` on its Retrofit `Json` conver
 
 A third Koin-named client, `audio_signed_url`, is **not** a Retrofit stack at all — in `di/NetworkModule.kt` it's a bare `OkHttpClient` with no `Retrofit.Builder`, no `SUPABASE_URL` base, and no interceptors. It exists only for raw `PUT` uploads of encrypted audio to Supabase Storage signed URLs, so it never hits `functions/v1`. It is deliberately un-authed — a Storage signed URL self-authenticates via its token query param, so it must not carry the user's JWT to a third-party host. Its only non-default setting is a 15-minute write timeout (`30 / 120 s / 15 min` connect/read/write) because audio uploads can be hundreds of MB on slow links.
 
-The same bare-client pattern now backs bug-report log uploads: `BugReportApiClient` is built in `di/NetworkModule.kt` with a separate bare `OkHttpClient` (a 2-minute `callTimeout`, no base URL, no interceptors) to `PUT` the merged log to a signed Storage URL, so that upload never carries the JWT or App Check headers either. See [Bug Reports](/rollingrecord/app/platform/bug-reports).
+The same bare-client pattern now backs feedback log uploads (bug reports only): `FeedbackApiClient` is built in `di/NetworkModule.kt` with a separate bare `OkHttpClient` (a 2-minute `callTimeout`, no base URL, no interceptors) to `PUT` the merged log to a signed Storage URL, so that upload never carries the JWT or App Check headers either. See [Feedback](/rollingrecord/app/platform/feedback).
 
 `SupabaseApi` (`data/remote/SupabaseApi.kt`) declares each function name once as a companion `const` (`FN_RESOLVE_IDENTITY`, `FN_SERVER_CONFIG`, `FN_DELETE_USER`, `FN_GENERATE_SUPPORT_TOKEN`) and one method each. `AiEngineApi` (`data/remote/aiengine/AiEngineApi.kt`) is a single `ai-engine` function reached by every method with a different typed body, all returning `Response<ResponseBody>` so the client can read headers and error envelopes. Its operations are `kbQuery` (with an optional `X-Query-Session-Token` header), `synthesis`, `transcribeUploadInit`/`transcribeSubmit`/`transcribeFetch`, `keywords`, `contextSummary`, `threadNaming`, `blueprintModeration`, `queryExpand`, and the user-blueprint CRUD trio. There is no `extract` method — extraction moved to `ExtractionJobsApi` (`extract-submit` / `extract-results`).
 

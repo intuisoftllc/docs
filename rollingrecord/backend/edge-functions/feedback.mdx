@@ -1,0 +1,115 @@
+---
+title: "feedback"
+description: "The user feedback endpoint — one function that files a bug report or a feature request, selected by a required kind field, into two separate tables, with a best-effort signed log upload for bug reports only."
+---
+
+`feedback` (`functions/feedback/index.ts`) is a `Deno.serve` POST endpoint that accepts one user-submitted piece of feedback — a **bug report** or a **feature request**, chosen by the request's `kind` field — and, for a bug report whose author attached their logs, hands back a short-lived signed URL to upload the merged log file to the private `bug-logs` Storage bucket. It replaces the retired `bug-report` endpoint: feature requests became a sibling kind under this shared endpoint, so the function, the sanitizer, and the triage lifecycle are now shared while the two kinds keep separate tables.
+
+Feedback is Free on every tier. A report is how we learn the app is broken, the free tier is exactly where sign-in, permission, and onboarding failures concentrate, and paywalling feature requests would mean only hearing from people already sold. The rate limit — not a paywall — is the only abuse control.
+
+## One function, two tables
+
+The two kinds share a submission shape, a gate chain, and a triage lifecycle, so they share an endpoint. They do **not** share a table. A bug report carries a merged app log (three columns, a Storage object, an AFTER DELETE trigger to reclaim it) that a feature request never will, and the two run different retention clocks — feature-request windows are deliberately double the bug ones. A single table would be half NULL columns and one sweeper that could only be tuned for one kind.
+
+`SUBMISSION_TABLES` (`functions/_shared/submissions/sanitize.ts`) is the routing map from kind to its table and PK column:
+
+| `kind` | Table | Id column | Log attachment |
+| --- | --- | --- | --- |
+| `bug` | `bug_reports` | `bug_report_id` | Yes (`acceptsLogAttachment` → true) |
+| `feature` | `feature_requests` | `feature_request_id` | No |
+
+`SUBMISSION_KINDS` is `['bug', 'feature']`, kept as an explicit wire enum rather than inferred from the endpoint path so the routing decision shows up in the payload and the logs.
+
+## Kind routing is strict
+
+`normalizeKind(input.kind)` is the one field that **rejects** instead of degrading. Every other unrecognized field on this endpoint falls back gracefully, but there is no safe default for kind: guessing files the row in a queue nobody reading it expects, and defaulting to `bug` would quietly turn every malformed feature request into a bug report. A `null` return yields `feedback_invalid_kind` (a developer-category code — a correct client, which always sends a known kind, cannot reach it). A rejected submission is recoverable; a misfiled one is invisible.
+
+## The shared sanitizer
+
+`functions/_shared/submissions/sanitize.ts` is pure (no DB, no env, no network) so it is unit-testable and the rules live in one place. It was `_shared/bugreport/sanitize.ts` and bug-specific in name only — none of the character rules ever were — and moved when feature requests became a sibling kind.
+
+| Helper | Behavior |
+| --- | --- |
+| `normalizeDescription(raw)` | Defers to `sanitizeDbText` (`functions/_shared/text/db-text.ts`): strips `U+0000` and the other C0 controls (keeps `\t` / `\n`), removes Unicode bidi overrides (the Trojan-Source trick), and normalizes CRLF to LF |
+| `describeDescriptionProblem(normalized)` | Returns `empty`, `too_long`, or `null`. Length is measured **after** normalization so stripped junk cannot pad a submission over the ceiling |
+| `normalizeArea(raw)` | Maps onto `SUBMISSION_AREAS`, falling back to `'other'` — never throws, never rejects |
+| `sanitizeClientMetadata(raw)` | Accepts only a flat object of primitives, cleaned and bounded (keys sliced to 64 chars, string values to 512, at most 40 keys); anything else is dropped |
+
+`MAX_DESCRIPTION_CHARS` is `12_000`; the compose screen caps input at the same number. `SUBMISSION_AREAS` is additive forever — adding one is safe, and removing one only makes old clients' submissions normalize to `'other'`:
+
+```
+recording · playback · library · transcription · contexts_ai
+cloud_sync · account_billing · app_lock · other
+```
+
+<Note>
+"Sanitize" here does **not** mean SQL-escaping (every write goes through PostgREST with bound parameters) or HTML-escaping (that belongs to whatever renders the text). It removes only bytes that cannot be stored (`NUL`) or can lie about what the text says (bidi overrides). An apostrophe in "didn't" is not an attack and is left alone.
+</Note>
+
+## Request body
+
+`FeedbackInput` is fully untyped on the wire and validated in-handler:
+
+| Field | Handling |
+| --- | --- |
+| `kind` | `normalizeKind` — strict; neither `bug` nor `feature` → `feedback_invalid_kind` |
+| `description?` | `normalizeDescription` / `describeDescriptionProblem` — `empty` → `feedback_empty_description`, `too_long` → `feedback_description_too_long` |
+| `area?` | `normalizeArea` — unknown area normalized to `'other'`, never rejected |
+| `client_metadata?` | `sanitizeClientMetadata` — app version, Android version, device model, tier, locale |
+| `attach_logs?` | `=== true` means the client wants a signed upload URL back; **dropped for a feature request** (no log columns exist) and logged, since a correct client never asks |
+| `log_sha256?` | Must match `/^[a-f0-9]{64}$/i` or the attachment intent is dropped (we can't vouch for the bytes, so we don't claim to) |
+| `log_bytes?` | Positive finite number, rounded |
+
+## Rate limit + soft signal
+
+The entry calls `runGates(req, { method: HttpMethod.Post, auth: AuthMode.Jwt, rateLimit: { bucket: Bucket.Feedback, abuseEventOnReject: AbuseEventType.FeedbackFlood } })`. The fixed chain is method + App Check + App Version floor + Clerk JWT + rate limit. There is deliberately **no** entitlement gate. After the chain passes, a missing identity returns `missing_auth_user_id`, and an unparseable body returns `invalid_body`.
+
+The live `feedback` ceiling is **10 requests / 3600s** (10 per user per hour), shared across both kinds — a flood is a flood whichever table it lands in, and one bucket is also what keeps the limit in the gate chain (a per-kind ceiling would depend on the body's `kind`, which the chain runs too early to know). The bucket also inherits the global **burst** window of **4 per 60s**.
+
+<Note>
+The ceiling moved: `20260925120000_feature_requests.sql` seeded `rate_limit_config.feedback` at 5/hour, and `20260930130000_rate_limit_tuning.sql` raised it to 10/hour (and deleted the retired `bug_report` bucket row). The code-side fallback in `BUCKET_DEFAULTS` (`functions/_shared/gates/rate-limit.ts`) is **5/hour** — deliberately half the live value, the same conservative "missing-row fallback errs below the real ceiling" pattern the other buckets use. The function's own header comment still cites "5/hour", describing that fallback rather than the live row.
+</Note>
+
+Tripping the limit records a `feedback_flood` abuse event (weight `1`, the floor) through the shared `abuseEventOnReject` chain-sugar path (`functions/_shared/users/abuse-log.ts`). It shows up in a suspicious account's history but is weighted so it can never by itself push anyone up the top-offenders list — the likely explanation is a user who found several things wrong and filed them all. It earns its own slug rather than folding into `rate_limit_hit` because the two mean different things: hammering `ai_engine` burns money, hammering `feedback` writes us paragraphs. See [anti-abuse](/rollingrecord/backend/accounts/anti-abuse).
+
+## Error codes
+
+All four `feedback_*` codes are **developer** category (`functions/_shared/errors.ts`) — a correctly-built client caps the description length, offers only known areas, and always sends a known kind, so anything that trips them is a client bug or a forged payload, not a user mistake worth surfacing.
+
+| Code | HTTP | Raised when |
+| --- | --- | --- |
+| `feedback_invalid_kind` | 400 | `kind` is neither `bug` nor `feature` — rejected rather than defaulted |
+| `feedback_empty_description` | 400 | Description is empty after normalization |
+| `feedback_description_too_long` | 400 | Description exceeds `MAX_DESCRIPTION_CHARS` (12,000) |
+| `feedback_insert_failed` | 500 | The row INSERT into the target table failed |
+
+## Write-order invariant (row before log)
+
+The submission row is INSERTed **before** any log upload. The row is built as a widening object — the shared spine (`[idColumn]`, `auth_user_id`, `area`, `description`, `client_metadata`) first, then the three log columns (`log_storage_path`, `log_sha256`, `log_bytes`) only when `acceptsLogAttachment(kind)` is true — so the common fields cannot drift between kinds. When logs are attached the storage path is `` `{auth_user_id}/{submission_id}.txt` `` in the `bug-logs` bucket, `null` otherwise; `auth_user_id` is always the first path segment, which is what makes `delete-user`'s folder wipe able to find these objects.
+
+The ordering is the point. A failed, cancelled, or abandoned upload still leaves a readable report behind, and the worst case is a row whose `log_storage_path` points at an object that was never created. The reverse order — upload, then submit — would throw away everything the user typed if the last call failed, which is the one outcome that must not happen when someone is already annoyed enough to file a bug. Keying the object by the row's own id also fixes the file name, so a log can never be attached to the wrong report.
+
+## Signed log upload (best-effort, bug reports only)
+
+When the attachment is valid (`wantsLogs && sha !== null`), the handler mints `supabase.storage.from('bug-logs').createSignedUploadUrl(storagePath, { upsert: true })`. The call passes only `{ upsert: true }` — supabase-js's `createSignedUploadUrl` accepts no expiry argument, so the URL takes the library's fixed ~2-hour lifetime. Nothing needs to bound it here: the URL writes one object at a path keyed by an already-durable row, and a late log is still the log for that report.
+
+If minting fails, the report is already safely stored, so the handler nulls out `log_storage_path` / `log_sha256` / `log_bytes` on the row (so it doesn't advertise a file that will never exist) and still answers `200`. The response is `` `{ submission_id, kind, upload_url }` ``, where `upload_url` is `null` when no logs were requested or minting failed.
+
+## Tables, bucket, and retention
+
+The `bug_reports` table (`20260817120000_bug_reports.sql`) and the `feature_requests` table (`20260925120000_feature_requests.sql`) both follow the `auth_user_id`-first column spine, both have an FK to `canonical_users(auth_user_id) ON DELETE CASCADE`, and both are RLS-enabled with **no policies** (service-role only). Their `status` CHECK constraints share the same six wire values (`new`, `stale`, `triaged`, `in_progress`, `resolved`, `wont_fix`), and `area` on each is deliberately **not** a CHECK enum.
+
+Only `bug_reports` has the `log_storage_path` / `log_sha256` / `log_bytes` triple (with `CHECK ((log_storage_path IS NULL) = (log_sha256 IS NULL))`), the private `bug-logs` bucket (`public = false`, 25 MiB limit, `text/plain` only), and the AFTER DELETE trigger `trg_bug_reports_delete_log_object` → `delete_bug_report_log_object()` that reclaims the row's object on any delete (manual triage delete or the `canonical_users` CASCADE). `feature_requests` has no log columns, no Storage object, and no trigger. The retention / stale sweepers and the triage ops are documented in [submission triage](/rollingrecord/backend/support-ops/submission-triage).
+
+## config.toml
+
+`config.toml` declares `[functions.feedback]` with `verify_jwt = false`. This is required, not optional: a function with no block silently inherits Supabase's default `verify_jwt = true`, which validates against Supabase Auth and would `401` every Clerk-signed request before `runGates()` ever runs.
+
+## Related pages
+
+- [Feedback (client)](/rollingrecord/app/platform/feedback) — the V2 compose flow, the `FeedbackApiClient` file-then-upload sequence, and the `FeedbackLogBundler`.
+- [Submission triage](/rollingrecord/backend/support-ops/submission-triage) — the `get_submissions` / `set_submission_status` support-ops that work both queues.
+- [Edge Function catalog](/rollingrecord/backend/edge-functions/overview) — the shared `runGates()` chain and the full function list.
+- [Rate limiting](/rollingrecord/backend/gates/rate-limiting) — the `rate_limit_config` buckets and the burst window.
+- [Storage buckets](/rollingrecord/backend/storage/buckets) — the private `bug-logs` bucket.
+- [delete-user](/rollingrecord/backend/accounts/delete-user) — the `bug-logs/{auth_user_id}/` folder wipe.

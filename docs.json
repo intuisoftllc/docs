@@ -126,6 +126,7 @@
               {
                 "group": "Monetization",
                 "pages": [
+                  "rollingrecord/app/monetization/ads",
                   "rollingrecord/app/monetization/bundles",
                   "rollingrecord/app/monetization/entitlements-revenuecat",
                   "rollingrecord/app/monetization/feature-gating",
@@ -154,7 +155,7 @@
                 "pages": [
                   "rollingrecord/app/platform/analytics",
                   "rollingrecord/app/platform/app-check",
-                  "rollingrecord/app/platform/bug-reports",
+                  "rollingrecord/app/platform/feedback",
                   "rollingrecord/app/platform/logging",
                   "rollingrecord/app/platform/networking",
                   "rollingrecord/app/platform/notifications",
@@ -209,7 +210,7 @@
                   "rollingrecord/backend/edge-functions/overview",
                   "rollingrecord/backend/edge-functions/ai-engine",
                   "rollingrecord/backend/edge-functions/analytics",
-                  "rollingrecord/backend/edge-functions/bug-report",
+                  "rollingrecord/backend/edge-functions/feedback",
                   "rollingrecord/backend/edge-functions/get-bundle-catalog",
                   "rollingrecord/backend/edge-functions/get-user-key",
                   "rollingrecord/backend/edge-functions/get-user-usage",
@@ -309,7 +310,7 @@
               {
                 "group": "Support-Ops",
                 "pages": [
-                  "rollingrecord/backend/support-ops/bug-triage",
+                  "rollingrecord/backend/support-ops/submission-triage",
                   "rollingrecord/backend/support-ops/dispatcher",
                   "rollingrecord/backend/support-ops/dry-run-and-audit",
                   "rollingrecord/backend/support-ops/operations-catalog",

@@ -13,16 +13,26 @@ Every paid capability in RollingRecord is assigned to one of four stacked tiers.
 fun atLeast(required: UserTier): Boolean = ordinal >= required.ordinal
 ```
 
-Any tier-gated check reads "am I at least tier X?" via `atLeast(required)`, so a `PRO_CLOUD_AI` user automatically satisfies a `PRO` requirement. `displayName()` maps each value to its user-facing label.
+Any tier-gated check reads "am I at least tier X?" via `atLeast(required)`, so a `PRO_CLOUD_AI` user automatically satisfies a `PRO` requirement. For the user-facing label, `nameRes()` returns an `@StringRes Int` (it replaced the old `displayName()` string method, so a tier label is now a localizable resource rather than a hard-coded string, reusing the choose-plan labels):
 
-| Enum value | ordinal | `displayName()` | Owning RC entitlement (lookupKey) |
-| --- | --- | --- | --- |
-| `FREE` | 0 | Free | (none — no paid entitlement) |
-| `PRO` | 1 | Pro | `pro` |
-| `PRO_CLOUD` | 2 | Pro + Cloud | `pro_cloud` |
-| `PRO_CLOUD_AI` | 3 | Cloud + AI | `pro_cloud_ai` |
+```kotlin
+@StringRes
+fun nameRes(): Int = when (this) {
+    FREE         -> R.string.choose_plan_tier_free
+    PRO          -> R.string.choose_plan_tier_pro
+    PRO_CLOUD    -> R.string.common_pro_cloud
+    PRO_CLOUD_AI -> R.string.common_cloud_ai
+}
+```
 
-Note that the top enum constant is `PRO_CLOUD_AI` but its `displayName()` is **"Cloud + AI"**, not "Pro + Cloud + AI".
+| Enum value | ordinal | `nameRes()` resource | Resolves to | Owning RC entitlement (lookupKey) |
+| --- | --- | --- | --- | --- |
+| `FREE` | 0 | `choose_plan_tier_free` | Free | (none — no paid entitlement) |
+| `PRO` | 1 | `choose_plan_tier_pro` | Pro | `pro` |
+| `PRO_CLOUD` | 2 | `common_pro_cloud` | Pro + Cloud | `pro_cloud` |
+| `PRO_CLOUD_AI` | 3 | `common_cloud_ai` | Cloud + AI | `pro_cloud_ai` |
+
+Note that the top enum constant is `PRO_CLOUD_AI` but its `nameRes()` resolves to **"Cloud + AI"**, not "Pro + Cloud + AI".
 
 ## The tier feature map
 
@@ -30,13 +40,15 @@ The ~180-line plain block comment directly above the enum in `data/models/UserTi
 
 | Tier | Representative features (see the KDoc for the exhaustive list) |
 | --- | --- |
-| `FREE` | Manual record (start/stop/pause/resume), interruption resilience, recordings list, playback (play/seek/rename/delete/share), categories, favorites, Trash (30-day), dark mode (account-tied — see below), fixed AAC/M4A audio format, Clerk profile picture, display name |
-| `PRO` | Import recordings + receive shared audio, Rolling Record mode, scheduled recordings, live marks, waveform, trim, notes, session detail (segment view/delete/trim/protect), audio-format settings, Quick Settings tiles, on-device transcription (Standard / Whisper) |
-| `PRO_CLOUD` | Google Drive backup, cross-device recording + trash access, semantic search (RR-487, server-side embeddings), cloud transcription (AssemblyAI, up to 8 hrs/mo), Medical Mode, Usage screen, free-up-cloud-space sheet |
-| `PRO_CLOUD_AI` | Cloud transcription raised to 20 hrs/mo, context cards (AI extraction, 30 hrs/mo), AI correction, AI/knowledge-base search, KB chat (Claude), custom extraction templates, context-architecture coaching. Below this tier the context-detail **and** tasks screens are `READ_ONLY`, not hidden — see below |
+| `FREE` | Manual record (start/stop/pause/resume), interruption resilience, recordings list, playback (play/seek/rename/delete/share), categories, favorites, Trash (30-day), dark mode (account-tied — see below), fixed AAC/M4A audio format, Clerk profile picture, display name, **ads (RR-521, Free only — see below)** |
+| `PRO` | **No ads (banner, interstitial, and app-open ad all removed)**, import recordings + receive shared audio, Rolling Record mode, scheduled recordings, live marks, waveform, trim, notes, session detail (segment view/delete/trim/protect), audio-format settings, Quick Settings tiles, transcription panel UI (cloud transcription itself starts at Pro + Cloud) |
+| `PRO_CLOUD` | Google Drive backup, cross-device recording + trash access, cloud transcription (AssemblyAI, up to 8 hrs/mo), Medical Mode, Usage screen, free-up-cloud-space sheet |
+| `PRO_CLOUD_AI` | Cloud transcription raised to 20 hrs/mo, context cards (AI extraction, 30 hrs/mo), AI correction, AI/knowledge-base search, KB chat (Claude), semantic search (RR-487, server-side embeddings — Cloud+AI only), custom extraction templates, context-architecture coaching. Below this tier the context-detail **and** tasks screens are `READ_ONLY`, not hidden — see below |
 
 A few map entries carry nuance the table can't:
 
+- **Ads are the one Free-vs-paid differentiator added in the UI itself (RR-521)** — the Free tier shows a thin anchored banner on Home/Library, a post-recording interstitial, and an app-open ad; every tier `atLeast(PRO)` removes all three. The map's design principle holds — free is "finished, not crippled", and ads are the only *addition* at Free, not a feature removed from it. The gate is an owner-stamped confirmed-free check, deliberately *not* `currentTier` (which reads `FREE` for an unknown tier). See [AdMob Ads](/rollingrecord/app/monetization/ads).
+- **Semantic search is Cloud+AI only, not Pro+Cloud (RR-487)** — search-by-meaning runs server-side (the `search` Edge Function gates `PRO_CLOUD_AI`), with keyword/FTS fallback offline or on error; the on-device Smart Search model was retired. The free-up-cloud-space sheet's optional semantic-search chip is likewise Cloud+AI only, even though the sheet itself is a Pro+Cloud feature.
 - **Audio format is fixed at AAC/M4A for `FREE`** — not a choice, and not a crippled one: it is the container that plays natively everywhere (iOS, macOS, Windows, Android), so a shared recording opens for whoever receives it (see `AudioFormat.DEFAULT`). Picking a format (AAC / Auto / Opus / WAV) is a `PRO` feature — the existing "audio-format settings" row.
 - **Dark mode is tied to the account, not the device (RR-500)** — free at every tier. Signing out returns the login screen to the system theme instead of the previous user's; signing in adopts that account's choice. It rides the existing settings sync, so `PRO_CLOUD` and above carry it cross-device, while below that it is per-account on the device.
 - **The context size meter is ungated** — each context shows how much of its extraction budget it uses, measured on-device against `extraction_max_input_tokens`. It was once `PRO_CLOUD_AI`-only, but is now visible at **every** tier: informational only, no gate, no metering. A downgraded user still owns the context and needs the number the moment they resubscribe.
@@ -53,10 +65,11 @@ See [Entitlements & RevenueCat](/rollingrecord/app/monetization/entitlements-rev
 
 ## `V2TierBadge`
 
-`V2TierBadge` (`ui/v2/components/V2TierBadge.kt`) renders the tier pill shown on the Account-settings header card and the Usage screen header card. It draws the tier's glyph (`ic_pro` / `ic_pro_cloud` / `ic_cloud_ai`; `FREE` has no icon) ahead of `tier.displayName()`, on the `tierBadgeBg` background. Sharing one composable keeps the pill identical across both surfaces.
+`V2TierBadge` (`ui/v2/components/V2TierBadge.kt`) renders the tier pill shown on the Account-settings header card and the Usage screen header card. It draws the tier's glyph (`ic_pro` / `ic_pro_cloud` / `ic_cloud_ai`; `FREE` has no icon) ahead of the label resolved from `tier.nameRes()`, on the `tierBadgeBg` background. Sharing one composable keeps the pill identical across both surfaces.
 
 ## Related pages
 
 - [Entitlements & RevenueCat](/rollingrecord/app/monetization/entitlements-revenuecat) — how RC entitlements map to tiers, plus the developer bypass.
 - [Feature Gating & Upsell](/rollingrecord/app/monetization/feature-gating) — the downgrade-aware access model built on `atLeast()`.
 - [Usage Metering & Caps](/rollingrecord/app/monetization/usage-metering) — per-tier monthly caps and the Usage screen.
+- [AdMob Ads](/rollingrecord/app/monetization/ads) — the Free-tier ad formats and the confirmed-free gate.

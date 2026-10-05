@@ -5,6 +5,12 @@ description: "Server-embedded, on-device-scored semantic search over recordings 
 
 Every semantic query is embedded SERVER-side (Cohere `embed-v4.0`, 1024-dim) via `SearchApiClient.embedQuery` on the `search` Edge Function; the cosine SCORING runs on-device against vectors stored in the unified `embeddings` table. On ANY embed failure — offline, server error, rate-limit — the engines return empty and each caller falls back to FTS or keyword search, so search is never blocked by the embed call.
 
+## Tier gating
+
+Semantic search is a **Cloud+AI-tier** feature (RR-487; narrowed from Pro+Cloud on 2026-10-02). The `search` Edge Function (`supabase/functions/search/index.ts`) admits only Cloud+AI through its `runGates` config — `entitlement: [Entitlement.ProCloudAi]` — which the effective-entitlement cascade auto-satisfies for `lifetime_pro_cloud_ai` / `developer` and which EXCLUDES Pro+Cloud, plain Pro, and founders_edition. A below-tier JWT is rejected before the query is ever embedded.
+
+Client-side the chip is offered only at Cloud+AI, so a below-tier user never reaches the embed call and the search bar stays keyword-only. Every V2 search surface derives `semanticAvailable` from `entitlementRepository.currentTier` with `map { it.atLeast(UserTier.PRO_CLOUD_AI) }` — `V2AllRecordingsViewModel`, `V2CategoryDetailViewModel`, `V2FavoritesViewModel`, `V2TrashViewModel`, `V2ContextsViewModel`, `V2ContextListViewModel`, `V2ContextDetailViewModel`, and `V2FreeUpSpaceViewModel` — and `RecordingSearch` (`ui/v2/screens/library/components/RecordingSearch.kt`) shows the Semantic chip only when `semanticAllowed`. The scoring engines below hold no tier logic; they are only reached once the chip is available. (On-device embedding INDEXING runs at a lower floor than querying — see [Embeddings Index & Reconciliation](/rollingrecord/app/ai/embeddings-index).)
+
 ## Recording transcript search
 
 `RecordingSemanticSearchEngine` (`data/repository/RecordingSemanticSearchEngine.kt`) scores recording-transcript chunks. `search(query, source)` returns `List<SearchResult(recordingId, score)>`: it server-embeds the query, then folds a max-per-recording cosine over `EmbeddingType.RECORDING_CHUNK` in keyset pages (`PAGE_SIZE` 512) to bound memory, and applies `applySemanticMarginFilter`. `findTopChunks(recordingId, queryEmbedding, limit)` returns the most similar chunks in TRANSCRIPT ORDER (not score order) for the snippet tool, so the model reads passages chronologically.

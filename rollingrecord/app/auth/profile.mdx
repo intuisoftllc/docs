@@ -1,6 +1,6 @@
 ---
 title: "Account Profile"
-description: "First/last name editing, the Clerk-hosted profile photo pipeline, the deterministic avatar fallback ladder, and the cold-start profile cache."
+description: "First/last name editing, the Clerk-hosted profile photo pipeline, the onboarding photo held-locally-then-uploaded lifecycle, the deterministic avatar fallback ladder, and the cold-start profile cache."
 ---
 
 The V2 Account screen renders and edits the signed-in user's identity — name and photo. The name is two independent Clerk fields (first + last), the photo lives only in Clerk's CDN, and a write-through cache keeps both painting real data during cold start before Clerk re-initializes.
@@ -61,6 +61,22 @@ The picker plumbing is separate from the sheet UI. `V2ProfilePhotoSheet` (`ui/v2
 
 The photo is stored **only** in Clerk's CDN — `AuthRepository.updateProfileImage` never persists it locally or in Supabase. `CachedUserProfile` mirrors just `imageUrl` + `hasImage`; the actual bytes come from Coil's durable per-user disk cache keyed by `imageUrl`, so there is no saved file to manage.
 
+## Onboarding photo: held locally, uploaded after sign-in
+
+The sign-up flow (RR-519) lets a new user pick a profile photo on its page-2 onboarding step — but no Clerk user exists until OTP verify, and `setProfileImage` needs a signed-in user. So the onboarding photo is **held locally through the rest of sign-up and uploaded after the session is established**, a separate path from the account-screen `ProfilePhotoController` pipeline above (no controller, no `isBusy`/`errors` flows). The avatar surface is also different: `OnboardingProfileAvatar` (`ui/v2/screens/login/OnboardingProfileAvatar.kt`) previews the picked **local cache file** with a Coil `AsyncImage(model = File(localPhotoPath))`, whereas `V2ProfileAvatar` renders a Clerk CDN URL.
+
+The lifecycle, start to finish:
+
+| Stage | Where | What happens |
+| --- | --- | --- |
+| Pick | `V2ProfilePhotoScreen` / `V2ReviewConfirmScreen` | Gallery → `ProfilePhotoFiles.copyUriToCache` then `compressToUniqueCache`; camera → `captureFile` then `compressToUniqueCache`. The compressed path is stored via `viewModel.updateLocalPhotoPath(path)` into `LoginUiState.localPhotoPath`. A retake cleans up the file it replaces. |
+| Hold | `LoginUiState.localPhotoPath` | The path rides the shared login state through the Review page. No upload — no account yet. |
+| Hand off | `V2LoginViewModel.onOtpSubmit` | For a sign-UP verify, the path is copied to `V2OnboardingSignals.pendingProfilePhotoPath` (alongside `nextSignInIsNewAccount` and `pendingPersonalizedAds`) **before** calling `verifySignUpOtpV2`. |
+| Capture | `V2App` (`ui/v2/V2App.kt`) | On `AuthState.SignedIn`, if the account is new, `pendingProfilePhotoPath` is read into the local `pendingProfilePhotoToApply` **before** `UserSessionManager.switchTo` wipes the signal, then the signal is cleared. |
+| Upload | `V2App` `LaunchedEffect(sessionActive, pendingProfilePhotoToApply)` | Once the session is active, off `Dispatchers.IO` (per the ANR rule): if the cache file still exists, `authRepository.updateProfileImage(file)` inside `runCatching`; then `ProfilePhotoFiles.cleanUp(file)` regardless of outcome, and the pending path is cleared. |
+
+Two details make this work. `compressToUniqueCache` (not the account path's `compressForUpload`) **moves** the compressed result to a uniquely-named cache file (`onboarding_<timestamp>.jpg`): the camera always captures to a fixed `capture.jpg` and Compressor names its output after the source, so a retake would reuse the same path — which both fails to change the held path string (no state update) and serves Coil's stale cached copy for that path. A unique name per pick guarantees a fresh path and a fresh Coil cache key. And the upload is deliberately **non-fatal** — a failed `updateProfileImage` just leaves the default avatar, which the user can replace later from the Account screen; it never blocks sign-in.
+
 ## `V2ProfileAvatar` fallback ladder
 
 `V2ProfileAvatar` (`ui/v2/components/V2ProfileAvatar.kt`) is the single avatar surface for the whole V2 account UX, and it is never empty — it renders a 4-step fallback ladder over a deterministic three-color mesh:
@@ -74,6 +90,8 @@ The photo is stored **only** in Clerk's CDN — `AuthRepository.updateProfileIma
 
 Case 1 is gated on `hasImage`, not on a blank `imageUrl`, because Clerk always serves a generated default URL. The background is `avatarMeshFor(primarySeed, secondarySeed)` (`ui/v2/theme/Color.kt`), which returns `AvatarMesh(base: Brush, overlay: Brush, hasIdentity: Boolean)` — a **three-color mesh**: a diagonal linear `base` blend of two palette colors seeded from `auth_user_id` (stop A) and email (stop B), plus a soft radial `overlay` bloom of a derived third color biased toward the upper-right (centre 0.78/0.22, radius 0.85, alpha 0.75). `V2ProfileAvatar` paints `mesh.base` as the background and, only when `mesh.hasIdentity`, composites `mesh.overlay` as a sibling `Box` over it. The mesh is kept in lock-step with RRSupport's `avatarMeshFor` (`ui/theme/AvatarPalette.kt`) via shared constants — the palette, the index math, the `+7` third-stop offset, the `+3` collision nudge, and the bloom centre/radius/alpha — so both apps render a user's avatar identically. The same user renders the same avatar everywhere and nothing is persisted; with no identity at all (both seeds null/blank — signed out) it degrades to a flat `Gray200` circle with dark initials.
 
+During sign-up there is no `auth_user_id` yet, so `OnboardingProfileAvatar` reuses this same ladder with `seed = null` and `emailSeed = email.ifBlank { null }` — the gradient is seeded from the typed email alone (stop B), with initials taken from the first/last name just entered. That is the fallback shown on the photo and review pages whenever no photo has been picked.
+
 ## Cold-start profile cache
 
 `ProfileCache` (`data/repository/ProfileCache.kt`) is a user-session-scoped `Closeable` write-through cache. It observes `AuthRepository.authState` and persists every `SignedIn` snapshot into the per-user `UserSettingsDataSource` via `setCachedProfile`. Only scalar fields are mirrored (avatar bytes stay in Coil's disk cache). It is eagerly resolved at session start so the observer runs regardless of which screen is open — the cache must be populated by *this* session for the *next* cold start to benefit.
@@ -82,6 +100,7 @@ Case 1 is gated on `hasImage`, not on a blank `imageUrl`, because Clerk always s
 
 ## Related pages
 
+- [Login & Sign-Up Flow](/rollingrecord/app/auth/login-flow) — where the onboarding photo is picked and held before this upload runs
 - [Account Settings](/rollingrecord/app/auth/account-settings)
 - [Account Health & Freeze](/rollingrecord/app/auth/account-health)
 - [Account Deletion](/rollingrecord/app/auth/account-deletion)

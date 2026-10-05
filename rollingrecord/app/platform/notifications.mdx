@@ -72,7 +72,7 @@ The battery-saver and mic-blocked alerts tap through to `Settings.ACTION_REQUEST
 
 ## Scheduled-recording reminders
 
-The pre-start reminder for a scheduled recording is posted primarily by `ScheduleAlarmReceiver.handleNotify` (`receiver/ScheduleAlarmReceiver.kt`) on the `schedule_reminders_v2` channel (`IMPORTANCE_HIGH`), with Skip and Show actions. `PreStartNotificationWorker` (`worker/PreStartNotificationWorker.kt`) is a secondary WorkManager path that posts a simpler "`<label>` is starting soon" reminder on its own `schedule_reminders` channel (`IMPORTANCE_DEFAULT`) at `NOTIFICATION_ID_BASE = 1000` plus the hashed schedule id. The alarm-driven path is the live production reminder; see [Broadcast Receivers](/rollingrecord/app/platform/receivers) and [Background Work](/rollingrecord/app/platform/workmanager).
+The pre-start reminder for a scheduled recording is posted by `ScheduleAlarmReceiver.handleNotify` (`receiver/ScheduleAlarmReceiver.kt`) on the `schedule_reminders_v2` channel (`IMPORTANCE_HIGH`), with Skip and Show actions, at `NOTIFICATION_ID_BASE = 1000` plus the hashed schedule id. It fires only when the schedule's `preStartNotification` flag is set, driven by the `ACTION_NOTIFY` exact alarm `ScheduleEnqueuer` sets 5 minutes before the start. See [Broadcast Receivers](/rollingrecord/app/platform/receivers) and [Scheduled Recordings](/rollingrecord/app/recording/scheduled-recordings).
 
 ## Worker foreground-service channels
 
@@ -95,5 +95,4 @@ Several background workers run as foreground services and register their own `LO
 | `transcription_channel` | `LOW` | `TranscriptionWorker` |
 | `context_synthesis_channel` | `LOW` | `ContextSynthesisWorker` |
 | `merge_channel` | `LOW` | `MergeWorker` |
-| `schedule_reminders_v2` | `HIGH` | `ScheduleAlarmReceiver` (production path) |
-| `schedule_reminders` | `DEFAULT` | `PreStartNotificationWorker` (secondary path) |
+| `schedule_reminders_v2` | `HIGH` | `ScheduleAlarmReceiver` |
